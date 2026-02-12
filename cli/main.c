@@ -43,6 +43,8 @@ typedef struct {
     int         gpu_id;
     int         max_tokens;
     bool        kv_fp8;
+    bool        cpu_only;
+    float       vram_budget;
     bool        verbose;
     const char* hotwords;
 } cli_args_t;
@@ -62,6 +64,8 @@ static void print_usage(const char* prog) {
         "  --trt-acoustic <plan> TensorRT engine for acoustic encoder\n"
         "  --trt-semantic <plan> TensorRT engine for semantic encoder\n"
         "  --kv-fp8              Use FP8 KV-cache (saves VRAM)\n"
+        "  --vram-budget <0-1>   VRAM fraction for model (default: 1.0)\n"
+        "  --cpu                 CPU-only mode (no GPU)\n"
         "  --verbose             Enable debug logging\n"
         "  --help                Show this message\n",
         VV_VERSION_STRING, prog);
@@ -70,6 +74,7 @@ static void print_usage(const char* prog) {
 static int parse_args(int argc, char** argv, cli_args_t* args) {
     memset(args, 0, sizeof(*args));
     args->max_tokens = 64000;
+    args->vram_budget = 1.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
@@ -90,6 +95,12 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->trt_semantic = argv[++i];
         } else if (strcmp(argv[i], "--kv-fp8") == 0) {
             args->kv_fp8 = true;
+        } else if (strcmp(argv[i], "--vram-budget") == 0 && i + 1 < argc) {
+            args->vram_budget = (float)atof(argv[++i]);
+            if (args->vram_budget < 0.0f) args->vram_budget = 0.0f;
+            if (args->vram_budget > 1.0f) args->vram_budget = 1.0f;
+        } else if (strcmp(argv[i], "--cpu") == 0) {
+            args->cpu_only = true;
         } else if (strcmp(argv[i], "--verbose") == 0) {
             args->verbose = true;
         } else if (strcmp(argv[i], "--help") == 0 ||
@@ -110,6 +121,12 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    /* Enable UTF-8 console output */
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+#endif
+
     cli_args_t args;
     if (parse_args(argc, argv, &args) != 0) {
         print_usage(argv[0]);
@@ -143,7 +160,11 @@ int main(int argc, char** argv) {
     /* Step 2: Initialize inference */
     t0 = get_time_ms();
     vv_inference_ctx_t* ctx = NULL;
-    s = vv_inference_init(args.model_dir, args.gpu_id, args.kv_fp8, &ctx);
+    vv_init_params_t init_params = vv_init_params_default();
+    init_params.kv_fp8 = args.kv_fp8;
+    init_params.vram_budget = args.vram_budget;
+    init_params.cpu_only = args.cpu_only;
+    s = vv_inference_init(args.model_dir, args.gpu_id, &init_params, &ctx);
     if (s != VV_OK) {
         VV_LOG_E("Failed to initialize inference: %s", vv_status_str(s));
         vv_free(audio);

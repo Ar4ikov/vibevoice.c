@@ -1,31 +1,72 @@
 cmake_minimum_required(VERSION 3.28)
-project(vibevoice C CXX CUDA)
+
+# ─── Bootstrap project (C/CXX first, CUDA probed afterward) ──────────────────
+project(vibevoice C CXX)
+
+option(VV_ENABLE_CUDA  "Enable CUDA GPU support"       ON)
+option(VV_ENABLE_BLAS  "Enable OpenBLAS for CPU GEMM"   OFF)
+option(VV_BUILD_TESTS  "Build test executables"          ON)
+option(VV_BUILD_BENCH  "Build benchmark executable"      ON)
+option(VV_BUILD_CLI    "Build CLI executable"            ON)
+option(VV_ENABLE_TRT   "Enable TensorRT support"         ON)
+option(VV_ENABLE_NVTX  "Enable NVTX profiling markers"   OFF)
+
+# ─── Probe for CUDA after C/CXX toolchain is ready ───────────────────────────
+set(VV_HAS_CUDA OFF)
+if(VV_ENABLE_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        set(VV_HAS_CUDA ON)
+        message(STATUS "CUDA enabled (${CMAKE_CUDA_COMPILER})")
+    else()
+        message(WARNING "CUDA requested but not found — building CPU-only")
+    endif()
+else()
+    message(STATUS "CUDA disabled — building CPU-only")
+endif()
 
 # ─── Standards ────────────────────────────────────────────────────────────────
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-# Default to Ampere + Ada if not specified
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "80;86;89")
+if(VV_HAS_CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "80;86;89")
+    endif()
 endif()
 
-# ─── Options ──────────────────────────────────────────────────────────────────
-option(VV_BUILD_TESTS "Build test executables" ON)
-option(VV_BUILD_BENCH "Build benchmark executable" ON)
-option(VV_BUILD_CLI   "Build CLI executable" ON)
-option(VV_ENABLE_TRT  "Enable TensorRT support" ON)
-option(VV_ENABLE_NVTX "Enable NVTX profiling markers" OFF)
-
 # ─── Find CUDA ────────────────────────────────────────────────────────────────
-find_package(CUDAToolkit REQUIRED)
+if(VV_HAS_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+endif()
+
+# ─── Find OpenBLAS (optional) ─────────────────────────────────────────────────
+set(VV_HAS_BLAS OFF)
+if(VV_ENABLE_BLAS)
+    find_package(BLAS)
+    if(BLAS_FOUND)
+        set(VV_HAS_BLAS ON)
+        message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
+    else()
+        find_library(OPENBLAS_LIB openblas)
+        if(OPENBLAS_LIB)
+            set(VV_HAS_BLAS ON)
+            set(BLAS_LIBRARIES ${OPENBLAS_LIB})
+            message(STATUS "OpenBLAS found: ${OPENBLAS_LIB}")
+        else()
+            message(WARNING "OpenBLAS not found — using naive CPU GEMM")
+        endif()
+    endif()
+endif()
 
 # ─── Find TensorRT (optional) ────────────────────────────────────────────────
-if(VV_ENABLE_TRT)
+set(VV_HAS_TRT OFF)
+if(VV_HAS_CUDA AND VV_ENABLE_TRT)
     if(DEFINED ENV{TENSORRT_PATH})
         set(TENSORRT_ROOT "$ENV{TENSORRT_PATH}")
     elseif(DEFINED TENSORRT_PATH)
@@ -52,7 +93,6 @@ if(VV_ENABLE_TRT)
         set(VV_HAS_TRT ON)
         message(STATUS "TensorRT found: ${NVINFER_LIB}")
     else()
-        set(VV_HAS_TRT OFF)
         message(WARNING "TensorRT not found, TRT support disabled")
     endif()
 endif()
@@ -60,17 +100,17 @@ endif()
 # ─── Compiler flags ───────────────────────────────────────────────────────────
 if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
-    # Release flags set via CMAKE_C_FLAGS_RELEASE etc.
     set(CMAKE_C_FLAGS_RELEASE "/O2 /GL /DNDEBUG")
     set(CMAKE_CXX_FLAGS_RELEASE "/O2 /GL /DNDEBUG")
     set(CMAKE_C_FLAGS_DEBUG "/Od /Zi /D_DEBUG")
     set(CMAKE_CXX_FLAGS_DEBUG "/Od /Zi /D_DEBUG")
 endif()
 
-# CUDA flags
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
-set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math -O3")
-set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -g")
+if(VV_HAS_CUDA)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
+    set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math -O3")
+    set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -g")
+endif()
 
 # ─── Include directories ─────────────────────────────────────────────────────
 include_directories(
@@ -102,6 +142,7 @@ add_library(vibevoice_core STATIC
     src/model/loader.c
     src/quant/nf4_table.c
     src/quant/dequant_cpu.c
+    src/cpu/cpu_kernels.c
     src/inference/pipeline.c
     src/inference/decoder.c
     src/inference/kv_cache.c
@@ -110,26 +151,43 @@ add_library(vibevoice_core STATIC
 )
 target_link_libraries(vibevoice_core PUBLIC cjson)
 
+# Propagate VV_HAS_CUDA define to C code
+if(VV_HAS_CUDA)
+    target_compile_definitions(vibevoice_core PUBLIC VV_HAS_CUDA=1)
+endif()
+
+# OpenBLAS
+if(VV_HAS_BLAS)
+    target_compile_definitions(vibevoice_core PUBLIC VV_HAS_OPENBLAS=1)
+    target_link_libraries(vibevoice_core PUBLIC ${BLAS_LIBRARIES})
+endif()
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(vibevoice_core PUBLIC m)
+endif()
+
 # ─── vibevoice_cuda (CUDA kernels) ───────────────────────────────────────────
-add_library(vibevoice_cuda STATIC
-    src/cuda/dequant_nf4.cu
-    src/cuda/conv1d.cu
-    src/cuda/conv_vae.cu
-    src/cuda/rmsnorm.cu
-    src/cuda/rope.cu
-    src/cuda/attention.cu
-    src/cuda/swiglu.cu
-    src/cuda/gemm.cu
-    src/cuda/embedding.cu
-    src/cuda/cuda_utils.cu
-)
-target_link_libraries(vibevoice_cuda PUBLIC
-    CUDA::cudart
-    CUDA::cublas
-)
-if(VV_ENABLE_NVTX)
-    target_compile_definitions(vibevoice_cuda PUBLIC VV_ENABLE_NVTX)
-    target_link_libraries(vibevoice_cuda PUBLIC CUDA::nvToolsExt)
+if(VV_HAS_CUDA)
+    add_library(vibevoice_cuda STATIC
+        src/cuda/dequant_nf4.cu
+        src/cuda/conv1d.cu
+        src/cuda/conv_vae.cu
+        src/cuda/rmsnorm.cu
+        src/cuda/rope.cu
+        src/cuda/attention.cu
+        src/cuda/swiglu.cu
+        src/cuda/gemm.cu
+        src/cuda/embedding.cu
+        src/cuda/cuda_utils.cu
+    )
+    target_link_libraries(vibevoice_cuda PUBLIC
+        CUDA::cudart
+        CUDA::cublas
+    )
+    if(VV_ENABLE_NVTX)
+        target_compile_definitions(vibevoice_cuda PUBLIC VV_ENABLE_NVTX)
+        target_link_libraries(vibevoice_cuda PUBLIC CUDA::nvToolsExt)
+    endif()
 endif()
 
 # ─── vibevoice_trt (TensorRT wrapper, optional) ──────────────────────────────
@@ -154,10 +212,10 @@ endif()
 add_library(vibevoice SHARED
     src/core/alloc.c  # re-add for DLL export; in production use object libs
 )
-target_link_libraries(vibevoice PUBLIC
-    vibevoice_core
-    vibevoice_cuda
-)
+target_link_libraries(vibevoice PUBLIC vibevoice_core)
+if(VV_HAS_CUDA)
+    target_link_libraries(vibevoice PUBLIC vibevoice_cuda)
+endif()
 if(VV_HAS_TRT)
     target_link_libraries(vibevoice PUBLIC vibevoice_trt)
 endif()
@@ -165,7 +223,10 @@ endif()
 # ─── CLI executable ───────────────────────────────────────────────────────────
 if(VV_BUILD_CLI)
     add_executable(vv_cli cli/main.c)
-    target_link_libraries(vv_cli PRIVATE vibevoice_core vibevoice_cuda)
+    target_link_libraries(vv_cli PRIVATE vibevoice_core)
+    if(VV_HAS_CUDA)
+        target_link_libraries(vv_cli PRIVATE vibevoice_cuda)
+    endif()
     if(VV_HAS_TRT)
         target_link_libraries(vv_cli PRIVATE vibevoice_trt)
     endif()
@@ -177,7 +238,10 @@ if(VV_BUILD_TESTS)
 
     function(vv_add_test name src)
         add_executable(${name} ${src})
-        target_link_libraries(${name} PRIVATE vibevoice_core vibevoice_cuda)
+        target_link_libraries(${name} PRIVATE vibevoice_core)
+        if(VV_HAS_CUDA)
+            target_link_libraries(${name} PRIVATE vibevoice_cuda)
+        endif()
         add_test(NAME ${name} COMMAND ${name})
     endfunction()
 
@@ -192,12 +256,29 @@ endif()
 if(VV_BUILD_BENCH)
     add_executable(vv_bench bench/benchmark.c)
     target_link_libraries(vv_bench PRIVATE vibevoice_core)
+    if(VV_HAS_CUDA)
+        target_link_libraries(vv_bench PRIVATE vibevoice_cuda)
+    endif()
 endif()
 
 # ─── Install ──────────────────────────────────────────────────────────────────
-install(TARGETS vibevoice vv_cli
+set(VV_INSTALL_TARGETS vibevoice)
+if(VV_BUILD_CLI)
+    list(APPEND VV_INSTALL_TARGETS vv_cli)
+endif()
+install(TARGETS ${VV_INSTALL_TARGETS}
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
 install(DIRECTORY include/vibevoice DESTINATION include)
+
+# ─── Summary ──────────────────────────────────────────────────────────────────
+message(STATUS "")
+message(STATUS "  vibevoice.c build configuration:")
+message(STATUS "    CUDA:      ${VV_HAS_CUDA}")
+message(STATUS "    OpenBLAS:  ${VV_HAS_BLAS}")
+message(STATUS "    TensorRT:  ${VV_HAS_TRT}")
+message(STATUS "    CLI:       ${VV_BUILD_CLI}")
+message(STATUS "    Tests:     ${VV_BUILD_TESTS}")
+message(STATUS "")

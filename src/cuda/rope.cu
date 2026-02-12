@@ -2,16 +2,17 @@
  * @file rope.cu
  * @brief Rotary Position Embedding (RoPE) CUDA kernel.
  *
- * Qwen2 RoPE parameters:
- * - theta = 1,000,000
- * - head_dim = 128
- * - Applied to Q and K tensors in-place
+ * Qwen2 RoPE uses the "half-split" dimension pairing convention:
+ *   pair (d, d + half_dim)  for d = 0 .. half_dim-1
  *
- * For position p and dimension pair (2i, 2i+1):
- *   cos_theta = cos(p * theta^(-2i/d))
- *   sin_theta = sin(p * theta^(-2i/d))
- *   q_new[2i]   = q[2i]   * cos_theta - q[2i+1] * sin_theta
- *   q_new[2i+1] = q[2i]   * sin_theta + q[2i+1] * cos_theta
+ * For position p and dimension pair d:
+ *   freq   = theta^(-2d / head_dim)
+ *   angle  = pos * freq
+ *   x_new[d]             = x[d]             * cos(angle) - x[d+half_dim] * sin(angle)
+ *   x_new[d + half_dim]  = x[d]             * sin(angle) + x[d+half_dim] * cos(angle)
+ *
+ * LAYOUT: x is [seq_len, n_heads, head_dim] FP16 (seq-major, heads interleaved).
+ *         This matches GEMM output [seq_len, n_heads * head_dim].
  */
 
 #include <cuda_runtime.h>
@@ -21,10 +22,12 @@
 /**
  * @brief Apply RoPE to Q or K tensor in-place.
  *
- * x: [n_heads, seq_len, head_dim] FP16
+ * x: [seq_len, n_heads, head_dim] FP16  (seq-major)
  *
- * Grid: (seq_len, n_heads)
- * Block: (head_dim/2)
+ * Grid:  (seq_len, n_heads)
+ * Block: (head_dim / 2)
+ *
+ * Each thread handles one dimension pair (d, d + half_dim).
  */
 __global__ void rope_kernel(
     half* __restrict__ x,
@@ -32,24 +35,28 @@ __global__ void rope_kernel(
     int position_offset,
     float theta)
 {
-    int pos = blockIdx.x + position_offset;
+    int seq_idx = blockIdx.x;
     int head = blockIdx.y;
-    int pair = threadIdx.x;  /* 0 .. head_dim/2 - 1 */
+    int d = threadIdx.x;          /* 0 .. head_dim/2 - 1 */
+    int half_dim = head_dim / 2;
 
-    if (pair >= head_dim / 2) return;
+    if (d >= half_dim) return;
+    if (seq_idx >= seq_len) return;
 
-    int seq_idx = blockIdx.x;  /* actual index in the tensor */
+    int pos = seq_idx + position_offset;
 
-    /* Compute rotation angle */
-    float freq = powf(theta, -2.0f * (float)pair / (float)head_dim);
+    /* Compute rotation angle — Qwen2 convention:
+     * freq = theta^(-2d / head_dim)  = 1 / theta^(2d / head_dim)
+     */
+    float freq = powf(theta, -2.0f * (float)d / (float)head_dim);
     float angle = (float)pos * freq;
     float cos_a = cosf(angle);
     float sin_a = sinf(angle);
 
-    /* Index into [n_heads, seq_len, head_dim] */
-    int base = head * seq_len * head_dim + seq_idx * head_dim;
-    int idx0 = base + pair * 2;
-    int idx1 = base + pair * 2 + 1;
+    /* Index into [seq_len, n_heads, head_dim]  (seq-major, half-split) */
+    int base = seq_idx * n_heads * head_dim + head * head_dim;
+    int idx0 = base + d;                /* dimension d */
+    int idx1 = base + d + half_dim;     /* dimension d + half_dim */
 
     float x0 = __half2float(x[idx0]);
     float x1 = __half2float(x[idx1]);
@@ -65,7 +72,7 @@ extern "C" {
 /**
  * @brief Apply RoPE to Q or K tensor.
  *
- * @param x              [n_heads, seq_len, head_dim] FP16, modified in-place
+ * @param x              [seq_len, n_heads, head_dim] FP16, modified in-place
  * @param seq_len        Sequence length
  * @param n_heads        Number of heads
  * @param head_dim       Dimension per head (128 for Qwen2)

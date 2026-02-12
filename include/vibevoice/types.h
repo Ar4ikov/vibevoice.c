@@ -162,6 +162,33 @@ typedef struct vv_audio_config {
     int   compress_ratio;      /**< 3200 */
 } vv_audio_config_t;
 
+/* ─── Inference initialization parameters ───────────────────────────────── */
+
+/** @brief Weight placement strategy (auto-selected from VRAM budget). */
+typedef enum vv_placement {
+    VV_PLACE_ALL_GPU,       /**< All layers + embed + lm_head on GPU          */
+    VV_PLACE_STREAM_FULL,   /**< Stream layers; embed + lm_head on GPU        */
+    VV_PLACE_STREAM_EMBED,  /**< Stream layers + lm_head; embed on GPU only   */
+    VV_PLACE_STREAM_ALL,    /**< Stream everything (layers + embed + lm_head) */
+    VV_PLACE_CPU_ONLY,      /**< Everything on CPU, no CUDA at all            */
+} vv_placement_t;
+
+/** @brief Parameters for vv_inference_init(). Pass NULL for defaults. */
+typedef struct vv_init_params {
+    float  vram_budget;   /**< 0.0-1.0 fraction of free VRAM. Default: 1.0   */
+    bool   kv_fp8;        /**< Use FP8 KV-cache (halves KV memory)           */
+    bool   cpu_only;      /**< Force CPU-only mode (vram_budget=0 shortcut)  */
+} vv_init_params_t;
+
+/** @brief Fill vv_init_params_t with sane defaults. */
+static inline vv_init_params_t vv_init_params_default(void) {
+    vv_init_params_t p;
+    p.vram_budget = 1.0f;
+    p.kv_fp8 = false;
+    p.cpu_only = false;
+    return p;
+}
+
 /* ─── Inference parameters ──────────────────────────────────────────────── */
 
 typedef struct vv_inference_params {

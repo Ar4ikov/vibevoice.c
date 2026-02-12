@@ -72,7 +72,7 @@ vv_status_t vv_model_free(vv_model_t* model);
 /* Inference — see inference.h */
 typedef struct vv_inference_ctx vv_inference_ctx_t;
 vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
-                               bool kv_fp8,
+                               const vv_init_params_t* params,
                                vv_inference_ctx_t** ctx);
 vv_status_t vv_inference_transcribe(
     vv_inference_ctx_t* ctx,

@@ -29,6 +29,7 @@ typedef enum vv_component_type {
 typedef struct vv_weight {
     char            name[256];
     vv_tensor_t     tensor;       /**< FP16/BF16 tensors */
+    vv_tensor_t     bias;         /**< Optional bias (FP16), NULL data if absent */
     vv_quant_tensor_t quant;      /**< NF4 quantized tensors (if applicable) */
     bool            is_quantized; /**< true if NF4 quantized */
 } vv_weight_t;

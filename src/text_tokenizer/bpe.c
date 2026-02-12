@@ -148,7 +148,8 @@ vv_status_t vv_tokenizer_load(const char* dir_path, vv_tokenizer_t** out) {
             }
         }
 
-        /* Parse merges */
+        /* Parse merges — use cJSON_ArrayForEach for O(n) linked-list walk
+         * instead of cJSON_GetArrayItem(i) which is O(n²) */
         cJSON* merges = cJSON_GetObjectItem(model, "merges");
         if (merges && cJSON_IsArray(merges)) {
             int nm = cJSON_GetArraySize(merges);
@@ -156,9 +157,9 @@ vv_status_t vv_tokenizer_load(const char* dir_path, vv_tokenizer_t** out) {
                 (size_t)nm * sizeof(vv_merge_t));
             if (tok->merges) {
                 tok->n_merges = 0;
-                for (int i = 0; i < nm; i++) {
-                    cJSON* m = cJSON_GetArrayItem(merges, i);
-                    if (!m || !cJSON_IsString(m)) continue;
+                cJSON* m;
+                cJSON_ArrayForEach(m, merges) {
+                    if (!cJSON_IsString(m)) continue;
 
                     const char* s = m->valuestring;
                     /* Format: "token1 token2" */
@@ -193,8 +194,8 @@ vv_status_t vv_tokenizer_load(const char* dir_path, vv_tokenizer_t** out) {
             (size_t)na * sizeof(vv_vocab_entry_t));
         if (tok->special_tokens) {
             tok->n_special = 0;
-            for (int i = 0; i < na; i++) {
-                cJSON* item = cJSON_GetArrayItem(added, i);
+            cJSON* item;
+            cJSON_ArrayForEach(item, added) {
                 cJSON* content = cJSON_GetObjectItem(item, "content");
                 cJSON* id_val = cJSON_GetObjectItem(item, "id");
                 if (!content || !id_val) continue;

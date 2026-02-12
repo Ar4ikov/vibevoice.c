@@ -14,12 +14,12 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-/* NF4 lookup table in constant memory for fast broadcast access */
+/* NF4 lookup table — exact bitsandbytes values (scipy.stats.norm quantiles) */
 __constant__ float c_nf4_table[16] = {
-    -1.0f, -0.6961928f, -0.5250730f, -0.3949338f,
-    -0.2844871f, -0.1848489f, -0.0911179f,  0.0f,
-     0.0796009f,  0.1609302f,  0.2461123f,  0.3379930f,
-     0.4407233f,  0.5626170f,  0.7229568f,  1.0f
+    -1.0f,              -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
+    -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f,  0.0f,
+     0.07958029955625534f,  0.16093020141124725f,  0.24611230194568634f,  0.33791524171829224f,
+     0.44070982933044434f,  0.5626170039176941f,   0.7229568362236023f,   1.0f
 };
 
 /**
@@ -59,22 +59,25 @@ __global__ void vv_dequant_nf4_kernel(
     /* Load packed byte */
     uint8_t byte_val = packed[byte_idx];
 
-    /* Unpack high nibble (first element) and low nibble (second element) */
+    /* Unpack: bitsandbytes packs first element in HIGH nibble,
+     *         second element in LOW nibble.
+     *   byte = (first_elem_nib << 4) | second_elem_nib
+     */
     uint8_t hi = (byte_val >> 4) & 0x0F;
     uint8_t lo = byte_val & 0x0F;
 
-    float val_hi = c_nf4_table[hi] * scale;
-    float val_lo = c_nf4_table[lo] * scale;
+    float val_first  = c_nf4_table[hi] * scale;   /* HIGH nibble = first element  */
+    float val_second = c_nf4_table[lo] * scale;   /* LOW nibble  = second element */
 
-    /* Vectorized half2 store */
-    half2 out_val = __floats2half2_rn(val_hi, val_lo);
+    /* half2 store: first element in low half (lower address),
+     *              second element in high half (higher address) */
+    half2 out_val = __floats2half2_rn(val_first, val_second);
 
     if (out_idx + 1 < n_elements) {
-        /* Aligned half2 store */
-        ((half2*)output)[quant_block * 16 + lane] = out_val;
+        ((half2*)output)[quant_block * 32 + lane] = out_val;
     } else {
         /* Edge case: last element */
-        output[out_idx] = __float2half(val_hi);
+        output[out_idx] = __float2half(val_first);
     }
 }
 
@@ -115,15 +118,15 @@ __global__ void vv_dequant_nf4_double_kernel(
     uint8_t hi = (byte_val >> 4) & 0x0F;
     uint8_t lo = byte_val & 0x0F;
 
-    float val_hi = c_nf4_table[hi] * scale;
-    float val_lo = c_nf4_table[lo] * scale;
+    float val_first  = c_nf4_table[hi] * scale;   /* HIGH nibble = first element  */
+    float val_second = c_nf4_table[lo] * scale;   /* LOW nibble  = second element */
 
-    half2 out_val = __floats2half2_rn(val_hi, val_lo);
+    half2 out_val = __floats2half2_rn(val_first, val_second);
 
     if (out_idx + 1 < n_elements) {
-        ((half2*)output)[quant_block * 16 + lane] = out_val;
+        ((half2*)output)[quant_block * 32 + lane] = out_val;
     } else {
-        output[out_idx] = __float2half(val_hi);
+        output[out_idx] = __float2half(val_first);
     }
 }
 

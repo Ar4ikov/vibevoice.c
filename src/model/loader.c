@@ -37,6 +37,7 @@ static bool is_nf4_weight(const char* name) {
  */
 static bool is_nf4_metadata(const char* name) {
     return strstr(name, ".absmax") != NULL ||
+           strstr(name, ".nested_absmax") != NULL ||
            strstr(name, ".quant_state") != NULL ||
            strstr(name, ".quant_map") != NULL ||
            strstr(name, ".nested_") != NULL ||
@@ -137,6 +138,105 @@ static vv_status_t find_safetensors_files(const char* model_dir,
     return VV_OK;
 }
 
+/* ─── BF16 → FP16 in-place conversion ──────────────────────────────────── */
+
+/**
+ * @brief Convert a BF16 value to FP16.
+ *
+ * BF16 = 1 sign + 8 exponent + 7 mantissa  (same exponent as FP32)
+ * FP16 = 1 sign + 5 exponent + 10 mantissa
+ *
+ * Strategy: BF16 → FP32 (just shift left 16) → FP16.
+ */
+static uint16_t bf16_to_fp16(uint16_t bf) {
+    /* BF16 → FP32: upper 16 bits of IEEE-754 float */
+    union { float f; uint32_t u; } u;
+    u.u = (uint32_t)bf << 16;
+    float f = u.f;
+
+    /* FP32 → FP16 */
+    uint32_t b;
+    memcpy(&b, &f, 4);
+    uint32_t sign = (b >> 16) & 0x8000;
+    int32_t  exp  = ((b >> 23) & 0xFF) - 127 + 15;
+    uint32_t frac = (b >> 13) & 0x03FF;
+    if (exp <= 0)       return (uint16_t)sign;            /* underflow → ±0   */
+    if (exp >= 0x1F)    return (uint16_t)(sign | 0x7C00); /* overflow  → ±inf */
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | frac);
+}
+
+/**
+ * @brief Convert an array of BF16 values to FP16 in-place.
+ */
+static void bf16_array_to_fp16(uint16_t* data, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        data[i] = bf16_to_fp16(data[i]);
+    }
+}
+
+/* ─── FP16 tensor → FP32 in-place (for CPU-side weights) ────────────────── */
+
+/**
+ * @brief Convert a single FP16 (IEEE-754 half) value to FP32.
+ */
+static float fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t frac = h & 0x03FF;
+
+    if (exp == 0) {
+        /* Subnormal or zero */
+        if (frac == 0) {
+            union { float f; uint32_t u; } u;
+            u.u = sign;
+            return u.f;
+        }
+        /* Subnormal: normalize */
+        exp = 1;
+        while (!(frac & 0x0400)) { frac <<= 1; exp--; }
+        frac &= 0x03FF;
+        exp = (127 - 15 + exp);
+        union { float f; uint32_t u; } u;
+        u.u = sign | (exp << 23) | (frac << 13);
+        return u.f;
+    }
+    if (exp == 0x1F) {
+        /* Inf / NaN */
+        union { float f; uint32_t u; } u;
+        u.u = sign | 0x7F800000 | (frac << 13);
+        return u.f;
+    }
+    /* Normal */
+    union { float f; uint32_t u; } u;
+    u.u = sign | ((exp + (127 - 15)) << 23) | (frac << 13);
+    return u.f;
+}
+
+/**
+ * @brief Convert a tensor from FP16 to FP32 in-place.
+ *
+ * Re-allocates the buffer to 4 bytes per element.
+ * Used for connector / Conv-VAE weights that are consumed on CPU as float*.
+ */
+static void tensor_fp16_to_fp32(vv_tensor_t* t) {
+    if (!t || !t->data) return;
+    if (t->dtype != VV_DTYPE_F16) return;
+
+    size_t n = t->size_bytes / 2;  /* number of FP16 elements */
+    float* fp32 = (float*)vv_alloc(n * sizeof(float));
+    if (!fp32) return;
+
+    const uint16_t* fp16 = (const uint16_t*)t->data;
+    for (size_t i = 0; i < n; i++) {
+        fp32[i] = fp16_to_fp32(fp16[i]);
+    }
+
+    vv_free(t->data);
+    t->data = fp32;
+    t->size_bytes = n * sizeof(float);
+    t->dtype = VV_DTYPE_F32;
+}
+
 /* ─── Load a single weight tensor ───────────────────────────────────────── */
 
 static vv_status_t load_tensor_from_st(vv_safetensors_t* st,
@@ -161,6 +261,14 @@ static vv_status_t load_tensor_from_st(vv_safetensors_t* st,
     tensor->size_bytes = info.data_size;
     tensor->on_gpu = false;
 
+    /* Auto-convert BF16 → FP16 so all downstream code uses FP16.
+     * Both are 2 bytes per element, so size_bytes stays the same. */
+    if (tensor->dtype == VV_DTYPE_BF16) {
+        size_t n_elements = tensor->size_bytes / 2;
+        bf16_array_to_fp16((uint16_t*)tensor->data, n_elements);
+        tensor->dtype = VV_DTYPE_F16;
+    }
+
     return VV_OK;
 }
 
@@ -176,25 +284,247 @@ static vv_status_t load_tensor_any(vv_safetensors_t** st_files, int n_st,
     return VV_ERR_NOT_FOUND;
 }
 
+/* FP16 → FP32 conversion helper */
+static float half_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    if (exp == 0) {
+        if (mant == 0) { float r; uint32_t b = sign; memcpy(&r, &b, 4); return r; }
+        while (!(mant & 0x400)) { mant <<= 1; exp--; }
+        mant &= 0x3FF; exp++;
+    } else if (exp == 31) {
+        uint32_t b = sign | 0x7F800000 | ((uint32_t)mant << 13);
+        float r; memcpy(&r, &b, 4); return r;
+    }
+    exp = exp + (127 - 15);
+    uint32_t b = sign | ((uint32_t)exp << 23) | ((uint32_t)mant << 13);
+    float r; memcpy(&r, &b, 4); return r;
+}
+
+/* FP32 → FP16 conversion helper */
+static uint16_t f32_to_half(float f) {
+    uint32_t b; memcpy(&b, &f, 4);
+    uint32_t sign = (b >> 16) & 0x8000;
+    int32_t  exp  = ((b >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = b & 0x7FFFFF;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
 /**
- * @brief Load NF4 absmax scales for a quantized weight.
+ * @brief Load NF4 scales for a quantized weight.
  *
- * For a weight named "foo.weight", loads "foo.weight.absmax" as the
- * per-block FP16 scales needed for dequantization.
+ * Handles bitsandbytes double quantization:
+ * 1. Load "foo.weight.absmax" (U8 — quantized per-block scales)
+ * 2. Load "foo.weight.nested_absmax" (F32 — per-superblock scale)
+ * 3. Load "foo.weight.quant_state.bitsandbytes__nf4" (JSON blob)
+ * 4. Parse JSON for nested_offset and nested_quant_map
+ * 5. Reconstruct FP16 per-block scales on CPU
  */
 static vv_status_t load_nf4_scales(vv_safetensors_t** st_files, int n_st,
                                     const char* weight_name,
                                     vv_weight_t* weight) {
-    char absmax_name[512];
-    snprintf(absmax_name, sizeof(absmax_name), "%s.absmax", weight_name);
+    char buf[512];
+    vv_status_t s;
 
-    vv_status_t s = load_tensor_any(st_files, n_st, absmax_name,
-                                     &weight->quant.scales);
-    if (s == VV_OK) {
-        weight->quant.block_size = 64;  /* bitsandbytes default */
-        VV_LOG_D("loader: loaded NF4 scales for '%s'", weight_name);
+    /* Load absmax */
+    vv_tensor_t absmax_tensor = {0};
+    snprintf(buf, sizeof(buf), "%s.absmax", weight_name);
+    s = load_tensor_any(st_files, n_st, buf, &absmax_tensor);
+    if (s != VV_OK) return s;
+
+    /* Check if this is double quantization (absmax dtype == U8) */
+    if (absmax_tensor.dtype != VV_DTYPE_U8) {
+        /* Simple (non-double) quantization: absmax is already FP16/FP32 scales */
+        weight->quant.scales = absmax_tensor;
+        weight->quant.block_size = 64;
+        weight->quant.double_quant = false;
+        VV_LOG_D("loader: loaded NF4 scales for '%s' (simple)", weight_name);
+        return VV_OK;
     }
-    return s;
+
+    /* ── Double quantization path ── */
+    weight->quant.double_quant = true;
+    weight->quant.block_size = 64;
+
+    /* Load nested_absmax (F32 per-superblock scales) */
+    vv_tensor_t nested_tensor = {0};
+    snprintf(buf, sizeof(buf), "%s.nested_absmax", weight_name);
+    s = load_tensor_any(st_files, n_st, buf, &nested_tensor);
+    if (s != VV_OK) {
+        VV_LOG_E("loader: missing nested_absmax for '%s'", weight_name);
+        vv_tensor_free(&absmax_tensor);
+        return s;
+    }
+
+    /* Load quant_state blob (JSON) */
+    vv_tensor_t qs_tensor = {0};
+    snprintf(buf, sizeof(buf), "%s.quant_state.bitsandbytes__nf4", weight_name);
+    s = load_tensor_any(st_files, n_st, buf, &qs_tensor);
+
+    /* Parse quant_state JSON for nested_offset and nested_quant_map */
+    float nested_offset = 0.0f;
+    int nested_blocksize = 256;
+    bool have_qmap = false;
+
+    /*
+     * Default bitsandbytes signed dynamic map: create_dynamic_map(signed=True).
+     * 255 entries covering [-0.993, +0.993], symmetric around 0.
+     * This is the default code used by bitsandbytes for blockwise quantization
+     * of absmax values (centered by offset subtraction).
+     * Index 255 padded with 1.0.
+     */
+    static const float BNB_DEFAULT_CODE[256] = {
+        -9.9296875e-01f, -9.7890625e-01f, -9.6484375e-01f, -9.5078125e-01f,
+        -9.3671875e-01f, -9.2265625e-01f, -9.0859375e-01f, -8.9453125e-01f,
+        -8.8046875e-01f, -8.6640625e-01f, -8.5234375e-01f, -8.3828125e-01f,
+        -8.2421875e-01f, -8.1015625e-01f, -7.9609375e-01f, -7.8203125e-01f,
+        -7.6796875e-01f, -7.5390625e-01f, -7.3984375e-01f, -7.2578125e-01f,
+        -7.1171875e-01f, -6.9765625e-01f, -6.8359375e-01f, -6.6953125e-01f,
+        -6.5546875e-01f, -6.4140625e-01f, -6.2734375e-01f, -6.1328125e-01f,
+        -5.9921875e-01f, -5.8515625e-01f, -5.7109375e-01f, -5.5703125e-01f,
+        -5.4296875e-01f, -5.2890625e-01f, -5.1484375e-01f, -5.0078125e-01f,
+        -4.8671875e-01f, -4.7265625e-01f, -4.5859375e-01f, -4.4453125e-01f,
+        -4.3046875e-01f, -4.1640625e-01f, -4.0234375e-01f, -3.8828125e-01f,
+        -3.7421875e-01f, -3.6015625e-01f, -3.4609375e-01f, -3.3203125e-01f,
+        -3.1796875e-01f, -3.0390625e-01f, -2.8984375e-01f, -2.7578125e-01f,
+        -2.6171875e-01f, -2.4765625e-01f, -2.3359375e-01f, -2.1953125e-01f,
+        -2.0546875e-01f, -1.9140625e-01f, -1.7734375e-01f, -1.6328125e-01f,
+        -1.4921875e-01f, -1.3515625e-01f, -1.2109375e-01f, -1.0703125e-01f,
+        -9.8593750e-02f, -9.5781250e-02f, -9.2968750e-02f, -9.0156250e-02f,
+        -8.7343750e-02f, -8.4531250e-02f, -8.1718750e-02f, -7.8906250e-02f,
+        -7.6093750e-02f, -7.3281250e-02f, -7.0468750e-02f, -6.7656250e-02f,
+        -6.4843750e-02f, -6.2031250e-02f, -5.9218750e-02f, -5.6406250e-02f,
+        -5.3593750e-02f, -5.0781250e-02f, -4.7968750e-02f, -4.5156250e-02f,
+        -4.2343750e-02f, -3.9531250e-02f, -3.6718750e-02f, -3.3906250e-02f,
+        -3.1093750e-02f, -2.8281250e-02f, -2.5468750e-02f, -2.2656250e-02f,
+        -1.9843750e-02f, -1.7031250e-02f, -1.4218750e-02f, -1.1406250e-02f,
+        -9.7187500e-03f, -9.1562500e-03f, -8.5937500e-03f, -8.0312500e-03f,
+        -7.4687500e-03f, -6.9062500e-03f, -6.3437500e-03f, -5.7812500e-03f,
+        -5.2187500e-03f, -4.6562500e-03f, -4.0937500e-03f, -3.5312500e-03f,
+        -2.9687500e-03f, -2.4062500e-03f, -1.8437500e-03f, -1.2812500e-03f,
+        -9.4375000e-04f, -8.3125000e-04f, -7.1875000e-04f, -6.0625000e-04f,
+        -4.9375000e-04f, -3.8125000e-04f, -2.6875000e-04f, -1.5625000e-04f,
+        -8.8750000e-05f, -6.6250000e-05f, -4.3750000e-05f, -2.1250000e-05f,
+        -7.7500000e-06f, -3.2500000e-06f, -5.5000000e-07f,  0.0000000e+00f,
+         5.5000000e-07f,  3.2500000e-06f,  7.7500000e-06f,  2.1250000e-05f,
+         4.3750000e-05f,  6.6250000e-05f,  8.8750000e-05f,  1.5625000e-04f,
+         2.6875000e-04f,  3.8125000e-04f,  4.9375000e-04f,  6.0625000e-04f,
+         7.1875000e-04f,  8.3125000e-04f,  9.4375000e-04f,  1.2812500e-03f,
+         1.8437500e-03f,  2.4062500e-03f,  2.9687500e-03f,  3.5312500e-03f,
+         4.0937500e-03f,  4.6562500e-03f,  5.2187500e-03f,  5.7812500e-03f,
+         6.3437500e-03f,  6.9062500e-03f,  7.4687500e-03f,  8.0312500e-03f,
+         8.5937500e-03f,  9.1562500e-03f,  9.7187500e-03f,  1.1406250e-02f,
+         1.4218750e-02f,  1.7031250e-02f,  1.9843750e-02f,  2.2656250e-02f,
+         2.5468750e-02f,  2.8281250e-02f,  3.1093750e-02f,  3.3906250e-02f,
+         3.6718750e-02f,  3.9531250e-02f,  4.2343750e-02f,  4.5156250e-02f,
+         4.7968750e-02f,  5.0781250e-02f,  5.3593750e-02f,  5.6406250e-02f,
+         5.9218750e-02f,  6.2031250e-02f,  6.4843750e-02f,  6.7656250e-02f,
+         7.0468750e-02f,  7.3281250e-02f,  7.6093750e-02f,  7.8906250e-02f,
+         8.1718750e-02f,  8.4531250e-02f,  8.7343750e-02f,  9.0156250e-02f,
+         9.2968750e-02f,  9.5781250e-02f,  9.8593750e-02f,  1.0703125e-01f,
+         1.2109375e-01f,  1.3515625e-01f,  1.4921875e-01f,  1.6328125e-01f,
+         1.7734375e-01f,  1.9140625e-01f,  2.0546875e-01f,  2.1953125e-01f,
+         2.3359375e-01f,  2.4765625e-01f,  2.6171875e-01f,  2.7578125e-01f,
+         2.8984375e-01f,  3.0390625e-01f,  3.1796875e-01f,  3.3203125e-01f,
+         3.4609375e-01f,  3.6015625e-01f,  3.7421875e-01f,  3.8828125e-01f,
+         4.0234375e-01f,  4.1640625e-01f,  4.3046875e-01f,  4.4453125e-01f,
+         4.5859375e-01f,  4.7265625e-01f,  4.8671875e-01f,  5.0078125e-01f,
+         5.1484375e-01f,  5.2890625e-01f,  5.4296875e-01f,  5.5703125e-01f,
+         5.7109375e-01f,  5.8515625e-01f,  5.9921875e-01f,  6.1328125e-01f,
+         6.2734375e-01f,  6.4140625e-01f,  6.5546875e-01f,  6.6953125e-01f,
+         6.8359375e-01f,  6.9765625e-01f,  7.1171875e-01f,  7.2578125e-01f,
+         7.3984375e-01f,  7.5390625e-01f,  7.6796875e-01f,  7.8203125e-01f,
+         7.9609375e-01f,  8.1015625e-01f,  8.2421875e-01f,  8.3828125e-01f,
+         8.5234375e-01f,  8.6640625e-01f,  8.8046875e-01f,  8.9453125e-01f,
+         9.0859375e-01f,  9.2265625e-01f,  9.3671875e-01f,  9.5078125e-01f,
+         9.6484375e-01f,  9.7890625e-01f,  9.9296875e-01f,  1.0000000e+00f,
+    };
+    const float* nested_qmap = BNB_DEFAULT_CODE;
+    float custom_qmap[256];  /* mutable buffer for JSON-provided map */
+
+    if (s == VV_OK && qs_tensor.data && qs_tensor.size_bytes > 0) {
+        /* quant_state is a JSON string stored as U8 bytes */
+        char* json_str = (char*)vv_alloc(qs_tensor.size_bytes + 1);
+        if (json_str) {
+            memcpy(json_str, qs_tensor.data, qs_tensor.size_bytes);
+            json_str[qs_tensor.size_bytes] = '\0';
+
+            cJSON* root = cJSON_Parse(json_str);
+            if (root) {
+                /* nested_offset */
+                cJSON* off = cJSON_GetObjectItem(root, "nested_offset");
+                if (off && cJSON_IsNumber(off))
+                    nested_offset = (float)off->valuedouble;
+
+                /* nested_blocksize */
+                cJSON* nbs = cJSON_GetObjectItem(root, "nested_blocksize");
+                if (nbs && cJSON_IsNumber(nbs))
+                    nested_blocksize = (int)nbs->valuedouble;
+
+                /* nested_quant_map — 256-entry lookup table (optional) */
+                cJSON* nqm = cJSON_GetObjectItem(root, "nested_quant_map");
+                if (nqm && cJSON_IsArray(nqm)) {
+                    int nqm_size = cJSON_GetArraySize(nqm);
+                    if (nqm_size >= 255 && nqm_size <= 256) {
+                        for (int i = 0; i < nqm_size; i++) {
+                            cJSON* v = cJSON_GetArrayItem(nqm, i);
+                            custom_qmap[i] = v ? (float)v->valuedouble : 0.0f;
+                        }
+                        if (nqm_size == 255)
+                            custom_qmap[255] = 1.0f;  /* pad to 256 */
+                        nested_qmap = custom_qmap;
+                        have_qmap = true;
+                    }
+                }
+                cJSON_Delete(root);
+            }
+            vv_free(json_str);
+        }
+    }
+    vv_tensor_free(&qs_tensor);
+
+    /* Reconstruct FP16 per-block scales */
+    int n_blocks = (int)absmax_tensor.size_bytes;  /* 1 byte per block (U8) */
+    const uint8_t* abs_u8 = (const uint8_t*)absmax_tensor.data;
+    const float* nested_f32 = (const float*)nested_tensor.data;
+    int n_superblocks = (int)(nested_tensor.size_bytes / sizeof(float));
+
+    size_t scales_bytes = (size_t)n_blocks * sizeof(uint16_t);
+    uint16_t* scales_fp16 = (uint16_t*)vv_alloc(scales_bytes);
+    if (!scales_fp16) {
+        vv_tensor_free(&absmax_tensor);
+        vv_tensor_free(&nested_tensor);
+        return VV_ERR_OUT_OF_MEMORY;
+    }
+
+    for (int i = 0; i < n_blocks; i++) {
+        int si = i / nested_blocksize;
+        if (si >= n_superblocks) si = n_superblocks - 1;
+
+        /* Dequantize: code[u8_val] * nested_absmax + offset */
+        float scale = nested_qmap[abs_u8[i]] * nested_f32[si] + nested_offset;
+        scales_fp16[i] = f32_to_half(scale);
+    }
+
+    /* Store as the weight's FP16 scales */
+    weight->quant.scales.data = scales_fp16;
+    weight->quant.scales.size_bytes = scales_bytes;
+    weight->quant.scales.dtype = VV_DTYPE_F16;
+    weight->quant.scales.ndim = 1;
+    weight->quant.scales.shape[0] = n_blocks;
+    weight->quant.scales.on_gpu = false;
+
+    vv_tensor_free(&absmax_tensor);
+    vv_tensor_free(&nested_tensor);
+
+    VV_LOG_D("loader: loaded NF4 scales for '%s' (double-quant, %d blocks, "
+             "offset=%.4f, sb=%d, qmap=%s)",
+             weight_name, n_blocks, nested_offset, nested_blocksize,
+             have_qmap ? "json-parsed" : "bnb-default");
+    return VV_OK;
 }
 
 /* ─── Public API ────────────────────────────────────────────────────────── */
@@ -323,56 +653,66 @@ vv_status_t vv_model_load(const char* model_dir, vv_model_t** out) {
                 load_tensor_from_st(st, info.name, &model->lm_head);
             }
 
-            /* ── Connector weights (FP16) ── */
+            /* ── Connector weights (BF16→FP16→FP32 for CPU use) ── */
             else if (strstr(info.name, "acoustic_connector.fc1.weight")) {
                 load_tensor_from_st(st, info.name,
                     &model->acoustic_connector_fc1.tensor);
+                tensor_fp16_to_fp32(&model->acoustic_connector_fc1.tensor);
                 strncpy(model->acoustic_connector_fc1.name, info.name, 255);
             }
             else if (strstr(info.name, "acoustic_connector.fc1.bias")) {
                 load_tensor_from_st(st, info.name,
                     &model->acoustic_connector_fc1.quant.packed);
-                /* Reuse quant.packed as bias storage for non-quantized */
+                tensor_fp16_to_fp32(&model->acoustic_connector_fc1.quant.packed);
             }
             else if (strstr(info.name, "acoustic_connector.norm.weight")) {
                 load_tensor_from_st(st, info.name,
                     &model->acoustic_connector_norm.tensor);
+                tensor_fp16_to_fp32(&model->acoustic_connector_norm.tensor);
             }
             else if (strstr(info.name, "acoustic_connector.fc2.weight")) {
                 load_tensor_from_st(st, info.name,
                     &model->acoustic_connector_fc2.tensor);
+                tensor_fp16_to_fp32(&model->acoustic_connector_fc2.tensor);
             }
             else if (strstr(info.name, "acoustic_connector.fc2.bias")) {
                 load_tensor_from_st(st, info.name,
                     &model->acoustic_connector_fc2.quant.packed);
+                tensor_fp16_to_fp32(&model->acoustic_connector_fc2.quant.packed);
             }
             else if (strstr(info.name, "semantic_connector.fc1.weight")) {
                 load_tensor_from_st(st, info.name,
                     &model->semantic_connector_fc1.tensor);
+                tensor_fp16_to_fp32(&model->semantic_connector_fc1.tensor);
                 strncpy(model->semantic_connector_fc1.name, info.name, 255);
             }
             else if (strstr(info.name, "semantic_connector.fc1.bias")) {
                 load_tensor_from_st(st, info.name,
                     &model->semantic_connector_fc1.quant.packed);
+                tensor_fp16_to_fp32(&model->semantic_connector_fc1.quant.packed);
             }
             else if (strstr(info.name, "semantic_connector.norm.weight")) {
                 load_tensor_from_st(st, info.name,
                     &model->semantic_connector_norm.tensor);
+                tensor_fp16_to_fp32(&model->semantic_connector_norm.tensor);
             }
             else if (strstr(info.name, "semantic_connector.fc2.weight")) {
                 load_tensor_from_st(st, info.name,
                     &model->semantic_connector_fc2.tensor);
+                tensor_fp16_to_fp32(&model->semantic_connector_fc2.tensor);
             }
             else if (strstr(info.name, "semantic_connector.fc2.bias")) {
                 load_tensor_from_st(st, info.name,
                     &model->semantic_connector_fc2.quant.packed);
+                tensor_fp16_to_fp32(&model->semantic_connector_fc2.quant.packed);
             }
 
-            /* ── Tokenizer encoder weights (FP16) ── */
+            /* ── Tokenizer encoder weights (BF16→FP16→FP32 for CPU use) ── */
             else if (strstr(info.name, "acoustic_tokenizer.encoder.") &&
                      model->acoustic_weights && ai < n_acoustic_enc) {
                 load_tensor_from_st(st, info.name,
                                     &model->acoustic_weights[ai].tensor);
+                tensor_fp16_to_fp32(&model->acoustic_weights[ai].tensor);
                 strncpy(model->acoustic_weights[ai].name, info.name, 255);
                 ai++;
             }
@@ -380,6 +720,7 @@ vv_status_t vv_model_load(const char* model_dir, vv_model_t** out) {
                      model->semantic_weights && si < n_semantic_enc) {
                 load_tensor_from_st(st, info.name,
                                     &model->semantic_weights[si].tensor);
+                tensor_fp16_to_fp32(&model->semantic_weights[si].tensor);
                 strncpy(model->semantic_weights[si].name, info.name, 255);
                 si++;
             }
@@ -403,6 +744,28 @@ vv_status_t vv_model_load(const char* model_dir, vv_model_t** out) {
                 else if (strstr(info.name, "post_attention_layernorm.weight")) {
                     load_tensor_from_st(st, info.name,
                                         &layer->post_attn_layernorm);
+                }
+                /* ── Attention / MLP bias (FP16) ── */
+                else if (strstr(info.name, "_proj.bias")) {
+                    vv_tensor_t* dst = NULL;
+                    if (strstr(info.name, "self_attn.q_proj.bias"))
+                        dst = &layer->attn.q_proj.bias;
+                    else if (strstr(info.name, "self_attn.k_proj.bias"))
+                        dst = &layer->attn.k_proj.bias;
+                    else if (strstr(info.name, "self_attn.v_proj.bias"))
+                        dst = &layer->attn.v_proj.bias;
+                    else if (strstr(info.name, "self_attn.o_proj.bias"))
+                        dst = &layer->attn.o_proj.bias;
+                    else if (strstr(info.name, "mlp.gate_proj.bias"))
+                        dst = &layer->mlp.gate_proj.bias;
+                    else if (strstr(info.name, "mlp.up_proj.bias"))
+                        dst = &layer->mlp.up_proj.bias;
+                    else if (strstr(info.name, "mlp.down_proj.bias"))
+                        dst = &layer->mlp.down_proj.bias;
+
+                    if (dst) {
+                        load_tensor_from_st(st, info.name, dst);
+                    }
                 }
                 else if (is_nf4_weight(info.name)) {
                     /* Determine which projection this is */
@@ -438,13 +801,23 @@ vv_status_t vv_model_load(const char* model_dir, vv_model_t** out) {
     model->n_acoustic_weights = ai;
     model->n_semantic_weights = si;
 
+    /* Count bias tensors loaded */
+    int n_bias = 0;
+    for (int li = 0; li < n_layers; li++) {
+        vv_layer_weights_t* L = &model->layers[li];
+        if (L->attn.q_proj.bias.data) n_bias++;
+        if (L->attn.k_proj.bias.data) n_bias++;
+        if (L->attn.v_proj.bias.data) n_bias++;
+        if (L->attn.o_proj.bias.data) n_bias++;
+    }
+
     VV_LOG_I("loader: model loaded successfully (%d layers, embed=%s, norm=%s, "
-             "connectors=%s, encoders=%d+%d)",
+             "connectors=%s, encoders=%d+%d, attn_bias=%d)",
              n_layers,
              model->embed_tokens.data ? "yes" : "no",
              model->final_norm.data ? "yes" : "no",
              model->acoustic_connector_fc1.tensor.data ? "yes" : "no",
-             ai, si);
+             ai, si, n_bias);
 
     *out = model;
     return VV_OK;
@@ -453,25 +826,32 @@ vv_status_t vv_model_load(const char* model_dir, vv_model_t** out) {
 vv_status_t vv_model_free(vv_model_t* model) {
     if (!model) return VV_ERR_NULL_PTR;
 
-    /* Free layer weights (including NF4 scales) */
+    /* Free layer weights (including NF4 scales and biases) */
     if (model->layers) {
         for (int i = 0; i < model->num_layers; i++) {
             vv_layer_weights_t* l = &model->layers[i];
             vv_tensor_free(&l->input_layernorm);
             vv_tensor_free(&l->post_attn_layernorm);
             vv_tensor_free(&l->attn.q_proj.tensor);
+            vv_tensor_free(&l->attn.q_proj.bias);
             vv_tensor_free(&l->attn.q_proj.quant.scales);
             vv_tensor_free(&l->attn.k_proj.tensor);
+            vv_tensor_free(&l->attn.k_proj.bias);
             vv_tensor_free(&l->attn.k_proj.quant.scales);
             vv_tensor_free(&l->attn.v_proj.tensor);
+            vv_tensor_free(&l->attn.v_proj.bias);
             vv_tensor_free(&l->attn.v_proj.quant.scales);
             vv_tensor_free(&l->attn.o_proj.tensor);
+            vv_tensor_free(&l->attn.o_proj.bias);
             vv_tensor_free(&l->attn.o_proj.quant.scales);
             vv_tensor_free(&l->mlp.gate_proj.tensor);
+            vv_tensor_free(&l->mlp.gate_proj.bias);
             vv_tensor_free(&l->mlp.gate_proj.quant.scales);
             vv_tensor_free(&l->mlp.up_proj.tensor);
+            vv_tensor_free(&l->mlp.up_proj.bias);
             vv_tensor_free(&l->mlp.up_proj.quant.scales);
             vv_tensor_free(&l->mlp.down_proj.tensor);
+            vv_tensor_free(&l->mlp.down_proj.bias);
             vv_tensor_free(&l->mlp.down_proj.quant.scales);
         }
         vv_free(model->layers);

@@ -1,6 +1,14 @@
 /**
  * @file special_tokens.c
  * @brief VibeVoice-ASR special token definitions and helpers.
+ *
+ * VibeVoice reuses Qwen2.5 extended tokens for speech:
+ *   speech_start = <|object_ref_start|>  (151646)
+ *   speech_pad   = <|box_start|>         (151648)
+ *   speech_end   = <|object_ref_end|>    (151647)
+ * ChatML framing:
+ *   <|im_start|> (151644)  /  <|im_end|> (151645)
+ * See: vllm_plugin/tools/generate_tokenizer_files.py
  */
 
 #include "vibevoice/text_tokenizer.h"
@@ -9,18 +17,34 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Well-known special token strings */
-const char* VV_TOKEN_START_TRANSCRIPT = "<|startoftranscript|>";
-const char* VV_TOKEN_END_TRANSCRIPT   = "<|endoftranscript|>";
+/* ── ChatML framing tokens ─────────────────────────────────────────────── */
+const char* VV_TOKEN_IM_START     = "<|im_start|>";
+const char* VV_TOKEN_IM_END       = "<|im_end|>";
+const char* VV_TOKEN_ENDOFTEXT    = "<|endoftext|>";
+
+/* ── VibeVoice speech tokens (Qwen2.5 extended) ───────────────────────── */
+const char* VV_TOKEN_SPEECH_START = "<|object_ref_start|>";  /* speech_start_id */
+const char* VV_TOKEN_SPEECH_PAD   = "<|box_start|>";         /* speech_pad_id   */
+const char* VV_TOKEN_SPEECH_END   = "<|object_ref_end|>";    /* speech_end_id   */
+
+/* Legacy names (kept for link compat, pipeline.c no longer uses them) */
+const char* VV_TOKEN_START_TRANSCRIPT = "<|object_ref_start|>";
+const char* VV_TOKEN_END_TRANSCRIPT   = "<|im_end|>";
 const char* VV_TOKEN_NOSPEECH         = "<|nospeech|>";
 const char* VV_TOKEN_HOTWORDS         = "<|hotwords|>";
 
 /**
- * @brief Check if a token ID corresponds to the end-of-transcript token.
+ * @brief Check if a token ID is an end-of-generation token.
+ *
+ * In ChatML the assistant turn ends with <|im_end|>.
+ * <|endoftext|> is also a valid stop signal.
  */
 bool vv_is_end_token(const vv_tokenizer_t* tok, int32_t token_id) {
-    int end_id = vv_tokenizer_special_id(tok, VV_TOKEN_END_TRANSCRIPT);
-    return (end_id >= 0 && token_id == end_id);
+    int im_end = vv_tokenizer_special_id(tok, VV_TOKEN_IM_END);
+    if (im_end >= 0 && token_id == im_end) return true;
+    int eot = vv_tokenizer_special_id(tok, VV_TOKEN_ENDOFTEXT);
+    if (eot >= 0 && token_id == eot) return true;
+    return false;
 }
 
 /**

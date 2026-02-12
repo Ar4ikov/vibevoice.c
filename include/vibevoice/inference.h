@@ -21,23 +21,25 @@ extern "C" {
  * FP16 by default. FP8 option for memory savings.
  */
 typedef struct vv_kv_cache {
-    void**   k_cache;         /**< [num_layers] pointers to K cache on GPU */
-    void**   v_cache;         /**< [num_layers] pointers to V cache on GPU */
+    void**   k_cache;         /**< [num_layers] pointers to K cache          */
+    void**   v_cache;         /**< [num_layers] pointers to V cache          */
     int      num_layers;
     int      n_kv_heads;
     int      head_dim;
     int      max_seq_len;     /**< Maximum cache capacity */
     int      current_len;     /**< Current number of cached positions */
     bool     fp8;             /**< Use FP8 KV-cache for memory savings */
+    bool     on_cpu;          /**< true = CPU RAM, false = GPU VRAM */
 } vv_kv_cache_t;
 
 /**
- * @brief Allocate KV-cache on GPU.
+ * @brief Allocate KV-cache (GPU or CPU).
+ * @param on_cpu  If true, allocate in CPU RAM instead of GPU VRAM.
  */
 vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
                                 int num_layers, int n_kv_heads,
                                 int head_dim, int max_seq_len,
-                                bool fp8);
+                                bool fp8, bool on_cpu);
 
 /**
  * @brief Append new K, V to cache at current position.
@@ -62,6 +64,39 @@ vv_status_t vv_kv_cache_reset(vv_kv_cache_t* cache);
  */
 vv_status_t vv_kv_cache_free(vv_kv_cache_t* cache);
 
+/* ─── Layer weight streaming pool ───────────────────────────────────────── */
+
+/**
+ * @brief Double-buffered GPU staging pool for layer-by-layer weight upload.
+ *
+ * When VRAM is too small to hold all 28 layers at once, we keep NF4
+ * weights on CPU and upload one layer's worth to a reusable GPU buffer
+ * before processing it.  Double-buffering allows overlapping transfer
+ * of layer i+1 while layer i is computing.
+ */
+#define VV_LAYER_POOL_SLOTS 2
+#define VV_LAYER_TENSORS_PER_LAYER 20   /* 2 norms + 7*(packed+scales) + 4 attn bias */
+
+typedef struct vv_layer_pool {
+    void*  gpu_buf[VV_LAYER_POOL_SLOTS]; /**< Pre-allocated GPU staging  */
+    size_t buf_size;                      /**< Size of each GPU buffer    */
+    int    loaded[VV_LAYER_POOL_SLOTS];   /**< Layer idx in slot (-1=empty) */
+
+    /* Saved CPU pointers for restoring after unstage */
+    void*  saved_ptrs[VV_LAYER_POOL_SLOTS][VV_LAYER_TENSORS_PER_LAYER];
+
+    bool   all_resident;  /**< true = all layers already on GPU, pool unused */
+} vv_layer_pool_t;
+
+vv_status_t vv_layer_pool_create(vv_layer_pool_t** pool,
+                                  const vv_model_t* model, bool all_resident);
+vv_status_t vv_layer_pool_stage(vv_layer_pool_t* pool,
+                                 vv_model_t* model, int layer_idx,
+                                 void* stream);
+vv_status_t vv_layer_pool_unstage(vv_layer_pool_t* pool,
+                                   vv_model_t* model, int layer_idx);
+vv_status_t vv_layer_pool_free(vv_layer_pool_t* pool);
+
 /* ─── Decoder ───────────────────────────────────────────────────────────── */
 
 /**
@@ -80,26 +115,51 @@ vv_status_t vv_decoder_layer_forward(
 
 /**
  * @brief Full prefill through all 28 layers.
+ * @param pool  Optional layer pool for streaming (NULL = weights on GPU).
+ * @param xfer  Transfer stream for async upload (NULL = use compute).
  */
 vv_status_t vv_decoder_prefill(
-    const vv_model_t* model,
+    vv_model_t* model,
     void* hidden_states,       /**< [seq_len, hidden_size] FP16, in/out */
     int seq_len,
     vv_kv_cache_t* kv_cache,
+    vv_layer_pool_t* pool,
     void* workspace,
     size_t workspace_size,
-    void* stream);
+    void* compute_stream,
+    void* xfer_stream);
 
 /**
  * @brief Single decode step through all 28 layers.
+ * @param pool  Optional layer pool for streaming (NULL = weights on GPU).
+ * @param xfer  Transfer stream for async upload (NULL = use compute).
  */
 vv_status_t vv_decoder_step(
-    const vv_model_t* model,
+    vv_model_t* model,
     void* hidden_state,        /**< [1, hidden_size] FP16, in/out */
     vv_kv_cache_t* kv_cache,
+    vv_layer_pool_t* pool,
     void* workspace,
     size_t workspace_size,
-    void* stream);
+    void* compute_stream,
+    void* xfer_stream);
+
+/* ─── CPU-mode decoder (Phase 3) ───────────────────────────────────────── */
+
+vv_status_t vv_decoder_prefill_cpu(
+    vv_model_t* model,
+    float* hidden_states,      /**< [seq_len, hidden_size] FP32, in/out */
+    int seq_len,
+    vv_kv_cache_t* kv_cache,
+    float* workspace,
+    size_t workspace_size);
+
+vv_status_t vv_decoder_step_cpu(
+    vv_model_t* model,
+    float* hidden_state,       /**< [1, hidden_size] FP32, in/out */
+    vv_kv_cache_t* kv_cache,
+    float* workspace,
+    size_t workspace_size);
 
 /* ─── Sampling ──────────────────────────────────────────────────────────── */
 
@@ -131,13 +191,17 @@ typedef struct vv_inference_ctx {
     size_t         workspace_size;
     int            gpu_id;
 
-    /* GPU-resident weight buffers */
+    /* Placement strategy (auto-selected from VRAM budget) */
+    vv_placement_t placement;
+    bool           use_gpu;           /**< false for CPU-only mode */
+
+    /* GPU-resident weight buffers (NULL if offloaded to CPU) */
     void*          embed_table_gpu;
     void*          lm_head_gpu;
     void*          final_norm_gpu;
 
-    /* Per-layer GPU buffers for NF4 dequantized weights */
-    void**         layer_temp_weights;
+    /* Layer weight streaming pool */
+    vv_layer_pool_t* layer_pool;
 
     /* Text tokenizer (cached for decode loop) */
     struct vv_tokenizer* tokenizer;
@@ -156,7 +220,7 @@ typedef struct vv_inference_ctx {
 } vv_inference_ctx_t;
 
 vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
-                               bool kv_fp8,
+                               const vv_init_params_t* params,
                                vv_inference_ctx_t** ctx);
 vv_status_t vv_inference_transcribe(
     vv_inference_ctx_t* ctx,

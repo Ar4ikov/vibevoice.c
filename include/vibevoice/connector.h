@@ -63,6 +63,16 @@ vv_status_t vv_connector_forward_cuda(const vv_connector_t* conn,
                                        void* output_gpu, void* stream);
 
 /**
+ * @brief Forward pass with GPU auto-fallback.
+ *
+ * Tries GPU first, falls back to CPU if GPU unavailable.
+ * Same interface as CPU version.
+ */
+vv_status_t vv_connector_forward_auto(const vv_connector_t* conn,
+                                        const float* input, int n_frames,
+                                        float** output);
+
+/**
  * @brief Free connector resources.
  */
 vv_status_t vv_connector_free(vv_connector_t* conn);
