@@ -1,0 +1,262 @@
+/**
+ * @file types.h
+ * @brief Core types, error codes, and constants for vibevoice.c
+ */
+#ifndef VV_TYPES_H
+#define VV_TYPES_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ─── Status codes ──────────────────────────────────────────────────────── */
+
+typedef enum vv_status {
+    VV_OK = 0,
+
+    /* General errors */
+    VV_ERR_INVALID_ARG    = -1,
+    VV_ERR_NULL_PTR       = -2,
+    VV_ERR_OUT_OF_MEMORY  = -3,
+    VV_ERR_NOT_FOUND      = -4,
+    VV_ERR_IO             = -5,
+    VV_ERR_PARSE          = -6,
+    VV_ERR_UNSUPPORTED    = -7,
+    VV_ERR_OVERFLOW       = -8,
+    VV_ERR_SHAPE_MISMATCH = -9,
+
+    /* CUDA errors */
+    VV_ERR_CUDA           = -100,
+    VV_ERR_CUDA_OOM       = -101,
+    VV_ERR_CUDA_LAUNCH    = -102,
+
+    /* TensorRT errors */
+    VV_ERR_TRT            = -200,
+    VV_ERR_TRT_BUILD      = -201,
+    VV_ERR_TRT_RUNTIME    = -202,
+
+    /* Model errors */
+    VV_ERR_MODEL_FORMAT   = -300,
+    VV_ERR_MODEL_VERSION  = -301,
+    VV_ERR_WEIGHT_MISSING = -302,
+
+    /* Audio errors */
+    VV_ERR_AUDIO_FORMAT   = -400,
+    VV_ERR_AUDIO_RESAMPLE = -401,
+} vv_status_t;
+
+/* ─── Data types ────────────────────────────────────────────────────────── */
+
+typedef enum vv_dtype {
+    VV_DTYPE_F32    = 0,
+    VV_DTYPE_F16    = 1,
+    VV_DTYPE_BF16   = 2,
+    VV_DTYPE_U8     = 3,   /* uint8, used for NF4 packed data */
+    VV_DTYPE_I32    = 4,
+    VV_DTYPE_I64    = 5,
+    VV_DTYPE_F8_E4M3 = 6,  /* FP8 for double-quantization scales */
+    VV_DTYPE_NF4    = 7,   /* logical type: NF4 packed as U8 */
+    VV_DTYPE_BOOL   = 8,
+} vv_dtype_t;
+
+/** @brief Size in bytes for a single element of the given dtype. */
+static inline size_t vv_dtype_size(vv_dtype_t dtype) {
+    switch (dtype) {
+        case VV_DTYPE_F32:     return 4;
+        case VV_DTYPE_F16:     return 2;
+        case VV_DTYPE_BF16:    return 2;
+        case VV_DTYPE_U8:      return 1;
+        case VV_DTYPE_I32:     return 4;
+        case VV_DTYPE_I64:     return 8;
+        case VV_DTYPE_F8_E4M3: return 1;
+        case VV_DTYPE_NF4:     return 1; /* packed: 2 values per byte */
+        case VV_DTYPE_BOOL:    return 1;
+        default:               return 0;
+    }
+}
+
+/* ─── Tensor descriptor ─────────────────────────────────────────────────── */
+
+#define VV_MAX_DIMS 8
+
+typedef struct vv_tensor {
+    void*       data;               /**< Raw data pointer (CPU or GPU) */
+    int64_t     shape[VV_MAX_DIMS]; /**< Shape dimensions */
+    int         ndim;               /**< Number of dimensions */
+    vv_dtype_t  dtype;              /**< Element data type */
+    size_t      size_bytes;         /**< Total size in bytes */
+    bool        on_gpu;             /**< true if data is on GPU */
+} vv_tensor_t;
+
+/** @brief Quantized tensor (NF4) with scale information. */
+typedef struct vv_quant_tensor {
+    vv_tensor_t packed;    /**< Packed uint8 data (2 NF4 values per byte) */
+    vv_tensor_t scales;    /**< Per-block scales (FP16 or FP8) */
+    int         block_size; /**< Quantization block size (typically 64) */
+    bool        double_quant; /**< True if scales are also quantized */
+    vv_tensor_t scale_scales; /**< Scales of scales (for double quant) */
+    float       scale_offset; /**< Offset for double quantization */
+} vv_quant_tensor_t;
+
+/* ─── Model configuration (from config.json) ────────────────────────────── */
+
+typedef struct vv_acoustic_tokenizer_config {
+    int   channels;
+    bool  causal;
+    int   vae_dim;
+    float fix_std;
+    int   encoder_n_filters;
+    int   encoder_ratios[8];
+    int   n_ratios;
+    int   encoder_depths[8];
+    int   n_depths;
+    float layernorm_eps;
+    float layer_scale_init_value;
+} vv_acoustic_tokenizer_config_t;
+
+typedef struct vv_semantic_tokenizer_config {
+    int   channels;
+    bool  causal;
+    int   vae_dim;
+    int   encoder_n_filters;
+    int   encoder_ratios[8];
+    int   n_ratios;
+    int   encoder_depths[8];
+    int   n_depths;
+    float layernorm_eps;
+    float layer_scale_init_value;
+} vv_semantic_tokenizer_config_t;
+
+typedef struct vv_llm_config {
+    int   hidden_size;
+    int   num_hidden_layers;
+    int   num_attention_heads;
+    int   num_key_value_heads;
+    int   head_dim;
+    int   intermediate_size;
+    int   vocab_size;
+    int   max_position_embeddings;
+    float rope_theta;
+    float rms_norm_eps;
+} vv_llm_config_t;
+
+typedef struct vv_model_config {
+    vv_acoustic_tokenizer_config_t acoustic;
+    vv_semantic_tokenizer_config_t semantic;
+    vv_llm_config_t                llm;
+    int   acoustic_vae_dim;
+    int   semantic_vae_dim;
+} vv_model_config_t;
+
+/* ─── Audio configuration ───────────────────────────────────────────────── */
+
+typedef struct vv_audio_config {
+    int   target_sample_rate;  /**< 24000 */
+    bool  normalize_audio;     /**< true */
+    float target_db_fs;        /**< -25.0 */
+    float eps;                 /**< 1e-6 */
+    int   compress_ratio;      /**< 3200 */
+} vv_audio_config_t;
+
+/* ─── Inference parameters ──────────────────────────────────────────────── */
+
+typedef struct vv_inference_params {
+    int          max_new_tokens;     /**< Default: 64000 */
+    float        temperature;        /**< Default: 0.0 (greedy) */
+    int          top_k;              /**< Default: 1 */
+    const char** hotwords;           /**< NULL-terminated array */
+    int          num_hotwords;
+    bool         enable_timestamps;
+    bool         enable_diarize;
+} vv_inference_params_t;
+
+/* ─── Transcription output ──────────────────────────────────────────────── */
+
+typedef struct vv_segment {
+    const char* speaker;
+    float       start_time;
+    float       end_time;
+    const char* text;
+} vv_segment_t;
+
+typedef struct vv_transcription {
+    vv_segment_t* segments;
+    int           num_segments;
+    const char*   full_text;
+    float         duration;
+    const char*   language;
+} vv_transcription_t;
+
+/* ─── Performance metrics ───────────────────────────────────────────────── */
+
+typedef struct vv_perf_metrics {
+    /* Timing — milliseconds */
+    double total_ms;             /**< Wall-clock for entire transcribe()    */
+    double audio_encode_ms;      /**< Step 1: Conv-VAE / feature prep       */
+    double sequence_build_ms;    /**< Step 2: embed + upload                */
+    double prefill_ms;           /**< Step 3: LLM prefill (28 layers)       */
+    double decode_ms;            /**< Step 4: autoregressive decode loop    */
+    double postprocess_ms;       /**< Step 5: detokenize + JSON             */
+
+    /* Key latencies */
+    double ttft_ms;              /**< Time To First Token (steps 1-3)       */
+
+    /* Throughput */
+    double prefill_tok_per_sec;  /**< Prefill tokens / second               */
+    double decode_tok_per_sec;   /**< Generated tokens / second             */
+
+    /* Token counts */
+    int    prefill_tokens;       /**< Tokens in the prefill sequence        */
+    int    decode_tokens;        /**< Tokens generated during decode        */
+    int    audio_frames;         /**< Audio feature frames (from encoder)   */
+
+    /* Audio */
+    float  audio_duration_sec;   /**< Input audio duration in seconds       */
+    double rtf;                  /**< Real-Time Factor (lower = faster)     */
+
+    /* GPU memory (bytes, 0 if unavailable) */
+    size_t vram_used_bytes;      /**< VRAM in use after transcribe          */
+    size_t vram_free_bytes;      /**< Free VRAM after transcribe            */
+    size_t vram_total_bytes;     /**< Total GPU VRAM                        */
+
+    /* KV cache */
+    int    kv_cache_used;        /**< KV-cache positions filled             */
+    int    kv_cache_max;         /**< KV-cache max capacity                 */
+    float  kv_cache_pct;         /**< Utilization (0-100%)                  */
+
+    /* Model info */
+    int    num_layers;           /**< Transformer layers                    */
+    int    hidden_size;          /**< Hidden dimension                      */
+    bool   kv_fp8;               /**< Whether KV cache uses FP8             */
+    size_t workspace_mb;         /**< Allocated workspace in MB             */
+} vv_perf_metrics_t;
+
+/* ─── Log levels ────────────────────────────────────────────────────────── */
+
+typedef enum vv_log_level {
+    VV_LOG_ERROR = 0,
+    VV_LOG_WARN  = 1,
+    VV_LOG_INFO  = 2,
+    VV_LOG_DEBUG = 3,
+} vv_log_level_t;
+
+/* ─── NVTX helpers ──────────────────────────────────────────────────────── */
+
+#ifdef VV_ENABLE_NVTX
+#include <nvToolsExt.h>
+#define VV_NVTX_PUSH(name) nvtxRangePushA(name)
+#define VV_NVTX_POP()      nvtxRangePop()
+#else
+#define VV_NVTX_PUSH(name) ((void)0)
+#define VV_NVTX_POP()      ((void)0)
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* VV_TYPES_H */

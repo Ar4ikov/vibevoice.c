@@ -1,0 +1,135 @@
+/**
+ * @file tokenizer_encoder.h
+ * @brief Conv-VAE speech tokenizer encoder API.
+ *
+ * Two parallel tokenizer encoders:
+ * - Acoustic: vae_dim=64, gaussian sampling (std=0.5)
+ * - Semantic: vae_dim=128, deterministic (mean only)
+ *
+ * Both use same architecture: causal 1D Conv-VAE with
+ * encoder_ratios=[8,5,5,4,2,2] (total compression 3200x).
+ * Output frame rate: 24000 / 3200 = 7.5 Hz
+ */
+#ifndef VV_TOKENIZER_ENCODER_H
+#define VV_TOKENIZER_ENCODER_H
+
+#include "vibevoice/types.h"
+#include "vibevoice/model.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ─── Conv-VAE block types ──────────────────────────────────────────────── */
+
+/** @brief 1D convolution layer weights. */
+typedef struct vv_conv1d_weights {
+    vv_tensor_t weight;   /**< [out_ch, in_ch, kernel_size] or [out_ch, 1, ks] for depthwise */
+    vv_tensor_t bias;     /**< [out_ch] or empty */
+    int         stride;
+    int         kernel_size;
+    bool        causal;
+    bool        depthwise;
+} vv_conv1d_weights_t;
+
+/** @brief Single encoder block weights (norm + mixer + ffn). */
+typedef struct vv_encoder_block {
+    /* Mixer path: norm → depthwise_conv → residual + layer_scale */
+    vv_tensor_t mixer_norm_weight;       /**< RMSNorm weight */
+    vv_conv1d_weights_t mixer_conv;      /**< Depthwise conv */
+    vv_tensor_t mixer_layer_scale;       /**< Learnable scale (scalar per channel) */
+
+    /* FFN path: norm → linear1 → act → linear2 → residual + layer_scale */
+    vv_tensor_t ffn_norm_weight;
+    vv_tensor_t ffn_linear1_weight;      /**< [hidden, channels] */
+    vv_tensor_t ffn_linear1_bias;
+    vv_tensor_t ffn_linear2_weight;      /**< [channels, hidden] */
+    vv_tensor_t ffn_linear2_bias;
+    vv_tensor_t ffn_layer_scale;
+} vv_encoder_block_t;
+
+/** @brief Single encoder stage (downsample + N blocks). */
+typedef struct vv_encoder_stage {
+    vv_conv1d_weights_t downsample;      /**< Strided conv for downsampling */
+    vv_encoder_block_t* blocks;
+    int                 n_blocks;
+    int                 channels;        /**< Output channels for this stage */
+} vv_encoder_stage_t;
+
+/** @brief Full Conv-VAE encoder. */
+typedef struct vv_conv_vae_encoder {
+    /* Initial convolution (1 channel → encoder_n_filters) */
+    vv_conv1d_weights_t input_conv;
+
+    /* Encoder stages */
+    vv_encoder_stage_t* stages;
+    int                 n_stages;
+
+    /* Final projection to VAE dim (mean and optionally logvar) */
+    vv_conv1d_weights_t proj_mean;       /**< Project to vae_dim (mean) */
+    vv_conv1d_weights_t proj_logvar;     /**< Project to vae_dim (logvar), acoustic only */
+
+    /* Config */
+    int   vae_dim;
+    float fix_std;
+    bool  gaussian;                      /**< true for acoustic, false for semantic */
+    bool  causal;
+
+    /* GPU buffers (pre-allocated at init) */
+    void* gpu_workspace;
+    size_t workspace_size;
+} vv_conv_vae_encoder_t;
+
+/* ─── API ───────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief Initialize a Conv-VAE encoder from model weights.
+ *
+ * @param model_weights  Pointer to loaded weight tensors for this encoder
+ * @param config         Acoustic or semantic tokenizer config
+ * @param is_acoustic    true for acoustic (gaussian), false for semantic
+ * @param encoder        Output: initialized encoder
+ */
+vv_status_t vv_conv_vae_init(const vv_weight_t* model_weights, int n_weights,
+                              const void* config,
+                              bool is_acoustic,
+                              vv_conv_vae_encoder_t** encoder);
+
+/**
+ * @brief Run Conv-VAE encoder forward pass (CPU reference).
+ *
+ * @param encoder      Initialized encoder
+ * @param audio        Input audio [n_samples] at 24kHz
+ * @param n_samples    Number of input samples
+ * @param output       Output: [n_frames, vae_dim] latent tokens
+ * @param n_frames     Output: number of frames
+ */
+vv_status_t vv_conv_vae_encode_cpu(const vv_conv_vae_encoder_t* encoder,
+                                    const float* audio, int n_samples,
+                                    float** output, int* n_frames);
+
+/**
+ * @brief Run Conv-VAE encoder forward pass on GPU.
+ *
+ * @param encoder      Initialized encoder (weights on GPU)
+ * @param audio_gpu    Input audio on GPU [n_samples]
+ * @param n_samples    Number of samples
+ * @param output_gpu   Output on GPU: [n_frames, vae_dim]
+ * @param n_frames     Output: number of frames
+ * @param stream       CUDA stream
+ */
+vv_status_t vv_conv_vae_encode_cuda(const vv_conv_vae_encoder_t* encoder,
+                                     const void* audio_gpu, int n_samples,
+                                     void** output_gpu, int* n_frames,
+                                     void* stream);
+
+/**
+ * @brief Free Conv-VAE encoder resources.
+ */
+vv_status_t vv_conv_vae_free(vv_conv_vae_encoder_t* encoder);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* VV_TOKENIZER_ENCODER_H */

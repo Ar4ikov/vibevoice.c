@@ -1,0 +1,136 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  vibevoice.c — Cursor Rules
+#  Pure C runtime for VibeVoice-ASR (4-bit quantized) with CUDA/TensorRT
+#  VERIFIED against actual model source code (2026-02-12)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Язык / Language ──────────────────────────────────────────────────────────
+# Все комментарии в коде — на английском. Общение с разработчиком — на русском.
+
+# ─── 1. ЯЗЫКОВОЙ СТЕК ─────────────────────────────────────────────────────────
+# • Весь runtime-код пишется на ЧИСТОМ C (C11, ISO/IEC 9899:2011).
+# • GPU-ядра пишутся как CUDA C (.cu) с extern "C" обёрткой для линковки.
+# • TensorRT интеграция — исключительно через C API (nvinfer_c.h / NvInferRuntime).
+# • C++ допускается ТОЛЬКО внутри .cu файлов и ТОЛЬКО для CUDA/TRT API calls.
+#   Любой публичный интерфейс — строго extern "C".
+# • Python допускается ТОЛЬКО в каталоге tools/ для одноразовой конвертации
+#   весов/экспорта ONNX. Python НИКОГДА не является runtime-зависимостью.
+# • Запрещено: PyTorch, TensorFlow, ONNX Runtime, Transformers, любые тяжёлые
+#   ML-фреймворки в runtime.
+
+# ─── 2. ЦЕЛЕВАЯ ПЛАТФОРМА ─────────────────────────────────────────────────────
+# • ОС: Windows 11 x64 (основная), Linux x64 (будущее).
+# • GPU: NVIDIA Ampere (SM 8.0+) — RTX 3060 и выше, минимум 12 GB VRAM.
+# • Компилятор: MSVC (Visual Studio 2022 17.x), nvcc (CUDA Toolkit 12.x).
+# • Сборка: CMake 3.28+, только Release x64 для production.
+# • CUDA Toolkit: 12.2+ (для Ampere Tensor Cores, FP16/INT8 поддержка).
+# • TensorRT: 10.x+ (C API, builder, runtime, plugin registry).
+# • cuBLAS/cuDNN: через CUDA Toolkit, линковка как внешние .dll/.lib.
+
+# ─── 3. АРХИТЕКТУРА ПРОЕКТА ───────────────────────────────────────────────────
+# vibevoice.c/
+# ├── CMakeLists.txt              — корневой CMake
+# ├── CLAUDE.md                   — контекст для AI-ассистента
+# ├── .cursorrules                — этот файл
+# ├── include/vibevoice/          — публичные .h заголовки (C API)
+# ├── src/
+# │   ├── core/                   — аллокаторы, логгер, ошибки, типы
+# │   ├── audio/                  — WAV-парсер, ресемплер 24kHz, normalize -25dBFS
+# │   │                             (БЕЗ FFT/mel — модель принимает raw PCM!)
+# │   ├── text_tokenizer/         — BPE-токенизатор на C (vocab + merges)
+# │   ├── tokenizer_encoder/      — Conv-VAE speech tokenizer encoders (CPU ref)
+# │   ├── connector/              — SpeechConnector MLP (fc1→GELU→norm→fc2)
+# │   ├── model/                  — safetensors парсер, config.json, loader
+# │   ├── quant/                  — NF4 lookup table, CPU dequant reference
+# │   ├── cuda/                   — CUDA ядра: dequant, conv1d, attention, etc.
+# │   ├── trt/                    — TensorRT engine builder/runtime (Conv-VAE)
+# │   └── inference/              — pipeline, decoder, KV-cache, sampling
+# ├── cli/                        — CLI executable (vv_cli.exe)
+# ├── tools/                      — Python утилиты (НЕ runtime)
+# ├── tests/                      — unit/integration тесты на C
+# ├── bench/                      — бенчмарки latency/throughput
+# └── third_party/                — cJSON и прочие минимальные зависимости
+
+# ─── 4. СТИЛЬ КОДА ────────────────────────────────────────────────────────────
+# • Именование: snake_case для функций и переменных, UPPER_SNAKE для макросов.
+# • Префикс: все публичные символы начинаются с vv_ (vibevoice).
+#   Пример: vv_model_load(), vv_inference_run(), VV_OK, VV_ERR_CUDA.
+# • Структуры: typedef struct vv_model vv_model_t;
+# • Enum-ы: typedef enum { VV_OK = 0, VV_ERR_... } vv_status_t;
+# • Все функции возвращают vv_status_t (или конкретный тип + out-параметр).
+# • Память: явный lifetime — кто аллоцировал, тот и освобождает.
+#   Использовать vv_alloc/vv_free обёртки для трекинга.
+# • Никаких глобальных переменных (кроме thread-local логгера).
+# • CUDA ядра: суффикс _kernel для __global__, _device для __device__.
+# • Максимальная длина строки: 100 символов (мягкий лимит).
+# • Каждый .c файл имеет соответствующий .h в include/vibevoice/.
+# • Комментарии: doxygen-стиль (/** ... */) для публичных API.
+
+# ─── 5. РАБОТА С ПАМЯТЬЮ И GPU ────────────────────────────────────────────────
+# • GPU-память: выделять при инициализации, переиспользовать пулы.
+#   Запрещено cudaMalloc в hot-path.
+# • Использовать pinned memory (cudaMallocHost) для H2D/D2H трансферов.
+# • CUDA Streams: минимум 2 (compute + memcpy), overlap вычислений и копирования.
+# • CUDA Graphs: применять для стационарных графов вычислений (decode loop).
+# • Tensor Cores: обязательно для GEMM (FP16 accumulate, INT8 где применимо).
+# • Для 4-bit: custom dequant kernel → FP16 GEMM через cuBLAS/custom kernel.
+# • KV-cache: paged allocation, поддержка до 128K токенов.
+
+# ─── 6. КВАНТИЗАЦИЯ (4-BIT NF4) ──────────────────────────────────────────────
+# • Формат: NF4 (NormalFloat4) из bitsandbytes — per-block quantization
+#   с double quantization (quant scales тоже квантованы в FP8).
+# • Хранение: упакованные uint8 (2 значения на байт) + FP16/FP8 scale + zero.
+# • Dequant на GPU: быстрый kernel (один warp на блок), результат в FP16.
+# • ТОЛЬКО Linear-слои LLM квантованы (q/k/v/o_proj, gate/up/down_proj).
+# • Tokenizer encoders, connectors, embeddings, norms — НЕ квантованы (BF16/FP16).
+# • Референсная CPU реализация для валидации точности (медленная, но корректная).
+
+# ─── 7. МОДЕЛЬ VIBEVOICE-ASR (ВЕРИФИЦИРОВАНО) ────────────────────────────────
+# • Архитектура: Acoustic Tokenizer + Semantic Tokenizer + Connectors + Qwen2 LLM
+# • Audio preprocessing: resample to 24kHz, normalize -25 dBFS. НЕТ mel/FFT!
+# • Acoustic Tokenizer: Conv-VAE encoder, vae_dim=64, gaussian sampling (std=0.5)
+#   - encoder_ratios: [8,5,5,4,2,2] (compression 3200x → 7.5 Hz)
+#   - encoder_depths: "3-3-3-3-3-3-8" (7 stage groups)
+#   - causal=true, depthwise_conv mixer, RMSNorm
+# • Semantic Tokenizer: Conv-VAE encoder, vae_dim=128, deterministic (no sampling)
+#   - Same architecture, different vae_dim and no sampling
+# • Acoustic Connector: MLP(64 → 3584): fc1 → GELU → RMSNorm → fc2
+# • Semantic Connector: MLP(128 → 3584): fc1 → GELU → RMSNorm → fc2
+# • Combined: acoustic_features + semantic_features (element-wise add)
+# • LLM backbone: Qwen2-7B — decoder-only transformer.
+#   - hidden_size: 3584, num_layers: 28, num_heads: 28, head_dim: 128
+#   - num_key_value_heads: 4 (GQA)
+#   - intermediate_size: 18944
+#   - vocab_size: 152064
+#   - max_position_embeddings: 131072 (128K!)
+#   - rope_theta: 1000000.0
+#   - rms_norm_eps: 1e-6
+#   - Activation: SiLU (SwiGLU in MLP)
+#   - All layers: full_attention (no sliding window)
+# • Выход: структурированная транскрипция (JSON):
+#   {"segments": [{"speaker": "S1", "start": 0.0, "end": 5.2, "text": "..."}]}
+
+# ─── 8. СБОРКА И CI ───────────────────────────────────────────────────────────
+# • CMake: минимум 3.28, preset-ы для Debug/Release/RelWithDebInfo.
+# • MSVC флаги: /O2 /GL /DNDEBUG (Release), /W4 /WX (warnings as errors).
+# • nvcc флаги: -arch=sm_80 -gencode=arch=compute_80,code=sm_80
+#   (Ampere); добавить sm_86, sm_89 (Ada).
+# • Линковка: cuda.lib cudart.lib cublas.lib nvinfer.lib nvinfer_plugin.lib.
+# • Тесты: CTest, запускаются автоматически при сборке (опционально).
+# • Формат выхода: vibevoice.dll + vibevoice.lib (shared) + vv_cli.exe (CLI).
+
+# ─── 9. ТЕСТИРОВАНИЕ И ВАЛИДАЦИЯ ──────────────────────────────────────────────
+# • Каждый модуль имеет unit-тесты (tests/test_*.c).
+# • End-to-end: эталонные .wav файлы + ожидаемый JSON-транскрипт.
+# • Числовая валидация: dequant output сравнивается с reference (tolerance 1e-3).
+# • Conv-VAE output: сравнивается с Python reference (tolerance 1e-4).
+# • Performance: bench/ измеряет latency (ms), throughput (tokens/s),
+#   memory (MB GPU), RTF (Real-Time Factor).
+# • Не мержить код без прохождения тестов и без profiling-отчёта.
+
+# ─── 10. БЕЗОПАСНОСТЬ И ЛИЦЕНЗИИ ─────────────────────────────────────────────
+# • Модель: MIT лицензия (Microsoft VibeVoice).
+# • Квантизация: MIT (scerz/VibeVoice-ASR-4bit).
+# • CUDA/TensorRT: проприетарная лицензия NVIDIA — не включать бинарники.
+# • third_party/: каждая библиотека с указанием лицензии в LICENSES/.
+# • Запрещено: хранить API-ключи, токены HuggingFace в коде/репо.

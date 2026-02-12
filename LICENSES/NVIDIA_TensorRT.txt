@@ -1,0 +1,13 @@
+NVIDIA TensorRT Software License Agreement
+
+TensorRT is proprietary software owned by NVIDIA Corporation.
+It is not distributed with this project.
+
+Users must install TensorRT separately from:
+https://developer.nvidia.com/tensorrt
+
+The TensorRT license can be found at:
+https://docs.nvidia.com/deeplearning/tensorrt/sla/index.html
+
+This project uses TensorRT via its public C API headers only.
+No NVIDIA binaries or libraries are included in this repository.

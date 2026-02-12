@@ -1,0 +1,622 @@
+# CLAUDE.md — vibevoice.c
+
+> Контекстный файл для AI-ассистента. Содержит всё необходимое для понимания
+> проекта, принятия архитектурных решений и генерации кода.
+> Данные верифицированы по исходникам: modeling_vibevoice_asr.py,
+> configuration_vibevoice.py, config.json, preprocessor_config.json.
+
+---
+
+## 1. Что это за проект
+
+**vibevoice.c** — высокопроизводительный runtime на **чистом C** для запуска
+квантованной (4-bit NF4) модели **VibeVoice-ASR** от Microsoft.
+
+Модель выполняет:
+- Автоматическое распознавание речи (ASR) длительностью до 60 минут
+- Диаризацию (определение, кто говорит)
+- Генерацию временных меток
+- Поддержку пользовательских hotwords (ключевых слов)
+
+**Ключевое ограничение**: весь runtime — на C. Никакого Python, PyTorch,
+TensorFlow, ONNX Runtime в runtime-коде. Python допустим только в `tools/`
+для одноразовой конвертации весов.
+
+---
+
+## 2. Ссылки на модель и ресурсы
+
+| Ресурс | URL |
+|--------|-----|
+| Оригинальное репо | https://github.com/microsoft/VibeVoice |
+| Оригинальные веса (BF16) | https://huggingface.co/microsoft/VibeVoice-ASR |
+| 4-bit квантованные веса | https://huggingface.co/scerz/VibeVoice-ASR-4bit |
+| Технический отчёт ASR | https://arxiv.org/pdf/2601.18184 |
+| Лицензия модели | MIT |
+
+---
+
+## 3. Архитектура модели VibeVoice-ASR (ВЕРИФИЦИРОВАНО)
+
+### Общая схема
+```
+Raw Audio (any sample rate)
+    │
+    ▼
+┌──────────────────────────────────┐
+│  Resample to 24kHz mono          │  target_sample_rate: 24000
+│  Normalize to -25 dBFS           │  normalize_audio: true
+└──────────────────────────────────┘
+    │                    │
+    ▼                    ▼
+┌──────────────┐  ┌──────────────┐
+│  Acoustic     │  │  Semantic     │
+│  Tokenizer    │  │  Tokenizer    │
+│  Encoder      │  │  Encoder      │
+│  (Conv-VAE)   │  │  (Conv-VAE)   │
+│  vae_dim=64   │  │  vae_dim=128  │
+│  gaussian     │  │  deterministic│
+│  sampling     │  │  (mean only)  │
+│  FP16/BF16    │  │  FP16/BF16    │
+└──────┬───────┘  └──────┬───────┘
+       │                  │
+       ▼                  ▼
+┌──────────────┐  ┌──────────────┐
+│  Acoustic     │  │  Semantic     │
+│  Connector    │  │  Connector    │
+│  MLP          │  │  MLP          │
+│  64 → 3584    │  │  128 → 3584   │
+│  FP16         │  │  FP16         │
+└──────┬───────┘  └──────┬───────┘
+       │                  │
+       └───────┬──────────┘
+               ▼
+       Element-wise Add
+               │
+               ▼
+┌──────────────────────────────────┐
+│  LLM Backbone (Qwen2-7B)        │
+│  28 layers, decoder-only         │
+│  NF4 quantized (4-bit)           │
+│  GQA: 28 Q heads, 4 KV heads    │
+│  hidden=3584, head_dim=128       │
+│  max_position_embeddings=131072  │
+└──────────────────────────────────┘
+               │
+               ▼
+       Structured Transcription (JSON)
+```
+
+### ВАЖНО: НЕТ mel-спектрограммы!
+Модель НЕ использует mel/STFT/FFT. Сырой 24kHz PCM подаётся напрямую
+в два Conv-VAE токенизатора. Каждый сжимает аудио в 3200 раз
+(произведение ratios [8,5,5,4,2,2] = 3200), что даёт 24000/3200 = 7.5 Hz.
+
+### Conv-VAE Tokenizer Encoder (из config.json)
+```
+Acoustic Tokenizer:
+  channels: 1 (mono input)
+  causal: true
+  encoder_ratios: [8, 5, 5, 4, 2, 2]     (6 downsample stages)
+  encoder_depths: "3-3-3-3-3-3-8"          (7 stage groups)
+  encoder_n_filters: 32                     (base filter count)
+  vae_dim: 64                               (latent dim)
+  fix_std: 0.5                              (gaussian sampling std)
+  std_dist_type: "gaussian"
+  mixer_layer: "depthwise_conv"
+  layernorm: "RMSNorm" (eps=1e-5)
+  layer_scale_init_value: 1e-6
+
+Semantic Tokenizer:
+  (same architecture but)
+  vae_dim: 128
+  fix_std: 0                                (deterministic, no sampling)
+  std_dist_type: "none"
+```
+
+### Speech Connector (из modeling_vibevoice.py SpeechConnector)
+```python
+# fc1: Linear(vae_dim, hidden_size)
+# norm: RMSNorm(hidden_size)
+# fc2: Linear(hidden_size, hidden_size)
+# forward: x -> fc1 -> GELU -> norm -> fc2
+```
+
+### Параметры LLM (Qwen2-7B backbone, из config.json)
+```
+model_type:              "qwen2"
+hidden_size:             3584
+num_hidden_layers:       28
+num_attention_heads:     28       (query heads)
+num_key_value_heads:     4        (GQA: grouped-query attention)
+head_dim:                128      (= 3584 / 28)
+intermediate_size:       18944    (MLP intermediate)
+vocab_size:              152064
+max_position_embeddings: 131072   (128K context!)
+rope_theta:              1000000.0
+rms_norm_eps:            1e-6
+hidden_act:              "silu"   (SwiGLU in MLP)
+layer_types:             all "full_attention" (no sliding window)
+use_mrope:               false
+```
+
+### Квантизация (4-bit NF4 — bitsandbytes)
+- **Что квантовано**: ТОЛЬКО Linear-слои в Qwen2 LLM
+  (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj)
+- **Что НЕ квантовано**: acoustic/semantic tokenizer encoders,
+  connectors, embed_tokens, layernorm weights, lm_head — всё в BF16/FP16.
+- **Формат**: NormalFloat4 (NF4) — 16 уровней.
+- **Упаковка**: 2 значения в 1 байт (uint8).
+- **Block size**: 64 элемента.
+- **Double quantization**: scale каждого блока квантуется в FP8 (E4M3).
+- **Dequantization**: `value_fp16 = NF4_LOOKUP[nibble] * block_scale`
+- **Размер 4-bit модели**: ~7.66 GB total (2 safetensors файла).
+
+### Audio Preprocessing (из preprocessor_config.json)
+```
+processor_class:         "VibeVoiceASRProcessor"
+target_sample_rate:      24000         (24kHz, НЕ 16kHz!)
+speech_tok_compress_ratio: 3200        (24000 / 7.5 Hz)
+normalize_audio:         true
+target_dB_FS:            -25
+eps:                     1e-6
+```
+
+### Специальные токены
+```
+<|startoftranscript|>    — начало транскрипта
+<|endoftranscript|>      — конец (stop token для decode)
+<|speaker_1|> ... <|speaker_N|>  — идентификация спикера
+<|timestamp_X.XX|>       — временная метка
+<|hotwords|>             — начало секции hotwords
+<|nospeech|>             — тишина/без речи
+```
+
+---
+
+## 4. Целевая платформа
+
+| Параметр | Значение |
+|----------|----------|
+| ОС | Windows 11 x64 (основная), Linux x64 (будущее) |
+| GPU | NVIDIA Ampere (SM 8.0+): RTX 3060 12GB, 3070, 3080, 3090 |
+| Min VRAM | 12 GB (для 4-bit, с KV-cache на 30 минут) |
+| Компилятор | MSVC 2022 (v143), nvcc (CUDA 12.2+) |
+| Сборка | CMake 3.28+ |
+| CUDA | 12.2+ (Tensor Cores FP16/INT8 на Ampere) |
+| TensorRT | 10.x+ (C API) |
+| cuBLAS | Через CUDA Toolkit |
+| cuDNN | 9.x (опционально, для Conv-VAE оптимизации) |
+
+---
+
+## 5. Структура проекта
+
+```
+vibevoice.c/
+│
+├── CMakeLists.txt                  # Корневой CMake
+├── CLAUDE.md                       # ← Этот файл
+├── .cursorrules                    # Правила для Cursor IDE
+├── .cursor/skills/                 # Agent Skills (навыки AI)
+│
+├── include/vibevoice/              # Публичные C заголовки
+│   ├── vibevoice.h                 # Главный заголовок (umbrella)
+│   ├── types.h                     # Базовые типы, коды ошибок
+│   ├── audio.h                     # Audio preprocessing API
+│   ├── text_tokenizer.h            # BPE text tokenizer API
+│   ├── tokenizer_encoder.h         # Conv-VAE speech tokenizer encoder API
+│   ├── connector.h                 # Speech connector MLP API
+│   ├── model.h                     # Model loading API
+│   ├── inference.h                 # Inference pipeline API
+│   ├── profiler.h                  # Profiling utilities API
+│   └── trt.h                       # TensorRT engine API
+│
+├── src/
+│   ├── core/                       # Ядро: аллокаторы, логгер, ошибки
+│   │   ├── alloc.c                 # Обёртки аллокации (CPU/GPU)
+│   │   ├── logger.c                # Логгирование (уровни: ERROR/WARN/INFO/DEBUG)
+│   │   └── error.c                 # Коды ошибок, строковые описания
+│   │
+│   ├── audio/                      # Аудио обработка (БЕЗ mel/FFT!)
+│   │   ├── wav.c                   # WAV парсер (PCM 16-bit, float32)
+│   │   ├── resample.c              # Ресемплер (sinc/polyphase → 24kHz)
+│   │   └── normalize.c             # RMS нормализация к -25 dBFS
+│   │
+│   ├── text_tokenizer/             # BPE текстовый токенизатор
+│   │   ├── bpe.c                   # BPE encode/decode
+│   │   ├── vocab.c                 # Vocab + merges загрузка
+│   │   └── special_tokens.c        # Специальные токены VibeVoice
+│   │
+│   ├── tokenizer_encoder/          # Conv-VAE speech tokenizer encoders
+│   │   └── conv_vae.c              # CPU reference для Conv-VAE
+│   │
+│   ├── connector/                  # Speech connectors (MLP)
+│   │   └── speech_connector.c      # fc1 → GELU → RMSNorm → fc2
+│   │
+│   ├── model/                      # Загрузка модели
+│   │   ├── safetensors.c           # Парсер формата safetensors
+│   │   ├── config.c                # Парсер config.json
+│   │   └── loader.c                # Оркестрация загрузки всех компонентов
+│   │
+│   ├── quant/                      # Квантизация
+│   │   ├── nf4_table.c             # NF4 lookup table (16 значений)
+│   │   └── dequant_cpu.c           # CPU reference dequantization
+│   │
+│   ├── cuda/                       # CUDA ядра (.cu файлы)
+│   │   ├── dequant_nf4.cu          # NF4 dequantization kernel
+│   │   ├── conv1d.cu               # 1D causal convolution kernels
+│   │   ├── conv_vae.cu             # Conv-VAE tokenizer encoder (GPU)
+│   │   ├── rmsnorm.cu              # RMSNorm kernel
+│   │   ├── rope.cu                 # Rotary Position Embeddings
+│   │   ├── attention.cu            # GQA Flash Attention (28Q/4KV)
+│   │   ├── swiglu.cu               # SwiGLU activation
+│   │   ├── gemm.cu                 # GEMM wrappers (cuBLAS + NF4)
+│   │   ├── embedding.cu            # Embedding lookup
+│   │   └── cuda_utils.cu           # Memory management, stream helpers
+│   │
+│   ├── trt/                        # TensorRT интеграция
+│   │   ├── engine_builder.c        # Engine build from ONNX (C API)
+│   │   ├── engine_runtime.c        # Engine load & execute
+│   │   └── trt_utils.c             # Error handling, logging for TRT
+│   │
+│   └── inference/                  # Inference pipeline
+│       ├── pipeline.c              # Полный pipeline: audio → transcript
+│       ├── decoder.c               # Autoregressive decoder loop
+│       ├── kv_cache.c              # KV-cache management (paged)
+│       ├── sampling.c              # Token sampling (greedy, top-k)
+│       └── postprocess.c           # Token stream → JSON transcription
+│
+├── cli/
+│   └── main.c                      # CLI executable (vv_cli.exe)
+│
+├── tools/                          # Python утилиты (НЕ runtime)
+│   ├── convert_weights.py          # HF safetensors → .vvmodel
+│   ├── export_onnx.py              # PyTorch → ONNX (Conv-VAE encoders)
+│   ├── build_trt_engine.py         # ONNX → TensorRT .plan
+│   ├── validate_weights.py         # Сравнение C vs Python output
+│   └── requirements.txt            # Python зависимости
+│
+├── tests/                          # Тесты (C)
+│   ├── test_audio.c                # resample + normalize
+│   ├── test_safetensors.c          # parser correctness
+│   ├── test_nf4.c                  # dequant vs CPU reference
+│   ├── test_conv_vae.c             # tokenizer encoder vs Python
+│   └── test_e2e.c                  # end-to-end: audio → transcript
+│
+├── bench/                          # Бенчмарки
+│   └── benchmark.c
+│
+├── third_party/                    # Минимальные зависимости
+│   └── cjson/                      # cJSON (MIT) — JSON парсер
+│
+└── LICENSES/                       # Лицензии зависимостей
+    ├── MIT_VibeVoice.txt
+    ├── MIT_cJSON.txt
+    └── NVIDIA_TensorRT.txt
+```
+
+---
+
+## 6. Правила разработки
+
+### Код
+- **Язык**: C11 (`/std:c11` для MSVC). CUDA C в .cu файлах.
+- **Naming**: `snake_case`, префикс `vv_` для всех публичных символов.
+- **Ошибки**: все функции возвращают `vv_status_t`. Никаких exceptions.
+- **Память**: явный lifetime. `vv_alloc()` / `vv_free()`. Zero malloc in hot path.
+- **GPU**: память выделяется при `init()`, переиспользуется. Pinned memory для transfers.
+- **Streams**: минимум 2 CUDA stream (compute + transfer), overlap.
+- **Комментарии**: Doxygen `/** */` для публичного API. Английский язык.
+
+### Запрещено
+- `malloc()` / `free()` напрямую (только через `vv_alloc` / `vv_free`).
+- Глобальные переменные (кроме thread-local логгера).
+- `#include <python.h>` или любые Python/ML-framework headers.
+- Хардкодить пути. Все пути — через параметры или env vars.
+- `cudaMalloc` в hot path (только при init / resize).
+- `printf` для ошибок (только `vv_log()`).
+
+### CUDA ядра
+- Все public функции: `extern "C"`.
+- Все kernel-launch функции принимают `cudaStream_t`.
+- Target architectures: sm_80 (Ampere), sm_86, sm_89 (Ada).
+- `--use_fast_math` для Release builds.
+- NVTX маркеры в каждом kernel-launch wrapper.
+
+### TensorRT
+- Только C API (`nvinfer_c.h` / extern "C" обёртки).
+- Engine сериализуется под конкретный GPU. Rebuild при смене GPU/драйвера.
+- Dynamic shapes обязательны (batch, seq_len).
+- TRT для Conv-VAE encoders (FP16, стандартные ops), НЕ для LLM decoder (NF4).
+
+---
+
+## 7. Стратегия ускорения
+
+### Приоритеты (от высшего к низшему)
+1. **TensorRT engine** для Conv-VAE Tokenizer Encoders (FP16, стандартные conv ops).
+2. **Custom CUDA kernels** для LLM decoder (4-bit dequant + GEMM).
+3. **cuBLAS** для FP16 GEMM (после dequant, и для connectors).
+4. **Flash Attention** (custom kernel) для long-context (128K).
+5. **CUDA Graphs** для стационарного decode loop.
+6. **FP8 KV-cache** для экономии памяти.
+7. **Kernel fusion** (RMSNorm + QKV projection, dequant + GEMM).
+
+### Почему не TensorRT для всей модели
+- TensorRT не поддерживает NF4 нативно.
+- Conv-VAE encoders отлично ложатся на TRT (стандартные conv1d ops, FP16).
+- LLM decoder: NF4 → custom CUDA kernels + cuBLAS — полный контроль.
+- Гибрид: TRT encoders + CUDA decoder = оптимальный баланс.
+
+### Memory Budget (RTX 3080, 10 GB usable)
+```
+Model weights (NF4 packed + FP16 non-quant): ~7.7 GB loaded, ~5.5 GB on GPU
+Tokenizer encoder weights (FP16):            ~0.3 GB
+Connector weights (FP16):                    ~0.1 GB
+KV-cache (FP16, 30 min audio):              ~2.5 GB
+Activations / workspace:                     ~1.0 GB
+Audio buffers + misc:                        ~0.3 GB
+──────────────────────────────────────────
+Total:                                       ~9.7 GB
+```
+
+Для RTX 3060 12GB — с запасом 2.3 GB.
+Для 60-мин аудио на 12 GB: FP8 KV-cache (~1.3 GB вместо 2.5 GB).
+
+---
+
+## 8. Pipeline инференса (подробно)
+
+### Speech Encoding Phase
+```
+1. Load audio:              WAV → float32 PCM
+2. Resample:                any SR → 24kHz mono
+3. Normalize:               RMS normalize to -25 dBFS
+4. Acoustic encoding:       raw PCM → acoustic_tokenizer.encode()
+                            → [B, T, 64] mean + gaussian sample (std=0.5)
+5. Semantic encoding:       raw PCM → semantic_tokenizer.encode()
+                            → [B, T, 128] mean (deterministic)
+6. Acoustic connector:      [B, T, 64]  → fc1 → GELU → norm → fc2 → [B, T, 3584]
+7. Semantic connector:      [B, T, 128] → fc1 → GELU → norm → fc2 → [B, T, 3584]
+8. Combine:                 acoustic_features + semantic_features → [B, T, 3584]
+```
+
+### Prefill Phase
+```
+1. Build input sequence:    [special_tokens, audio_features, prompt_tokens]
+2. Embed text tokens:       embed_tokens(input_ids) → [B, S, 3584]
+3. Replace audio positions: inputs_embeds[acoustic_input_mask] = combined_features
+4. LLM prefill:             process full sequence through 28 Qwen2 layers
+   - For each layer:
+     - RMSNorm → Q, K, V (4-bit dequant + GEMM)
+     - RoPE → GQA Attention → O proj → Residual
+     - RMSNorm → SwiGLU MLP (4-bit dequant + GEMM) → Residual
+   - Fill KV-cache for all positions
+5. Get first output logits
+```
+
+### Decode Phase (autoregressive)
+```
+for each token:
+  1. Embedding lookup: token_id → hidden [1, 1, 3584]
+  2. For each layer (28x):
+     a. RMSNorm(hidden)
+     b. Q = dequant_gemm(hidden, W_q)     — NF4
+        K = dequant_gemm(hidden, W_k)     — NF4
+        V = dequant_gemm(hidden, W_v)     — NF4
+     c. RoPE(Q, K)
+     d. KV-cache: append K, V at position
+     e. Attention(Q, K_cached, V_cached)   — GQA (28Q/4KV)
+     f. O = dequant_gemm(attn_out, W_o)   — NF4
+     g. hidden += O  (residual)
+     h. RMSNorm(hidden)
+     i. gate = dequant_gemm(hidden, W_gate) — NF4
+        up   = dequant_gemm(hidden, W_up)   — NF4
+     j. down = dequant_gemm(SwiGLU(gate, up), W_down) — NF4
+     k. hidden += down (residual)
+  3. Final RMSNorm
+  4. LM Head: hidden → logits [152064]    — FP16 GEMM
+  5. Greedy/top-k sampling → next token_id
+  6. If token_id == <|endoftranscript|>: break
+```
+
+### Per-layer GEMM operations (NF4)
+```
+Layer projections (per transformer layer):
+  W_q:    [3584, 3584]
+  W_k:    [3584, 512]     (4 KV heads × 128)
+  W_v:    [3584, 512]
+  W_o:    [3584, 3584]
+  W_gate: [3584, 18944]
+  W_up:   [3584, 18944]
+  W_down: [18944, 3584]
+
+Total NF4 GEMMs per token: 28 layers × 7 = 196 GEMM operations
+```
+
+---
+
+## 9. Model Files (4-bit, from HuggingFace)
+
+### Files in scerz/VibeVoice-ASR-4bit
+```
+config.json                           (4.32 kB)
+generation_config.json                (73 B)
+preprocessor_config.json              (189 B)
+model.safetensors.index.json          (232 kB)
+model-00001-of-00002.safetensors      (4.97 GB)
+model-00002-of-00002.safetensors      (2.69 GB)
+```
+
+### Weight Categories (from model.safetensors.index.json)
+```
+model.acoustic_tokenizer.encoder.*     — BF16, Conv-VAE encoder
+model.acoustic_tokenizer.decoder.*     — BF16, Conv-VAE decoder (NOT needed for ASR)
+model.semantic_tokenizer.*             — BF16 (check if present)
+model.acoustic_connector.*             — BF16, MLP (fc1, fc2, norm)
+model.semantic_connector.*             — BF16, MLP
+model.embed_tokens.weight              — BF16, embedding table
+model.layers.N.self_attn.{q,k,v,o}_proj.* — NF4 (uint8 packed + scales)
+model.layers.N.mlp.{gate,up,down}_proj.*  — NF4
+model.layers.N.input_layernorm.weight     — BF16
+model.layers.N.post_attention_layernorm.weight — BF16
+model.norm.weight                      — BF16
+lm_head.weight                         — BF16 (may be tied to embed_tokens)
+```
+
+### NOTE: Tokenizer files not in 4-bit repo
+Text tokenizer files (tokenizer.json, vocab, merges) must be fetched from
+the base model microsoft/VibeVoice-ASR or Qwen2.5-7B.
+
+---
+
+## 10. Сборка
+
+```powershell
+$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2"
+$env:TENSORRT_PATH = "C:\TensorRT-10.4.0"
+
+cmake -B build -G "Visual Studio 17 2022" -A x64 `
+    -DCMAKE_BUILD_TYPE=Release `
+    -DCMAKE_CUDA_ARCHITECTURES="80;86;89"
+
+cmake --build build --config Release --parallel
+ctest --test-dir build --build-config Release --output-on-failure
+```
+
+---
+
+## 11. Использование (CLI)
+
+```powershell
+# Базовая транскрипция
+vv_cli.exe --model ./model_hf --audio recording.wav --output transcript.json
+
+# С hotwords
+vv_cli.exe --model ./model_hf --audio meeting.wav --hotwords "VibeVoice,Azure"
+
+# С TensorRT engines для tokenizer encoders
+vv_cli.exe --model ./model_hf --trt-acoustic encoder_ac.plan \
+    --trt-semantic encoder_sem.plan --audio recording.wav
+
+# С ограничением по VRAM (для 12GB карт)
+vv_cli.exe --model ./model_hf --audio recording.wav --max-seq-len 32000 --kv-fp8
+```
+
+---
+
+## 12. Метрики качества и производительности
+
+### Целевые метрики (RTX 3080, 10GB)
+| Метрика | Цель | Хорошо | Отлично |
+|---------|------|--------|---------|
+| Prefill (1K tokens) | < 300ms | < 200ms | < 100ms |
+| Decode (per token) | < 20ms | < 15ms | < 10ms |
+| Throughput (decode) | > 50 tok/s | > 70 tok/s | > 100 tok/s |
+| RTF (10 min audio) | < 1.0 | < 0.5 | < 0.3 |
+| GPU Memory | < 10 GB | < 9 GB | < 8 GB |
+| Model load | < 10s | < 5s | < 2s |
+| Speech encoding (10s) | < 500ms | < 200ms | < 50ms |
+
+### Качество (WER — Word Error Rate)
+- Должно совпадать с Python reference ± 0.5% WER.
+- Диаризация (DER): ± 1% от reference.
+- Timestamps: ± 100ms от reference.
+
+---
+
+## 13. Важные технические детали
+
+### Safetensors формат
+```
+[8 bytes]  header_size (uint64, little-endian)
+[N bytes]  header (JSON): {"tensor_name": {"dtype":"U8","shape":[...],"data_offsets":[start,end]}, ...}
+[M bytes]  raw tensor data (aligned, contiguous)
+```
+- Для NF4 слоёв: dtype = "U8" (packed uint8), "F16" или "BF16" для scales.
+- Для FP16 слоёв: dtype = "BF16" или "F16".
+- Для FP32 слоёв: dtype = "F32".
+
+### bitsandbytes NF4 Memory Layout
+```
+Для Linear(in=K, out=N) с block_size=64:
+  packed_weight:  [N, K/2] uint8     — каждый байт = 2 NF4 значения
+  absmax:         [N*K/64] float16   — per-block scale
+  quant_state:    metadata (block_size, quant_type, nested quant info)
+
+Double quantization:
+  absmax квантуется в FP8 с offset:
+  absmax_fp8 + absmax_offset (float32, per superblock)
+```
+
+### NF4 Lookup Table (16 values)
+```c
+static const float NF4_TABLE[16] = {
+    -1.0f, -0.6961928f, -0.5250730f, -0.3949338f,
+    -0.2844871f, -0.1848489f, -0.0911179f,  0.0f,
+     0.0796009f,  0.1609302f,  0.2461123f,  0.3379930f,
+     0.4407233f,  0.5626170f,  0.7229568f,  1.0f
+};
+```
+
+### Conv-VAE Encoder Block (per stage)
+```
+Each block: norm → mixer(depthwise_conv) → residual + layer_scale
+            norm → ffn(linear1 → act → linear2) → residual + ffn_layer_scale
+
+Downsample: strided 1D convolution with stride = ratio[i]
+
+Stage filter progression (encoder_n_filters=32):
+  Stage 0: 32 → 32×2=64  (downsample 8x)
+  Stage 1: 64 → 64×2=128 (downsample 5x)
+  Stage 2: 128 → 128×2=256 (downsample 5x)
+  ...etc, doubling filters at each stage
+  Final: project to vae_dim
+```
+
+### Формат вывода (Rich Transcription)
+```json
+{
+  "text": "Full transcription text...",
+  "segments": [
+    {
+      "speaker": "Speaker 1",
+      "start": 0.0,
+      "end": 5.24,
+      "text": "Hello, welcome to the meeting."
+    }
+  ],
+  "duration": 120.5,
+  "language": "en"
+}
+```
+
+---
+
+## 14. Внешние зависимости (минимальные)
+
+| Зависимость | Версия | Лицензия | Назначение |
+|-------------|--------|----------|------------|
+| CUDA Toolkit | 12.2+ | NVIDIA EULA | GPU runtime, nvcc, cuBLAS |
+| TensorRT | 10.x+ | NVIDIA EULA | Conv-VAE encoder engine |
+| cJSON | 1.7.x | MIT | JSON парсинг (config, output) |
+
+Все остальное — собственная реализация на C.
+
+---
+
+## 15. Streaming для длинного аудио
+
+Из `modeling_vibevoice_asr.py`: аудио > 60s обрабатывается чанками:
+```python
+segment_samples = int(60.0 * 24000)  # 60s chunks
+for start, end in segments:
+    chunk = audio[:, start:end]
+    acoustic_mean = acoustic_tokenizer.encode(chunk, cache=cache, is_final=is_final).mean
+    semantic_mean = semantic_tokenizer.encode(chunk, cache=cache, is_final=is_final).mean
+# Concatenate all means, then sample once for acoustic
+acoustic_full = concat(acoustic_means)
+semantic_full = concat(semantic_means)
+```
+Tokenizer encoders поддерживают кэш для streaming (VibeVoiceTokenizerStreamingCache).
