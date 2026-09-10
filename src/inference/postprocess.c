@@ -1,10 +1,17 @@
 /**
  * @file postprocess.c
- * @brief Post-processing: token stream → structured JSON transcription.
+ * @brief Post-processing: generated token stream → structured transcription.
  *
- * Parse special tokens like <|speaker_N|>, <|timestamp_X.XX|>,
- * <|im_start|>, <|im_end|> from the generated token stream
- * and produce the final vv_transcription_t result.
+ * VibeVoice-ASR is prompted to answer in JSON, so the assistant turn looks
+ * like
+ *
+ *   <|im_start|>assistant
+ *   [{"Start":0.0,"End":11.1,"Speaker":0,"Content":"..."}, ...]
+ *
+ * The keys mirror the ones requested in the user turn ("Start time",
+ * "End time", "Speaker ID", "Content"), and the model abbreviates them, so
+ * several spellings are accepted — the same set the reference processor's
+ * post_process_transcription maps.
  */
 
 #include "vibevoice/inference.h"
@@ -15,179 +22,197 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-/* ─── Token classification ──────────────────────────────────────────────── */
+/* ─── Helpers ───────────────────────────────────────────────────────────── */
 
-static bool is_timestamp_token(const char* text, float* time_val) {
-    if (!text) return false;
-    if (strncmp(text, "<|timestamp_", 12) != 0) return false;
-    const char* p = text + 12;
-    char* end;
-    *time_val = strtof(p, &end);
-    return (end != p && *end == '|');
+static char* dup_cstr(const char* s, size_t n) {
+    char* p = (char*)vv_alloc(n + 1);
+    if (!p) return NULL;
+    memcpy(p, s, n);
+    p[n] = '\0';
+    return p;
 }
 
-static bool is_speaker_token(const char* text, int* speaker_id) {
-    if (!text) return false;
-    if (strncmp(text, "<|speaker_", 10) != 0) return false;
-    *speaker_id = atoi(text + 10);
-    return true;
+/** @brief First member found among a NULL-terminated list of key spellings. */
+static cJSON* pick(cJSON* obj, const char* const* keys) {
+    for (int i = 0; keys[i]; i++) {
+        cJSON* v = cJSON_GetObjectItemCaseSensitive(obj, keys[i]);
+        if (v) return v;
+    }
+    return NULL;
+}
+
+static float as_float(cJSON* v, float dflt) {
+    if (!v) return dflt;
+    if (cJSON_IsNumber(v)) return (float)v->valuedouble;
+    if (cJSON_IsString(v) && v->valuestring) return (float)atof(v->valuestring);
+    return dflt;
+}
+
+/**
+ * @brief Locate the JSON array/object inside the model's answer.
+ *
+ * Handles a bare array, a ```json fenced block, and a truncated tail (when
+ * generation hit the token budget mid-array) by closing the brackets that
+ * are still open.
+ */
+static char* extract_json(const char* text) {
+    if (!text) return NULL;
+
+    const char* start = strstr(text, "```json");
+    if (start) start += 7;
+    else start = text;
+
+    const char* open = strpbrk(start, "[{");
+    if (!open) return NULL;
+
+    int depth = 0;
+    bool in_str = false, esc = false;
+    const char* p = open;
+    for (; *p; p++) {
+        char c = *p;
+        if (esc) { esc = false; continue; }
+        if (c == '\\') { esc = true; continue; }
+        if (c == '"') { in_str = !in_str; continue; }
+        if (in_str) continue;
+        if (c == '[' || c == '{') depth++;
+        else if (c == ']' || c == '}') {
+            depth--;
+            if (depth == 0) { p++; break; }
+        }
+    }
+
+    size_t len = (size_t)(p - open);
+    if (depth == 0) return dup_cstr(open, len);
+
+    /* Truncated output: drop the partial trailing object and close up. */
+    const char* last = open + len;
+    while (last > open && *(last - 1) != '}') last--;
+    if (last <= open) return NULL;
+    size_t keep = (size_t)(last - open);
+
+    char* out = (char*)vv_alloc(keep + 8);
+    if (!out) return NULL;
+    memcpy(out, open, keep);
+    size_t w = keep;
+    if (*open == '[') out[w++] = ']';
+    out[w] = '\0';
+    return out;
 }
 
 /* ─── Build transcription from decoded text ─────────────────────────────── */
 
+vv_status_t vv_postprocess_text(const char* text, float audio_duration,
+                                vv_transcription_t** result) {
+    if (!text || !result) return VV_ERR_NULL_PTR;
+
+    vv_transcription_t* tr = (vv_transcription_t*)vv_alloc(sizeof(*tr));
+    if (!tr) return VV_ERR_OUT_OF_MEMORY;
+    memset(tr, 0, sizeof(*tr));
+    tr->duration = audio_duration;
+    tr->language = "unknown";
+
+    char* json_str = extract_json(text);
+    cJSON* root = json_str ? cJSON_Parse(json_str) : NULL;
+    if (json_str) vv_free(json_str);
+
+    if (!root) {
+        /* Not JSON after all — hand back the raw answer. */
+        tr->full_text = dup_cstr(text, strlen(text));
+        *result = tr;
+        return VV_OK;
+    }
+
+    cJSON* arr = cJSON_IsArray(root) ? root : NULL;
+    int n = arr ? cJSON_GetArraySize(arr) : 1;
+    if (n < 0) n = 0;
+
+    tr->segments = (vv_segment_t*)vv_alloc((size_t)(n > 0 ? n : 1) *
+                                           sizeof(vv_segment_t));
+    if (!tr->segments) { cJSON_Delete(root); vv_free(tr); return VV_ERR_OUT_OF_MEMORY; }
+    memset(tr->segments, 0, (size_t)(n > 0 ? n : 1) * sizeof(vv_segment_t));
+
+    static const char* K_START[]   = {"Start time", "Start", "start_time", "start", NULL};
+    static const char* K_END[]     = {"End time", "End", "end_time", "end", NULL};
+    static const char* K_SPEAKER[] = {"Speaker ID", "Speaker", "speaker_id", "speaker", NULL};
+    static const char* K_TEXT[]    = {"Content", "Text", "content", "text", NULL};
+
+    size_t cap = 1024, len = 0;
+    char* full = (char*)vv_alloc(cap);
+    if (!full) { cJSON_Delete(root); vv_free(tr->segments); vv_free(tr); return VV_ERR_OUT_OF_MEMORY; }
+    full[0] = '\0';
+
+    for (int i = 0; i < n; i++) {
+        cJSON* item = arr ? cJSON_GetArrayItem(arr, i) : root;
+        if (!item || !cJSON_IsObject(item)) continue;
+
+        vv_segment_t* seg = &tr->segments[tr->num_segments];
+        seg->start_time = as_float(pick(item, K_START), 0.0f);
+        seg->end_time   = as_float(pick(item, K_END), 0.0f);
+
+        cJSON* spk = pick(item, K_SPEAKER);
+        char name[64];
+        if (spk && cJSON_IsString(spk) && spk->valuestring)
+            snprintf(name, sizeof(name), "%s", spk->valuestring);
+        else if (spk && cJSON_IsNumber(spk))
+            snprintf(name, sizeof(name), "Speaker %d", (int)spk->valuedouble);
+        else
+            snprintf(name, sizeof(name), "Speaker 0");
+        seg->speaker = dup_cstr(name, strlen(name));
+
+        cJSON* txt = pick(item, K_TEXT);
+        const char* body = (txt && cJSON_IsString(txt) && txt->valuestring)
+                           ? txt->valuestring : "";
+        seg->text = dup_cstr(body, strlen(body));
+
+        size_t blen = strlen(body);
+        if (blen) {
+            if (len + blen + 2 > cap) {
+                cap = (len + blen + 2) * 2;
+                char* nf = (char*)vv_realloc(full, cap);
+                if (!nf) break;
+                full = nf;
+            }
+            if (len) full[len++] = ' ';
+            memcpy(full + len, body, blen);
+            len += blen;
+            full[len] = '\0';
+        }
+        tr->num_segments++;
+    }
+
+    cJSON_Delete(root);
+    tr->full_text = full;
+    *result = tr;
+    return VV_OK;
+}
+
+/**
+ * @brief Legacy entry point: joins the per-token strings, then parses.
+ */
 vv_status_t vv_postprocess_tokens(
     const char** token_texts, int n_tokens,
     vv_transcription_t** result)
 {
     if (!token_texts || !result) return VV_ERR_NULL_PTR;
 
-    vv_transcription_t* tr = (vv_transcription_t*)vv_alloc(
-        sizeof(vv_transcription_t));
-    if (!tr) return VV_ERR_OUT_OF_MEMORY;
-    memset(tr, 0, sizeof(*tr));
+    size_t total = 1;
+    for (int i = 0; i < n_tokens; i++)
+        if (token_texts[i]) total += strlen(token_texts[i]);
 
-    /* First pass: count segments (each speaker_token starts a new segment) */
-    int n_segs = 0;
+    char* joined = (char*)vv_alloc(total);
+    if (!joined) return VV_ERR_OUT_OF_MEMORY;
+    size_t w = 0;
     for (int i = 0; i < n_tokens; i++) {
-        int sid;
-        if (is_speaker_token(token_texts[i], &sid)) n_segs++;
+        if (!token_texts[i]) continue;
+        size_t l = strlen(token_texts[i]);
+        memcpy(joined + w, token_texts[i], l);
+        w += l;
     }
-    if (n_segs == 0) n_segs = 1;
+    joined[w] = '\0';
 
-    tr->segments = (vv_segment_t*)vv_alloc(
-        (size_t)n_segs * sizeof(vv_segment_t));
-    if (!tr->segments) {
-        vv_free(tr);
-        return VV_ERR_OUT_OF_MEMORY;
-    }
-    memset(tr->segments, 0, (size_t)n_segs * sizeof(vv_segment_t));
-    tr->num_segments = 0;
-
-    /* Build full text and parse segments */
-    size_t full_text_cap = 4096;
-    char* full_text = (char*)vv_alloc(full_text_cap);
-    if (!full_text) {
-        vv_free(tr->segments);
-        vv_free(tr);
-        return VV_ERR_OUT_OF_MEMORY;
-    }
-    full_text[0] = '\0';
-    size_t full_text_len = 0;
-
-    int cur_speaker = 0;
-    float cur_start = 0.0f;
-    float cur_end = 0.0f;
-    size_t seg_text_cap = 1024;
-    char* seg_text = (char*)vv_alloc(seg_text_cap);
-    if (!seg_text) {
-        vv_free(full_text);
-        vv_free(tr->segments);
-        vv_free(tr);
-        return VV_ERR_OUT_OF_MEMORY;
-    }
-    seg_text[0] = '\0';
-    size_t seg_text_len = 0;
-    bool in_segment = false;
-
-    for (int i = 0; i < n_tokens; i++) {
-        const char* tok = token_texts[i];
-        if (!tok) continue;
-
-        /* Skip special / framing tokens */
-        if (strcmp(tok, "<|startoftranscript|>") == 0) continue;
-        if (strcmp(tok, "<|endoftranscript|>") == 0) break;
-        if (strcmp(tok, "<|im_start|>") == 0) continue;
-        if (strcmp(tok, "<|im_end|>") == 0) break;
-        if (strcmp(tok, "<|endoftext|>") == 0) break;
-        if (strcmp(tok, "<|object_ref_start|>") == 0) continue;
-        if (strcmp(tok, "<|object_ref_end|>") == 0) continue;
-        if (strcmp(tok, "<|box_start|>") == 0) continue;
-        if (strcmp(tok, "<|nospeech|>") == 0) continue;
-
-        int sid;
-        float ts;
-
-        if (is_speaker_token(tok, &sid)) {
-            /* Flush previous segment */
-            if (in_segment && tr->num_segments < n_segs) {
-                vv_segment_t* seg = &tr->segments[tr->num_segments];
-                char speaker_name[32];
-                snprintf(speaker_name, sizeof(speaker_name),
-                         "Speaker %d", cur_speaker);
-                seg->speaker = (char*)vv_alloc(strlen(speaker_name) + 1);
-                if (seg->speaker) strcpy((char*)seg->speaker, speaker_name);
-                seg->start_time = cur_start;
-                seg->end_time = cur_end;
-                seg->text = (char*)vv_alloc(seg_text_len + 1);
-                if (seg->text) {
-                    memcpy((char*)seg->text, seg_text, seg_text_len);
-                    ((char*)seg->text)[seg_text_len] = '\0';
-                }
-                tr->num_segments++;
-            }
-            cur_speaker = sid;
-            seg_text[0] = '\0';
-            seg_text_len = 0;
-            in_segment = true;
-        }
-        else if (is_timestamp_token(tok, &ts)) {
-            if (!in_segment) {
-                cur_start = ts;
-                in_segment = true;
-            } else {
-                cur_end = ts;
-            }
-        }
-        else {
-            /* Regular text token */
-            size_t tlen = strlen(tok);
-
-            /* Append to segment text */
-            if (seg_text_len + tlen + 1 > seg_text_cap) {
-                seg_text_cap = seg_text_cap * 2 + tlen;
-                seg_text = (char*)vv_realloc(seg_text, seg_text_cap);
-            }
-            memcpy(seg_text + seg_text_len, tok, tlen);
-            seg_text_len += tlen;
-            seg_text[seg_text_len] = '\0';
-
-            /* Append to full text */
-            if (full_text_len + tlen + 1 > full_text_cap) {
-                full_text_cap = full_text_cap * 2 + tlen;
-                full_text = (char*)vv_realloc(full_text, full_text_cap);
-            }
-            memcpy(full_text + full_text_len, tok, tlen);
-            full_text_len += tlen;
-            full_text[full_text_len] = '\0';
-        }
-    }
-
-    /* Flush last segment */
-    if (in_segment && seg_text_len > 0 && tr->num_segments < n_segs) {
-        vv_segment_t* seg = &tr->segments[tr->num_segments];
-        char speaker_name[32];
-        snprintf(speaker_name, sizeof(speaker_name),
-                 "Speaker %d", cur_speaker);
-        seg->speaker = (char*)vv_alloc(strlen(speaker_name) + 1);
-        if (seg->speaker) strcpy((char*)seg->speaker, speaker_name);
-        seg->start_time = cur_start;
-        seg->end_time = cur_end;
-        seg->text = (char*)vv_alloc(seg_text_len + 1);
-        if (seg->text) {
-            memcpy((char*)seg->text, seg_text, seg_text_len);
-            ((char*)seg->text)[seg_text_len] = '\0';
-        }
-        tr->num_segments++;
-    }
-
-    tr->full_text = full_text;
-    tr->duration = cur_end;
-    tr->language = "en"; /* TODO: detect from tokens */
-
-    vv_free(seg_text);
-
-    *result = tr;
-    return VV_OK;
+    vv_status_t s = vv_postprocess_text(joined, 0.0f, result);
+    vv_free(joined);
+    return s;
 }
 
 /* ─── JSON output ───────────────────────────────────────────────────────── */

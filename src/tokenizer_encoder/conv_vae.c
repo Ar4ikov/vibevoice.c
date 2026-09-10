@@ -1461,6 +1461,13 @@ vv_status_t vv_conv_vae_init(const vv_weight_t* model_weights, int n_weights,
         memcpy(depths, sem->encoder_depths, sizeof(int) * n_stages);
         memcpy(ratios, sem->encoder_ratios, sizeof(int) * n_ratios);
     }
+    if (n_stages < 1 || n_stages > 8 || n_ratios < 1 || n_ratios > 8 ||
+        enc->vae_dim < 1) {
+        VV_LOG_E("conv_vae: invalid config (stages=%d, ratios=%d, vae_dim=%d)",
+                 n_stages, n_ratios, enc->vae_dim);
+        vv_free(enc);
+        return VV_ERR_INVALID_ARG;
+    }
     enc->n_stages = n_stages;
 
     /* ── Allocate stages and blocks ── */

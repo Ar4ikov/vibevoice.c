@@ -231,6 +231,15 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx);
 vv_status_t vv_transcription_free(vv_transcription_t* result);
 
 /**
+ * @brief Parse the model's JSON answer into a structured transcription.
+ *
+ * Falls back to returning the raw text with no segments when the answer is
+ * not the expected JSON array.
+ */
+vv_status_t vv_postprocess_text(const char* text, float audio_duration,
+                                 vv_transcription_t** result);
+
+/**
  * @brief Get performance metrics from the last transcribe() call.
  */
 const vv_perf_metrics_t* vv_inference_get_perf(const vv_inference_ctx_t* ctx);

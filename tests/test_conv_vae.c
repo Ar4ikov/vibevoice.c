@@ -46,11 +46,24 @@ static void test_conv_vae_init_acoustic(void) {
     vv_status_t s = vv_conv_vae_init(NULL, 0, &config, true, &enc);
     TEST_ASSERT(s == VV_OK, "acoustic init returns VV_OK");
     TEST_ASSERT(enc != NULL, "encoder pointer is non-NULL");
+    if (!enc) return;
     TEST_ASSERT(enc->vae_dim == 64, "vae_dim == 64");
     TEST_ASSERT(enc->gaussian == true, "gaussian == true for acoustic");
 
     s = vv_conv_vae_free(enc);
     TEST_ASSERT(s == VV_OK, "free returns VV_OK");
+}
+
+/** @brief A config with no stages must be rejected, not half-built. */
+static void test_conv_vae_rejects_empty_config(void) {
+    printf("test_conv_vae_rejects_empty_config:\n");
+    vv_semantic_tokenizer_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.vae_dim = 128;
+    vv_conv_vae_encoder_t* enc = NULL;
+    vv_status_t s = vv_conv_vae_init(NULL, 0, &config, false, &enc);
+    TEST_ASSERT(s == VV_ERR_INVALID_ARG, "zero-stage config is rejected");
+    TEST_ASSERT(enc == NULL, "no encoder is returned");
 }
 
 static void test_conv_vae_init_semantic(void) {
@@ -65,13 +78,18 @@ static void test_conv_vae_init_semantic(void) {
     int ratios[] = {8, 5, 5, 4, 2, 2};
     memcpy(config.encoder_ratios, ratios, sizeof(ratios));
     config.n_ratios = 6;
+    int depths[] = {3, 3, 3, 3, 3, 3, 8};
+    memcpy(config.encoder_depths, depths, sizeof(depths));
+    config.n_depths = 7;
 
     vv_conv_vae_encoder_t* enc = NULL;
     vv_status_t s = vv_conv_vae_init(NULL, 0, &config, false, &enc);
     TEST_ASSERT(s == VV_OK, "semantic init returns VV_OK");
     TEST_ASSERT(enc != NULL, "encoder pointer is non-NULL");
+    if (!enc) return;
     TEST_ASSERT(enc->vae_dim == 128, "vae_dim == 128");
     TEST_ASSERT(enc->gaussian == false, "gaussian == false for semantic");
+    TEST_ASSERT(enc->n_stages == 7, "7 encoder stages");
 
     s = vv_conv_vae_free(enc);
     TEST_ASSERT(s == VV_OK, "free returns VV_OK");
@@ -82,6 +100,7 @@ int main(void) {
 
     test_conv_vae_init_acoustic();
     test_conv_vae_init_semantic();
+    test_conv_vae_rejects_empty_config();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

@@ -252,6 +252,7 @@ if(VV_BUILD_TESTS)
     vv_add_test(test_safetensors tests/test_safetensors.c)
     vv_add_test(test_nf4 tests/test_nf4.c)
     vv_add_test(test_conv_vae tests/test_conv_vae.c)
+    vv_add_test(test_tokenizer tests/test_tokenizer.c)
     vv_add_test(test_e2e tests/test_e2e.c)
 endif()
 

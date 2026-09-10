@@ -345,9 +345,13 @@ vv_status_t vv_tokenizer_load(const char* dir_path, vv_tokenizer_t** out) {
         if (!t->mentry) goto oom;
         memset(t->mentry, 0, (size_t)nm * sizeof(merge_entry_t));
 
-        int k = 0;
-        for (int i = 0; i < nm; i++) {
-            cJSON* m = cJSON_GetArrayItem(merges, i);
+        /*
+         * Walk the sibling list directly: cJSON arrays are linked lists, so
+         * indexing with cJSON_GetArrayItem() inside the loop is quadratic —
+         * 151 k merges turned tokenizer loading into a 22-second stall.
+         */
+        int k = 0, i = 0;
+        for (cJSON* m = merges->child; m; m = m->next, i++) {
             const char *a = NULL, *b = NULL;
             size_t an = 0, bn = 0;
             if (cJSON_IsString(m)) {

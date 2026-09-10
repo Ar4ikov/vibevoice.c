@@ -7,6 +7,74 @@
 
 ---
 
+## 0. Статус (проверено на RTX 3090, CUDA 12.4)
+
+Runtime работает end-to-end и **побайтово совпадает с PyTorch-эталоном**
+(`transformers` + `bitsandbytes`, тот же чекпоинт) на:
+
+* 11 c моно 24 кГц — транскрипт идентичен;
+* 120 c, два стриминговых сегмента, два говорящих — транскрипт идентичен,
+  диаризация и таймстемпы совпадают;
+* 274 c, 5 сегментов — валидный JSON, 24 сегмента.
+
+Измерено (RTX 3090, `--max-seq-len 32768`, все веса резидентны в VRAM):
+
+| Метрика | Цель CLAUDE.md | Факт |
+|---|---|---|
+| Загрузка модели | < 10 c | **9.5 c** |
+| Speech encoding (11 c аудио) | < 500 мс | **243 мс** |
+| Prefill | < 300 мс / 1K | **82 мс / 143 tok**, ~490 мс / 1K |
+| Decode | > 50 tok/s | **118 tok/s** (контекст 200), 72 tok/s (контекст 3.5K) |
+| RTF | < 1.0 | **0.067 … 0.089** |
+| VRAM | < 10 GB | 9.8 GB (из них 1.8 GB — KV на 32K) |
+
+Для сравнения: `transformers` + `bitsandbytes` на той же карте — 27.6 tok/s,
+то есть C-runtime быстрее в **2.8×**.
+
+### Что было сломано (и почему это стоит помнить)
+
+Четыре независимых дефекта, каждый из которых в одиночку превращал вывод в мусор:
+
+1. **BPE-токенизатор** не делал byte-level кодирование (нет GPT-2 алфавита,
+   нет pre-tokenizer split), плюс O(merges × tokens) перебор слияний.
+2. **Causal SConv1d**: левый паддинг брался как `k - 1` вместо
+   `(k - 1) * dilation - (stride - 1)`. Для stride=1 совпадает, поэтому баг
+   был не виден на stem/head, но сдвигал каждый downsample-слой.
+3. **FFN в tokenizer** применял SiLU там, где эталон использует точный GELU
+   (`erf`, не tanh-аппроксимация).
+4. **Flash-attention prefill** вычислял границу цикла по KV из построчного
+   causal-лимита — варпы одного блока приходили к разному числу
+   `__syncthreads()` и разносили общие K/V-тайлы.
+
+### Формат промпта (точно как в `vibevoice_asr_processor.py`)
+
+```
+<|im_start|>system\n
+You are a helpful assistant that transcribes audio input into text output in JSON format.<|im_end|>\n
+<|im_start|>user\n
+<|object_ref_start|>[<|box_start|> × ceil(N/3200)]<|object_ref_end|>\n
+This is a {dur:.2f} seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>\n
+```
+
+**Generation prompt НЕ добавляется** — модель сама генерирует
+`<|im_start|>assistant\n`, а затем JSON-массив сегментов. С hotwords
+инструкция принимает вид `...seconds audio, with extra info: {ctx}\n\nPlease
+transcribe it with these keys: ...`.
+
+Спец-токены (переиспользованные из Qwen2.5):
+`speech_start = <|object_ref_start|>` (151646),
+`speech_end = <|object_ref_end|>` (151647),
+`speech_pad = <|box_start|>` (151648).
+
+### Отличие от эталона, о котором надо знать
+
+Эталон при кодировании акустических латентов делает гауссову выборку
+(`fix_std/0.8 × randn` на батч, затем `mean + std × randn_like`). Runtime
+использует само среднее — детерминированно и воспроизводимо. На проверенных
+файлах транскрипт совпадает; при желании вернуть шум нужен seeded RNG.
+
+---
+
 ## 1. Что это за проект
 
 **vibevoice.c** — высокопроизводительный runtime на **чистом C** для запуска
@@ -473,6 +541,21 @@ the base model microsoft/VibeVoice-ASR or Qwen2.5-7B.
 
 ## 10. Сборка
 
+### Linux (основная площадка разработки — gpubox)
+
+```bash
+export PATH=/usr/local/cuda-12.4/bin:$PATH
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+      -DVV_ENABLE_TRT=OFF -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build -j 16
+VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
+```
+
+`ctest` без `VV_TEST_MODEL` тоже проходит — тесты, которым нужны веса,
+рапортуют SKIP.
+
+### Windows
+
 ```powershell
 $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2"
 $env:TENSORRT_PATH = "C:\TensorRT-10.4.0"
@@ -501,7 +584,10 @@ vv_cli.exe --model ./model_hf --trt-acoustic encoder_ac.plan \
     --trt-semantic encoder_sem.plan --audio recording.wav
 
 # С ограничением по VRAM (для 12GB карт)
-vv_cli.exe --model ./model_hf --audio recording.wav --max-seq-len 32000 --kv-fp8
+vv_cli.exe --model ./model_hf --audio recording.wav --max-seq-len 8192 --kv-fp8
+
+# Дамп промежуточных тензоров для сверки с PyTorch (tools/compare_ref.py)
+VV_DUMP_DIR=./cdump vv_cli --model ./model_hf --audio recording.wav
 ```
 
 ---
@@ -560,10 +646,27 @@ static const float NF4_TABLE[16] = {
 };
 ```
 
+### Causal SConv1d — паддинг (частый источник ошибок)
+
+```
+padding_total  = (k - 1) * dilation - (stride - 1)      # НЕ (k - 1)
+extra_padding  = out_len * stride - in_len              # нули справа
+out_len        = ceil(in_len / stride)
+```
+
+Слева кладём `padding_total` нулей, справа `extra_padding`. В стриминге
+левый контекст берётся не из нулей, а из хвоста предыдущего чанка
+(`k - stride` отсчётов), поэтому результат в точности равен обработке всего
+сигнала целиком.
+
 ### Conv-VAE Encoder Block (per stage)
 ```
-Each block: norm → mixer(depthwise_conv) → residual + layer_scale
-            norm → ffn(linear1 → act → linear2) → residual + ffn_layer_scale
+Each block: norm → mixer(depthwise_conv) → residual + gamma * y
+            norm → ffn(linear1 → GELU → linear2) → residual + ffn_gamma * y
+
+  norm  = ConvRMSNorm по каналам, eps = layernorm_eps = 1e-5
+  act   = ТОЧНЫЙ GELU (erf), это ACT2FN["gelu"], не tanh-аппроксимация
+  ffn   = expansion 4x, bias = conv_bias = true у обоих линейных слоёв
 
 Downsample: strided 1D convolution with stride = ratio[i]
 

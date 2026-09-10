@@ -21,9 +21,17 @@
 
 /* ─── Tile sizes ─────────────────────────────────────────────────────────── */
 
-#define FA2_BR          4      /* Q rows per block (= warps per block)     */
+#define FA2_BR          8      /* Q rows per block (= warps per block)     */
 #define FA2_BC          32     /* K/V positions per tile (= warp size)     */
-#define FA2_THREADS     128    /* blockDim = (32, 4)                       */
+#define FA2_THREADS     256    /* blockDim = (32, 8)                       */
+/*
+ * Row padding for the shared K/V tiles. Lane L reads K_tile[L * stride + d]
+ * while scoring, so an unpadded stride of head_dim (128 halves = 64 words)
+ * puts every lane on the same bank — a 32-way conflict on the hottest loop
+ * in prefill. Two extra halves per row (65 words) walk the banks by one per
+ * lane, making all 32 accesses conflict-free.
+ */
+#define FA2_KV_PAD      2
 
 #define DECODE_WARPS    4
 #define DECODE_DPT      4      /* head_dim / 32 — dims held per lane       */
@@ -88,10 +96,12 @@ __global__ void flash_attn2_prefill_kernel(
     const int q_stride  = n_q_heads  * head_dim;
     const int kv_stride = n_kv_heads * head_dim;
 
+    const int kv_row = head_dim + FA2_KV_PAD;
+
     extern __shared__ char smem_raw[];
     half* K_tile = (half*)smem_raw;
-    half* V_tile = K_tile + FA2_BC * head_dim;
-    half* Q_smem = V_tile + FA2_BC * head_dim;
+    half* V_tile = K_tile + FA2_BC * kv_row;
+    half* Q_smem = V_tile + FA2_BC * kv_row;
 
     {
         const int q_base = q_row * q_stride + head * head_dim;
@@ -120,11 +130,11 @@ __global__ void flash_attn2_prefill_kernel(
                 int global_pos = kv_start + r;
                 if (global_pos < kv_len) {
                     int kv_off = global_pos * kv_stride + kv_head * head_dim + c;
-                    K_tile[r * head_dim + c] = K[kv_off];
-                    V_tile[r * head_dim + c] = V[kv_off];
+                    K_tile[r * kv_row + c] = K[kv_off];
+                    V_tile[r * kv_row + c] = V[kv_off];
                 } else {
-                    K_tile[r * head_dim + c] = __float2half(0.0f);
-                    V_tile[r * head_dim + c] = __float2half(0.0f);
+                    K_tile[r * kv_row + c] = __float2half(0.0f);
+                    V_tile[r * kv_row + c] = __float2half(0.0f);
                 }
             }
         }
@@ -133,11 +143,15 @@ __global__ void flash_attn2_prefill_kernel(
         const int kv_pos = kv_start + lane;
         float score = -FLT_MAX;
         if (alive && kv_pos < kv_len && (!causal || kv_pos <= q_abs)) {
-            const half* q_ptr = Q_smem + warp_id * head_dim;
-            const half* k_ptr = K_tile + lane * head_dim;
+            const half2* q_ptr = (const half2*)(Q_smem + warp_id * head_dim);
+            const half2* k_ptr = (const half2*)(K_tile + lane * kv_row);
             float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++)
-                dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d]);
+            for (int d = 0; d < head_dim / 2; d++) {
+                const float2 a = __half22float2(q_ptr[d]);
+                const float2 b = __half22float2(k_ptr[d]);
+                dot = fmaf(a.x, b.x, dot);
+                dot = fmaf(a.y, b.y, dot);
+            }
             score = dot * scale;
         }
 
@@ -158,7 +172,7 @@ __global__ void flash_attn2_prefill_kernel(
         for (int k = 0; k < tile_valid; k++) {
             const float pk = __shfl_sync(0xFFFFFFFF, p, k);
             if (pk != 0.0f) {
-                const half* v_row = V_tile + k * head_dim + dim_base;
+                const half* v_row = V_tile + k * kv_row + dim_base;
                 for (int d = 0; d < dims_per_thread; d++)
                     o_reg[d] += pk * __half2float(v_row[d]);
             }
@@ -396,7 +410,8 @@ vv_status_t vv_gqa_attention_prefill_cached_cuda(
     dim3 grid(n_q_heads, num_q_tiles);
     dim3 block(32, FA2_BR);
 
-    size_t shared_bytes = (size_t)(2 * FA2_BC + FA2_BR) * head_dim * sizeof(half);
+    size_t shared_bytes = (size_t)(2 * FA2_BC * (head_dim + FA2_KV_PAD)
+                                   + FA2_BR * head_dim) * sizeof(half);
 
     flash_attn2_prefill_kernel<<<grid, block, shared_bytes,
                                   (cudaStream_t)stream>>>(
