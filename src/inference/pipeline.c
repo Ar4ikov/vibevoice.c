@@ -311,6 +311,19 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     vv_init_params_t p = params ? *params : vv_init_params_default();
     bool cpu_only = p.cpu_only || p.vram_budget <= 0.0f;
 
+    /*
+     * FP8 KV is only wired into the allocator: nothing converts on append and
+     * the attention kernels read half. Half-sized rows would be read as FP16
+     * and produce silent garbage, so refuse instead. Use --max-seq-len to trim
+     * the window when VRAM is tight.
+     */
+    if (p.kv_fp8) {
+        VV_LOG_E("inference: --kv-fp8 is not implemented "
+                 "(attention kernels are FP16-only); "
+                 "use --max-seq-len to bound KV memory instead");
+        return VV_ERR_UNSUPPORTED;
+    }
+
     VV_LOG_I("inference: initializing from '%s' %s (budget=%.0f%%)",
              model_dir,
              cpu_only ? "CPU-only" : "on GPU",

@@ -24,12 +24,19 @@ Runtime работает end-to-end и **побайтово совпадает �
 | Загрузка модели | < 10 c | **9.5 c** |
 | Speech encoding (11 c аудио) | < 500 мс | **243 мс** |
 | Prefill | < 300 мс / 1K | **82 мс / 143 tok**, ~490 мс / 1K |
-| Decode | > 50 tok/s | **118 tok/s** (контекст 200), 72 tok/s (контекст 3.5K) |
-| RTF | < 1.0 | **0.067 … 0.089** |
+| Decode | > 50 tok/s | **123 tok/s** (контекст 0.2K), 106 (1.5K), 67 (24K) |
+| RTF | < 1.0 | **0.061** (120 c), **0.102** (32 мин) |
 | VRAM | < 10 GB | 9.8 GB (из них 1.8 GB — KV на 32K) |
 
+Из 8.1 мс на токен (контекст 1.5K): 6.8 мс — 28 слоёв трансформера,
+1.26 мс — lm_head + argmax (это уже 865 GB/s, почти потолок 3090).
+
 Для сравнения: `transformers` + `bitsandbytes` на той же карте — 27.6 tok/s,
-то есть C-runtime быстрее в **2.8×**.
+то есть C-runtime быстрее в **3.9×**.
+
+Проверено на длинном аудио: 32 минуты (1918 c) → 32 стриминговых сегмента,
+14449 токенов prefill, 9524 сгенерированных, 168 сегментов в JSON,
+195 c общего времени, VRAM не растёт (9.8 GB).
 
 ### Что было сломано (и почему это стоит помнить)
 
@@ -65,6 +72,17 @@ transcribe it with these keys: ...`.
 `speech_start = <|object_ref_start|>` (151646),
 `speech_end = <|object_ref_end|>` (151647),
 `speech_pad = <|box_start|>` (151648).
+
+### Что ещё не сделано
+
+* `--kv-fp8` — аллокатор умеет, ядра нет: флаг возвращает ошибку, а не тихий
+  мусор. Для экономии VRAM используйте `--max-seq-len`.
+* `src/trt/` — заглушки. CUDA-энкодер укладывается в 243 мс на 11 c аудио,
+  так что TensorRT может и не понадобиться.
+* Prefill-attention всё ещё O(S²) на самописном ядре без tensor cores:
+  до ~15K токенов нормально, дальше доминирует.
+* Decode делает ~500 запусков ядер на токен; CUDA Graphs и слияние
+  gate+up — очевидный следующий шаг.
 
 ### Отличие от эталона, о котором надо знать
 
@@ -584,7 +602,7 @@ vv_cli.exe --model ./model_hf --trt-acoustic encoder_ac.plan \
     --trt-semantic encoder_sem.plan --audio recording.wav
 
 # С ограничением по VRAM (для 12GB карт)
-vv_cli.exe --model ./model_hf --audio recording.wav --max-seq-len 8192 --kv-fp8
+vv_cli.exe --model ./model_hf --audio recording.wav --max-seq-len 8192
 
 # Дамп промежуточных тензоров для сверки с PyTorch (tools/compare_ref.py)
 VV_DUMP_DIR=./cdump vv_cli --model ./model_hf --audio recording.wav

@@ -50,6 +50,34 @@ typedef struct {
     const char* hotwords;
 } cli_args_t;
 
+
+/**
+ * @brief Split "a, b ,c" into a counted array of trimmed strings.
+ *
+ * The pieces point into @p scratch, which the caller keeps alive for as long
+ * as the array is used.
+ */
+static int split_hotwords(const char* csv, char* scratch, size_t scratch_size,
+                          const char** out, int max_out) {
+    if (!csv || !csv[0]) return 0;
+    snprintf(scratch, scratch_size, "%s", csv);
+
+    int n = 0;
+    char* p = scratch;
+    while (*p && n < max_out) {
+        while (*p == ' ' || *p == '\t') p++;
+        char* start = p;
+        char* comma = strchr(p, ',');
+        if (comma) { *comma = '\0'; p = comma + 1; }
+        else       { p += strlen(p); }
+        size_t len = strlen(start);
+        while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t'))
+            start[--len] = '\0';
+        if (len > 0) out[n++] = start;
+    }
+    return n;
+}
+
 static void print_usage(const char* prog) {
     fprintf(stderr,
         "vibevoice.c v%s — Pure C VibeVoice-ASR runtime\n\n"
@@ -65,7 +93,7 @@ static void print_usage(const char* prog) {
         "  --hotwords <words>    Comma-separated hotwords\n"
         "  --trt-acoustic <plan> TensorRT engine for acoustic encoder\n"
         "  --trt-semantic <plan> TensorRT engine for semantic encoder\n"
-        "  --kv-fp8              Use FP8 KV-cache (saves VRAM)\n"
+        "  --kv-fp8              FP8 KV-cache (NOT IMPLEMENTED — errors out)\n"
         "  --vram-budget <0-1>   VRAM fraction for model (default: 1.0)\n"
         "  --cpu                 CPU-only mode (no GPU)\n"
         "  --verbose             Enable debug logging\n"
@@ -168,6 +196,7 @@ int main(int argc, char** argv) {
     init_params.kv_fp8 = args.kv_fp8;
     init_params.vram_budget = args.vram_budget;
     init_params.cpu_only = args.cpu_only;
+    if (args.max_seq_len > 0) init_params.max_seq_len = args.max_seq_len;
     s = vv_inference_init(args.model_dir, args.gpu_id, &init_params, &ctx);
     if (s != VV_OK) {
         VV_LOG_E("Failed to initialize inference: %s", vv_status_str(s));
@@ -186,6 +215,15 @@ int main(int argc, char** argv) {
     params.top_k = 1;
     params.enable_timestamps = true;
     params.enable_diarize = true;
+
+    char hotword_buf[512];
+    const char* hotword_list[32];
+    params.num_hotwords = split_hotwords(args.hotwords, hotword_buf,
+                                          sizeof(hotword_buf),
+                                          hotword_list, 32);
+    params.hotwords = params.num_hotwords ? hotword_list : NULL;
+    if (params.num_hotwords)
+        VV_LOG_I("Hotwords: %d term(s)", params.num_hotwords);
 
     vv_transcription_t* result = NULL;
     s = vv_inference_transcribe(ctx, audio, n_samples, &params, &result);
