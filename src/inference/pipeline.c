@@ -1218,6 +1218,7 @@ static vv_status_t transcribe_gpu(
 
     perf->prefill_ms = vv_time_ms() - t_step;
     perf->ttft_ms = vv_time_ms() - t_total_start;
+    (void)0;
     perf->prefill_tok_per_sec = (perf->prefill_ms > 0.001)
         ? (double)seq_len / perf->prefill_ms * 1000.0 : 0.0;
     VV_LOG_I("inference: prefill %.1f ms (%.0f tok/s), TTFT=%.1f ms",
@@ -1229,6 +1230,10 @@ static vv_status_t transcribe_gpu(
     int32_t* output_tokens = (int32_t*)vv_alloc((size_t)out_cap * sizeof(int32_t));
     if (!output_tokens) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_decode; }
     int n_generated = 0;
+
+    /* Split the decode cost so the next optimisation targets the real hot
+     * spot: 28 transformer layers vs the 152k-row LM head + sampling. */
+    double t_layers_ms = 0.0, t_head_ms = 0.0, t_embed_ms = 0.0;
 
     fprintf(stderr, "\n--- token stream ---\n");
     if (!vv_is_end_token(ctx->tokenizer, token_id)) {
@@ -1245,6 +1250,8 @@ static vv_status_t transcribe_gpu(
 
     while (n_generated < max_new_tokens &&
            !vv_is_end_token(ctx->tokenizer, token_id)) {
+
+        double t_tok = vv_time_ms();
 
         /* Embed token */
         if (embed_on_cpu) {
@@ -1263,12 +1270,20 @@ static vv_status_t transcribe_gpu(
             if (s != VV_OK) break;
         }
 
+        vv_cuda_stream_sync(ctx->compute_stream);
+        t_embed_ms += vv_time_ms() - t_tok;
+        t_tok = vv_time_ms();
+
         /* Decoder step */
         s = vv_decoder_step(ctx->model, hidden_one_gpu, ctx->kv_cache,
                              ctx->layer_pool, ctx->workspace,
                              ctx->workspace_size, ctx->compute_stream,
                              ctx->transfer_stream);
         if (s != VV_OK) { VV_LOG_E("inference: decode step %d failed", n_generated); break; }
+
+        vv_cuda_stream_sync(ctx->compute_stream);
+        t_layers_ms += vv_time_ms() - t_tok;
+        t_tok = vv_time_ms();
 
         /* RMSNorm + LM head + sample */
         s = vv_rmsnorm_cuda(hidden_one_gpu, ctx->final_norm_gpu,
@@ -1304,6 +1319,8 @@ static vv_status_t transcribe_gpu(
             vv_cuda_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t), NULL);
         }
 
+        t_head_ms += vv_time_ms() - t_tok;
+
         if (vv_is_end_token(ctx->tokenizer, token_id)) break;
 
         if (n_generated >= out_cap) {
@@ -1334,6 +1351,9 @@ static vv_status_t transcribe_gpu(
     fprintf(stderr, "\n--- end stream (%d tokens) ---\n", n_generated);
     fflush(stderr);
 
+    perf->decode_layers_ms = t_layers_ms;
+    perf->decode_head_ms   = t_head_ms;
+    perf->decode_embed_ms  = t_embed_ms;
     perf->decode_ms = vv_time_ms() - t_step;
     perf->decode_tokens = n_generated;
     perf->decode_tok_per_sec = (perf->decode_ms > 0.001)

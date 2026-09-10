@@ -255,6 +255,16 @@ int main(int argc, char** argv) {
                perf->prefill_ms, perf->prefill_tokens, perf->num_layers);
         printf("    Autoregressive decode%8.1f ms   (%d tokens)\n",
                perf->decode_ms, perf->decode_tokens);
+        if (perf->decode_layers_ms > 0.0 && perf->decode_tokens > 0) {
+            printf("      layers             %8.1f ms   (%.2f ms/token)\n",
+                   perf->decode_layers_ms,
+                   perf->decode_layers_ms / perf->decode_tokens);
+            printf("      lm_head + sample   %8.1f ms   (%.2f ms/token)\n",
+                   perf->decode_head_ms,
+                   perf->decode_head_ms / perf->decode_tokens);
+            printf("      embed              %8.1f ms\n",
+                   perf->decode_embed_ms);
+        }
         printf("    Post-processing      %8.1f ms\n",
                perf->postprocess_ms);
         printf("    ----------------------------------------\n");

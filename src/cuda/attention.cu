@@ -33,8 +33,15 @@
  */
 #define FA2_KV_PAD      2
 
-#define DECODE_WARPS    4
+#define DECODE_WARPS    8
 #define DECODE_DPT      4      /* head_dim / 32 — dims held per lane       */
+/*
+ * Decode attention is latency bound, not bandwidth bound: each warp walks its
+ * slice one position at a time and every step depends on a warp reduction, so
+ * nothing hides the K/V load latency. The only lever is more warps in flight,
+ * hence a short slice (128 positions) and a high cap on the split count.
+ */
+#define VV_DECODE_POS_PER_WARP 128
 
 /* ─── Warp-level reduce helpers ──────────────────────────────────────────── */
 
@@ -317,7 +324,7 @@ extern "C" {
  * Split-decode scratch: allocated on first use and reused for the session —
  * the decode hot path must never call cudaMalloc.
  */
-#define VV_DECODE_MAX_PARTS 64
+#define VV_DECODE_MAX_PARTS 256
 static float* s_part_o = NULL;
 static float* s_part_m = NULL;
 static float* s_part_l = NULL;
@@ -358,8 +365,8 @@ vv_status_t vv_gqa_attention_decode_cuda(
     vv_status_t st = ensure_decode_scratch(n_q_heads, head_dim);
     if (st != VV_OK) return st;
 
-    /* ~512 cache positions per warp, rounded up to whole blocks. */
-    int n_parts = (cache_len + 511) / 512;
+    int n_parts = (cache_len + VV_DECODE_POS_PER_WARP - 1)
+                  / VV_DECODE_POS_PER_WARP;
     if (n_parts < 1) n_parts = 1;
     if (n_parts > VV_DECODE_MAX_PARTS) n_parts = VV_DECODE_MAX_PARTS;
     n_parts = ((n_parts + DECODE_WARPS - 1) / DECODE_WARPS) * DECODE_WARPS;

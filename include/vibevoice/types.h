@@ -280,6 +280,9 @@ typedef struct vv_perf_metrics {
     double sequence_build_ms;    /**< Step 2: embed + upload                */
     double prefill_ms;           /**< Step 3: LLM prefill (28 layers)       */
     double decode_ms;            /**< Step 4: autoregressive decode loop    */
+    double decode_layers_ms;     /**< ...of which: the 28 transformer layers */
+    double decode_head_ms;       /**< ...of which: LM head + argmax + sync   */
+    double decode_embed_ms;      /**< ...of which: token embedding lookup    */
     double postprocess_ms;       /**< Step 5: detokenize + JSON             */
 
     /* Key latencies */
