@@ -119,16 +119,17 @@ vv_status_t vv_silu_cuda(void* data, int total, void* stream) {
 /**
  * @brief GELU activation kernel.
  *
- * GELU(x) ≈ x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x³)))
+ * Exact form GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2))), matching
+ * transformers' ACT2FN["gelu"] (== F.gelu) used by the tokenizer FFN.
+ * The tanh approximation is NOT interchangeable here: it drifts by up to
+ * ~1e-3 absolute, which compounds across 26 residual blocks.
  */
 static __global__ void gelu_kernel(half* __restrict__ data, int total) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
     float x = __half2float(data[idx]);
-    float c = 0.7978845608028654f;
-    float inner = c * (x + 0.044715f * x * x * x);
-    data[idx] = __float2half(0.5f * x * (1.0f + tanhf(inner)));
+    data[idx] = __float2half(0.5f * x * (1.0f + erff(x * 0.7071067811865476f)));
 }
 
 vv_status_t vv_gelu_cuda(void* data, int total, void* stream) {

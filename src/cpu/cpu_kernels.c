@@ -60,19 +60,20 @@ vv_status_t vv_nf4_gemm_cpu(const float* input,
         return VV_ERR_NULL_PTR;
 
     /* Step 1: Dequantize weight [N, K/2 packed] → [N, K] FP32 row-major */
+    /* bitsandbytes convention: byte = (quant[even] << 4) | quant[odd] */
     int total = N * K;
     int n_packed = (total + 1) / 2;
     int ei = 0;
     for (int i = 0; i < n_packed && ei < total; i++) {
         uint8_t byte = weight_packed[i];
-        /* High nibble */
+        /* High nibble → first element */
         {
             int block_idx = ei / block_size;
             temp_weight[ei] = VV_NF4_TABLE[(byte >> 4) & 0x0F]
                               * weight_scales[block_idx];
             ei++;
         }
-        /* Low nibble */
+        /* Low nibble → second element */
         if (ei < total) {
             int block_idx = ei / block_size;
             temp_weight[ei] = VV_NF4_TABLE[byte & 0x0F]

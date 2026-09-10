@@ -27,6 +27,12 @@ const char* vv_status_str(vv_status_t status);
 
 /** @brief Set the global log level. Default: VV_LOG_INFO. */
 void vv_log_set_level(vv_log_level_t level);
+vv_log_level_t vv_log_get_level(void);
+
+/** @brief VV_DUMP_DIR if set and non-empty, else NULL. */
+const char* vv_debug_dump_dir(void);
+/** @brief Write a raw blob to $VV_DUMP_DIR/<name>.bin (no-op when unset). */
+void vv_debug_dump(const char* name, const void* data, size_t bytes);
 
 /** @brief Log a message. Prefer the VV_LOG_* macros below. */
 void vv_log(vv_log_level_t level, const char* fmt, ...);

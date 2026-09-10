@@ -155,4 +155,14 @@ vv_status_t vv_cuda_set_device(int device_id) {
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
 }
 
+
+/**
+ * @brief Fill device memory with a byte value (synchronous on the null stream).
+ */
+vv_status_t vv_cuda_memset(void* ptr, int value, size_t size) {
+    if (!ptr) return VV_ERR_NULL_PTR;
+    return (cudaMemset(ptr, value, size) == cudaSuccess)
+           ? VV_OK : VV_ERR_CUDA;
+}
+
 } /* extern "C" */

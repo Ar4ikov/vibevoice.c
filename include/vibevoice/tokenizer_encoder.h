@@ -56,6 +56,33 @@ typedef struct vv_encoder_stage {
     int                 channels;        /**< Output channels for this stage */
 } vv_encoder_stage_t;
 
+/** @brief FP16 GPU mirror of one encoder block's weights. */
+typedef struct vv_encoder_block_gpu {
+    void* norm_w;
+    void* conv_w;
+    void* conv_b;
+    void* gamma;
+    void* ffn_norm_w;
+    void* ffn_gamma;
+    void* l1_w;
+    void* l1_b;
+    void* l2_w;
+    void* l2_b;
+    int   ffn_hidden;
+    int   channels;
+    void* cache;      /**< streaming tail for the depthwise mixer conv */
+    int   cache_len;
+} vv_encoder_block_gpu_t;
+
+/** @brief FP16 GPU mirror of one encoder stage. */
+typedef struct vv_encoder_stage_gpu {
+    void* ds_w;
+    void* ds_b;
+    void* ds_cache;   /**< streaming tail for the downsample conv */
+    int   ds_cache_len;
+    vv_encoder_block_gpu_t* blocks;
+} vv_encoder_stage_gpu_t;
+
 /** @brief Full Conv-VAE encoder. */
 typedef struct vv_conv_vae_encoder {
     /* Initial convolution (1 channel → encoder_n_filters) */
@@ -78,6 +105,22 @@ typedef struct vv_conv_vae_encoder {
     /* GPU buffers (pre-allocated at init) */
     void* gpu_workspace;
     size_t workspace_size;
+
+    /*
+     * FP16 GPU mirrors of every weight, uploaded once on the first encode.
+     * Re-uploading per block cost ~270 MB of H2D traffic and hundreds of
+     * cudaMalloc/cudaFree pairs per call, which dominated audio encoding.
+     */
+    bool  gpu_weights_ready;
+    void* input_w_gpu;
+    void* input_b_gpu;
+    void* proj_w_gpu;
+    void* proj_b_gpu;
+    void* input_cache;
+    int   input_cache_len;
+    void* proj_cache;
+    int   proj_cache_len;
+    vv_encoder_stage_gpu_t* gpu_stages;
 } vv_conv_vae_encoder_t;
 
 /* ─── API ───────────────────────────────────────────────────────────────── */
@@ -104,7 +147,7 @@ vv_status_t vv_conv_vae_init(const vv_weight_t* model_weights, int n_weights,
  * @param output       Output: [n_frames, vae_dim] latent tokens
  * @param n_frames     Output: number of frames
  */
-vv_status_t vv_conv_vae_encode_cpu(const vv_conv_vae_encoder_t* encoder,
+vv_status_t vv_conv_vae_encode_cpu(vv_conv_vae_encoder_t* encoder,
                                     const float* audio, int n_samples,
                                     float** output, int* n_frames);
 
@@ -122,6 +165,14 @@ vv_status_t vv_conv_vae_encode_cuda(const vv_conv_vae_encoder_t* encoder,
                                      const void* audio_gpu, int n_samples,
                                      void** output_gpu, int* n_frames,
                                      void* stream);
+
+/**
+ * @brief Upload the encoder weights to the GPU ahead of the first encode.
+ *
+ * Without this the ~600 ms of host-to-device traffic lands inside the first
+ * transcription and is charged to audio encoding.
+ */
+vv_status_t vv_conv_vae_warmup(vv_conv_vae_encoder_t* encoder);
 
 /**
  * @brief Free Conv-VAE encoder resources.

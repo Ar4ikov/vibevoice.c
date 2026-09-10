@@ -23,18 +23,20 @@ __constant__ float c_nf4_table[16] = {
 };
 
 /**
- * @brief Dequantize NF4 packed uint8 to FP16.
+ * @brief Dequantize NF4 packed uint8 to FP16 (block-scaled, blocksize 64).
  *
- * Grid: (n_blocks, 1, 1)  where n_blocks = n_elements / block_size
- * Block: (32, 1, 1)       one warp per quantization block
+ * One thread handles 4 packed bytes = 8 values, so a 256-thread block covers
+ * 2048 elements. The earlier one-warp-per-64-element mapping launched a block
+ * for every 32 bytes of input — over a million blocks for a single MLP
+ * weight — and spent most of its time on scheduling rather than bandwidth.
  *
- * Each thread handles 2 elements (one packed byte).
- * block_size is assumed to be 64.
+ * Eight consecutive values starting at a multiple of 8 always live in the
+ * same 64-element scale block, so one scale lookup covers the whole group.
  *
- * @param packed    Packed uint8 data (2 NF4 values per byte)
- * @param scales    Per-block FP16 scales [n_quant_blocks]
- * @param output    Output FP16 data [n_elements]
- * @param n_elements Total number of elements
+ * @param packed     Packed uint8 data (2 NF4 values per byte)
+ * @param scales     Per-block FP16 scales [n_elements / 64]
+ * @param output     Output FP16 data [n_elements]
+ * @param n_elements Total number of elements (multiple of 8)
  */
 __global__ void vv_dequant_nf4_kernel(
     const uint8_t* __restrict__ packed,
@@ -42,43 +44,24 @@ __global__ void vv_dequant_nf4_kernel(
     half*          __restrict__ output,
     int            n_elements)
 {
-    /* Each block processes one quantization block of 64 elements */
-    int quant_block = blockIdx.x;
-    int lane = threadIdx.x;  /* 0..31 */
+    __shared__ float lut[16];
+    if (threadIdx.x < 16) lut[threadIdx.x] = c_nf4_table[threadIdx.x];
+    __syncthreads();
 
-    /* 32 threads, each reads 1 byte = 2 elements → 64 elements per block */
-    int base_elem = quant_block * 64;
-    int byte_idx  = quant_block * 32 + lane;  /* 64/2 = 32 bytes per block */
-    int out_idx   = base_elem + lane * 2;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int e0  = idx * 8;
+    if (e0 >= n_elements) return;
 
-    if (out_idx >= n_elements) return;
+    const uint32_t bits = ((const uint32_t*)packed)[idx];
+    const float sc = __half2float(scales[e0 >> 6]);
 
-    /* Load scale for this block */
-    float scale = __half2float(scales[quant_block]);
-
-    /* Load packed byte */
-    uint8_t byte_val = packed[byte_idx];
-
-    /* Unpack: bitsandbytes packs first element in HIGH nibble,
-     *         second element in LOW nibble.
-     *   byte = (first_elem_nib << 4) | second_elem_nib
-     */
-    uint8_t hi = (byte_val >> 4) & 0x0F;
-    uint8_t lo = byte_val & 0x0F;
-
-    float val_first  = c_nf4_table[hi] * scale;   /* HIGH nibble = first element  */
-    float val_second = c_nf4_table[lo] * scale;   /* LOW nibble  = second element */
-
-    /* half2 store: first element in low half (lower address),
-     *              second element in high half (higher address) */
-    half2 out_val = __floats2half2_rn(val_first, val_second);
-
-    if (out_idx + 1 < n_elements) {
-        ((half2*)output)[quant_block * 32 + lane] = out_val;
-    } else {
-        /* Edge case: last element */
-        output[out_idx] = __float2half(val_first);
+    half2 out[4];
+#pragma unroll
+    for (int b = 0; b < 4; b++) {
+        const uint32_t byte = (bits >> (b * 8)) & 0xFFu;
+        out[b] = __floats2half2_rn(lut[byte >> 4] * sc, lut[byte & 0xF] * sc);
     }
+    *(float4*)(output + e0) = *(const float4*)out;
 }
 
 /**
@@ -150,10 +133,12 @@ vv_status_t vv_dequant_nf4_cuda(
     if (!packed || !scales_fp16 || !output_fp16) return VV_ERR_NULL_PTR;
     if (n_elements <= 0 || block_size <= 0) return VV_ERR_INVALID_ARG;
 
-    int n_quant_blocks = (n_elements + block_size - 1) / block_size;
+    if (block_size != 64 || (n_elements & 7) != 0) return VV_ERR_UNSUPPORTED;
 
-    dim3 grid(n_quant_blocks);
-    dim3 block(32);  /* one warp */
+    const int threads = 256;
+    const int groups = n_elements / 8;
+    dim3 grid((groups + threads - 1) / threads);
+    dim3 block(threads);
 
     cudaStream_t s = (cudaStream_t)stream;
 

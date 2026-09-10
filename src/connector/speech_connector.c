@@ -28,7 +28,6 @@ extern vv_status_t vv_gemm_fp16_cuda(
     const void* A, const void* B, void* C,
     int M, int N, int K,
     float alpha, float beta, void* stream);
-extern vv_status_t vv_gelu_cuda(void* data, int total, void* stream);
 extern vv_status_t vv_bias_add_cuda(void* output, const void* bias,
                                       int M, int N, void* stream);
 extern vv_status_t vv_rmsnorm_cuda(
@@ -38,19 +37,6 @@ extern vv_status_t vv_fp32_to_fp16_cuda(const void* in, void* out,
                                           int n, void* stream);
 extern vv_status_t vv_fp16_to_fp32_cuda(const void* in, void* out,
                                           int n, void* stream);
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-/* ─── GELU activation ───────────────────────────────────────────────────── */
-
-static float gelu(float x) {
-    /* GELU(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
-    float c = 0.7978845608028654f; /* sqrt(2/pi) */
-    float inner = c * (x + 0.044715f * x * x * x);
-    return 0.5f * x * (1.0f + tanhf(inner));
-}
 
 /* ─── RMSNorm ───────────────────────────────────────────────────────────── */
 
@@ -225,6 +211,47 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
     s = vv_cuda_alloc(&fc2_gpu, out_elems * 2);
     if (s != VV_OK) goto cleanup;
 
+    /* ── Diagnostic: check input and weight stats ── */
+    {
+        /* Sample connector input (first few values of FP32 on CPU) */
+        float imin = input_cpu[0], imax = input_cpu[0], isum = 0.0f;
+        int in_n = vd < 64 ? vd : 64;
+        for (int i = 0; i < in_n; i++) {
+            float v = input_cpu[i];
+            if (v < imin) imin = v;
+            if (v > imax) imax = v;
+            isum += v;
+        }
+        VV_LOG_D("connector diag: input[0] (%d dims): min=%.4f max=%.4f mean=%.6f",
+                 in_n, imin, imax, isum / in_n);
+
+        /* Sample fc1 weight stats */
+        const float* w1_cpu = (const float*)conn->fc1_weight.data;
+        float wmin = w1_cpu[0], wmax = w1_cpu[0], wsum = 0.0f;
+        int wn = (hs * vd) < 1024 ? (hs * vd) : 1024;
+        for (int i = 0; i < wn; i++) {
+            float v = w1_cpu[i];
+            if (v < wmin) wmin = v;
+            if (v > wmax) wmax = v;
+            wsum += v;
+        }
+        VV_LOG_D("connector diag: fc1_weight (%d vals): min=%.4f max=%.4f mean=%.6f",
+                 wn, wmin, wmax, wsum / wn);
+
+        /* Sample fc2 weight stats */
+        const float* w2_cpu = (const float*)conn->fc2_weight.data;
+        wmin = w2_cpu[0]; wmax = w2_cpu[0]; wsum = 0.0f;
+        wn = (hs * hs) < 1024 ? (hs * hs) : 1024;
+        for (int i = 0; i < wn; i++) {
+            float v = w2_cpu[i];
+            if (v < wmin) wmin = v;
+            if (v > wmax) wmax = v;
+            wsum += v;
+        }
+        VV_LOG_D("connector diag: fc2_weight (%d vals): min=%.4f max=%.4f mean=%.6f",
+                 wn, wmin, wmax, wsum / wn);
+    }
+
     /* fc1: [n_frames, vd] @ [hs, vd]^T → [n_frames, hs] */
     s = vv_gemm_fp16_cuda(input_gpu, w1_gpu, fc1_gpu,
                             n_frames, hs, vd, 1.0f, 0.0f, stream);
@@ -234,9 +261,60 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
     if (b1_gpu)
         vv_bias_add_cuda(fc1_gpu, b1_gpu, n_frames, hs, stream);
 
+    /* ── Diagnostic: dump intermediate stats ── */
+    #define CONN_DIAG_N 256
+    {
+        vv_cuda_stream_sync(stream);
+        int diag_n = (int)out_elems < CONN_DIAG_N ? (int)out_elems : CONN_DIAG_N;
+        uint16_t diag_h[CONN_DIAG_N];
+        vv_cuda_memcpy_d2h(diag_h, fc1_gpu, (size_t)diag_n * 2, NULL);
+        float dmin = 1e30f, dmax = -1e30f, dsum = 0.0f;
+        for (int i = 0; i < diag_n; i++) {
+            /* inline fp16→fp32 */
+            uint16_t h = diag_h[i];
+            uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+            uint32_t exp_ = (h >> 10) & 0x1F;
+            uint32_t frac_ = h & 0x03FF;
+            union { float f; uint32_t u; } u_;
+            if (exp_ == 0) u_.u = sign;
+            else if (exp_ == 0x1F) u_.u = sign | 0x7F800000;
+            else u_.u = sign | ((exp_ + 112) << 23) | (frac_ << 13);
+            float v = u_.f;
+            if (v < dmin) dmin = v;
+            if (v > dmax) dmax = v;
+            dsum += v;
+        }
+        VV_LOG_D("connector diag: after fc1+bias: min=%.4f max=%.4f mean=%.6f (%d vals)",
+                 dmin, dmax, dsum / diag_n, diag_n);
+    }
+
     /* RMSNorm (no activation — matches Python: fc1 → norm → fc2) */
     vv_rmsnorm_cuda(fc1_gpu, nw_gpu, norm_gpu,
                      n_frames, hs, conn->rms_eps, stream);
+
+    {
+        vv_cuda_stream_sync(stream);
+        int diag_n = (int)out_elems < CONN_DIAG_N ? (int)out_elems : CONN_DIAG_N;
+        uint16_t diag_h[CONN_DIAG_N];
+        vv_cuda_memcpy_d2h(diag_h, norm_gpu, (size_t)diag_n * 2, NULL);
+        float dmin = 1e30f, dmax = -1e30f, dsum = 0.0f;
+        for (int i = 0; i < diag_n; i++) {
+            uint16_t h = diag_h[i];
+            uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+            uint32_t exp_ = (h >> 10) & 0x1F;
+            uint32_t frac_ = h & 0x03FF;
+            union { float f; uint32_t u; } u_;
+            if (exp_ == 0) u_.u = sign;
+            else if (exp_ == 0x1F) u_.u = sign | 0x7F800000;
+            else u_.u = sign | ((exp_ + 112) << 23) | (frac_ << 13);
+            float v = u_.f;
+            if (v < dmin) dmin = v;
+            if (v > dmax) dmax = v;
+            dsum += v;
+        }
+        VV_LOG_D("connector diag: after RMSNorm: min=%.4f max=%.4f mean=%.6f (%d vals)",
+                 dmin, dmax, dsum / diag_n, diag_n);
+    }
 
     /* fc2: [n_frames, hs] @ [hs, hs]^T → [n_frames, hs] */
     s = vv_gemm_fp16_cuda(norm_gpu, w2_gpu, fc2_gpu,
@@ -246,6 +324,31 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
     /* bias add */
     if (b2_gpu)
         vv_bias_add_cuda(fc2_gpu, b2_gpu, n_frames, hs, stream);
+
+    {
+        vv_cuda_stream_sync(stream);
+        int diag_n = (int)out_elems < CONN_DIAG_N ? (int)out_elems : CONN_DIAG_N;
+        uint16_t diag_h[CONN_DIAG_N];
+        vv_cuda_memcpy_d2h(diag_h, fc2_gpu, (size_t)diag_n * 2, NULL);
+        float dmin = 1e30f, dmax = -1e30f, dsum = 0.0f;
+        for (int i = 0; i < diag_n; i++) {
+            uint16_t h = diag_h[i];
+            uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+            uint32_t exp_ = (h >> 10) & 0x1F;
+            uint32_t frac_ = h & 0x03FF;
+            union { float f; uint32_t u; } u_;
+            if (exp_ == 0) u_.u = sign;
+            else if (exp_ == 0x1F) u_.u = sign | 0x7F800000;
+            else u_.u = sign | ((exp_ + 112) << 23) | (frac_ << 13);
+            float v = u_.f;
+            if (v < dmin) dmin = v;
+            if (v > dmax) dmax = v;
+            dsum += v;
+        }
+        VV_LOG_D("connector diag: after fc2+bias: min=%.4f max=%.4f mean=%.6f (%d vals)",
+                 dmin, dmax, dsum / diag_n, diag_n);
+    }
+    #undef CONN_DIAG_N
 
     /* Download result as FP32 */
     {

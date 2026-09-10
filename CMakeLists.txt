@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 3.22)
 
 # ─── Bootstrap project (C/CXX first, CUDA probed afterward) ──────────────────
 project(vibevoice C CXX)
@@ -30,6 +30,7 @@ endif()
 # ─── Standards ────────────────────────────────────────────────────────────────
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(VV_HAS_CUDA)
@@ -170,6 +171,8 @@ endif()
 if(VV_HAS_CUDA)
     add_library(vibevoice_cuda STATIC
         src/cuda/dequant_nf4.cu
+        src/cuda/nf4_gemv.cu
+        src/cuda/lm_head.cu
         src/cuda/conv1d.cu
         src/cuda/conv_vae.cu
         src/cuda/rmsnorm.cu

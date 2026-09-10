@@ -39,6 +39,11 @@ extern vv_status_t vv_gqa_attention_decode_cuda(
     int n_q_heads, int n_kv_heads, int head_dim,
     int cache_len, void* stream);
 
+extern vv_status_t vv_gqa_attention_prefill_cached_cuda(
+    const void* q, const void* k_cache, const void* v_cache, void* output,
+    int n_q_heads, int n_kv_heads, int head_dim,
+    int q_len, int q_offset, int kv_len, bool causal, void* stream);
+
 extern vv_status_t vv_gqa_attention_prefill_cuda(
     const void* q, const void* k, const void* v,
     void* output,
@@ -48,6 +53,10 @@ extern vv_status_t vv_gqa_attention_prefill_cuda(
 extern vv_status_t vv_swiglu_cuda(
     const void* gate, const void* up, void* output,
     int n_elements, void* stream);
+
+extern vv_status_t vv_nf4_gemv_cuda(
+    const void* x, const uint8_t* packed, const void* scales,
+    const void* bias, void* y, int N, int K, void* stream);
 
 extern vv_status_t vv_nf4_gemm_cuda(
     const void* input_fp16,
@@ -284,6 +293,62 @@ vv_status_t vv_layer_pool_free(vv_layer_pool_t* pool) {
  * GPU decoder — per-layer forward (unchanged core logic)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+
+
+/**
+ * @brief One quantised linear layer: y[M,N] = x[M,K] @ dequant(W)^T + bias.
+ *
+ * Single-token decode takes the fused path, which reads the 4-bit weights
+ * straight into the MAC instead of materialising an FP16 copy first — the
+ * scratch round-trip costs ~5x the memory traffic and dominates decode.
+ */
+static vv_status_t quant_linear(
+    const vv_weight_t* w, const void* x, void* y,
+    void* scratch, int M, int N, int K, void* stream)
+{
+    vv_status_t s;
+
+    if (w->is_quantized) {
+        if (M == 1) {
+            s = vv_nf4_gemv_cuda(x, (const uint8_t*)w->tensor.data,
+                                 w->quant.scales.data, w->bias.data,
+                                 y, N, K, stream);
+            if (s == VV_OK) return VV_OK;      /* bias already folded in */
+            if (s != VV_ERR_UNSUPPORTED) return s;
+        }
+        s = vv_nf4_gemm_cuda(x, (const uint8_t*)w->tensor.data,
+                             w->quant.scales.data, y, scratch,
+                             M, N, K, 64, stream);
+    } else {
+        s = vv_gemm_fp16_cuda(x, w->tensor.data, y, M, N, K,
+                              1.0f, 0.0f, stream);
+    }
+    if (s != VV_OK) return s;
+
+    if (w->bias.data)
+        s = vv_bias_add_cuda(y, w->bias.data, M, N, stream);
+    return s;
+}
+
+/**
+ * @brief Dump a GPU FP16 buffer as FP32 to $VV_DUMP_DIR (debug builds only).
+ */
+static void dump_gpu_fp16(const char* name, const void* gpu, size_t n,
+                          void* stream) {
+    if (!vv_debug_dump_dir() || !gpu || n == 0) return;
+    uint16_t* h = (uint16_t*)vv_alloc(n * 2);
+    if (!h) return;
+    vv_cuda_stream_sync(stream);
+    vv_cuda_memcpy_d2h(h, gpu, n * 2, NULL);
+    float* f = (float*)vv_alloc(n * sizeof(float));
+    if (f) {
+        for (size_t i = 0; i < n; i++) f[i] = vv_half_to_float(h[i]);
+        vv_debug_dump(name, f, n * sizeof(float));
+        vv_free(f);
+    }
+    vv_free(h);
+}
+
 static vv_status_t decoder_layer_impl(
     const vv_layer_weights_t* layer,
     const vv_llm_config_t* config,
@@ -356,58 +421,26 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 2. Q, K, V projections (+ bias if present) */
-    if (layer->attn.q_proj.is_quantized) {
-        s = vv_nf4_gemm_cuda(norm_out,
-                              (const uint8_t*)layer->attn.q_proj.tensor.data,
-                              layer->attn.q_proj.quant.scales.data,
-                              q_buf, temp_weight,
-                              seq_len, n_heads * head_dim, hs, 64, stream);
-    } else {
-        s = vv_gemm_fp16_cuda(norm_out, layer->attn.q_proj.tensor.data,
-                               q_buf, seq_len, n_heads * head_dim, hs,
-                               1.0f, 0.0f, stream);
-    }
+    s = quant_linear(&layer->attn.q_proj, norm_out, q_buf, temp_weight,
+                     seq_len, n_heads * head_dim, hs, stream);
     if (s != VV_OK) return s;
-    if (layer->attn.q_proj.bias.data) {
-        s = vv_bias_add_cuda(q_buf, layer->attn.q_proj.bias.data,
-                              seq_len, n_heads * head_dim, stream);
-        if (s != VV_OK) return s;
-    }
 
-    if (layer->attn.k_proj.is_quantized) {
-        s = vv_nf4_gemm_cuda(norm_out,
-                              (const uint8_t*)layer->attn.k_proj.tensor.data,
-                              layer->attn.k_proj.quant.scales.data,
-                              k_buf, temp_weight,
-                              seq_len, n_kv_heads * head_dim, hs, 64, stream);
-    } else {
-        s = vv_gemm_fp16_cuda(norm_out, layer->attn.k_proj.tensor.data,
-                               k_buf, seq_len, n_kv_heads * head_dim, hs,
-                               1.0f, 0.0f, stream);
-    }
+    s = quant_linear(&layer->attn.k_proj, norm_out, k_buf, temp_weight,
+                     seq_len, n_kv_heads * head_dim, hs, stream);
     if (s != VV_OK) return s;
-    if (layer->attn.k_proj.bias.data) {
-        s = vv_bias_add_cuda(k_buf, layer->attn.k_proj.bias.data,
-                              seq_len, n_kv_heads * head_dim, stream);
-        if (s != VV_OK) return s;
-    }
 
-    if (layer->attn.v_proj.is_quantized) {
-        s = vv_nf4_gemm_cuda(norm_out,
-                              (const uint8_t*)layer->attn.v_proj.tensor.data,
-                              layer->attn.v_proj.quant.scales.data,
-                              v_buf, temp_weight,
-                              seq_len, n_kv_heads * head_dim, hs, 64, stream);
-    } else {
-        s = vv_gemm_fp16_cuda(norm_out, layer->attn.v_proj.tensor.data,
-                               v_buf, seq_len, n_kv_heads * head_dim, hs,
-                               1.0f, 0.0f, stream);
-    }
+    s = quant_linear(&layer->attn.v_proj, norm_out, v_buf, temp_weight,
+                     seq_len, n_kv_heads * head_dim, hs, stream);
     if (s != VV_OK) return s;
-    if (layer->attn.v_proj.bias.data) {
-        s = vv_bias_add_cuda(v_buf, layer->attn.v_proj.bias.data,
-                              seq_len, n_kv_heads * head_dim, stream);
-        if (s != VV_OK) return s;
+
+    if (layer_idx == 0 && seq_len > 1) {
+        dump_gpu_fp16("c_l0_norm", norm_out, (size_t)seq_len * hs, stream);
+        dump_gpu_fp16("c_l0_q_prerope", q_buf,
+                      (size_t)seq_len * n_heads * head_dim, stream);
+        dump_gpu_fp16("c_l0_k_prerope", k_buf,
+                      (size_t)seq_len * n_kv_heads * head_dim, stream);
+        dump_gpu_fp16("c_l0_v", v_buf,
+                      (size_t)seq_len * n_kv_heads * head_dim, stream);
     }
 
     /* 3. RoPE */
@@ -418,54 +451,56 @@ static vv_status_t decoder_layer_impl(
                       position_offset, config->rope_theta, stream);
     if (s != VV_OK) return s;
 
+    if (layer_idx == 0 && seq_len > 1) {
+        dump_gpu_fp16("c_l0_q", q_buf,
+                      (size_t)seq_len * n_heads * head_dim, stream);
+        dump_gpu_fp16("c_l0_k", k_buf,
+                      (size_t)seq_len * n_kv_heads * head_dim, stream);
+    }
+
     /* 4. KV-cache append */
     s = vv_kv_cache_append(kv_cache, layer_idx, k_buf, v_buf,
                             seq_len, stream);
     if (s != VV_OK) return s;
 
-    /* 5. GQA Attention */
-    if (seq_len > 1) {
-        s = vv_gqa_attention_prefill_cuda(
-            q_buf, k_buf, v_buf, attn_out,
-            n_heads, n_kv_heads, head_dim,
-            seq_len, true, stream);
-    } else {
+    /* 5. GQA attention over the cache (queries of this chunk see all of it) */
+    {
         const void* k_cached;
         const void* v_cached;
         int cache_len;
-        vv_kv_cache_get(kv_cache, layer_idx,
-                         &k_cached, &v_cached, &cache_len);
-        /* Include the just-appended token(s): current_len is only
-         * incremented on the last layer, but we need the full length
-         * including the token we just appended to this layer's cache. */
-        int actual_cache_len = position_offset + seq_len;
-        s = vv_gqa_attention_decode_cuda(
-            q_buf, k_cached, v_cached, attn_out,
-            n_heads, n_kv_heads, head_dim, actual_cache_len, stream);
+        vv_kv_cache_get(kv_cache, layer_idx, &k_cached, &v_cached, &cache_len);
+        /*
+         * current_len only advances on the last layer, so derive the true
+         * length from this call's position instead.
+         */
+        const int actual_cache_len = position_offset + seq_len;
+
+        if (seq_len > 1) {
+            s = vv_gqa_attention_prefill_cached_cuda(
+                q_buf, k_cached, v_cached, attn_out,
+                n_heads, n_kv_heads, head_dim,
+                seq_len, position_offset, actual_cache_len, true, stream);
+        } else {
+            s = vv_gqa_attention_decode_cuda(
+                q_buf, k_cached, v_cached, attn_out,
+                n_heads, n_kv_heads, head_dim, actual_cache_len, stream);
+        }
     }
     if (s != VV_OK) return s;
 
+    if (layer_idx == 0 && seq_len > 1)
+        dump_gpu_fp16("c_l0_attn", attn_out, (size_t)seq_len * hs, stream);
+
     /* 6. O projection + bias + residual */
-    if (layer->attn.o_proj.is_quantized) {
-        s = vv_nf4_gemm_cuda(attn_out,
-                              (const uint8_t*)layer->attn.o_proj.tensor.data,
-                              layer->attn.o_proj.quant.scales.data,
-                              norm_out, temp_weight,
-                              seq_len, hs, hs, 64, stream);
-    } else {
-        s = vv_gemm_fp16_cuda(attn_out, layer->attn.o_proj.tensor.data,
-                               norm_out, seq_len, hs, hs,
-                               1.0f, 0.0f, stream);
-    }
+    s = quant_linear(&layer->attn.o_proj, attn_out, norm_out, temp_weight,
+                     seq_len, hs, hs, stream);
     if (s != VV_OK) return s;
-    if (layer->attn.o_proj.bias.data) {
-        s = vv_bias_add_cuda(norm_out, layer->attn.o_proj.bias.data,
-                              seq_len, hs, stream);
-        if (s != VV_OK) return s;
-    }
     s = vv_residual_add_cuda(hidden_states, norm_out,
                               seq_len * hs, stream);
     if (s != VV_OK) return s;
+
+    if (layer_idx == 0 && seq_len > 1)
+        dump_gpu_fp16("c_l0_postattn", hidden_states, (size_t)seq_len * hs, stream);
 
     /* 7. Post-attention LayerNorm */
     s = vv_rmsnorm_cuda(hidden_states, layer->post_attn_layernorm.data,
@@ -474,41 +509,13 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 8. MLP: gate + up (+ bias if present) */
-    if (layer->mlp.gate_proj.is_quantized) {
-        s = vv_nf4_gemm_cuda(norm_out,
-                              (const uint8_t*)layer->mlp.gate_proj.tensor.data,
-                              layer->mlp.gate_proj.quant.scales.data,
-                              gate_buf, temp_weight,
-                              seq_len, inter_size, hs, 64, stream);
-    } else {
-        s = vv_gemm_fp16_cuda(norm_out, layer->mlp.gate_proj.tensor.data,
-                               gate_buf, seq_len, inter_size, hs,
-                               1.0f, 0.0f, stream);
-    }
+    s = quant_linear(&layer->mlp.gate_proj, norm_out, gate_buf, temp_weight,
+                     seq_len, inter_size, hs, stream);
     if (s != VV_OK) return s;
-    if (layer->mlp.gate_proj.bias.data) {
-        s = vv_bias_add_cuda(gate_buf, layer->mlp.gate_proj.bias.data,
-                              seq_len, inter_size, stream);
-        if (s != VV_OK) return s;
-    }
 
-    if (layer->mlp.up_proj.is_quantized) {
-        s = vv_nf4_gemm_cuda(norm_out,
-                              (const uint8_t*)layer->mlp.up_proj.tensor.data,
-                              layer->mlp.up_proj.quant.scales.data,
-                              up_buf, temp_weight,
-                              seq_len, inter_size, hs, 64, stream);
-    } else {
-        s = vv_gemm_fp16_cuda(norm_out, layer->mlp.up_proj.tensor.data,
-                               up_buf, seq_len, inter_size, hs,
-                               1.0f, 0.0f, stream);
-    }
+    s = quant_linear(&layer->mlp.up_proj, norm_out, up_buf, temp_weight,
+                     seq_len, inter_size, hs, stream);
     if (s != VV_OK) return s;
-    if (layer->mlp.up_proj.bias.data) {
-        s = vv_bias_add_cuda(up_buf, layer->mlp.up_proj.bias.data,
-                              seq_len, inter_size, stream);
-        if (s != VV_OK) return s;
-    }
 
     /* 9. SwiGLU */
     s = vv_swiglu_cuda(gate_buf, up_buf, gate_buf,
@@ -516,23 +523,9 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 10. Down projection + bias + residual */
-    if (layer->mlp.down_proj.is_quantized) {
-        s = vv_nf4_gemm_cuda(gate_buf,
-                              (const uint8_t*)layer->mlp.down_proj.tensor.data,
-                              layer->mlp.down_proj.quant.scales.data,
-                              mlp_out, temp_weight,
-                              seq_len, hs, inter_size, 64, stream);
-    } else {
-        s = vv_gemm_fp16_cuda(gate_buf, layer->mlp.down_proj.tensor.data,
-                               mlp_out, seq_len, hs, inter_size,
-                               1.0f, 0.0f, stream);
-    }
+    s = quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out, temp_weight,
+                     seq_len, hs, inter_size, stream);
     if (s != VV_OK) return s;
-    if (layer->mlp.down_proj.bias.data) {
-        s = vv_bias_add_cuda(mlp_out, layer->mlp.down_proj.bias.data,
-                              seq_len, hs, stream);
-        if (s != VV_OK) return s;
-    }
     s = vv_residual_add_cuda(hidden_states, mlp_out,
                               seq_len * hs, stream);
     return s;
@@ -619,7 +612,38 @@ vv_status_t vv_decoder_prefill(
 
     bool streaming = pool && !pool->all_resident;
 
-    for (int i = 0; i < model->num_layers; i++) {
+    const vv_llm_config_t* cfg = &model->config.llm;
+    const int hs = cfg->hidden_size;
+
+    /*
+     * Chunked prefill. Activation scratch grows linearly with the number of
+     * tokens in flight (the two 18944-wide MLP buffers dominate), so a
+     * 30-minute prompt would need gigabytes if run in one shot. Chunking caps
+     * that at a fixed budget; correctness is preserved because each chunk
+     * attends to the whole KV cache written by the chunks before it.
+     */
+    size_t per_token = (size_t)(hs * 3
+                       + cfg->num_attention_heads * cfg->head_dim
+                       + 2 * cfg->num_key_value_heads * cfg->head_dim
+                       + 2 * cfg->intermediate_size) * 2;
+    size_t weight_scratch = (size_t)cfg->intermediate_size * hs * 2;
+    int chunk = seq_len;
+    if (workspace_size > weight_scratch + per_token) {
+        size_t budget = (workspace_size - weight_scratch) / per_token;
+        if (budget < 1) budget = 1;
+        if (budget > 2048) budget = 2048;
+        if ((int)budget < chunk) chunk = (int)budget;
+    }
+    if (chunk < 1) chunk = 1;
+    if (chunk < seq_len)
+        VV_LOG_I("decoder: prefill in %d chunks of %d tokens",
+                 (seq_len + chunk - 1) / chunk, chunk);
+
+    for (int start = 0; start < seq_len; start += chunk) {
+      const int len = (start + chunk <= seq_len) ? chunk : (seq_len - start);
+      void* chunk_hidden = (uint8_t*)hidden_states + (size_t)start * hs * 2;
+
+      for (int i = 0; i < model->num_layers; i++) {
 
         /* Stage layer i */
         if (streaming) {
@@ -629,7 +653,7 @@ vv_status_t vv_decoder_prefill(
 
         vv_status_t s = decoder_layer_impl(
             &model->layers[i], &model->config.llm,
-            hidden_states, kv_cache, i, 0, seq_len,
+            chunk_hidden, kv_cache, i, start, len,
             workspace, workspace_size, compute_stream);
 
         /* Unstage */
@@ -643,6 +667,25 @@ vv_status_t vv_decoder_prefill(
                      i, vv_status_str(s));
             return s;
         }
+
+        if (start + len == seq_len && vv_debug_dump_dir() && start == 0) {
+            size_t n = (size_t)seq_len * (size_t)model->config.llm.hidden_size;
+            uint16_t* h = (uint16_t*)vv_alloc(n * 2);
+            if (h) {
+                vv_cuda_stream_sync(compute_stream);
+                vv_cuda_memcpy_d2h(h, hidden_states, n * 2, NULL);
+                float* f = (float*)vv_alloc(n * sizeof(float));
+                if (f) {
+                    for (size_t j = 0; j < n; j++) f[j] = vv_half_to_float(h[j]);
+                    char nm[64];
+                    snprintf(nm, sizeof(nm), "c_layer%02d", i + 1);
+                    vv_debug_dump(nm, f, n * sizeof(float));
+                    vv_free(f);
+                }
+                vv_free(h);
+            }
+        }
+      }
     }
 
     return VV_OK;

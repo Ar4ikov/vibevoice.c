@@ -39,7 +39,7 @@
 # │   │                             (БЕЗ FFT/mel — модель принимает raw PCM!)
 # │   ├── text_tokenizer/         — BPE-токенизатор на C (vocab + merges)
 # │   ├── tokenizer_encoder/      — Conv-VAE speech tokenizer encoders (CPU ref)
-# │   ├── connector/              — SpeechConnector MLP (fc1→GELU→norm→fc2)
+# │   ├── connector/              — SpeechConnector MLP (fc1→RMSNorm→fc2, no activation)
 # │   ├── model/                  — safetensors парсер, config.json, loader
 # │   ├── quant/                  — NF4 lookup table, CPU dequant reference
 # │   ├── cuda/                   — CUDA ядра: dequant, conv1d, attention, etc.
@@ -94,8 +94,8 @@
 #   - causal=true, depthwise_conv mixer, RMSNorm
 # • Semantic Tokenizer: Conv-VAE encoder, vae_dim=128, deterministic (no sampling)
 #   - Same architecture, different vae_dim and no sampling
-# • Acoustic Connector: MLP(64 → 3584): fc1 → GELU → RMSNorm → fc2
-# • Semantic Connector: MLP(128 → 3584): fc1 → GELU → RMSNorm → fc2
+# • Acoustic Connector: MLP(64 → 3584): fc1 → RMSNorm → fc2 (no activation)
+# • Semantic Connector: MLP(128 → 3584): fc1 → RMSNorm → fc2 (no activation)
 # • Combined: acoustic_features + semantic_features (element-wise add)
 # • LLM backbone: Qwen2-7B — decoder-only transformer.
 #   - hidden_size: 3584, num_layers: 28, num_heads: 28, head_dim: 128

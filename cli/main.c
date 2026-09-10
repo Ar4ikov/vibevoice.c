@@ -42,6 +42,7 @@ typedef struct {
     const char* trt_semantic;
     int         gpu_id;
     int         max_tokens;
+    int         max_seq_len;
     bool        kv_fp8;
     bool        cpu_only;
     float       vram_budget;
@@ -60,6 +61,7 @@ static void print_usage(const char* prog) {
         "  --output <file>       Output JSON file (default: stdout)\n"
         "  --gpu <id>            GPU device ID (default: 0)\n"
         "  --max-tokens <N>      Max decode tokens (default: 64000)\n"
+        "  --max-seq-len <N>     KV-cache window in tokens (default: 32768)\n"
         "  --hotwords <words>    Comma-separated hotwords\n"
         "  --trt-acoustic <plan> TensorRT engine for acoustic encoder\n"
         "  --trt-semantic <plan> TensorRT engine for semantic encoder\n"
@@ -87,6 +89,8 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->gpu_id = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
             args->max_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--max-seq-len") == 0 && i + 1 < argc) {
+            args->max_seq_len = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--hotwords") == 0 && i + 1 < argc) {
             args->hotwords = argv[++i];
         } else if (strcmp(argv[i], "--trt-acoustic") == 0 && i + 1 < argc) {

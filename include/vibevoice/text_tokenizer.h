@@ -4,7 +4,7 @@
  *
  * Loads tokenizer.json from the model directory (HuggingFace format).
  * Supports encoding text → token IDs and decoding token IDs → text.
- * Special tokens for VibeVoice-ASR: <|startoftranscript|>, etc.
+ * Special tokens for VibeVoice-ASR: <|object_ref_start|>, <|im_end|>, etc.
  */
 #ifndef VV_TEXT_TOKENIZER_H
 #define VV_TEXT_TOKENIZER_H
@@ -52,10 +52,29 @@ vv_status_t vv_tokenizer_decode(const vv_tokenizer_t* tok,
                                  char** text);
 
 /**
+ * @brief Decode token IDs, optionally dropping HF "special" added tokens.
+ *
+ * @param skip_special  When true, tokens flagged `special` in tokenizer.json
+ *                      (`<|im_end|>`, `<|endoftext|>`, the speech markers …)
+ *                      are omitted from the output.
+ */
+vv_status_t vv_tokenizer_decode_ex(const vv_tokenizer_t* tok,
+                                    const int32_t* ids, int n_tokens,
+                                    bool skip_special, char** text);
+
+/**
+ * @brief Raw vocabulary string for a token id (NULL when unknown).
+ *
+ * The result is the byte-level-encoded form, not human-readable text; use
+ * vv_tokenizer_decode() to get actual text.
+ */
+const char* vv_tokenizer_id_to_token(const vv_tokenizer_t* tok, int32_t id);
+
+/**
  * @brief Get the token ID for a special token by name.
  *
  * @param tok   Tokenizer handle
- * @param name  Special token string (e.g., "<|endoftranscript|>")
+ * @param name  Special token string (e.g., "<|im_end|>")
  * @return Token ID, or -1 if not found
  */
 int vv_tokenizer_special_id(const vv_tokenizer_t* tok, const char* name);

@@ -7,11 +7,17 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <time.h>
+#include <stdlib.h>
+#include <string.h>
 
 static _Thread_local vv_log_level_t s_log_level = VV_LOG_INFO;
 
 void vv_log_set_level(vv_log_level_t level) {
     s_log_level = level;
+}
+
+vv_log_level_t vv_log_get_level(void) {
+    return s_log_level;
 }
 
 void vv_log(vv_log_level_t level, const char* fmt, ...) {
@@ -43,4 +49,25 @@ void vv_log(vv_log_level_t level, const char* fmt, ...) {
 
     fputc('\n', out);
     fflush(out);
+}
+
+
+/* ─── Debug tensor dumping ──────────────────────────────────────────────── */
+
+const char* vv_debug_dump_dir(void) {
+    static const char* d = NULL;
+    static int probed = 0;
+    if (!probed) { d = getenv("VV_DUMP_DIR"); probed = 1; }
+    return (d && d[0]) ? d : NULL;
+}
+
+void vv_debug_dump(const char* name, const void* data, size_t bytes) {
+    const char* d = vv_debug_dump_dir();
+    if (!d || !data || bytes == 0) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.bin", d, name);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(data, 1, bytes, f);
+    fclose(f);
 }

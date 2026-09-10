@@ -31,6 +31,8 @@ vv_status_t vv_dequant_nf4_cpu(const uint8_t* packed,
      *   high nibble = first element  (bits 7..4)
      *   low  nibble = second element (bits 3..0)
      *
+     * bitsandbytes convention: byte = (quant[even] << 4) | quant[odd]
+     *
      * Elements are grouped into blocks of 'block_size'.
      * Each block has one scale factor in 'scales'.
      */

@@ -3,8 +3,8 @@
  * @brief Post-processing: token stream → structured JSON transcription.
  *
  * Parse special tokens like <|speaker_N|>, <|timestamp_X.XX|>,
- * <|startoftranscript|>, <|endoftranscript|> from the generated
- * token stream and produce the final vv_transcription_t result.
+ * <|im_start|>, <|im_end|> from the generated token stream
+ * and produce the final vv_transcription_t result.
  */
 
 #include "vibevoice/inference.h"
@@ -93,9 +93,15 @@ vv_status_t vv_postprocess_tokens(
         const char* tok = token_texts[i];
         if (!tok) continue;
 
-        /* Skip transcript markers */
+        /* Skip special / framing tokens */
         if (strcmp(tok, "<|startoftranscript|>") == 0) continue;
         if (strcmp(tok, "<|endoftranscript|>") == 0) break;
+        if (strcmp(tok, "<|im_start|>") == 0) continue;
+        if (strcmp(tok, "<|im_end|>") == 0) break;
+        if (strcmp(tok, "<|endoftext|>") == 0) break;
+        if (strcmp(tok, "<|object_ref_start|>") == 0) continue;
+        if (strcmp(tok, "<|object_ref_end|>") == 0) continue;
+        if (strcmp(tok, "<|box_start|>") == 0) continue;
         if (strcmp(tok, "<|nospeech|>") == 0) continue;
 
         int sid;

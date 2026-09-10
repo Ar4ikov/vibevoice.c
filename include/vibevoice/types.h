@@ -79,6 +79,57 @@ static inline size_t vv_dtype_size(vv_dtype_t dtype) {
     }
 }
 
+
+/** @brief IEEE-754 half → float (scalar, host side). */
+static inline float vv_half_to_float(uint16_t h) {
+    uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    uint32_t exp  = ((uint32_t)h >> 10) & 0x1Fu;
+    uint32_t man  = (uint32_t)h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while (!(man & 0x400u)) { man <<= 1; exp--; }
+            man &= 0x3FFu;
+            bits = sign | ((exp + 127u - 15u) << 23) | (man << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000u | (man << 13);
+    } else {
+        bits = sign | ((exp + 127u - 15u) << 23) | (man << 13);
+    }
+    union { uint32_t u; float f; } c;
+    c.u = bits;
+    return c.f;
+}
+
+/** @brief float → IEEE-754 half (round-to-nearest-even, host side). */
+static inline uint16_t vv_float_to_half(float f) {
+    union { float f; uint32_t u; } c;
+    c.f = f;
+    uint32_t sign = (c.u >> 16) & 0x8000u;
+    int32_t  exp  = (int32_t)((c.u >> 23) & 0xFFu) - 127 + 15;
+    uint32_t man  = c.u & 0x7FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        man |= 0x800000u;
+        int shift = 14 - exp;
+        uint32_t round = (man >> (shift - 1)) & 1u;
+        man >>= shift;
+        man += round;
+        return (uint16_t)(sign | man);
+    }
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
+    uint32_t round = (man >> 12) & 1u;
+    man >>= 13;
+    man += round;
+    if (man & 0x400u) { man = 0; exp++; }
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | man);
+}
+
 /* ─── Tensor descriptor ─────────────────────────────────────────────────── */
 
 #define VV_MAX_DIMS 8
@@ -178,6 +229,7 @@ typedef struct vv_init_params {
     float  vram_budget;   /**< 0.0-1.0 fraction of free VRAM. Default: 1.0   */
     bool   kv_fp8;        /**< Use FP8 KV-cache (halves KV memory)           */
     bool   cpu_only;      /**< Force CPU-only mode (vram_budget=0 shortcut)  */
+    int    max_seq_len;   /**< KV-cache window in tokens. Default: 32768     */
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -186,6 +238,7 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.vram_budget = 1.0f;
     p.kv_fp8 = false;
     p.cpu_only = false;
+    p.max_seq_len = 32768;
     return p;
 }
 

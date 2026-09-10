@@ -117,9 +117,9 @@ Semantic Tokenizer:
 ### Speech Connector (из modeling_vibevoice.py SpeechConnector)
 ```python
 # fc1: Linear(vae_dim, hidden_size)
-# norm: RMSNorm(hidden_size)
+# norm: LlamaRMSNorm(hidden_size, eps=1e-6)
 # fc2: Linear(hidden_size, hidden_size)
-# forward: x -> fc1 -> GELU -> norm -> fc2
+# forward: x -> fc1 -> RMSNorm -> fc2  (NO activation, NO GELU!)
 ```
 
 ### Параметры LLM (Qwen2-7B backbone, из config.json)
@@ -232,7 +232,7 @@ vibevoice.c/
 │   │   └── conv_vae.c              # CPU reference для Conv-VAE
 │   │
 │   ├── connector/                  # Speech connectors (MLP)
-│   │   └── speech_connector.c      # fc1 → GELU → RMSNorm → fc2
+│   │   └── speech_connector.c      # fc1 → RMSNorm → fc2 (no activation)
 │   │
 │   ├── model/                      # Загрузка модели
 │   │   ├── safetensors.c           # Парсер формата safetensors
@@ -377,8 +377,8 @@ Total:                                       ~9.7 GB
                             → [B, T, 64] mean + gaussian sample (std=0.5)
 5. Semantic encoding:       raw PCM → semantic_tokenizer.encode()
                             → [B, T, 128] mean (deterministic)
-6. Acoustic connector:      [B, T, 64]  → fc1 → GELU → norm → fc2 → [B, T, 3584]
-7. Semantic connector:      [B, T, 128] → fc1 → GELU → norm → fc2 → [B, T, 3584]
+6. Acoustic connector:      [B, T, 64]  → fc1 → RMSNorm → fc2 → [B, T, 3584]
+7. Semantic connector:      [B, T, 128] → fc1 → RMSNorm → fc2 → [B, T, 3584]
 8. Combine:                 acoustic_features + semantic_features → [B, T, 3584]
 ```
 
