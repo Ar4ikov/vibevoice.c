@@ -61,10 +61,11 @@ vv_status_t vv_awq_repack(const uint32_t* qweight, const uint32_t* qzeros,
      * Parallelise over output rows: each thread owns one destination row of
      * packed/scales/mins, so nothing is shared and no locking is needed.
      */
+    int n;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int n = 0; n < N; n++) {
+    for (n = 0; n < N; n++) {
         const int word = n >> 3;
         const int sh   = shift[n & 7];
 
@@ -103,10 +104,11 @@ vv_status_t vv_int4g_quantize(const float* w, int N, int K, int group_size,
 
     const int n_groups = K / group_size;
 
+    int n;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int n = 0; n < N; n++) {
+    for (n = 0; n < N; n++) {
         const float* wrow = w + (size_t)n * K;
         uint8_t*  prow = out_packed + (size_t)n * (K / 2);
         uint16_t* srow = out_scales + (size_t)n * n_groups;

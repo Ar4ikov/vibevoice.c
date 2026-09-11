@@ -509,7 +509,7 @@ static float int4g_dot_avx2(const uint8_t* __restrict w,
  * DEQUANT_SLICE fills `row[0..kc)` with weight row `n` from column `kp`; the
  * whole row, in this arrangement.
  */
-#define VV_QGEMM_BODY(DEQUANT_SLICE)                                             build_tables();                                                              const uint16_t* bs = (const uint16_t*)bias;                                  const int kp = 0, kc = K;                                                    _Pragma("omp parallel")                                                      {                                                                                float* row = (float*)malloc((size_t)K * sizeof(float));                      if (row) {                                                                       _Pragma("omp for schedule(static)")                                          for (int n = 0; n < N; n++) {                                                    DEQUANT_SLICE;                                                               const float b = bs ? vv_half_to_float(bs[n]) : 0.0f;                         for (int m = 0; m < M; m++)                                                      output[(size_t)m * N + n] =                                                      dot_f32(input + (size_t)m * K + kp, row, kc) + b;                }                                                                            free(row);                                                               }                                                                        }
+#define VV_QGEMM_BODY(DEQUANT_SLICE)                                             build_tables();                                                              const uint16_t* bs = (const uint16_t*)bias;                                  const int kp = 0, kc = K;                                                    _Pragma("omp parallel")                                                      {                                                                                float* row = (float*)malloc((size_t)K * sizeof(float));                      if (row) {                                                                       int n;                             _Pragma("omp for schedule(static)")                                          for (n = 0; n < N; n++)      {                                                    DEQUANT_SLICE;                                                               const float b = bs ? vv_half_to_float(bs[n]) : 0.0f;                         for (int m = 0; m < M; m++)                                                      output[(size_t)m * N + n] =                                                      dot_f32(input + (size_t)m * K + kp, row, kc) + b;                }                                                                            free(row);                                                               }                                                                        }
 
 vv_status_t vv_nf4_gemm_cpu(const float* input, const uint8_t* packed,
                             const void* scales, const void* bias,
@@ -523,10 +523,11 @@ vv_status_t vv_nf4_gemm_cpu(const float* input, const uint8_t* packed,
     const bool use_avx2 = (simd_kind() == SIMD_AVX2);
     if (use_avx2 && M == 1) {
         build_tables();
+        int n;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int n = 0; n < N; n++)
+        for (n = 0; n < N; n++)
             output[n] = nf4_dot_avx2(packed + (size_t)n * (K >> 1),
                                      sc + (size_t)n * (K >> 6), input, K)
                         + (bsv ? vv_half_to_float(bsv[n]) : 0.0f);
@@ -565,10 +566,11 @@ vv_status_t vv_int4g_gemm_cpu(const float* input, const uint8_t* packed,
 
 #if defined(VV_X86) && defined(__GNUC__)
     if (simd_kind() == SIMD_AVX2 && M == 1) {
+        int n;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int n = 0; n < N; n++)
+        for (n = 0; n < N; n++)
             output[n] = int4g_dot_avx2(packed + (size_t)n * (K >> 1),
                                        sc + (size_t)n * ng,
                                        mn + (size_t)n * ng, input, K, group)
@@ -610,10 +612,11 @@ vv_status_t vv_gemm_f16w_cpu(const float* input, const void* w_fp16,
     {
         float* row = (float*)malloc((size_t)K * sizeof(float));
         if (row) {
+            int n;
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
-            for (int n = 0; n < N; n++) {
+            for (n = 0; n < N; n++) {
                 f16_row(w + (size_t)n * K, row, K);
                 const float b = bs ? vv_half_to_float(bs[n]) : 0.0f;
                 for (int m = 0; m < M; m++)
@@ -629,10 +632,11 @@ vv_status_t vv_gemm_f16w_cpu(const float* input, const void* w_fp16,
 vv_status_t vv_gemm_f32_cpu(const float* A, const float* B, float* C,
                             int M, int N, int K, float alpha, float beta) {
     if (!A || !B || !C) return VV_ERR_NULL_PTR;
+    int i;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 0; i < M; i++) {
+    for (i = 0; i < M; i++) {
         float* crow = C + (size_t)i * N;
         if (beta == 0.0f) memset(crow, 0, (size_t)N * sizeof(float));
         else for (int j = 0; j < N; j++) crow[j] *= beta;
@@ -653,10 +657,11 @@ vv_status_t vv_rmsnorm_cpu(const float* input, const void* weight_fp16,
     if (!input || !weight_fp16 || !output) return VV_ERR_NULL_PTR;
     const uint16_t* w = (const uint16_t*)weight_fp16;
 
+    int r;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int r = 0; r < rows; r++) {
+    for (r = 0; r < rows; r++) {
         const float* x = input + (size_t)r * n;
         float* y = output + (size_t)r * n;
         double ss = 0.0;
@@ -673,10 +678,11 @@ vv_status_t vv_rope_cpu(float* x, int rows, int n_heads, int head_dim,
     if (!x) return VV_ERR_NULL_PTR;
     const int half = head_dim / 2;
 
+    int r;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int r = 0; r < rows; r++) {
+    for (r = 0; r < rows; r++) {
         const int pos = position_offset + r;
         for (int h = 0; h < n_heads; h++) {
             float* v = x + ((size_t)r * n_heads + h) * head_dim;
@@ -705,10 +711,11 @@ vv_status_t vv_attention_prefill_cpu(
     const int kv_stride = n_kv_heads * head_dim;
     const float scale = 1.0f / sqrtf((float)head_dim);
 
+    int r;
 #ifdef _OPENMP
 #pragma omp parallel for collapse(2) schedule(static)
 #endif
-    for (int r = 0; r < rows; r++) {
+    for (r = 0; r < rows; r++) {
         for (int h = 0; h < n_q_heads; h++) {
             const int kv_head = h / group;
             const int q_abs = q_offset + r;
@@ -752,10 +759,11 @@ vv_status_t vv_attention_decode_cpu(
 vv_status_t vv_swiglu_cpu(const float* gate, const float* up,
                           float* output, int n) {
     if (!gate || !up || !output) return VV_ERR_NULL_PTR;
+    int i;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 0; i < n; i++) {
+    for (i = 0; i < n; i++) {
         const float g = gate[i];
         output[i] = (g / (1.0f + expf(-g))) * up[i];
     }
@@ -764,10 +772,11 @@ vv_status_t vv_swiglu_cpu(const float* gate, const float* up,
 
 vv_status_t vv_residual_add_cpu(float* x, const float* y, int n) {
     if (!x || !y) return VV_ERR_NULL_PTR;
+    int i;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 0; i < n; i++) x[i] += y[i];
+    for (i = 0; i < n; i++) x[i] += y[i];
     return VV_OK;
 }
 
@@ -798,10 +807,11 @@ vv_status_t vv_lm_head_argmax_cpu(const float* x, const void* w_fp16,
         float lv = -INFINITY;
         float* row = (float*)malloc((size_t)K * sizeof(float));
         if (row) {
+            int t;
 #ifdef _OPENMP
 #pragma omp for schedule(static) nowait
 #endif
-            for (int t = 0; t < V; t++) {
+            for (t = 0; t < V; t++) {
                 f16_row(w + (size_t)t * K, row, K);
                 const float s = dot_f32(x, row, K);
                 if (s > lv) { lv = s; lb = t; }
