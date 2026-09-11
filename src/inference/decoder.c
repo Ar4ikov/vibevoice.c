@@ -20,6 +20,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include "vibevoice/device.h"
 #include "vibevoice/kv_quant.h"
@@ -40,12 +41,14 @@ static size_t layer_gpu_size(const vv_layer_weights_t* L) {
     total += L->input_layernorm.size_bytes;
     total += L->post_attn_layernorm.size_bytes;
 
-    #define ADD_WEIGHT_SIZE(w) do {           \
-        total += (w).tensor.size_bytes;       \
-        if ((w).quant.scales.data)            \
-            total += (w).quant.scales.size_bytes; \
-        if ((w).bias.data)                    \
-            total += (w).bias.size_bytes;     \
+    #define ADD_WEIGHT_SIZE(w) do {                   \
+        total += (w).tensor.size_bytes;               \
+        if ((w).quant.scales.data)                    \
+            total += (w).quant.scales.size_bytes;     \
+        if ((w).mins.data)                            \
+            total += (w).mins.size_bytes;             \
+        if ((w).bias.data)                            \
+            total += (w).bias.size_bytes;             \
     } while(0)
 
     ADD_WEIGHT_SIZE(L->attn.q_proj);
@@ -71,6 +74,15 @@ vv_status_t vv_layer_pool_create(vv_layer_pool_t** pool,
     p->all_resident = all_resident;
     p->loaded[0] = p->loaded[1] = -1;
 
+    /*
+     * Which layers are permanently resident is fixed here, before anything is
+     * staged. It cannot be re-derived later from tensor.on_gpu: staging sets
+     * that flag too, and confusing "already staged" with "resident" skips the
+     * wait for the copy that just started.
+     */
+    for (p->n_resident = 0; p->n_resident < model->num_layers; p->n_resident++)
+        if (!model->layers[p->n_resident].attn.q_proj.tensor.on_gpu) break;
+
     if (!all_resident && model->num_layers > 0) {
         /* Find max layer size */
         size_t max_sz = 0;
@@ -78,8 +90,12 @@ vv_status_t vv_layer_pool_create(vv_layer_pool_t** pool,
             size_t sz = layer_gpu_size(&model->layers[i]);
             if (sz > max_sz) max_sz = sz;
         }
-        /* Add 256-byte alignment padding per tensor (16 tensors * 256) */
-        p->buf_size = max_sz + 16 * 256;
+        /*
+         * Every staged tensor lands on a 256-byte boundary, so the slack has
+         * to cover one alignment gap per tensor rather than a guessed
+         * handful -- at 20 live tensors the old 16 was already short.
+         */
+        p->buf_size = max_sz + (size_t)VV_LAYER_TENSORS_PER_LAYER * 256;
 
         for (int s = 0; s < VV_LAYER_POOL_SLOTS; s++) {
             vv_status_t st = vv_dev_alloc(&p->gpu_buf[s], p->buf_size);
@@ -93,9 +109,13 @@ vv_status_t vv_layer_pool_create(vv_layer_pool_t** pool,
                 return st;
             }
         }
+        p->n_bufs = p->gpu_buf[1] ? 2 : 1;
+        for (int s = 0; s < p->n_bufs; s++) {
+            vv_dev_event_create(&p->ready_ev[s]);
+            vv_dev_event_create(&p->done_ev[s]);
+        }
         VV_LOG_I("layer_pool: %d staging buffer(s) of %.1f MB each",
-                 p->gpu_buf[1] ? 2 : 1,
-                 (double)p->buf_size / (1024.0 * 1024.0));
+                 p->n_bufs, (double)p->buf_size / (1024.0 * 1024.0));
     }
 
     *pool = p;
@@ -112,6 +132,14 @@ vv_status_t vv_layer_pool_stage(vv_layer_pool_t* pool,
     if (layer_idx < 0 || layer_idx >= model->num_layers)
         return VV_ERR_INVALID_ARG;
 
+    /*
+     * With partial offload the first N layers already live on the GPU. They
+     * must not pass through a staging slot: that would evict a layer that is
+     * actually streamed, and unstaging one would hand a device pointer back
+     * as if it were host memory.
+     */
+    if (layer_idx < pool->n_resident) return VV_OK;
+
     int slot = layer_idx % VV_LAYER_POOL_SLOTS;
     /* If only 1 buffer, always use slot 0 */
     if (!pool->gpu_buf[1]) slot = 0;
@@ -127,11 +155,17 @@ vv_status_t vv_layer_pool_stage(vv_layer_pool_t* pool,
     size_t off = 0;
     int idx = 0;
 
+    /* A NULL saved pointer tells unstage there is nothing to restore. */
     #define STAGE_TENSOR(t) do {                                        \
-        pool->saved_ptrs[slot][idx] = (t).data;                        \
+        pool->saved_ptrs[slot][idx] = (t).on_gpu ? NULL : (t).data;    \
         if ((t).data && !(t).on_gpu && (t).size_bytes > 0) {           \
             /* Align to 256 bytes */                                    \
             off = (off + 255) & ~(size_t)255;                          \
+            if (off + (t).size_bytes > pool->buf_size) {               \
+                VV_LOG_E("layer_pool: staging overflow on layer %d",    \
+                         layer_idx);                                    \
+                return VV_ERR_OVERFLOW;                                 \
+            }                                                          \
             vv_dev_memcpy_h2d(buf + off, (t).data,                    \
                                (t).size_bytes, stream);                \
             (t).data = buf + off;                                      \
@@ -239,8 +273,108 @@ vv_status_t vv_layer_pool_free(vv_layer_pool_t* pool) {
     if (!pool) return VV_OK;
     for (int s = 0; s < VV_LAYER_POOL_SLOTS; s++) {
         if (pool->gpu_buf[s]) vv_dev_free(pool->gpu_buf[s]);
+        if (pool->ready_ev[s]) vv_dev_event_destroy(pool->ready_ev[s]);
+        if (pool->done_ev[s]) vv_dev_event_destroy(pool->done_ev[s]);
     }
     vv_free(pool);
+    return VV_OK;
+}
+
+/* ─── Overlapped weight streaming ───────────────────────────────────────── */
+
+static int pool_slot(const vv_layer_pool_t* pool, int layer_idx) {
+    return (pool->n_bufs > 1) ? (layer_idx % VV_LAYER_POOL_SLOTS) : 0;
+}
+
+/** @brief VV_NO_PREFETCH=1 stages each layer synchronously (for bisecting). */
+static bool prefetch_disabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("VV_NO_PREFETCH");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+vv_status_t vv_layer_prefetch_begin(vv_layer_pool_t* pool, vv_model_t* model,
+                                    int layer_idx, void* xfer_stream) {
+    if (!pool || pool->all_resident || !model) return VV_OK;
+    if (layer_idx < 0 || layer_idx >= model->num_layers) return VV_OK;
+    if (prefetch_disabled()) return VV_OK;
+    if (layer_idx < pool->n_resident) return VV_OK;
+
+    const int slot = pool_slot(pool, layer_idx);
+    if (pool->loaded[slot] == layer_idx) return VV_OK;
+
+    /*
+     * Overwriting a slot is only safe once the compute that read it is done.
+     * With a single staging buffer there is nothing to overlap with, so the
+     * caller's prefetch-ahead is simply skipped and vv_layer_prefetch_wait
+     * stages the layer synchronously instead.
+     */
+    if (pool->loaded[slot] >= 0) {
+        if (!pool->done_valid[slot]) return VV_OK;
+        vv_dev_stream_wait_event(xfer_stream, pool->done_ev[slot]);
+    }
+
+    vv_status_t s = vv_layer_pool_stage(pool, model, layer_idx, xfer_stream);
+    if (s != VV_OK) return s;
+
+    pool->done_valid[slot] = false;
+    return vv_dev_event_record(pool->ready_ev[slot], xfer_stream);
+}
+
+vv_status_t vv_layer_prefetch_wait(vv_layer_pool_t* pool, vv_model_t* model,
+                                   int layer_idx, void* compute_stream) {
+    if (!pool || pool->all_resident || !model) return VV_OK;
+    if (layer_idx < pool->n_resident) return VV_OK;
+
+    const int slot = pool_slot(pool, layer_idx);
+    if (pool->loaded[slot] != layer_idx) {
+        /* Not prefetched (single buffer, or the slot was still busy). */
+        vv_status_t s = vv_layer_pool_stage(pool, model, layer_idx,
+                                            compute_stream);
+        if (s != VV_OK) return s;
+        pool->done_valid[slot] = false;
+        return VV_OK;
+    }
+    return vv_dev_stream_wait_event(compute_stream, pool->ready_ev[slot]);
+}
+
+vv_status_t vv_layer_prefetch_done(vv_layer_pool_t* pool, int layer_idx,
+                                   void* compute_stream) {
+    if (!pool || pool->all_resident) return VV_OK;
+    if (layer_idx < pool->n_resident) return VV_OK;
+    const int slot = pool_slot(pool, layer_idx);
+    if (pool->loaded[slot] != layer_idx) return VV_OK;
+    pool->done_valid[slot] = true;
+    return vv_dev_event_record(pool->done_ev[slot], compute_stream);
+}
+
+vv_status_t vv_layer_pool_pin_host(vv_model_t* model, int first_streamed) {
+    if (!model) return VV_ERR_NULL_PTR;
+    if (first_streamed >= model->num_layers) return VV_OK;
+
+    size_t pinned = 0;
+    const double t0 = vv_time_ms();
+
+    #define PIN(t) do {                                                             if ((t).data && !(t).on_gpu && (t).size_bytes >= 65536) {                       if (vv_dev_host_register((t).data, (t).size_bytes) == VV_OK)                    pinned += (t).size_bytes;                                           }                                                                       } while (0)
+    #define PIN_W(w) do { PIN((w).tensor); PIN((w).quant.scales);                                     PIN((w).mins); PIN((w).bias); } while (0)
+
+    for (int i = first_streamed; i < model->num_layers; i++) {
+        vv_layer_weights_t* L = &model->layers[i];
+        PIN_W(L->attn.q_proj); PIN_W(L->attn.k_proj);
+        PIN_W(L->attn.v_proj); PIN_W(L->attn.o_proj);
+        PIN_W(L->mlp.gate_proj); PIN_W(L->mlp.up_proj);
+        PIN_W(L->mlp.down_proj);
+    }
+    #undef PIN_W
+    #undef PIN
+
+    if (pinned)
+        VV_LOG_I("layer_pool: page-locked %.1f MB of streamed weights "
+                 "(%.0f ms)", (double)pinned / (1024.0 * 1024.0),
+                 vv_time_ms() - t0);
     return VV_OK;
 }
 
@@ -564,11 +698,13 @@ vv_status_t vv_decoder_step(
     int position = kv_cache->current_len;
     bool streaming = pool && !pool->all_resident;
 
+    if (streaming) vv_layer_prefetch_begin(pool, model, 0, xfer_stream);
+
     for (int i = 0; i < model->num_layers; i++) {
-        /* Stage layer i if streaming */
         if (streaming) {
-            vv_layer_pool_stage(pool, model, i, xfer_stream ? xfer_stream : compute_stream);
-            if (xfer_stream) vv_dev_stream_sync(xfer_stream);
+            vv_layer_prefetch_wait(pool, model, i, compute_stream);
+            if (i + 1 < model->num_layers)
+                vv_layer_prefetch_begin(pool, model, i + 1, xfer_stream);
         }
 
         vv_status_t s = decoder_layer_impl(
@@ -576,11 +712,7 @@ vv_status_t vv_decoder_step(
             hidden_state, kv_cache, i, position, 1,
             workspace, workspace_size, compute_stream);
 
-        /* Unstage after processing */
-        if (streaming) {
-            vv_dev_stream_sync(compute_stream);
-            vv_layer_pool_unstage(pool, model, i);
-        }
+        if (streaming) vv_layer_prefetch_done(pool, i, compute_stream);
 
         if (s != VV_OK) {
             VV_LOG_E("decoder: layer %d failed: %s", i, vv_status_str(s));
@@ -641,12 +773,14 @@ vv_status_t vv_decoder_prefill(
       const int len = (start + chunk <= seq_len) ? chunk : (seq_len - start);
       void* chunk_hidden = (uint8_t*)hidden_states + (size_t)start * hs * 2;
 
+      if (streaming) vv_layer_prefetch_begin(pool, model, 0, xfer_stream);
+
       for (int i = 0; i < model->num_layers; i++) {
 
-        /* Stage layer i */
         if (streaming) {
-            vv_layer_pool_stage(pool, model, i, xfer_stream ? xfer_stream : compute_stream);
-            if (xfer_stream) vv_dev_stream_sync(xfer_stream);
+            vv_layer_prefetch_wait(pool, model, i, compute_stream);
+            if (i + 1 < model->num_layers)
+                vv_layer_prefetch_begin(pool, model, i + 1, xfer_stream);
         }
 
         vv_status_t s = decoder_layer_impl(
@@ -654,11 +788,7 @@ vv_status_t vv_decoder_prefill(
             chunk_hidden, kv_cache, i, start, len,
             workspace, workspace_size, compute_stream);
 
-        /* Unstage */
-        if (streaming) {
-            vv_dev_stream_sync(compute_stream);
-            vv_layer_pool_unstage(pool, model, i);
-        }
+        if (streaming) vv_layer_prefetch_done(pool, i, compute_stream);
 
         if (s != VV_OK) {
             VV_LOG_E("decoder: prefill layer %d failed: %s",

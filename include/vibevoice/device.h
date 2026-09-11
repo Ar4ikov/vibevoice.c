@@ -50,6 +50,15 @@ vv_status_t vv_dev_set_device(int device_id);
 vv_status_t vv_dev_get_device_info(int device_id, size_t* total_mem,
                                    size_t* free_mem, int* sm_count);
 
+/* Events order the copy stream against the compute stream when weights are
+ * streamed layer by layer; host registration makes those copies DMA. */
+vv_status_t vv_dev_event_create(void** ev);
+vv_status_t vv_dev_event_destroy(void* ev);
+vv_status_t vv_dev_event_record(void* ev, void* stream);
+vv_status_t vv_dev_stream_wait_event(void* stream, void* ev);
+vv_status_t vv_dev_host_register(void* p, size_t n);
+vv_status_t vv_dev_host_unregister(void* p);
+
 /** @brief Short name of the compiled-in backend ("CUDA", "Metal", "none"). */
 const char* vv_dev_backend_name(void);
 

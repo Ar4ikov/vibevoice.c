@@ -101,6 +101,18 @@ typedef struct vv_layer_pool {
     void*  saved_ptrs[VV_LAYER_POOL_SLOTS][VV_LAYER_TENSORS_PER_LAYER];
 
     bool   all_resident;  /**< true = all layers already on GPU, pool unused */
+
+    /*
+     * Ordering between the copy stream and the compute stream. `ready` fires
+     * when a slot's weights have landed; `done` fires when the compute that
+     * used them has finished, which is what makes it safe to overwrite the
+     * slot with the next layer.
+     */
+    void*  ready_ev[VV_LAYER_POOL_SLOTS];
+    void*  done_ev[VV_LAYER_POOL_SLOTS];
+    bool   done_valid[VV_LAYER_POOL_SLOTS];
+    int    n_bufs;
+    int    n_resident;   /**< Layers permanently on the GPU          */
 } vv_layer_pool_t;
 
 vv_status_t vv_layer_pool_create(vv_layer_pool_t** pool,
@@ -111,6 +123,27 @@ vv_status_t vv_layer_pool_stage(vv_layer_pool_t* pool,
 vv_status_t vv_layer_pool_unstage(vv_layer_pool_t* pool,
                                    vv_model_t* model, int layer_idx);
 vv_status_t vv_layer_pool_free(vv_layer_pool_t* pool);
+
+/**
+ * @brief Start uploading layer `layer_idx` on the copy stream.
+ *
+ * With two staging buffers this runs while the previous layer is still on
+ * the tensor cores, which is the whole point of streaming weights: the PCIe
+ * transfer for layer i+1 overlaps the compute of layer i.
+ */
+vv_status_t vv_layer_prefetch_begin(vv_layer_pool_t* pool, vv_model_t* model,
+                                    int layer_idx, void* xfer_stream);
+
+/** @brief Block the compute stream until layer `layer_idx` has landed. */
+vv_status_t vv_layer_prefetch_wait(vv_layer_pool_t* pool, vv_model_t* model,
+                                   int layer_idx, void* compute_stream);
+
+/** @brief Mark a layer's compute finished so its slot can be reused. */
+vv_status_t vv_layer_prefetch_done(vv_layer_pool_t* pool, int layer_idx,
+                                   void* compute_stream);
+
+/** @brief Page-lock the host copies of the layers that will be streamed. */
+vv_status_t vv_layer_pool_pin_host(vv_model_t* model, int first_streamed);
 
 /* ─── Decoder ───────────────────────────────────────────────────────────── */
 
@@ -209,6 +242,8 @@ typedef struct vv_inference_ctx {
     /* Placement strategy (auto-selected from VRAM budget) */
     vv_placement_t placement;
     bool           use_gpu;           /**< false for CPU-only mode */
+    int            n_resident_layers; /**< Layers held on the GPU          */
+    int            auto_resident_layers; /**< What the budget allowed      */
 
     /* GPU-resident weight buffers (NULL if offloaded to CPU) */
     void*          embed_table_gpu;

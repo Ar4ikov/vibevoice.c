@@ -44,6 +44,7 @@ typedef struct {
     int         gpu_id;
     int         max_tokens;
     int         max_seq_len;
+    int         gpu_layers;
     const char* kv_cache;
     bool        cpu_only;
     float       vram_budget;
@@ -97,6 +98,7 @@ static void print_usage(const char* prog) {
         "  --kv-cache FMT        KV-cache storage: fp16 (default), fp8,\n"
         "                        fp8-e5m2, tq4, tq3, tq2, tq1.5\n"
         "  --vram-budget <0-1>   VRAM fraction for model (default: 1.0)\n"
+        "  --gpu-layers <N>      Layers to keep on the GPU (-1 = fit to VRAM)\n"
         "  --cpu                 CPU-only mode (no GPU)\n"
         "  --verbose             Enable debug logging\n"
         "  --help                Show this message\n\n"
@@ -113,6 +115,7 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
     memset(args, 0, sizeof(*args));
     args->max_tokens = 64000;
     args->vram_budget = 1.0f;
+    args->gpu_layers = -1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
@@ -139,6 +142,8 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->vram_budget = (float)atof(argv[++i]);
             if (args->vram_budget < 0.0f) args->vram_budget = 0.0f;
             if (args->vram_budget > 1.0f) args->vram_budget = 1.0f;
+        } else if (strcmp(argv[i], "--gpu-layers") == 0 && i + 1 < argc) {
+            args->gpu_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cpu") == 0) {
             args->cpu_only = true;
         } else if (strcmp(argv[i], "--verbose") == 0) {
@@ -236,6 +241,7 @@ int main(int argc, char** argv) {
     init_params.vram_budget = args.vram_budget;
     init_params.cpu_only = args.cpu_only;
     if (args.max_seq_len > 0) init_params.max_seq_len = args.max_seq_len;
+    init_params.gpu_layers = args.gpu_layers;
     s = vv_inference_init(args.model_dir, args.gpu_id, &init_params, &ctx);
     if (s != VV_OK) {
         VV_LOG_E("Failed to initialize inference: %s", vv_status_str(s));

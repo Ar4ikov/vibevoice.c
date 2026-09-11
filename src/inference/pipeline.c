@@ -98,9 +98,18 @@ static vv_status_t upload_tensor_to_gpu(vv_tensor_t* t, void* stream) {
  */
 static void attach_frontend(vv_inference_ctx_t* c);
 
-static vv_status_t upload_layer_weights(vv_model_t* model, void* stream) {
+/**
+ * @brief Upload the first `n_layers` transformer layers to the GPU.
+ *
+ * Partial residency is the point: on a card that cannot hold all 28, the
+ * layers that fit stay put and only the remainder is streamed per token, so
+ * the PCIe cost scales with what is missing rather than with the whole model.
+ */
+static vv_status_t upload_layer_weights(vv_model_t* model, int n_layers,
+                                        void* stream) {
     size_t total_bytes = 0;
-    for (int i = 0; i < model->num_layers; i++) {
+    if (n_layers > model->num_layers) n_layers = model->num_layers;
+    for (int i = 0; i < n_layers; i++) {
         vv_layer_weights_t* L = &model->layers[i];
         vv_status_t s;
 
@@ -142,8 +151,9 @@ static vv_status_t upload_layer_weights(vv_model_t* model, void* stream) {
         UPLOAD_WEIGHT(L->mlp.down_proj);
         #undef UPLOAD_WEIGHT
     }
-    VV_LOG_I("inference: uploaded %d layers (%.1f MB NF4+scales+norms) to GPU",
-             model->num_layers, (double)total_bytes / (1024.0 * 1024.0));
+    VV_LOG_I("inference: %d/%d layers resident on GPU (%.1f MB)",
+             n_layers, model->num_layers,
+             (double)total_bytes / (1024.0 * 1024.0));
     return VV_OK;
 }
 
@@ -367,9 +377,45 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
             p.vram_budget, false, free_vram,
             all_layers, embed_sz, lm_head_sz,
             per_layer, kv_total, ws_target);
+
+        /*
+         * When not everything fits, work out how many layers do. Two staging
+         * buffers must be kept back for the ones that don't, plus embed and
+         * lm_head if this placement keeps them on the GPU.
+         */
+        size_t fixed = ws_target + kv_total + 2 * per_layer;
+        if (c->placement == VV_PLACE_STREAM_FULL)
+            fixed += embed_sz + lm_head_sz;
+        else if (c->placement == VV_PLACE_STREAM_EMBED)
+            fixed += embed_sz;
+        if (available > fixed) {
+            size_t fit = (available - fixed) / per_layer;
+            c->auto_resident_layers = fit > (size_t)llm->num_hidden_layers
+                                      ? llm->num_hidden_layers : (int)fit;
+        } else {
+            c->auto_resident_layers = 0;
+        }
     }
 
-    VV_LOG_I("inference: placement strategy = %s", placement_str(c->placement));
+    /*
+     * How many layers stay on the GPU. The placement enum only says whether
+     * embed and lm_head fit; this is the finer knob, and the one that
+     * actually decides the per-token PCIe bill.
+     */
+    if (c->placement == VV_PLACE_CPU_ONLY) {
+        c->n_resident_layers = 0;
+    } else if (p.gpu_layers >= 0) {
+        c->n_resident_layers = p.gpu_layers < llm->num_hidden_layers
+                               ? p.gpu_layers : llm->num_hidden_layers;
+    } else if (c->placement == VV_PLACE_ALL_GPU) {
+        c->n_resident_layers = llm->num_hidden_layers;
+    } else {
+        c->n_resident_layers = c->auto_resident_layers;
+    }
+
+    VV_LOG_I("inference: placement strategy = %s, %d/%d layers resident",
+             placement_str(c->placement), c->n_resident_layers,
+             llm->num_hidden_layers);
 
     /* ── CPU-only path: skip all CUDA ── */
     if (c->placement == VV_PLACE_CPU_ONLY) {
@@ -433,18 +479,18 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     }
 
     /* ── Layer weights ── */
-    if (c->placement == VV_PLACE_ALL_GPU) {
-        /* Upload all layers to GPU permanently */
-        s = upload_layer_weights(c->model, c->transfer_stream);
+    if (c->n_resident_layers > 0) {
+        s = upload_layer_weights(c->model, c->n_resident_layers,
+                                 c->transfer_stream);
         if (s != VV_OK) {
             VV_LOG_E("inference: failed to upload layer weights");
             goto fail_gpu;
         }
-        s = vv_layer_pool_create(&c->layer_pool, c->model, true);
-    } else {
-        /* Streaming mode: keep layers on CPU, create staging pool */
-        s = vv_layer_pool_create(&c->layer_pool, c->model, false);
     }
+    s = vv_layer_pool_create(&c->layer_pool, c->model,
+                             c->n_resident_layers >= c->model->num_layers);
+    if (s == VV_OK && c->n_resident_layers < c->model->num_layers)
+        vv_layer_pool_pin_host(c->model, c->n_resident_layers);
     if (s != VV_OK) {
         VV_LOG_E("inference: failed to create layer pool");
         goto fail_gpu;

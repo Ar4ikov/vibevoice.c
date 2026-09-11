@@ -82,6 +82,7 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
         else if (strcmp(s, "--gpu") == 0 && next) a->ep.gpu_id = atoi(argv[++i]);
         else if (strcmp(s, "--slots") == 0 && next) a->ep.n_slots = atoi(argv[++i]);
         else if (strcmp(s, "--max-seq-len") == 0 && next) a->ep.max_seq_len = atoi(argv[++i]);
+        else if (strcmp(s, "--gpu-layers") == 0 && next) a->ep.gpu_layers = atoi(argv[++i]);
         else if (strcmp(s, "--vram-budget") == 0 && next) a->ep.vram_budget = (float)atof(argv[++i]);
         else if (strcmp(s, "--kv-cache") == 0 && next) {
             vv_kv_format_t f = vv_kv_format_parse(argv[++i]);

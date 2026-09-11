@@ -34,6 +34,7 @@ typedef struct vv_engine_params {
     int         max_seq_len;  /**< Per-slot KV window. Default 32768.       */
     int         kv_format;    /**< vv_kv_format_t                           */
     float       vram_budget;  /**< Fraction of free VRAM. Default 1.0       */
+    int         gpu_layers;   /**< Layers on the GPU. -1 = fit to VRAM      */
     bool        cpu_only;
 } vv_engine_params_t;
 
@@ -45,6 +46,7 @@ static inline vv_engine_params_t vv_engine_params_default(void) {
     p.max_seq_len = 32768;
     p.kv_format = 0;
     p.vram_budget = 1.0f;
+    p.gpu_layers = -1;
     p.cpu_only = false;
     return p;
 }

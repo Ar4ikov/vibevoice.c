@@ -40,6 +40,7 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
     ip.cpu_only    = params->cpu_only;
     ip.max_seq_len = params->max_seq_len;
     ip.kv_format   = params->kv_format;
+    ip.gpu_layers  = params->gpu_layers;
 
     e->slots = (vv_inference_ctx_t**)vv_alloc((size_t)n * sizeof(void*));
     e->busy  = (bool*)vv_alloc((size_t)n * sizeof(bool));

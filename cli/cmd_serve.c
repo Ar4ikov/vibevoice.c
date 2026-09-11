@@ -57,6 +57,7 @@ int vv_cmd_serve(int argc, char** argv) {
         else if (strcmp(a, "--api-key") == 0 && next) { sp.api_key = argv[++i]; }
         else if (strcmp(a, "--gpu") == 0 && next) { ep.gpu_id = atoi(argv[++i]); }
         else if (strcmp(a, "--max-seq-len") == 0 && next) { ep.max_seq_len = atoi(argv[++i]); }
+        else if (strcmp(a, "--gpu-layers") == 0 && next) { ep.gpu_layers = atoi(argv[++i]); }
         else if (strcmp(a, "--vram-budget") == 0 && next) { ep.vram_budget = (float)atof(argv[++i]); }
         else if (strcmp(a, "--kv-cache") == 0 && next) {
             vv_kv_format_t f = vv_kv_format_parse(argv[++i]);

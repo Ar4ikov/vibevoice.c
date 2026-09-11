@@ -168,3 +168,54 @@ vv_status_t vv_dev_memset(void* ptr, int value, size_t size) {
 }
 
 } /* extern "C" */
+
+/* ─── Events and pinned host memory (weight streaming) ──────────────────── */
+
+vv_status_t vv_dev_event_create(void** ev) {
+    if (!ev) return VV_ERR_NULL_PTR;
+    cudaEvent_t e;
+    /* No timing data: the event exists only to order two streams. */
+    if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess)
+        return VV_ERR_CUDA;
+    *ev = (void*)e;
+    return VV_OK;
+}
+
+vv_status_t vv_dev_event_destroy(void* ev) {
+    if (!ev) return VV_OK;
+    return cudaEventDestroy((cudaEvent_t)ev) == cudaSuccess
+           ? VV_OK : VV_ERR_CUDA;
+}
+
+vv_status_t vv_dev_event_record(void* ev, void* stream) {
+    if (!ev) return VV_ERR_NULL_PTR;
+    return cudaEventRecord((cudaEvent_t)ev, (cudaStream_t)stream) == cudaSuccess
+           ? VV_OK : VV_ERR_CUDA;
+}
+
+vv_status_t vv_dev_stream_wait_event(void* stream, void* ev) {
+    if (!ev) return VV_ERR_NULL_PTR;
+    return cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)ev, 0)
+           == cudaSuccess ? VV_OK : VV_ERR_CUDA;
+}
+
+/**
+ * @brief Page-lock an existing host buffer so H2D can DMA straight out of it.
+ *
+ * Weight streaming reads the same pages every token; from pageable memory the
+ * driver has to bounce each transfer through its own staging buffer, which
+ * costs roughly half the achievable PCIe bandwidth.
+ */
+vv_status_t vv_dev_host_register(void* p, size_t n) {
+    if (!p || n == 0) return VV_ERR_NULL_PTR;
+    const cudaError_t e = cudaHostRegister(p, n, cudaHostRegisterDefault);
+    if (e == cudaErrorHostMemoryAlreadyRegistered) { cudaGetLastError(); return VV_OK; }
+    if (e != cudaSuccess) { cudaGetLastError(); return VV_ERR_CUDA; }
+    return VV_OK;
+}
+
+vv_status_t vv_dev_host_unregister(void* p) {
+    if (!p) return VV_OK;
+    if (cudaHostUnregister(p) != cudaSuccess) { cudaGetLastError(); return VV_ERR_CUDA; }
+    return VV_OK;
+}

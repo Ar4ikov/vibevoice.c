@@ -230,6 +230,7 @@ typedef struct vv_init_params {
     int    kv_format;     /**< vv_kv_format_t for the KV cache. 0 = FP16     */
     bool   cpu_only;      /**< Force CPU-only mode (vram_budget=0 shortcut)  */
     int    max_seq_len;   /**< KV-cache window in tokens. Default: 32768     */
+    int    gpu_layers;    /**< Layers to keep on the GPU. -1 = fit to VRAM   */
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -239,6 +240,7 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.kv_format = 0;
     p.cpu_only = false;
     p.max_seq_len = 32768;
+    p.gpu_layers = -1;
     return p;
 }
 
