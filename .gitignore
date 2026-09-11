@@ -1,2 +1,7 @@
 build/
-model_hf/build-release/
+build-*/
+model_hf/
+4bit/
+windump*/
+lindump*/
+miccheck/

@@ -24,6 +24,15 @@
 
 #include "vibevoice/tokenizer_encoder.h"
 #include "vibevoice/vibevoice.h"
+/*
+ * The device ops must be declared on every platform. This include used to sit
+ * in the non-Windows branch below, so an MSVC build had no prototypes for the
+ * whole GPU encoder: C then assumes int-returning functions and promotes
+ * every float argument to double, which silently drops `eps` in the RMSNorm
+ * and `alpha`/`beta` in the GEMM. The encoder ran, reported no error, and
+ * produced latents that the model transcribed as "[Noise]".
+ */
+#include "vibevoice/device.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -40,7 +49,6 @@ static double vv_time_ms_enc(void) {
 }
 #else
 #include <time.h>
-#include "vibevoice/device.h"
 static double vv_time_ms_enc(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -376,6 +384,33 @@ static vv_status_t sconv_chunk(
     return VV_OK;
 }
 
+static void enc_stats(const char* tag, const float* x, size_t n);
+
+/**
+ * @brief Checksum a device FP16 buffer, when VV_ENC_STATS is set.
+ *
+ * The GPU and CPU encoders have to agree stage by stage; this is the cheap
+ * way to find the first one that does not, without a second machine.
+ */
+static void enc_stats_dev(const char* tag, const void* gpu, size_t n,
+                          void* stream) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("VV_ENC_STATS"); on = (e && e[0]) ? 1 : 0; }
+    if (!on || !gpu || n == 0) return;
+
+    uint16_t* h = (uint16_t*)vv_alloc(n * 2);
+    float* f = (float*)vv_alloc(n * sizeof(float));
+    if (!h || !f) { if (h) vv_free(h); if (f) vv_free(f); return; }
+    /* The work runs on `stream`; read it only once that stream is done. */
+    vv_dev_stream_sync(stream);
+    vv_dev_memcpy_d2h(h, gpu, n * 2, stream);
+    vv_dev_stream_sync(stream);
+    for (size_t i = 0; i < n; i++) f[i] = fp16_to_fp32_val(h[i]);
+    enc_stats(tag, f, n);
+    vv_free(h);
+    vv_free(f);
+}
+
 /* ─── Full GPU Conv-VAE encode ─────────────────────────────────────────── */
 
 /**
@@ -407,6 +442,7 @@ static vv_status_t encode_gpu_chunk(
         cur_gpu = conv_out;
         cur_ch  = out_ch;
         cur_len = conv_len;
+        enc_stats_dev("gpu/stem", cur_gpu, (size_t)cur_ch * (size_t)cur_len, stream);
     }
 
     const float eps = 1e-5f;
@@ -456,9 +492,17 @@ static vv_status_t encode_gpu_chunk(
                 void* ffn = NULL;
                 s = vv_dev_alloc(&ffn, (size_t)ffn_hidden * cur_len * 2);
                 if (s == VV_OK) {
-                    vv_gemm_fp16_nn_dev(gb->l1_w, work1, ffn,
-                                         ffn_hidden, cur_ch, cur_len,
-                                         1.0f, 0.0f, stream);
+                    {
+                        /* A launch failure here used to be swallowed, and a
+                         * silently empty FFN reads as plausible noise. */
+                        const vv_status_t gs = vv_gemm_fp16_nn_dev(
+                            gb->l1_w, work1, ffn, ffn_hidden, cur_ch,
+                            cur_len, 1.0f, 0.0f, stream);
+                        if (gs != VV_OK)
+                            VV_LOG_E("conv_vae_gpu: FFN l1 GEMM failed "
+                                     "(%d x %d x %d): %d",
+                                     ffn_hidden, cur_ch, cur_len, (int)gs);
+                    }
                     if (gb->l1_b)
                         vv_channel_bias_add_dev(ffn, gb->l1_b, ffn_hidden,
                                                  cur_len, stream);
@@ -472,6 +516,8 @@ static vv_status_t encode_gpu_chunk(
                     vv_dev_free(ffn);
                 } else {
                     /* Not enough VRAM for the whole segment — tile over time. */
+                    VV_LOG_W("conv_vae_gpu: FFN tiled (no room for %d x %d fp16)",
+                             ffn_hidden, cur_len);
                     int tile = FFN_TILE_GPU;
                     if (tile > cur_len) tile = cur_len;
                     void *tin = NULL, *tff = NULL, *tout = NULL;
@@ -531,6 +577,11 @@ static vv_status_t encode_gpu_chunk(
         }
 
         vv_dev_stream_sync(stream);
+        {
+            char tag[32];
+            snprintf(tag, sizeof(tag), "gpu/stage%d", st + 1);
+            enc_stats_dev(tag, cur_gpu, (size_t)cur_ch * (size_t)cur_len, stream);
+        }
         VV_LOG_D("conv_vae_gpu: stage %d/%d (%d blocks, %d ch x %d len) %.0f ms",
                  st + 1, encoder->n_stages, stage->n_blocks,
                  cur_ch, cur_len, vv_time_ms_enc() - stage_t0);
@@ -661,6 +712,29 @@ cleanup:
 }
 
 /* ─── Helper: 1D causal convolution (CPU reference) ─────────────────────── */
+
+/**
+ * @brief Log a checksum of an intermediate tensor, for cross-platform diffing.
+ *
+ * Two builds of the same source have to agree here; when a transcript comes
+ * back as noise on one platform only, this is how the first diverging stage
+ * gets found without shipping tensors around.
+ */
+static void enc_stats(const char* tag, const float* x, size_t n) {
+    if (!x || n == 0) return;
+    double sum = 0.0, sumsq = 0.0;
+    float mx = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const double v = (double)x[i];
+        sum += v;
+        sumsq += v * v;
+        const float a = x[i] < 0.0f ? -x[i] : x[i];
+        if (a > mx) mx = a;
+    }
+    VV_LOG_I("conv_vae/stats %-12s n=%zu sum=%.6f rms=%.6f max=%.6f",
+             tag, n, sum, sqrt(sumsq / (double)n), (double)mx);
+}
+
 
 /**
  * @brief 1D convolution with optional causal padding and stride.
@@ -1173,6 +1247,7 @@ vv_status_t vv_conv_vae_encode_cpu(vv_conv_vae_encoder_t* encoder,
                         encoder->causal,
                         conv_out, &out_len);
         VV_LOG_D("conv_vae: input_conv done, out_len=%d", out_len);
+        enc_stats("input_conv", conv_out, (size_t)out_ch * (size_t)out_len);
 
         vv_free(cur);
         cur = conv_out;
@@ -1244,6 +1319,11 @@ vv_status_t vv_conv_vae_encode_cpu(vv_conv_vae_encoder_t* encoder,
             cur_len = new_len;
         }
 
+        {
+            char tag[32];
+            snprintf(tag, sizeof(tag), "stage%d", s + 1);
+            enc_stats(tag, cur, (size_t)cur_channels * (size_t)cur_len);
+        }
         double stage_ms = vv_time_ms_enc() - stage_t0;
         VV_LOG_D("conv_vae: stage %d/%d done (%d blocks, %d ch × %d len) in %.1f ms",
                  s + 1, encoder->n_stages, stage->n_blocks,

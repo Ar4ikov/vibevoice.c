@@ -105,12 +105,22 @@ if(VV_HAS_CUDA AND VV_ENABLE_TRT)
 endif()
 
 # ─── Compiler flags ───────────────────────────────────────────────────────────
+#
+# A call with no prototype in sight is an error, not a warning. C happily
+# invents `int f()` and promotes float arguments to double, which on the
+# Windows ABI quietly corrupts every float parameter -- that is how the GPU
+# speech encoder came to run with eps = garbage and transcribe speech as
+# "[Noise]" on MSVC while Linux was fine.
 if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:/we4013>)
     set(CMAKE_C_FLAGS_RELEASE "/O2 /GL /DNDEBUG")
     set(CMAKE_CXX_FLAGS_RELEASE "/O2 /GL /DNDEBUG")
     set(CMAKE_C_FLAGS_DEBUG "/Od /Zi /D_DEBUG")
     set(CMAKE_CXX_FLAGS_DEBUG "/Od /Zi /D_DEBUG")
+else()
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>)
 endif()
 
 if(VV_HAS_CUDA)
