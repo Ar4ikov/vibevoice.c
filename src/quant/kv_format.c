@@ -13,6 +13,7 @@ static const struct {
     const char*    alias;
     int            bits_x100;
 } k_formats[] = {
+    { VV_KV_FP32,     "fp32",     "f32",      3200 },
     { VV_KV_FP16,     "fp16",     "f16",      1600 },
     { VV_KV_FP8_E4M3, "fp8",      "fp8-e4m3",  800 },
     { VV_KV_FP8_E5M2, "fp8-e5m2", "e5m2",      800 },

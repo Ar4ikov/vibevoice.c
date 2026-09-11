@@ -1,10 +1,16 @@
 /**
  * @file cpu_kernels.h
- * @brief CPU compute kernels for vibevoice.c — CPU-only inference path.
+ * @brief CPU compute kernels — the path taken when there is no accelerator.
  *
- * All operations are in FP32.  NF4 weights are dequantized on-the-fly.
- * When OpenBLAS is linked, SGEMM is accelerated; otherwise a naive
- * triple-loop GEMM is used.
+ * Activations are FP32 (CPUs are fast at FP32 and it avoids a conversion in
+ * every inner loop); weights stay in the form they were loaded in, NF4 or
+ * INT4-group, and are dequantized inside the kernel. Nothing here
+ * materialises a whole weight matrix: at 7B that would be 13 GB of FP32 per
+ * forward pass, which is what made the old CPU path unusable.
+ *
+ * Every kernel is OpenMP-parallel over output rows or heads when OpenMP is
+ * available. The quantized GEMMs have an AVX2 specialisation selected at
+ * runtime, so one binary still runs on a CPU without it.
  */
 #ifndef VV_CPU_KERNELS_H
 #define VV_CPU_KERNELS_H
@@ -16,90 +22,93 @@
 extern "C" {
 #endif
 
-/* ─── GEMM ──────────────────────────────────────────────────────────────── */
+/** @brief Name of the SIMD path in use ("AVX2", "NEON", "scalar"). */
+const char* vv_cpu_simd_name(void);
+
+/** @brief Threads the CPU kernels will use. */
+int vv_cpu_threads(void);
+
+/* ─── Quantized linear ──────────────────────────────────────────────────── */
 
 /**
- * @brief FP32 GEMM: C = alpha*A*B + beta*C  (row-major).
- * A[M,K]  B[K,N]  C[M,N]
+ * @brief output[M,N] = input[M,K] @ dequant(W)[N,K]^T + bias.
+ *
+ * @param packed  NF4, 2 values per byte, high nibble first, row-major [N, K/2]
+ * @param scales  FP16 absmax per 64 values, already de-nested by the loader
+ * @param bias    FP16 [N], or NULL
  */
+vv_status_t vv_nf4_gemm_cpu(const float* input, const uint8_t* packed,
+                            const void* scales, const void* bias,
+                            float* output, int M, int N, int K);
+
+/**
+ * @brief Same shape, for INT4 group-affine weights (AWQ / GPTQ).
+ *
+ * @param scales FP16 [N, K/group]
+ * @param mins   FP16 [N, K/group], equal to -zero * scale
+ */
+vv_status_t vv_int4g_gemm_cpu(const float* input, const uint8_t* packed,
+                              const void* scales, const void* mins,
+                              const void* bias, float* output,
+                              int M, int N, int K, int group);
+
+/** @brief output[M,N] = input[M,K] @ W[N,K]^T + bias, W and bias FP16. */
+vv_status_t vv_gemm_f16w_cpu(const float* input, const void* w_fp16,
+                             const void* bias_fp16, float* output,
+                             int M, int N, int K);
+
+/** @brief Plain FP32 GEMM: C[M,N] = alpha * A[M,K] @ B[K,N] + beta * C. */
 vv_status_t vv_gemm_f32_cpu(const float* A, const float* B, float* C,
-                             int M, int N, int K,
-                             float alpha, float beta);
+                            int M, int N, int K, float alpha, float beta);
+
+/* ─── Transformer ops ───────────────────────────────────────────────────── */
+
+/** @brief RMSNorm with an FP16 weight vector. */
+vv_status_t vv_rmsnorm_cpu(const float* input, const void* weight_fp16,
+                           float* output, int rows, int n, float eps);
+
+/** @brief RoPE in place over [rows, n_heads, head_dim]. */
+vv_status_t vv_rope_cpu(float* x, int rows, int n_heads, int head_dim,
+                        int position_offset, float theta);
 
 /**
- * @brief NF4 dequant + FP32 GEMM.
- * output = input @ dequant(weight)^T
- * input:  [M, K] FP32
- * weight: [N, K/2] uint8 (NF4)
- * scales: [N*K / block_size] FP32 (or FP16 that we'll convert)
- * temp:   [N * K] FP32 preallocated
- */
-vv_status_t vv_nf4_gemm_cpu(const float* input,
-                              const uint8_t* weight_packed,
-                              const float* weight_scales,
-                              float* output, float* temp_weight,
-                              int M, int N, int K, int block_size);
-
-/* ─── Normalization ─────────────────────────────────────────────────────── */
-
-/**
- * @brief RMSNorm (FP32).
- * out[i] = (x[i] / rms(x)) * weight[i]
- */
-vv_status_t vv_rmsnorm_cpu(const float* input, const float* weight,
-                            float* output, int seq_len, int hidden_size,
-                            float eps);
-
-/* ─── Positional encoding ───────────────────────────────────────────────── */
-
-/**
- * @brief Apply RoPE in-place (FP32).
- */
-vv_status_t vv_rope_cpu(float* x, int seq_len, int n_heads,
-                         int head_dim, int position_offset, float theta);
-
-/* ─── Attention ─────────────────────────────────────────────────────────── */
-
-/**
- * @brief GQA attention prefill, causal, FP32.
- * q/o: [seq_len, n_q_heads, head_dim]  k/v: [seq_len, n_kv_heads, head_dim] (seq-major)
+ * @brief Causal GQA attention over a contiguous block.
+ * q/o: [rows, n_q_heads, head_dim]   k/v: [kv_len, n_kv_heads, head_dim]
  */
 vv_status_t vv_attention_prefill_cpu(
     const float* q, const float* k, const float* v, float* output,
-    int n_q_heads, int n_kv_heads, int head_dim, int seq_len, bool causal);
+    int n_q_heads, int n_kv_heads, int head_dim,
+    int rows, int q_offset, int kv_len, bool causal);
 
-/**
- * @brief GQA attention decode (single query against KV-cache), FP32.
- */
+/** @brief One query row against a cache of `cache_len` positions. */
 vv_status_t vv_attention_decode_cpu(
-    const float* q, const float* k_cache, const float* v_cache,
-    float* output,
+    const float* q, const float* k_cache, const float* v_cache, float* output,
     int n_q_heads, int n_kv_heads, int head_dim, int cache_len);
 
-/* ─── Activations ───────────────────────────────────────────────────────── */
-
-/** @brief SwiGLU: out[i] = silu(gate[i]) * up[i].  */
+/** @brief out[i] = silu(gate[i]) * up[i]. */
 vv_status_t vv_swiglu_cpu(const float* gate, const float* up,
-                           float* output, int n_elements);
+                          float* output, int n);
 
-/* ─── Element-wise ──────────────────────────────────────────────────────── */
-
-/** @brief Residual add: x[i] += y[i].  */
+/** @brief x[i] += y[i]. */
 vv_status_t vv_residual_add_cpu(float* x, const float* y, int n);
 
-/* ─── Embedding ─────────────────────────────────────────────────────────── */
-
-/**
- * @brief CPU embedding lookup (FP16 table → FP32 output).
- */
+/** @brief Gather rows of an FP16 embedding table into FP32. */
 vv_status_t vv_embedding_cpu(const void* table_fp16, const int32_t* ids,
-                              float* output, int seq_len, int hidden_size);
+                             float* output, int rows, int hidden);
 
 /**
- * @brief FP32 greedy argmax sampling.
+ * @brief logits = W[V,K] @ x[K] with an FP16 weight, then argmax.
+ *
+ * Fused because the transcription only ever needs the winning token, and
+ * 152k logits is 600 KB of traffic that nothing else reads.
  */
+vv_status_t vv_lm_head_argmax_cpu(const float* x, const void* w_fp16,
+                                  int V, int K, int32_t* token_id,
+                                  float* out_value);
+
+/** @brief Greedy argmax over an FP32 logit vector. */
 vv_status_t vv_sample_greedy_cpu(const float* logits, int vocab_size,
-                                  int32_t* token_id);
+                                 int32_t* token_id);
 
 #ifdef __cplusplus
 }

@@ -17,6 +17,7 @@
 #include "vibevoice/inference.h"
 #include "vibevoice/vibevoice.h"
 #include "vibevoice/cpu_kernels.h"
+#include "vibevoice/quant.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -577,7 +578,7 @@ static vv_status_t decoder_layer_impl(
         const int actual_cache_len = position_offset + seq_len;
         const vv_kv_format_t fmt = (vv_kv_format_t)kv_cache->format;
 
-        if (fmt == VV_KV_FP16) {
+        if (vv_kv_is_raw(fmt)) {
             if (seq_len > 1) {
                 s = vv_gqa_attention_prefill_cached_dev(
                     q_buf, k_cached, v_cached, attn_out,
@@ -820,65 +821,17 @@ vv_status_t vv_decoder_prefill(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * CPU decoder — per-layer forward (FP32, all on CPU)
+ * CPU decoder — per-layer forward (FP32 activations, quantized weights)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** NF4 lookup table (for scale conversion) */
-extern const float VV_NF4_TABLE[16];
-
 /**
- * @brief Convert FP16 scale tensor to FP32 float array.
- * Caller must free returned pointer.
+ * @brief One transformer layer on the CPU, FP32 activations.
+ *
+ * Weights are read in the form they were loaded in. Nothing is converted or
+ * materialised here: the earlier version allocated an FP32 copy of every
+ * weight and every scale vector on every call, which is 13 GB of traffic and
+ * 200-odd mallocs per token.
  */
-static float* fp16_scales_to_fp32(const vv_tensor_t* scales) {
-    if (!scales || !scales->data || scales->size_bytes == 0) return NULL;
-    int n = (int)(scales->size_bytes / 2); /* FP16 = 2 bytes */
-    float* out = (float*)vv_alloc((size_t)n * sizeof(float));
-    if (!out) return NULL;
-    const uint16_t* src = (const uint16_t*)scales->data;
-    for (int i = 0; i < n; i++) {
-        uint16_t h = src[i];
-        uint32_t sign = ((uint32_t)h & 0x8000) << 16;
-        uint32_t expo = ((uint32_t)h >> 10) & 0x1F;
-        uint32_t frac = (uint32_t)h & 0x03FF;
-        union { float f; uint32_t u; } u;
-        if (expo == 0)
-            u.u = sign;
-        else if (expo == 0x1F)
-            u.u = sign | 0x7F800000 | (frac << 13);
-        else
-            u.u = sign | ((expo - 15 + 127) << 23) | (frac << 13);
-        out[i] = u.f;
-    }
-    return out;
-}
-
-/**
- * @brief Convert FP16 weight tensor to FP32.
- * Caller must free returned pointer.
- */
-static float* fp16_to_fp32(const void* data, int n_elements) {
-    if (!data || n_elements <= 0) return NULL;
-    float* out = (float*)vv_alloc((size_t)n_elements * sizeof(float));
-    if (!out) return NULL;
-    const uint16_t* src = (const uint16_t*)data;
-    for (int i = 0; i < n_elements; i++) {
-        uint16_t h = src[i];
-        uint32_t sign = ((uint32_t)h & 0x8000) << 16;
-        uint32_t expo = ((uint32_t)h >> 10) & 0x1F;
-        uint32_t frac = (uint32_t)h & 0x03FF;
-        union { float f; uint32_t u; } u;
-        if (expo == 0)
-            u.u = sign;
-        else if (expo == 0x1F)
-            u.u = sign | 0x7F800000 | (frac << 13);
-        else
-            u.u = sign | ((expo - 15 + 127) << 23) | (frac << 13);
-        out[i] = u.f;
-    }
-    return out;
-}
-
 static vv_status_t decoder_layer_cpu(
     const vv_layer_weights_t* layer,
     const vv_llm_config_t* config,
@@ -890,208 +843,80 @@ static vv_status_t decoder_layer_cpu(
     float* workspace,
     size_t workspace_size)
 {
-    int hs = config->hidden_size;
-    int n_heads = config->num_attention_heads;
-    int n_kv_heads = config->num_key_value_heads;
-    int head_dim = config->head_dim;
-    int inter_size = config->intermediate_size;
+    const int hs = config->hidden_size;
+    const int n_heads = config->num_attention_heads;
+    const int n_kv_heads = config->num_key_value_heads;
+    const int head_dim = config->head_dim;
+    const int inter = config->intermediate_size;
     vv_status_t s;
 
-    /* Workspace layout (FP32): each element 4 bytes */
+    const size_t need = (size_t)seq_len *
+        (3 * (size_t)hs + (size_t)n_heads * head_dim +
+         2 * (size_t)n_kv_heads * head_dim + 2 * (size_t)inter);
+    if (workspace_size < need * sizeof(float)) return VV_ERR_OUT_OF_MEMORY;
+
     float* wp = workspace;
     size_t off = 0;
+    float* norm_out = wp + off; off += (size_t)seq_len * hs;
+    float* q_buf    = wp + off; off += (size_t)seq_len * n_heads * head_dim;
+    float* k_buf    = wp + off; off += (size_t)seq_len * n_kv_heads * head_dim;
+    float* v_buf    = wp + off; off += (size_t)seq_len * n_kv_heads * head_dim;
+    float* attn_out = wp + off; off += (size_t)seq_len * hs;
+    float* gate_buf = wp + off; off += (size_t)seq_len * inter;
+    float* up_buf   = wp + off; off += (size_t)seq_len * inter;
+    float* mlp_out  = wp + off;
 
-    float* norm_out = wp + off; off += seq_len * hs;
-    float* q_buf    = wp + off; off += seq_len * n_heads * head_dim;
-    float* k_buf    = wp + off; off += seq_len * n_kv_heads * head_dim;
-    float* v_buf    = wp + off; off += seq_len * n_kv_heads * head_dim;
-    float* attn_out = wp + off; off += seq_len * hs;
-    float* gate_buf = wp + off; off += seq_len * inter_size;
-    float* up_buf   = wp + off; off += seq_len * inter_size;
-    float* mlp_out  = wp + off; off += seq_len * hs;
-    float* temp_w   = wp + off;
-    /* remaining workspace used for temp dequant weight */
+    /** Run one projection in whatever format its weights are stored in. */
+    #define CPU_PROJ(w, in, out_buf, M, N, KK)                                      do {                                                                            if ((w).quant_kind == VV_QUANT_INT4G) {                                         s = vv_int4g_gemm_cpu((in), (const uint8_t*)(w).tensor.data,                        (w).quant.scales.data, (w).mins.data,                                       (w).bias.data, (out_buf), (M), (N), (KK),                                   (w).group_size);                                                } else if ((w).quant_kind == VV_QUANT_NF4) {                                    s = vv_nf4_gemm_cpu((in), (const uint8_t*)(w).tensor.data,                          (w).quant.scales.data, (w).bias.data,                                       (out_buf), (M), (N), (KK));                                     } else {                                                                        s = vv_gemm_f16w_cpu((in), (w).tensor.data,                                         (w).bias.data, (out_buf), (M), (N), (KK));                      }                                                                           if (s != VV_OK) return s;                                               } while (0)
 
-    /* Convert FP16 layernorm weights to FP32 */
-    float* ln1_w = fp16_to_fp32(layer->input_layernorm.data,
-                                 hs);
-    float* ln2_w = fp16_to_fp32(layer->post_attn_layernorm.data,
-                                 hs);
-    if (!ln1_w || !ln2_w) {
-        if (ln1_w) vv_free(ln1_w);
-        if (ln2_w) vv_free(ln2_w);
-        return VV_ERR_OUT_OF_MEMORY;
-    }
+    s = vv_rmsnorm_cpu(hidden_states, layer->input_layernorm.data, norm_out,
+                       seq_len, hs, config->rms_norm_eps);
+    if (s != VV_OK) return s;
 
-    /* 1. RMSNorm */
-    s = vv_rmsnorm_cpu(hidden_states, ln1_w, norm_out,
-                        seq_len, hs, config->rms_norm_eps);
-    if (s != VV_OK) goto cleanup_norms;
+    CPU_PROJ(layer->attn.q_proj, norm_out, q_buf, seq_len, n_heads * head_dim, hs);
+    CPU_PROJ(layer->attn.k_proj, norm_out, k_buf, seq_len, n_kv_heads * head_dim, hs);
+    CPU_PROJ(layer->attn.v_proj, norm_out, v_buf, seq_len, n_kv_heads * head_dim, hs);
 
-    /* 2. Q, K, V projections (NF4 or FP16→FP32) + bias */
-    #define CPU_PROJ(w, out_buf, M, N, K_dim) do {                        \
-        if ((w).is_quantized) {                                           \
-            float* sc = fp16_scales_to_fp32(&(w).quant.scales);           \
-            if (!sc) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_norms; }    \
-            s = vv_nf4_gemm_cpu(norm_out,                                 \
-                (const uint8_t*)(w).tensor.data, sc,                      \
-                (out_buf), temp_w, (M), (N), (K_dim), 64);               \
-            vv_free(sc);                                                  \
-        } else {                                                          \
-            float* wf = fp16_to_fp32((w).tensor.data, (N) * (K_dim));     \
-            if (!wf) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_norms; }    \
-            /* output = input @ weight^T */                               \
-            for (int _i = 0; _i < (M); _i++) {                           \
-                for (int _j = 0; _j < (N); _j++) {                       \
-                    float sum = 0.0f;                                     \
-                    for (int _k = 0; _k < (K_dim); _k++)                  \
-                        sum += norm_out[_i*(K_dim)+_k] * wf[_j*(K_dim)+_k]; \
-                    (out_buf)[_i*(N)+_j] = sum;                           \
-                }                                                         \
-            }                                                             \
-            vv_free(wf);                                                  \
-        }                                                                 \
-        if (s != VV_OK) goto cleanup_norms;                               \
-        /* Add bias if present */                                         \
-        if ((w).bias.data) {                                              \
-            float* bf = fp16_to_fp32((w).bias.data, (N));                 \
-            if (bf) {                                                     \
-                for (int _i = 0; _i < (M); _i++)                         \
-                    for (int _j = 0; _j < (N); _j++)                     \
-                        (out_buf)[_i*(N)+_j] += bf[_j];                   \
-                vv_free(bf);                                              \
-            }                                                             \
-        }                                                                 \
-    } while(0)
-
-    CPU_PROJ(layer->attn.q_proj, q_buf, seq_len, n_heads * head_dim, hs);
-    CPU_PROJ(layer->attn.k_proj, k_buf, seq_len, n_kv_heads * head_dim, hs);
-    CPU_PROJ(layer->attn.v_proj, v_buf, seq_len, n_kv_heads * head_dim, hs);
-
-    /* 3. RoPE */
     s = vv_rope_cpu(q_buf, seq_len, n_heads, head_dim,
-                     position_offset, config->rope_theta);
-    if (s != VV_OK) goto cleanup_norms;
+                    position_offset, config->rope_theta);
+    if (s != VV_OK) return s;
     s = vv_rope_cpu(k_buf, seq_len, n_kv_heads, head_dim,
-                     position_offset, config->rope_theta);
-    if (s != VV_OK) goto cleanup_norms;
+                    position_offset, config->rope_theta);
+    if (s != VV_OK) return s;
 
-    /* 4. KV cache append (CPU cache uses memcpy) */
-    s = vv_kv_cache_append(kv_cache, layer_idx, k_buf, v_buf,
-                            seq_len, NULL);
-    if (s != VV_OK) goto cleanup_norms;
+    s = vv_kv_cache_append(kv_cache, layer_idx, k_buf, v_buf, seq_len, NULL);
+    if (s != VV_OK) return s;
 
-    /* 5. GQA Attention */
-    if (seq_len > 1) {
-        s = vv_attention_prefill_cpu(q_buf, k_buf, v_buf, attn_out,
-                                      n_heads, n_kv_heads, head_dim,
-                                      seq_len, true);
-    } else {
-        const void* kc; const void* vc; int cl;
-        vv_kv_cache_get(kv_cache, layer_idx, &kc, &vc, &cl);
-        /* Include the just-appended token */
-        int actual_cl = position_offset + seq_len;
-        s = vv_attention_decode_cpu(q_buf, (const float*)kc,
-                                     (const float*)vc, attn_out,
-                                     n_heads, n_kv_heads, head_dim, actual_cl);
-    }
-    if (s != VV_OK) goto cleanup_norms;
-
-    /* 6. O projection + bias + residual */
     {
-        /* Reuse norm_out as temp */
-        float* o_out = norm_out; /* overwrite ok, done with input norm */
-
-        if (layer->attn.o_proj.is_quantized) {
-            float* sc = fp16_scales_to_fp32(&layer->attn.o_proj.quant.scales);
-            if (!sc) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_norms; }
-            s = vv_nf4_gemm_cpu(attn_out,
-                (const uint8_t*)layer->attn.o_proj.tensor.data, sc,
-                o_out, temp_w, seq_len, hs, hs, 64);
-            vv_free(sc);
-        } else {
-            float* wf = fp16_to_fp32(layer->attn.o_proj.tensor.data, hs * hs);
-            if (!wf) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_norms; }
-            for (int _i = 0; _i < seq_len; _i++)
-                for (int _j = 0; _j < hs; _j++) {
-                    float sum = 0.0f;
-                    for (int _k = 0; _k < hs; _k++)
-                        sum += attn_out[_i*hs+_k] * wf[_j*hs+_k];
-                    o_out[_i*hs+_j] = sum;
-                }
-            vv_free(wf);
-        }
-        if (s != VV_OK) goto cleanup_norms;
-        /* Add bias if present */
-        if (layer->attn.o_proj.bias.data) {
-            float* bf = fp16_to_fp32(layer->attn.o_proj.bias.data, hs);
-            if (bf) {
-                for (int _i = 0; _i < seq_len; _i++)
-                    for (int _j = 0; _j < hs; _j++)
-                        o_out[_i*hs+_j] += bf[_j];
-                vv_free(bf);
-            }
-        }
-        vv_residual_add_cpu(hidden_states, o_out, seq_len * hs);
+        const void *kc, *vc;
+        int cl;
+        vv_kv_cache_get(kv_cache, layer_idx, &kc, &vc, &cl);
+        /* current_len only advances on the last layer; derive the truth. */
+        const int kv_len = position_offset + seq_len;
+        s = vv_attention_prefill_cpu(q_buf, (const float*)kc, (const float*)vc,
+                                     attn_out, n_heads, n_kv_heads, head_dim,
+                                     seq_len, position_offset, kv_len, true);
+        if (s != VV_OK) return s;
     }
 
-    /* 7. Post-attention LayerNorm */
-    s = vv_rmsnorm_cpu(hidden_states, ln2_w, norm_out,
-                        seq_len, hs, config->rms_norm_eps);
-    if (s != VV_OK) goto cleanup_norms;
+    CPU_PROJ(layer->attn.o_proj, attn_out, norm_out, seq_len, hs, hs);
+    vv_residual_add_cpu(hidden_states, norm_out, seq_len * hs);
 
-    /* 8. MLP: gate + up + SwiGLU + down + residual */
-    CPU_PROJ(layer->mlp.gate_proj, gate_buf, seq_len, inter_size, hs);
-    CPU_PROJ(layer->mlp.up_proj,   up_buf,   seq_len, inter_size, hs);
+    s = vv_rmsnorm_cpu(hidden_states, layer->post_attn_layernorm.data,
+                       norm_out, seq_len, hs, config->rms_norm_eps);
+    if (s != VV_OK) return s;
+
+    CPU_PROJ(layer->mlp.gate_proj, norm_out, gate_buf, seq_len, inter, hs);
+    CPU_PROJ(layer->mlp.up_proj,   norm_out, up_buf,   seq_len, inter, hs);
+    s = vv_swiglu_cpu(gate_buf, up_buf, gate_buf, seq_len * inter);
+    if (s != VV_OK) return s;
+
+    CPU_PROJ(layer->mlp.down_proj, gate_buf, mlp_out, seq_len, hs, inter);
+    vv_residual_add_cpu(hidden_states, mlp_out, seq_len * hs);
 
     #undef CPU_PROJ
-
-    s = vv_swiglu_cpu(gate_buf, up_buf, gate_buf, seq_len * inter_size);
-    if (s != VV_OK) goto cleanup_norms;
-
-    /* Down proj + bias */
-    {
-        if (layer->mlp.down_proj.is_quantized) {
-            float* sc = fp16_scales_to_fp32(&layer->mlp.down_proj.quant.scales);
-            if (!sc) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_norms; }
-            s = vv_nf4_gemm_cpu(gate_buf,
-                (const uint8_t*)layer->mlp.down_proj.tensor.data, sc,
-                mlp_out, temp_w, seq_len, hs, inter_size, 64);
-            vv_free(sc);
-        } else {
-            float* wf = fp16_to_fp32(layer->mlp.down_proj.tensor.data,
-                                      hs * inter_size);
-            if (!wf) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_norms; }
-            for (int _i = 0; _i < seq_len; _i++)
-                for (int _j = 0; _j < hs; _j++) {
-                    float sum = 0.0f;
-                    for (int _k = 0; _k < inter_size; _k++)
-                        sum += gate_buf[_i*inter_size+_k] * wf[_j*inter_size+_k];
-                    mlp_out[_i*hs+_j] = sum;
-                }
-            vv_free(wf);
-        }
-        if (s != VV_OK) goto cleanup_norms;
-        /* Add bias if present */
-        if (layer->mlp.down_proj.bias.data) {
-            float* bf = fp16_to_fp32(layer->mlp.down_proj.bias.data, hs);
-            if (bf) {
-                for (int _i = 0; _i < seq_len; _i++)
-                    for (int _j = 0; _j < hs; _j++)
-                        mlp_out[_i*hs+_j] += bf[_j];
-                vv_free(bf);
-            }
-        }
-        vv_residual_add_cpu(hidden_states, mlp_out, seq_len * hs);
-    }
-
-cleanup_norms:
-    vv_free(ln1_w);
-    vv_free(ln2_w);
-    return s;
+    return VV_OK;
 }
-
-/* ─── CPU prefill / step ────────────────────────────────────────────────── */
 
 vv_status_t vv_decoder_prefill_cpu(
     vv_model_t* model,

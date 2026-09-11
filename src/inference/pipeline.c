@@ -26,6 +26,7 @@
 
 #include "vibevoice/device.h"
 #include "vibevoice/kv_quant.h"
+#include "vibevoice/cpu_kernels.h"
 
 /* Forward declarations — CUDA helpers */
 
@@ -292,12 +293,12 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         VV_LOG_E("inference: unknown KV-cache format");
         return VV_ERR_INVALID_ARG;
     }
-    /* Only the FP16 store has a CPU implementation of the append path. */
-    if (cpu_only && p.kv_format != VV_KV_FP16) {
+    /* Quantized stores need a device; the CPU path keeps its FP32 values. */
+    if (cpu_only && !vv_kv_is_raw((vv_kv_format_t)p.kv_format)) {
         VV_LOG_W("inference: KV format %s needs a device; "
                  "falling back to fp16 on CPU",
                  vv_kv_format_name((vv_kv_format_t)p.kv_format));
-        p.kv_format = VV_KV_FP16;
+        p.kv_format = VV_KV_FP32;
     }
 
     VV_LOG_I("inference: initializing from '%s' %s (budget=%.0f%%)",
@@ -424,7 +425,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
                                 llm->num_hidden_layers,
                                 llm->num_key_value_heads,
                                 llm->head_dim,
-                                max_seq, VV_KV_FP16, true);
+                                max_seq, VV_KV_FP32, true);
         if (s != VV_OK) {
             VV_LOG_E("inference: failed to create CPU KV-cache");
             vv_model_free(c->model);
@@ -455,6 +456,9 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
             return VV_ERR_OUT_OF_MEMORY;
         }
 
+        /* Calling this once here also applies the physical-core default. */
+        VV_LOG_I("inference: CPU kernels use %s on %d thread(s)",
+                 vv_cpu_simd_name(), vv_cpu_threads());
         goto init_common;
     }
 
@@ -1531,7 +1535,7 @@ static vv_status_t transcribe_cpu(
     perf->audio_duration_sec = (float)num_samples / 24000.0f;
     perf->num_layers = ctx->model->num_layers;
     perf->hidden_size = hs;
-    perf->kv_format = VV_KV_FP16;
+    perf->kv_format = ctx->kv_cache ? ctx->kv_cache->format : VV_KV_FP32;
     perf->workspace_mb = ctx->workspace_size / (1024 * 1024);
 
     VV_LOG_I("inference: CPU transcribe %d samples (%.2f sec)",
@@ -1643,41 +1647,24 @@ static vv_status_t transcribe_cpu(
     if (s != VV_OK) { vv_free(hidden); return s; }
 
     /* Final norm + lm_head + sample (CPU FP32) */
-    float* norm_w = (float*)vv_alloc((size_t)hs * sizeof(float));
-    if (!norm_w) { vv_free(hidden); return VV_ERR_OUT_OF_MEMORY; }
-    {
-        const uint16_t* nw = (const uint16_t*)ctx->model->final_norm.data;
-        for (int d = 0; d < hs; d++) norm_w[d] = half_to_float_single(nw[d]);
-    }
-
+    const void* norm_w = ctx->model->final_norm.data;
     float* normed = (float*)vv_alloc((size_t)hs * sizeof(float));
-    float* logits = (float*)vv_alloc((size_t)vocab_size * sizeof(float));
     float* hidden_one = (float*)vv_alloc((size_t)hs * sizeof(float));
-    if (!normed || !logits || !hidden_one) {
+    float* logits = NULL;   /* the fused head never materialises them */
+    if (!normed || !hidden_one) {
         if (normed) vv_free(normed);
-        if (logits) vv_free(logits);
         if (hidden_one) vv_free(hidden_one);
-        vv_free(norm_w); vv_free(hidden);
+        vv_free(hidden);
         return VV_ERR_OUT_OF_MEMORY;
     }
 
-    /* Norm last hidden */
-    float* last_hidden = hidden + (size_t)(seq_len-1) * hs;
+    float* last_hidden = hidden + (size_t)(seq_len - 1) * hs;
     vv_rmsnorm_cpu(last_hidden, norm_w, normed, 1, hs, llm->rms_norm_eps);
 
-    /* LM head GEMM: [1, hs] @ [vocab, hs]^T → [1, vocab] */
-    {
-        const uint16_t* lm = (const uint16_t*)ctx->model->lm_head.data;
-        for (int j = 0; j < vocab_size; j++) {
-            float sum = 0.0f;
-            for (int k = 0; k < hs; k++) sum += normed[k] * half_to_float_single(lm[j*hs+k]);
-            logits[j] = sum;
-        }
-    }
+    int32_t token_id = 0;
+    vv_lm_head_argmax_cpu(normed, ctx->model->lm_head.data,
+                          vocab_size, hs, &token_id, NULL);
     vv_free(hidden); hidden = NULL;
-
-    int32_t token_id;
-    vv_sample_greedy_cpu(logits, vocab_size, &token_id);
 
     perf->prefill_ms = vv_time_ms() - t_step;
     perf->ttft_ms = vv_time_ms() - t_total_start;
@@ -1704,15 +1691,8 @@ static vv_status_t transcribe_cpu(
 
         /* Norm + LM head */
         vv_rmsnorm_cpu(hidden_one, norm_w, normed, 1, hs, llm->rms_norm_eps);
-        {
-            const uint16_t* lm = (const uint16_t*)ctx->model->lm_head.data;
-            for (int j = 0; j < vocab_size; j++) {
-                float sum = 0.0f;
-                for (int k = 0; k < hs; k++) sum += normed[k] * half_to_float_single(lm[j*hs+k]);
-                logits[j] = sum;
-            }
-        }
-        vv_sample_greedy_cpu(logits, vocab_size, &token_id);
+        vv_lm_head_argmax_cpu(normed, ctx->model->lm_head.data,
+                              vocab_size, hs, &token_id, NULL);
         if (vv_is_end_token(ctx->tokenizer, token_id)) break;
 
         if (n_generated >= out_cap) {
@@ -1768,7 +1748,6 @@ cpu_cleanup:
     vv_free(normed);
     vv_free(logits);
     vv_free(hidden_one);
-    vv_free(norm_w);
     return s;
 }
 

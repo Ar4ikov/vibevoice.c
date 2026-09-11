@@ -39,6 +39,7 @@ typedef enum vv_kv_format {
     VV_KV_TQ3      = 4,  /**< TurboQuant 3-bit                         */
     VV_KV_TQ2      = 5,  /**< TurboQuant 2-bit                         */
     VV_KV_TQ1_5    = 6,  /**< TurboQuant 1.5-bit, 8-entry 2-D codebook */
+    VV_KV_FP32     = 7,  /**< 32 bits/value; the CPU path's activations  */
     VV_KV_FORMAT_COUNT
 } vv_kv_format_t;
 
@@ -48,12 +49,13 @@ vv_kv_format_t vv_kv_format_parse(const char* name);
 /** @brief Canonical name of a format, for logs and CLI output. */
 const char* vv_kv_format_name(vv_kv_format_t fmt);
 
-/** @brief Bits stored per value, x100 (1600, 800, 400, 300, 200, 150). */
+/** @brief Bits stored per value, x100 (3200, 1600, 800, 400, ... 150). */
 int vv_kv_format_bits_x100(vv_kv_format_t fmt);
 
 /** @brief Bytes one head's vector occupies. Always a multiple of 4. */
 static inline int vv_kv_bytes_per_vec(vv_kv_format_t fmt, int head_dim) {
     switch (fmt) {
+        case VV_KV_FP32:     return head_dim * 4;
         case VV_KV_FP16:     return head_dim * 2;
         case VV_KV_FP8_E4M3:
         case VV_KV_FP8_E5M2: return head_dim;
@@ -65,14 +67,19 @@ static inline int vv_kv_bytes_per_vec(vv_kv_format_t fmt, int head_dim) {
     }
 }
 
+/** @brief True if values are stored verbatim, with no quantization. */
+static inline bool vv_kv_is_raw(vv_kv_format_t fmt) {
+    return fmt == VV_KV_FP16 || fmt == VV_KV_FP32;
+}
+
 /** @brief True if the format stores a per-vector FP16 scale alongside. */
 static inline bool vv_kv_has_meta(vv_kv_format_t fmt) {
-    return fmt >= VV_KV_TQ4;
+    return fmt >= VV_KV_TQ4 && fmt <= VV_KV_TQ1_5;
 }
 
 /** @brief True if the format needs Q rotated and O un-rotated (TurboQuant). */
 static inline bool vv_kv_rotates(vv_kv_format_t fmt) {
-    return fmt >= VV_KV_TQ4;
+    return fmt >= VV_KV_TQ4 && fmt <= VV_KV_TQ1_5;
 }
 
 /* ─── Hadamard rotation, applied outside the attention kernels ───────────── */

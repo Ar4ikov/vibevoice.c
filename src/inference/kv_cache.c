@@ -30,7 +30,7 @@ size_t vv_kv_cache_bytes(int num_layers, int n_kv_heads, int head_dim,
     size_t per_layer = 2 * store_bytes(max_seq_len, n_kv_heads, bpv);
     if (vv_kv_has_meta((vv_kv_format_t)format))
         per_layer += 2 * meta_bytes(max_seq_len, n_kv_heads);
-    if (format != VV_KV_FP16)
+    if (!vv_kv_is_raw((vv_kv_format_t)format))
         per_layer += (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
     return per_layer * (size_t)num_layers;
 }
@@ -67,7 +67,7 @@ vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
     memset(c->k_cache, 0, (size_t)num_layers * sizeof(void*));
     memset(c->v_cache, 0, (size_t)num_layers * sizeof(void*));
 
-    if (format != VV_KV_FP16) {
+    if (!vv_kv_is_raw((vv_kv_format_t)format)) {
         /* Reference key per layer: softmax is shift-invariant, so storing
          * K relative to a fixed vector is free and cuts the magnitude the
          * quantizer has to cover by more than 20x on this model. */
@@ -139,7 +139,7 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
     if (cache->current_len + seq_len > cache->max_seq_len) return VV_ERR_OVERFLOW;
 
     vv_status_t s;
-    if (cache->format == VV_KV_FP16) {
+    if (vv_kv_is_raw((vv_kv_format_t)cache->format)) {
         const size_t row = (size_t)cache->n_kv_heads * (size_t)cache->bytes_per_vec;
         const size_t off = (size_t)cache->current_len * row;
         const size_t n   = (size_t)seq_len * row;
