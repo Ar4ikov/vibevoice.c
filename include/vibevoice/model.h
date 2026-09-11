@@ -7,6 +7,7 @@
 
 #include "vibevoice/types.h"
 #include "vibevoice/safetensors.h"
+#include "vibevoice/quant.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,10 +29,13 @@ typedef enum vv_component_type {
 /** @brief A single loaded weight tensor (may be quantized). */
 typedef struct vv_weight {
     char            name[256];
-    vv_tensor_t     tensor;       /**< FP16/BF16 tensors */
-    vv_tensor_t     bias;         /**< Optional bias (FP16), NULL data if absent */
-    vv_quant_tensor_t quant;      /**< NF4 quantized tensors (if applicable) */
-    bool            is_quantized; /**< true if NF4 quantized */
+    vv_tensor_t     tensor;       /**< Dense FP16/BF16, or the packed codes  */
+    vv_tensor_t     bias;         /**< Optional bias (FP16), NULL if absent  */
+    vv_quant_tensor_t quant;      /**< .scales holds per-group scales        */
+    vv_tensor_t     mins;         /**< INT4G only: -zero * scale per group   */
+    int             quant_kind;   /**< vv_quant_kind_t                       */
+    int             group_size;   /**< INT4G only: weights per scale         */
+    bool            is_quantized; /**< quant_kind != VV_QUANT_NONE           */
 } vv_weight_t;
 
 /** @brief Attention layer weights. */

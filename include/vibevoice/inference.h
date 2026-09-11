@@ -90,7 +90,7 @@ vv_status_t vv_kv_cache_free(vv_kv_cache_t* cache);
  * of layer i+1 while layer i is computing.
  */
 #define VV_LAYER_POOL_SLOTS 2
-#define VV_LAYER_TENSORS_PER_LAYER 20   /* 2 norms + 7*(packed+scales) + 4 attn bias */
+#define VV_LAYER_TENSORS_PER_LAYER 27   /* 2 norms + 7*(packed+scales+mins) + 4 attn bias */
 
 typedef struct vv_layer_pool {
     void*  gpu_buf[VV_LAYER_POOL_SLOTS]; /**< Pre-allocated GPU staging  */

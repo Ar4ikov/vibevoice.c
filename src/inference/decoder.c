@@ -145,22 +145,29 @@ vv_status_t vv_layer_pool_stage(vv_layer_pool_t* pool,
     STAGE_TENSOR(L->post_attn_layernorm);
     STAGE_TENSOR(L->attn.q_proj.tensor);
     STAGE_TENSOR(L->attn.q_proj.quant.scales);
+    STAGE_TENSOR(L->attn.q_proj.mins);
     STAGE_TENSOR(L->attn.q_proj.bias);
     STAGE_TENSOR(L->attn.k_proj.tensor);
     STAGE_TENSOR(L->attn.k_proj.quant.scales);
+    STAGE_TENSOR(L->attn.k_proj.mins);
     STAGE_TENSOR(L->attn.k_proj.bias);
     STAGE_TENSOR(L->attn.v_proj.tensor);
     STAGE_TENSOR(L->attn.v_proj.quant.scales);
+    STAGE_TENSOR(L->attn.v_proj.mins);
     STAGE_TENSOR(L->attn.v_proj.bias);
     STAGE_TENSOR(L->attn.o_proj.tensor);
     STAGE_TENSOR(L->attn.o_proj.quant.scales);
+    STAGE_TENSOR(L->attn.o_proj.mins);
     STAGE_TENSOR(L->attn.o_proj.bias);
     STAGE_TENSOR(L->mlp.gate_proj.tensor);
     STAGE_TENSOR(L->mlp.gate_proj.quant.scales);
+    STAGE_TENSOR(L->mlp.gate_proj.mins);
     STAGE_TENSOR(L->mlp.up_proj.tensor);
     STAGE_TENSOR(L->mlp.up_proj.quant.scales);
+    STAGE_TENSOR(L->mlp.up_proj.mins);
     STAGE_TENSOR(L->mlp.down_proj.tensor);
     STAGE_TENSOR(L->mlp.down_proj.quant.scales);
+    STAGE_TENSOR(L->mlp.down_proj.mins);
 
     #undef STAGE_TENSOR
 
@@ -198,22 +205,29 @@ vv_status_t vv_layer_pool_unstage(vv_layer_pool_t* pool,
     UNSTAGE_TENSOR(L->post_attn_layernorm);
     UNSTAGE_TENSOR(L->attn.q_proj.tensor);
     UNSTAGE_TENSOR(L->attn.q_proj.quant.scales);
+    UNSTAGE_TENSOR(L->attn.q_proj.mins);
     UNSTAGE_TENSOR(L->attn.q_proj.bias);
     UNSTAGE_TENSOR(L->attn.k_proj.tensor);
     UNSTAGE_TENSOR(L->attn.k_proj.quant.scales);
+    UNSTAGE_TENSOR(L->attn.k_proj.mins);
     UNSTAGE_TENSOR(L->attn.k_proj.bias);
     UNSTAGE_TENSOR(L->attn.v_proj.tensor);
     UNSTAGE_TENSOR(L->attn.v_proj.quant.scales);
+    UNSTAGE_TENSOR(L->attn.v_proj.mins);
     UNSTAGE_TENSOR(L->attn.v_proj.bias);
     UNSTAGE_TENSOR(L->attn.o_proj.tensor);
     UNSTAGE_TENSOR(L->attn.o_proj.quant.scales);
+    UNSTAGE_TENSOR(L->attn.o_proj.mins);
     UNSTAGE_TENSOR(L->attn.o_proj.bias);
     UNSTAGE_TENSOR(L->mlp.gate_proj.tensor);
     UNSTAGE_TENSOR(L->mlp.gate_proj.quant.scales);
+    UNSTAGE_TENSOR(L->mlp.gate_proj.mins);
     UNSTAGE_TENSOR(L->mlp.up_proj.tensor);
     UNSTAGE_TENSOR(L->mlp.up_proj.quant.scales);
+    UNSTAGE_TENSOR(L->mlp.up_proj.mins);
     UNSTAGE_TENSOR(L->mlp.down_proj.tensor);
     UNSTAGE_TENSOR(L->mlp.down_proj.quant.scales);
+    UNSTAGE_TENSOR(L->mlp.down_proj.mins);
 
     #undef UNSTAGE_TENSOR
 
@@ -248,7 +262,20 @@ static vv_status_t quant_linear(
 {
     vv_status_t s;
 
-    if (w->is_quantized) {
+    if (w->quant_kind == VV_QUANT_INT4G) {
+        if (M == 1) {
+            s = vv_awq_gemv_dev(x, (const uint32_t*)w->tensor.data,
+                                (const uint32_t*)w->mins.data,
+                                w->quant.scales.data, w->bias.data,
+                                y, N, K, w->group_size, stream);
+            if (s == VV_OK) return VV_OK;      /* bias already folded in */
+            if (s != VV_ERR_UNSUPPORTED) return s;
+        }
+        s = vv_awq_gemm_dev(x, (const uint32_t*)w->tensor.data,
+                            (const uint32_t*)w->mins.data,
+                            w->quant.scales.data, y, scratch,
+                            M, N, K, w->group_size, stream);
+    } else if (w->quant_kind == VV_QUANT_NF4) {
         if (M == 1) {
             s = vv_nf4_gemv_dev(x, (const uint8_t*)w->tensor.data,
                                  w->quant.scales.data, w->bias.data,

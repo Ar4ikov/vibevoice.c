@@ -72,21 +72,28 @@ vv_status_t vv_dequant_nf4_dev(
     const uint8_t* packed, const void* scales_fp16,
     void* output_fp16, int n_elements, int block_size, void* stream);
 
-/** @brief AWQ INT4 dequant fused into a GEMV (M = 1). Bias may be NULL. */
+/*
+ * INT4 group-affine weights (the runtime form of an AWQ or GPTQ checkpoint,
+ * repacked at load time by vv_awq_repack):
+ *   packed [N][K/2] uint8, scales [N][K/G] FP16, mins [N][K/G] FP16
+ * with w = q * scale + min, so dequantisation is a single FMA.
+ */
+
+/** @brief INT4 dequant fused into a GEMV (M = 1). Bias may be NULL. */
 vv_status_t vv_awq_gemv_dev(
-    const void* x, const uint32_t* qweight, const uint32_t* qzeros,
+    const void* x, const uint32_t* packed, const uint32_t* mins,
     const void* scales, const void* bias, void* y,
     int N, int K, int group_size, void* stream);
 
-/** @brief AWQ INT4 dequant + FP16 GEMM through `temp_weight`. */
+/** @brief INT4 GEMM: a direct kernel for M <= 8, else dequant + FP16 GEMM. */
 vv_status_t vv_awq_gemm_dev(
-    const void* input_fp16, const uint32_t* qweight, const uint32_t* qzeros,
+    const void* input_fp16, const uint32_t* packed, const uint32_t* mins,
     const void* scales, void* output_fp16, void* temp_weight_fp16,
     int M, int N, int K, int group_size, void* stream);
 
-/** @brief Standalone AWQ INT4 → FP16 dequantization into [N, K]. */
+/** @brief Standalone INT4 → FP16 dequantization into [N, K]. */
 vv_status_t vv_dequant_awq_dev(
-    const uint32_t* qweight, const uint32_t* qzeros, const void* scales,
+    const uint32_t* packed, const uint32_t* mins, const void* scales,
     void* output_fp16, int N, int K, int group_size, void* stream);
 
 /* ─── Dense linear ───────────────────────────────────────────────────────── */

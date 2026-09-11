@@ -137,6 +137,11 @@ static vv_status_t upload_layer_weights(vv_model_t* model, void* stream) {
                 if (s != VV_OK) return s;                              \
                 total_bytes += (w).quant.scales.size_bytes;            \
             }                                                          \
+            if ((w).mins.data) {                                       \
+                s = upload_tensor_to_gpu(&(w).mins, stream);           \
+                if (s != VV_OK) return s;                              \
+                total_bytes += (w).mins.size_bytes;                    \
+            }                                                          \
             if ((w).bias.data) {                                       \
                 s = upload_tensor_to_gpu(&(w).bias, stream);           \
                 if (s != VV_OK) return s;                              \
@@ -179,6 +184,7 @@ static void free_layer_gpu_weights(vv_model_t* model) {
         #define FREE_GPU_WEIGHT(w) do {                 \
             FREE_GPU_TENSOR((w).tensor);                \
             FREE_GPU_TENSOR((w).quant.scales);          \
+            FREE_GPU_TENSOR((w).mins);                  \
             FREE_GPU_TENSOR((w).bias);                  \
         } while(0)
 
@@ -210,6 +216,7 @@ static size_t calc_per_layer_gpu_bytes(const vv_model_t* model) {
 
     #define ADD_W(w) do { total += (w).tensor.size_bytes; \
         if ((w).quant.scales.data) total += (w).quant.scales.size_bytes; \
+        if ((w).mins.data) total += (w).mins.size_bytes; \
         if ((w).bias.data) total += (w).bias.size_bytes; \
     } while(0)
     ADD_W(L->attn.q_proj); ADD_W(L->attn.k_proj);

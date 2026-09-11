@@ -4,6 +4,7 @@
  */
 
 #include "vibevoice/model.h"
+#include "vibevoice/quant.h"
 #include "vibevoice/vibevoice.h"
 #include "cJSON.h"
 
@@ -42,6 +43,19 @@ static bool is_nf4_metadata(const char* name) {
            strstr(name, ".quant_map") != NULL ||
            strstr(name, ".nested_") != NULL ||
            strstr(name, "SCB") != NULL;
+}
+
+/** @brief AWQ / GPTQ store a projection as qweight + qzeros + scales. */
+static bool is_awq_weight(const char* name) {
+    return (strstr(name, ".self_attn.") || strstr(name, ".mlp.")) &&
+           strstr(name, "_proj.qweight") != NULL;
+}
+
+/** @brief Companion tensors of an AWQ weight, loaded with their parent. */
+static bool is_awq_metadata(const char* name) {
+    return strstr(name, "_proj.qzeros") != NULL ||
+           strstr(name, "_proj.scales") != NULL ||
+           strstr(name, "_proj.g_idx") != NULL;
 }
 
 /**
@@ -527,6 +541,110 @@ static vv_status_t load_nf4_scales(vv_safetensors_t** st_files, int n_st,
     return VV_OK;
 }
 
+/**
+ * @brief Load an AWQ / GPTQ projection and repack it into the INT4G layout.
+ *
+ * `weight_name` ends in ".qweight"; the zeros and scales sit next to it. The
+ * repack is what makes the GEMV coalesce — see src/quant/awq_repack.c.
+ */
+static vv_status_t load_awq_weight(vv_safetensors_t** st_files, int n_st,
+                                   const char* weight_name, vv_weight_t* w)
+{
+    char base[256];
+    size_t blen = strlen(weight_name) - strlen(".qweight");
+    if (blen >= sizeof(base)) return VV_ERR_OVERFLOW;
+    memcpy(base, weight_name, blen);
+    base[blen] = '\0';
+
+    char buf[300];
+    vv_tensor_t qweight = {0}, qzeros = {0}, scales = {0};
+    vv_status_t s;
+
+    s = load_tensor_any(st_files, n_st, weight_name, &qweight);
+    if (s != VV_OK) return s;
+    snprintf(buf, sizeof(buf), "%s.qzeros", base);
+    s = load_tensor_any(st_files, n_st, buf, &qzeros);
+    if (s != VV_OK) { vv_tensor_free(&qweight); return s; }
+    snprintf(buf, sizeof(buf), "%s.scales", base);
+    s = load_tensor_any(st_files, n_st, buf, &scales);
+    if (s != VV_OK) {
+        vv_tensor_free(&qweight); vv_tensor_free(&qzeros);
+        return s;
+    }
+
+    /* qweight is [K, N/8] int32; scales is [K/G, N] fp16. */
+    const int K = (int)qweight.shape[0];
+    const int N = (int)qweight.shape[1] * 8;
+    const int n_groups = (int)scales.shape[0];
+    if (K <= 0 || N <= 0 || n_groups <= 0 || (K % n_groups) != 0) {
+        VV_LOG_E("loader: '%s' has inconsistent AWQ shapes", weight_name);
+        vv_tensor_free(&qweight); vv_tensor_free(&qzeros);
+        vv_tensor_free(&scales);
+        return VV_ERR_SHAPE_MISMATCH;
+    }
+    const int group_size = K / n_groups;
+
+    /*
+     * GPTQ writes zero_point - 1; AWQ writes it directly. The two formats
+     * are otherwise identical here, and a g_idx tensor is the tell.
+     */
+    snprintf(buf, sizeof(buf), "%s.g_idx", base);
+    vv_tensor_t g_idx = {0};
+    const int zero_bias = (load_tensor_any(st_files, n_st, buf, &g_idx) == VV_OK)
+                          ? 1 : 0;
+    vv_tensor_free(&g_idx);
+
+    const size_t packed_bytes = (size_t)N * (K / 2);
+    const size_t group_bytes  = (size_t)N * n_groups * sizeof(uint16_t);
+    uint8_t*  packed = (uint8_t*)vv_alloc(packed_bytes);
+    uint16_t* sc     = (uint16_t*)vv_alloc(group_bytes);
+    uint16_t* mn     = (uint16_t*)vv_alloc(group_bytes);
+    if (!packed || !sc || !mn) {
+        vv_free(packed); vv_free(sc); vv_free(mn);
+        vv_tensor_free(&qweight); vv_tensor_free(&qzeros);
+        vv_tensor_free(&scales);
+        return VV_ERR_OUT_OF_MEMORY;
+    }
+
+    s = vv_awq_repack((const uint32_t*)qweight.data,
+                      (const uint32_t*)qzeros.data,
+                      (const uint16_t*)scales.data,
+                      K, N, group_size, zero_bias, packed, sc, mn);
+    vv_tensor_free(&qweight);
+    vv_tensor_free(&qzeros);
+    vv_tensor_free(&scales);
+    if (s != VV_OK) {
+        vv_free(packed); vv_free(sc); vv_free(mn);
+        return s;
+    }
+
+    w->quant_kind   = VV_QUANT_INT4G;
+    w->is_quantized = true;
+    w->group_size   = group_size;
+    strncpy(w->name, base, sizeof(w->name) - 1);
+
+    w->tensor.data = packed;
+    w->tensor.size_bytes = packed_bytes;
+    w->tensor.dtype = VV_DTYPE_U8;
+    w->tensor.ndim = 2;
+    w->tensor.shape[0] = N;
+    w->tensor.shape[1] = K / 2;
+
+    w->quant.scales.data = sc;
+    w->quant.scales.size_bytes = group_bytes;
+    w->quant.scales.dtype = VV_DTYPE_F16;
+    w->quant.scales.ndim = 2;
+    w->quant.scales.shape[0] = N;
+    w->quant.scales.shape[1] = n_groups;
+
+    w->mins = w->quant.scales;
+    w->mins.data = mn;
+
+    VV_LOG_D("loader: AWQ '%s' N=%d K=%d group=%d%s",
+             base, N, K, group_size, zero_bias ? " (gptq zeros)" : "");
+    return VV_OK;
+}
+
 /* ─── Public API ────────────────────────────────────────────────────────── */
 
 vv_status_t vv_model_load(const char* model_dir, vv_model_t** out) {
@@ -638,8 +756,9 @@ vv_status_t vv_model_load(const char* model_dir, vv_model_t** out) {
             vv_st_tensor_info_t info;
             vv_safetensors_get_info(st, ti, &info);
 
-            /* Skip NF4 metadata — loaded alongside their parent weight */
+            /* Skip quantization metadata — loaded with its parent weight */
             if (is_nf4_metadata(info.name)) continue;
+            if (is_awq_metadata(info.name)) continue;
 
             /* ── LLM global weights ── */
             if (strstr(info.name, "embed_tokens.weight")) {
@@ -767,26 +886,30 @@ vv_status_t vv_model_load(const char* model_dir, vv_model_t** out) {
                         load_tensor_from_st(st, info.name, dst);
                     }
                 }
-                else if (is_nf4_weight(info.name)) {
+                else if (is_nf4_weight(info.name) || is_awq_weight(info.name)) {
                     /* Determine which projection this is */
+                    const bool awq = is_awq_weight(info.name);
                     vv_weight_t* w = NULL;
-                    if (strstr(info.name, "self_attn.q_proj.weight"))
+                    if (strstr(info.name, "self_attn.q_proj."))
                         w = &layer->attn.q_proj;
-                    else if (strstr(info.name, "self_attn.k_proj.weight"))
+                    else if (strstr(info.name, "self_attn.k_proj."))
                         w = &layer->attn.k_proj;
-                    else if (strstr(info.name, "self_attn.v_proj.weight"))
+                    else if (strstr(info.name, "self_attn.v_proj."))
                         w = &layer->attn.v_proj;
-                    else if (strstr(info.name, "self_attn.o_proj.weight"))
+                    else if (strstr(info.name, "self_attn.o_proj."))
                         w = &layer->attn.o_proj;
-                    else if (strstr(info.name, "mlp.gate_proj.weight"))
+                    else if (strstr(info.name, "mlp.gate_proj."))
                         w = &layer->mlp.gate_proj;
-                    else if (strstr(info.name, "mlp.up_proj.weight"))
+                    else if (strstr(info.name, "mlp.up_proj."))
                         w = &layer->mlp.up_proj;
-                    else if (strstr(info.name, "mlp.down_proj.weight"))
+                    else if (strstr(info.name, "mlp.down_proj."))
                         w = &layer->mlp.down_proj;
 
-                    if (w) {
+                    if (w && awq) {
+                        load_awq_weight(model->st_files, n_st, info.name, w);
+                    } else if (w) {
                         w->is_quantized = true;
+                        w->quant_kind = VV_QUANT_NF4;
                         load_tensor_from_st(st, info.name, &w->tensor);
                         strncpy(w->name, info.name, 255);
                         /* Load NF4 absmax scales */
@@ -835,24 +958,31 @@ vv_status_t vv_model_free(vv_model_t* model) {
             vv_tensor_free(&l->attn.q_proj.tensor);
             vv_tensor_free(&l->attn.q_proj.bias);
             vv_tensor_free(&l->attn.q_proj.quant.scales);
+            vv_tensor_free(&l->attn.q_proj.mins);
             vv_tensor_free(&l->attn.k_proj.tensor);
             vv_tensor_free(&l->attn.k_proj.bias);
             vv_tensor_free(&l->attn.k_proj.quant.scales);
+            vv_tensor_free(&l->attn.k_proj.mins);
             vv_tensor_free(&l->attn.v_proj.tensor);
             vv_tensor_free(&l->attn.v_proj.bias);
             vv_tensor_free(&l->attn.v_proj.quant.scales);
+            vv_tensor_free(&l->attn.v_proj.mins);
             vv_tensor_free(&l->attn.o_proj.tensor);
             vv_tensor_free(&l->attn.o_proj.bias);
             vv_tensor_free(&l->attn.o_proj.quant.scales);
+            vv_tensor_free(&l->attn.o_proj.mins);
             vv_tensor_free(&l->mlp.gate_proj.tensor);
             vv_tensor_free(&l->mlp.gate_proj.bias);
             vv_tensor_free(&l->mlp.gate_proj.quant.scales);
+            vv_tensor_free(&l->mlp.gate_proj.mins);
             vv_tensor_free(&l->mlp.up_proj.tensor);
             vv_tensor_free(&l->mlp.up_proj.bias);
             vv_tensor_free(&l->mlp.up_proj.quant.scales);
+            vv_tensor_free(&l->mlp.up_proj.mins);
             vv_tensor_free(&l->mlp.down_proj.tensor);
             vv_tensor_free(&l->mlp.down_proj.bias);
             vv_tensor_free(&l->mlp.down_proj.quant.scales);
+            vv_tensor_free(&l->mlp.down_proj.mins);
         }
         vv_free(model->layers);
     }

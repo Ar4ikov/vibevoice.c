@@ -46,6 +46,12 @@ if(VV_HAS_CUDA)
     find_package(CUDAToolkit REQUIRED)
 endif()
 
+# ─── OpenMP (weight repacking and the CPU kernels) ───────────────────────────
+find_package(OpenMP)
+if(OpenMP_C_FOUND)
+    message(STATUS "OpenMP found: ${OpenMP_C_FLAGS}")
+endif()
+
 # ─── Find OpenBLAS (optional) ─────────────────────────────────────────────────
 set(VV_HAS_BLAS OFF)
 if(VV_ENABLE_BLAS)
@@ -143,6 +149,7 @@ add_library(vibevoice_core STATIC
     src/model/loader.c
     src/quant/nf4_table.c
     src/quant/kv_format.c
+    src/quant/awq_repack.c
     src/quant/dequant_cpu.c
     src/cpu/cpu_kernels.c
     src/inference/pipeline.c
@@ -152,6 +159,9 @@ add_library(vibevoice_core STATIC
     src/inference/postprocess.c
 )
 target_link_libraries(vibevoice_core PUBLIC cjson)
+if(OpenMP_C_FOUND)
+    target_link_libraries(vibevoice_core PUBLIC OpenMP::OpenMP_C)
+endif()
 
 # Propagate VV_HAS_CUDA define to C code
 if(VV_HAS_CUDA)
@@ -174,6 +184,7 @@ if(VV_HAS_CUDA)
         src/cuda/dequant_nf4.cu
         src/cuda/nf4_gemv.cu
         src/cuda/kv_quant.cu
+        src/cuda/awq_gemv.cu
         src/cuda/lm_head.cu
         src/cuda/conv1d.cu
         src/cuda/conv_vae.cu
