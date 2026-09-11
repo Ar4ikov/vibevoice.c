@@ -53,8 +53,13 @@ static const float NF4[16] = {
      1.0f
 };
 
-/** byte -> its two NF4 values, high nibble first. Built once. */
+/*
+ * byte -> its two values, high nibble first. A pair table rather than a
+ * 16-entry code book because NEON has no permute across 16 floats: two
+ * 8-byte loads and a combine beat any select chain, and the table is 2 KB.
+ */
 static float g_nf4_pair[256][2];
+static float g_i4_pair[256][2];
 static bool  g_tables_ready = false;
 
 static void build_tables(void) {
@@ -62,6 +67,8 @@ static void build_tables(void) {
     for (int b = 0; b < 256; b++) {
         g_nf4_pair[b][0] = NF4[b >> 4];
         g_nf4_pair[b][1] = NF4[b & 0xF];
+        g_i4_pair[b][0] = (float)(b >> 4);
+        g_i4_pair[b][1] = (float)(b & 0xF);
     }
     g_tables_ready = true;
 }
@@ -289,6 +296,75 @@ static void f16_row_avx2(const uint16_t* __restrict src,
 }
 #endif /* VV_X86 && __GNUC__ */
 
+#ifdef VV_NEON
+static void nf4_row_neon(const uint8_t* __restrict w,
+                         const uint16_t* __restrict scales,
+                         float* __restrict out, int K) {
+    for (int base = 0; base < K; base += 64) {
+        const float32x4_t s = vdupq_n_f32(vv_half_to_float(scales[base >> 6]));
+        const uint8_t* wb = w + (base >> 1);
+        float* o = out + base;
+        for (int j = 0; j < 32; j += 2) {
+            const float32x4_t v = vcombine_f32(vld1_f32(g_nf4_pair[wb[j]]),
+                                               vld1_f32(g_nf4_pair[wb[j + 1]]));
+            vst1q_f32(o + 2 * j, vmulq_f32(v, s));
+        }
+    }
+}
+
+static void int4g_row_neon(const uint8_t* __restrict w,
+                           const uint16_t* __restrict scales,
+                           const uint16_t* __restrict mins,
+                           float* __restrict out, int K, int group) {
+    for (int base = 0; base < K; base += group) {
+        const int g = base / group;
+        const float32x4_t s = vdupq_n_f32(vv_half_to_float(scales[g]));
+        const float32x4_t m = vdupq_n_f32(vv_half_to_float(mins[g]));
+        const uint8_t* wb = w + (base >> 1);
+        float* o = out + base;
+        for (int j = 0; j < group / 2; j += 2) {
+            const float32x4_t q = vcombine_f32(vld1_f32(g_i4_pair[wb[j]]),
+                                               vld1_f32(g_i4_pair[wb[j + 1]]));
+            vst1q_f32(o + 2 * j, vfmaq_f32(m, q, s));
+        }
+    }
+}
+
+static float dot_neon(const float* __restrict a, const float* __restrict b,
+                      int n) {
+    float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f), acc3 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i),      vld1q_f32(b + i));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
+        acc2 = vfmaq_f32(acc2, vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
+        acc3 = vfmaq_f32(acc3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    }
+    const float32x4_t acc = vaddq_f32(vaddq_f32(acc0, acc1),
+                                      vaddq_f32(acc2, acc3));
+#ifdef __aarch64__
+    float sum = vaddvq_f32(acc);
+#else
+    float32x2_t h = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+    float sum = vget_lane_f32(vpadd_f32(h, h), 0);
+#endif
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+
+#if defined(__ARM_FP16_FORMAT_IEEE) || defined(__aarch64__)
+static void f16_row_neon(const uint16_t* __restrict src,
+                         float* __restrict dst, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4)
+        vst1q_f32(dst + i,
+                  vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(src + i))));
+    for (; i < n; i++) dst[i] = vv_half_to_float(src[i]);
+}
+#endif
+#endif /* VV_NEON */
+
 static void int4g_row_scalar(const uint8_t* __restrict w,
                              const uint16_t* __restrict scales,
                              const uint16_t* __restrict mins,
@@ -310,12 +386,19 @@ static void f16_row(const uint16_t* src, float* dst, int n) {
 #if defined(VV_X86) && defined(__GNUC__)
     if (simd_kind() == SIMD_AVX2) { f16_row_avx2(src, dst, n); return; }
 #endif
+#if defined(VV_NEON) && (defined(__ARM_FP16_FORMAT_IEEE) || defined(__aarch64__))
+    f16_row_neon(src, dst, n);
+    return;
+#endif
     for (int i = 0; i < n; i++) dst[i] = vv_half_to_float(src[i]);
 }
 
 static float dot_f32(const float* a, const float* b, int n) {
 #if defined(VV_X86) && defined(__GNUC__)
     if (simd_kind() == SIMD_AVX2) return dot_avx2(a, b, n);
+#endif
+#ifdef VV_NEON
+    return dot_neon(a, b, n);
 #endif
     float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
     int i = 0;
@@ -456,9 +539,14 @@ vv_status_t vv_nf4_gemm_cpu(const float* input, const uint8_t* packed,
         return VV_OK;
     }
 #endif
+#ifdef VV_NEON
+    VV_QGEMM_BODY(nf4_row_neon(packed + (size_t)n * (K >> 1) + (kp >> 1),
+                               sc + (size_t)n * (K >> 6) + (kp >> 6), row, kc))
+#else
     VV_QGEMM_BODY(nf4_row_scalar(packed + (size_t)n * (K >> 1) + (kp >> 1),
                                  sc + (size_t)n * (K >> 6) + (kp >> 6),
                                  row, kc))
+#endif
     return VV_OK;
 }
 
@@ -495,10 +583,17 @@ vv_status_t vv_int4g_gemm_cpu(const float* input, const uint8_t* packed,
         return VV_OK;
     }
 #endif
+#ifdef VV_NEON
+    VV_QGEMM_BODY(int4g_row_neon(packed + (size_t)n * (K >> 1) + (kp >> 1),
+                                 sc + (size_t)n * ng + kp / group,
+                                 mn + (size_t)n * ng + kp / group,
+                                 row, kc, group))
+#else
     VV_QGEMM_BODY(int4g_row_scalar(packed + (size_t)n * (K >> 1) + (kp >> 1),
                                    sc + (size_t)n * ng + kp / group,
                                    mn + (size_t)n * ng + kp / group,
                                    row, kc, group))
+#endif
     return VV_OK;
 }
 

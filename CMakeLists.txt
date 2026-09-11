@@ -168,6 +168,13 @@ add_library(vibevoice_core STATIC
     src/inference/sampling.c
     src/inference/postprocess.c
 )
+# With no accelerator backend the device op set still has to link. The stub
+# implements memory and streams on the host and refuses every compute op,
+# which is what steers the pipeline to the CPU kernels.
+if(NOT VV_HAS_CUDA AND NOT VV_HAS_METAL)
+    target_sources(vibevoice_core PRIVATE src/device/device_none.c)
+endif()
+
 target_link_libraries(vibevoice_core PUBLIC cjson)
 if(OpenMP_C_FOUND)
     target_link_libraries(vibevoice_core PUBLIC OpenMP::OpenMP_C)
@@ -281,6 +288,7 @@ if(VV_BUILD_TESTS)
     vv_add_test(test_conv_vae tests/test_conv_vae.c)
     vv_add_test(test_tokenizer tests/test_tokenizer.c)
     vv_add_test(test_kv_quant tests/test_kv_quant.c)
+    vv_add_test(test_cpu_kernels tests/test_cpu_kernels.c)
     vv_add_test(test_e2e tests/test_e2e.c)
 endif()
 
