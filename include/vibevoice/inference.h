@@ -232,11 +232,30 @@ typedef struct vv_inference_ctx {
 
     /* Performance metrics from last transcribe() call */
     vv_perf_metrics_t last_perf;
+
+    /*
+     * A clone borrows the parent's weights (model, embed, lm_head, norm) and
+     * owns only its own KV cache, workspace and streams, so several requests
+     * can run concurrently against one copy of the 3.2 GB of weights.
+     */
+    bool           is_clone;
 } vv_inference_ctx_t;
 
 vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
                                const vv_init_params_t* params,
                                vv_inference_ctx_t** ctx);
+
+/**
+ * @brief Create a context sharing `parent`'s GPU weights.
+ *
+ * Only valid when the parent placed every layer on the GPU; a streaming
+ * parent has one staging pool that two threads cannot share. The clone gets
+ * its own KV cache, workspace, streams, tokenizer and speech encoders.
+ * Freeing a clone leaves the parent intact; free clones before the parent.
+ */
+vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
+                                const vv_init_params_t* params,
+                                vv_inference_ctx_t** out);
 vv_status_t vv_inference_transcribe(
     vv_inference_ctx_t* ctx,
     const float* audio_samples, int num_samples,

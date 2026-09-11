@@ -1,0 +1,70 @@
+/**
+ * @file vv_http.h
+ * @brief Internal HTTP plumbing used by src/server/api.c.
+ */
+#ifndef VV_HTTP_H
+#define VV_HTTP_H
+
+#include "vibevoice/types.h"
+
+#include <stddef.h>
+
+#define VV_HTTP_MAX_HEADERS 48
+#define VV_HTTP_MAX_PARTS   16
+
+typedef struct vv_http vv_http_t;
+
+typedef struct {
+    char name[64];
+    char value[512];
+} vv_http_hdr_t;
+
+typedef struct {
+    char        method[8];
+    char        path[512];
+    char        query[512];
+    vv_http_hdr_t headers[VV_HTTP_MAX_HEADERS];
+    int         n_headers;
+    const char* body;
+    size_t      body_len;
+} vv_http_req_t;
+
+typedef struct {
+    void* fd;
+    bool  sent;
+} vv_http_res_t;
+
+/** @brief One part of a multipart/form-data body; `data` points into it. */
+typedef struct {
+    char        name[128];
+    char        filename[256];
+    const char* data;
+    size_t      size;
+} vv_http_part_t;
+
+typedef void (*vv_http_handler_fn)(const vv_http_req_t* req,
+                                   vv_http_res_t* res, void* user);
+
+/** @brief Bind and accept until vv_http_shutdown(). Blocks the caller. */
+vv_status_t vv_http_serve(const char* host, int port, int max_conns,
+                          size_t max_body, vv_http_handler_fn handler,
+                          void* user, vv_http_t** out);
+
+/** @brief Stop the accept loop and drain in-flight connections. */
+void vv_http_shutdown(vv_http_t* s);
+
+const char* vv_http_header(const vv_http_req_t* r, const char* name);
+
+int vv_http_parse_multipart(const char* body, size_t len,
+                            const char* content_type,
+                            vv_http_part_t* parts, int max_parts);
+const vv_http_part_t* vv_http_part(const vv_http_part_t* parts, int n,
+                                   const char* name);
+
+void vv_http_respond(vv_http_res_t* res, int status, const char* content_type,
+                     const void* body, size_t len);
+void vv_http_respond_json(vv_http_res_t* res, int status, const char* json);
+void vv_http_error(vv_http_res_t* res, int status, const char* type,
+                   const char* message);
+
+#endif /* VV_HTTP_H */

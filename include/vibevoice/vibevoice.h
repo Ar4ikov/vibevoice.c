@@ -34,6 +34,12 @@ const char* vv_debug_dump_dir(void);
 /** @brief Write a raw blob to $VV_DUMP_DIR/<name>.bin (no-op when unset). */
 void vv_debug_dump(const char* name, const void* data, size_t bytes);
 
+/** @brief Monotonic clock in milliseconds. */
+double vv_time_ms(void);
+
+/** @brief Sleep for the given number of milliseconds. */
+void vv_msleep(int ms);
+
 /** @brief Log a message. Prefer the VV_LOG_* macros below. */
 void vv_log(vv_log_level_t level, const char* fmt, ...);
 

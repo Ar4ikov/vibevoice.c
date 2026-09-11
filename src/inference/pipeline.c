@@ -24,26 +24,8 @@
 #include <stdio.h>
 #include <math.h>
 
-/* Portable high-resolution timer */
-#ifdef _WIN32
-#include <windows.h>
-
-static double vv_time_ms(void) {
-    LARGE_INTEGER freq, count;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&count);
-    return (double)count.QuadPart / (double)freq.QuadPart * 1000.0;
-}
-#else
-#include <time.h>
 #include "vibevoice/device.h"
 #include "vibevoice/kv_quant.h"
-static double vv_time_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
-}
-#endif
 
 /* Forward declarations — CUDA helpers */
 
@@ -114,6 +96,8 @@ static vv_status_t upload_tensor_to_gpu(vv_tensor_t* t, void* stream) {
  * @brief Upload all NF4 layer weights (packed + scales + norms) to GPU.
  * Used only for VV_PLACE_ALL_GPU mode.
  */
+static void attach_frontend(vv_inference_ctx_t* c);
+
 static vv_status_t upload_layer_weights(vv_model_t* model, void* stream) {
     size_t total_bytes = 0;
     for (int i = 0; i < model->num_layers; i++) {
@@ -555,30 +539,47 @@ fail_gpu:
     return s;
 
 init_common:
-    /* ── Load tokenizer ── */
-    s = vv_tokenizer_load(model_dir, &c->tokenizer);
-    if (s != VV_OK)
-        VV_LOG_W("inference: failed to load tokenizer (will retry from model dir)");
+    attach_frontend(c);
 
-    /* ── Init audio encoders ── */
+    VV_LOG_I("inference: initialized (%s, workspace=%zu MB, tokenizer=%s)",
+             placement_str(c->placement),
+             c->workspace_size / (1024 * 1024),
+             c->tokenizer ? "yes" : "no");
+    *ctx = c;
+    return VV_OK;
+}
+
+
+/**
+ * @brief Attach the speech encoders, connectors and tokenizer to a context.
+ *
+ * Shared by vv_inference_init and vv_inference_clone; everything here reads
+ * the model's CPU-side tensors, so a clone builds its own without touching
+ * the parent.
+ */
+static void attach_frontend(vv_inference_ctx_t* c) {
+    const vv_llm_config_t* llm = &c->model->config.llm;
+    vv_status_t s;
+
+    s = vv_tokenizer_load(c->model_dir, &c->tokenizer);
+    if (s != VV_OK)
+        VV_LOG_W("inference: failed to load tokenizer from '%s'", c->model_dir);
+
     if (c->model->n_acoustic_weights > 0) {
         s = vv_conv_vae_init(c->model->acoustic_weights,
                               c->model->n_acoustic_weights,
                               &c->model->config.acoustic,
                               true, &c->acoustic_encoder);
-        if (s != VV_OK)
-            VV_LOG_W("inference: failed to init acoustic encoder");
+        if (s != VV_OK) VV_LOG_W("inference: failed to init acoustic encoder");
     }
     if (c->model->n_semantic_weights > 0) {
         s = vv_conv_vae_init(c->model->semantic_weights,
                               c->model->n_semantic_weights,
                               &c->model->config.semantic,
                               false, &c->semantic_encoder);
-        if (s != VV_OK)
-            VV_LOG_W("inference: failed to init semantic encoder");
+        if (s != VV_OK) VV_LOG_W("inference: failed to init semantic encoder");
     }
 
-    /* ── Init connectors ── */
     if (c->model->acoustic_connector_fc1.tensor.data) {
         c->acoustic_connector = (vv_connector_t*)vv_alloc(sizeof(vv_connector_t));
         if (c->acoustic_connector) {
@@ -606,7 +607,6 @@ init_common:
         }
     }
 
-    /* Stage the speech-encoder weights now, not on the first transcription. */
     if (c->use_gpu) {
         double t_w = vv_time_ms();
         if (c->acoustic_encoder) vv_conv_vae_warmup(c->acoustic_encoder);
@@ -614,15 +614,75 @@ init_common:
         VV_LOG_I("inference: speech encoder weights staged to GPU (%.0f ms)",
                  vv_time_ms() - t_w);
     }
-
-    VV_LOG_I("inference: initialized (%s, workspace=%zu MB, tokenizer=%s)",
-             placement_str(c->placement),
-             c->workspace_size / (1024 * 1024),
-             c->tokenizer ? "yes" : "no");
-    *ctx = c;
-    return VV_OK;
 }
 
+vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
+                                const vv_init_params_t* params,
+                                vv_inference_ctx_t** out) {
+    if (!parent || !out) return VV_ERR_NULL_PTR;
+    if (!parent->use_gpu || parent->placement != VV_PLACE_ALL_GPU) {
+        VV_LOG_E("inference: clone needs a parent with all layers resident");
+        return VV_ERR_UNSUPPORTED;
+    }
+
+    vv_init_params_t p = params ? *params : vv_init_params_default();
+    const vv_llm_config_t* llm = &parent->model->config.llm;
+    const int max_seq = (p.max_seq_len > 0) ? p.max_seq_len : 32768;
+
+    vv_inference_ctx_t* c =
+        (vv_inference_ctx_t*)vv_alloc(sizeof(vv_inference_ctx_t));
+    if (!c) return VV_ERR_OUT_OF_MEMORY;
+    memset(c, 0, sizeof(*c));
+
+    c->is_clone  = true;
+    c->gpu_id    = parent->gpu_id;
+    c->use_gpu   = true;
+    c->placement = parent->placement;
+    c->model     = parent->model;
+    c->layer_pool = parent->layer_pool;      /* all_resident: stateless */
+    c->embed_table_gpu = parent->embed_table_gpu;
+    c->lm_head_gpu     = parent->lm_head_gpu;
+    c->final_norm_gpu  = parent->final_norm_gpu;
+    memcpy(c->model_dir, parent->model_dir, sizeof(c->model_dir));
+
+    vv_status_t s = vv_dev_stream_create(&c->compute_stream);
+    if (s != VV_OK) { vv_free(c); return s; }
+    s = vv_dev_stream_create(&c->transfer_stream);
+    if (s != VV_OK) {
+        vv_dev_stream_destroy(c->compute_stream);
+        vv_free(c);
+        return s;
+    }
+
+    s = vv_kv_cache_create(&c->kv_cache, llm->num_hidden_layers,
+                           llm->num_key_value_heads, llm->head_dim,
+                           max_seq, p.kv_format, false);
+    if (s != VV_OK) goto fail;
+
+    c->workspace_size = parent->workspace_size;
+    s = vv_dev_alloc(&c->workspace, c->workspace_size);
+    if (s != VV_OK) {
+        c->workspace_size = (size_t)256 * 1024 * 1024;
+        s = vv_dev_alloc(&c->workspace, c->workspace_size);
+    }
+    if (s != VV_OK) goto fail;
+
+    attach_frontend(c);
+
+    VV_LOG_I("inference: cloned context (workspace=%zu MB, kv=%.0f MB)",
+             c->workspace_size / (1024 * 1024),
+             (double)c->kv_cache->bytes_total / (1024.0 * 1024.0));
+    *out = c;
+    return VV_OK;
+
+fail:
+    if (c->kv_cache) vv_kv_cache_free(c->kv_cache);
+    if (c->workspace) vv_dev_free(c->workspace);
+    vv_dev_stream_destroy(c->compute_stream);
+    vv_dev_stream_destroy(c->transfer_stream);
+    vv_free(c);
+    return s;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Debug tensor dumping
@@ -1223,14 +1283,19 @@ static vv_status_t transcribe_gpu(
      * spot: 28 transformer layers vs the 152k-row LM head + sampling. */
     double t_layers_ms = 0.0, t_head_ms = 0.0, t_embed_ms = 0.0;
 
-    fprintf(stderr, "\n--- token stream ---\n");
+    /*
+     * Live token echo. Worth watching during a long transcription, pure
+     * noise inside the chat and mic loops, so it follows the log level.
+     */
+    const bool echo_tokens = vv_log_get_level() >= VV_LOG_INFO;
+    if (echo_tokens) fprintf(stderr, "\n--- token stream ---\n");
     if (!vv_is_end_token(ctx->tokenizer, token_id)) {
         output_tokens[n_generated++] = token_id;
         /* Stream first token */
         char* first_text = NULL;
         vv_tokenizer_decode(ctx->tokenizer, &token_id, 1, &first_text);
         if (first_text) {
-            fprintf(stderr, "%s", first_text);
+            if (echo_tokens) fprintf(stderr, "%s", first_text);
             fflush(stderr);
             vv_free(first_text);
         }
@@ -1324,7 +1389,7 @@ static vv_status_t transcribe_gpu(
             char* tok_text = NULL;
             vv_tokenizer_decode(ctx->tokenizer, &token_id, 1, &tok_text);
             if (tok_text) {
-                fprintf(stderr, "%s", tok_text);
+                if (echo_tokens) fprintf(stderr, "%s", tok_text);
                 fflush(stderr);
                 vv_free(tok_text);
             }
@@ -1336,7 +1401,9 @@ static vv_status_t transcribe_gpu(
                      n_generated, (elapsed > 0.001) ? (double)n_generated / elapsed * 1000.0 : 0.0);
         }
     }
-    fprintf(stderr, "\n--- end stream (%d tokens) ---\n", n_generated);
+    if (echo_tokens)
+        fprintf(stderr, "\n--- end stream (%d tokens) ---\n",
+                n_generated);
     fflush(stderr);
 
     perf->decode_layers_ms = t_layers_ms;
@@ -1694,10 +1761,12 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
 
     if (ctx->use_gpu) {
         if (ctx->workspace) vv_dev_free(ctx->workspace);
-        if (ctx->embed_table_gpu) vv_dev_free(ctx->embed_table_gpu);
-        if (ctx->lm_head_gpu) vv_dev_free(ctx->lm_head_gpu);
-        if (ctx->final_norm_gpu) vv_dev_free(ctx->final_norm_gpu);
-        if (ctx->layer_pool) vv_layer_pool_free(ctx->layer_pool);
+        if (!ctx->is_clone) {
+            if (ctx->embed_table_gpu) vv_dev_free(ctx->embed_table_gpu);
+            if (ctx->lm_head_gpu) vv_dev_free(ctx->lm_head_gpu);
+            if (ctx->final_norm_gpu) vv_dev_free(ctx->final_norm_gpu);
+            if (ctx->layer_pool) vv_layer_pool_free(ctx->layer_pool);
+        }
     } else {
         if (ctx->workspace) vv_free(ctx->workspace);
     }
@@ -1714,13 +1783,13 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
     if (ctx->acoustic_connector) vv_free(ctx->acoustic_connector);
     if (ctx->semantic_connector) vv_free(ctx->semantic_connector);
 
-    if (ctx->model) {
+    if (ctx->model && !ctx->is_clone) {
         if (ctx->use_gpu && ctx->placement == VV_PLACE_ALL_GPU)
             free_layer_gpu_weights(ctx->model);
         vv_model_free(ctx->model);
     }
 
-    if (ctx->use_gpu) vv_gemm_cleanup();
+    if (ctx->use_gpu && !ctx->is_clone) vv_gemm_cleanup();
     vv_free(ctx);
 
     VV_LOG_I("inference: context freed");

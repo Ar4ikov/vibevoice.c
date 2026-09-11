@@ -99,8 +99,14 @@ static void print_usage(const char* prog) {
         "  --vram-budget <0-1>   VRAM fraction for model (default: 1.0)\n"
         "  --cpu                 CPU-only mode (no GPU)\n"
         "  --verbose             Enable debug logging\n"
-        "  --help                Show this message\n",
-        VV_VERSION_STRING, prog);
+        "  --help                Show this message\n\n"
+        "Commands:\n"
+        "  serve                 Run the OpenAI-compatible HTTP server\n"
+        "  chat                  Interactive prompt, model stays loaded\n"
+        "  mic                   Live microphone transcription\n"
+        "  (none)                Transcribe one file and exit\n\n"
+        "Run `%s <command> --help` for that command's own options.\n",
+        VV_VERSION_STRING, prog, prog);
 }
 
 static int parse_args(int argc, char** argv, cli_args_t* args) {
@@ -154,12 +160,35 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
     return 0;
 }
 
+int vv_cmd_serve(int argc, char** argv);
+int vv_cmd_chat(int argc, char** argv);
+int vv_cmd_mic(int argc, char** argv);
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     /* Enable UTF-8 console output */
     SetConsoleOutputCP(65001);
     SetConsoleCP(65001);
 #endif
+
+    /*
+     * Subcommands. Without one the arguments are read as a single
+     * transcription, which is how the CLI has always behaved.
+     */
+    if (argc > 1 && argv[1][0] != '-') {
+        if (strcmp(argv[1], "serve") == 0)
+            return vv_cmd_serve(argc - 2, argv + 2);
+        if (strcmp(argv[1], "chat") == 0)
+            return vv_cmd_chat(argc - 2, argv + 2);
+        if (strcmp(argv[1], "mic") == 0)
+            return vv_cmd_mic(argc - 2, argv + 2);
+        if (strcmp(argv[1], "transcribe") == 0) { argc--; argv++; }
+        else {
+            fprintf(stderr, "unknown command '%s'\n\n", argv[1]);
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
 
     cli_args_t args;
     if (parse_args(argc, argv, &args) != 0) {

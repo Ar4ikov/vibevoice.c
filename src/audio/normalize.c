@@ -6,6 +6,8 @@
  */
 
 #include "vibevoice/audio.h"
+
+#include <string.h>
 #include "vibevoice/vibevoice.h"
 
 #include <math.h>
@@ -80,5 +82,32 @@ vv_status_t vv_audio_preprocess(const char* wav_path, float** samples,
 
     VV_LOG_I("audio: preprocessed %s -> %d samples at 24kHz, -25 dBFS",
              wav_path, resampled_len);
+    return VV_OK;
+}
+
+vv_status_t vv_audio_prepare(const float* pcm, int n_samples, int sample_rate,
+                             float** out, int* out_len) {
+    if (!pcm || !out || !out_len) return VV_ERR_NULL_PTR;
+    if (n_samples <= 0 || sample_rate <= 0) return VV_ERR_INVALID_ARG;
+
+    float* buf = NULL;
+    int len = 0;
+
+    if (sample_rate != 24000) {
+        vv_status_t s = vv_audio_resample(pcm, sample_rate, n_samples,
+                                          &buf, 24000, &len);
+        if (s != VV_OK) return s;
+    } else {
+        buf = (float*)vv_alloc((size_t)n_samples * sizeof(float));
+        if (!buf) return VV_ERR_OUT_OF_MEMORY;
+        memcpy(buf, pcm, (size_t)n_samples * sizeof(float));
+        len = n_samples;
+    }
+
+    vv_status_t s = vv_audio_normalize(buf, len, -25.0f, 1e-6f);
+    if (s != VV_OK) { vv_free(buf); return s; }
+
+    *out = buf;
+    *out_len = len;
     return VV_OK;
 }

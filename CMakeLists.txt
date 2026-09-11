@@ -131,14 +131,24 @@ add_library(cjson STATIC
 )
 target_include_directories(cjson PUBLIC third_party/cjson)
 
+# Internal headers (threading shim, HTTP plumbing) live next to their users.
+include_directories(${CMAKE_SOURCE_DIR}/src/core ${CMAKE_SOURCE_DIR}/src/server)
+
 # ─── vibevoice_core (pure C, no GPU) ─────────────────────────────────────────
 add_library(vibevoice_core STATIC
     src/core/alloc.c
     src/core/logger.c
     src/core/error.c
+    src/core/clock.c
     src/audio/wav.c
     src/audio/resample.c
     src/audio/normalize.c
+    src/audio/decode.c
+    src/audio/mic.c
+    src/audio/vad.c
+    src/engine/engine.c
+    src/server/http.c
+    src/server/api.c
     src/text_tokenizer/bpe.c
     src/text_tokenizer/vocab.c
     src/text_tokenizer/special_tokens.c
@@ -175,7 +185,14 @@ if(VV_HAS_BLAS)
 endif()
 
 if(UNIX AND NOT APPLE)
-    target_link_libraries(vibevoice_core PUBLIC m)
+    target_link_libraries(vibevoice_core PUBLIC m dl)
+endif()
+if(UNIX)
+    find_package(Threads REQUIRED)
+    target_link_libraries(vibevoice_core PUBLIC Threads::Threads)
+endif()
+if(WIN32)
+    target_link_libraries(vibevoice_core PUBLIC ws2_32)
 endif()
 
 # ─── vibevoice_cuda (CUDA kernels) ───────────────────────────────────────────
@@ -235,7 +252,7 @@ endif()
 
 # ─── CLI executable ───────────────────────────────────────────────────────────
 if(VV_BUILD_CLI)
-    add_executable(vv_cli cli/main.c)
+    add_executable(vv_cli cli/main.c cli/cmd_serve.c cli/cmd_chat.c)
     target_link_libraries(vv_cli PRIVATE vibevoice_core)
     if(VV_HAS_CUDA)
         target_link_libraries(vv_cli PRIVATE vibevoice_cuda)

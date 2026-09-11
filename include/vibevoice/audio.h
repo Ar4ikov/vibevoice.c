@@ -67,6 +67,33 @@ vv_status_t vv_audio_normalize(float* samples, int num_samples,
 vv_status_t vv_audio_preprocess(const char* wav_path, float** samples,
                                  int* num_samples);
 
+/**
+ * @brief Same pipeline for samples already in memory (mic, HTTP upload).
+ *
+ * Resamples to 24 kHz if needed and normalizes to -25 dBFS, always returning
+ * a fresh buffer the caller frees with vv_free().
+ */
+vv_status_t vv_audio_prepare(const float* pcm, int n_samples, int sample_rate,
+                             float** out, int* out_len);
+
+/**
+ * @brief Decode any audio file into mono float samples.
+ *
+ * WAV is parsed directly. Anything else is handed to ffmpeg when it is on
+ * PATH, which is how the server accepts mp3/m4a/ogg/flac uploads; without
+ * ffmpeg those return VV_ERR_AUDIO_FORMAT.
+ */
+vv_status_t vv_audio_load_any(const char* path, float** samples,
+                              int* num_samples, int* sample_rate);
+
+/**
+ * @brief Decode an in-memory audio blob (sniffs WAV, else ffmpeg via a temp
+ *        file). Used by the HTTP upload path.
+ */
+vv_status_t vv_audio_load_memory(const void* data, size_t size,
+                                 float** samples, int* num_samples,
+                                 int* sample_rate);
+
 #ifdef __cplusplus
 }
 #endif
