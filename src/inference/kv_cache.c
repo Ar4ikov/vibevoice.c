@@ -1,41 +1,62 @@
 /**
  * @file kv_cache.c
- * @brief KV-cache management for Qwen2 transformer.
+ * @brief KV-cache management for the Qwen2 backbone.
  *
- * 28 layers x 2 (K+V) x 4 KV heads x 128 head_dim
- * Supports both GPU (VRAM) and CPU (RAM) allocation.
+ * 28 layers x 2 (K+V) x 4 KV heads x 128 head_dim, in whichever storage format
+ * kv_quant.h defines. FP16 is a straight d2d copy of the projection output;
+ * every other format runs the values through a quantizing store kernel.
  */
 
 #include "vibevoice/inference.h"
 #include "vibevoice/vibevoice.h"
+#include "vibevoice/kv_quant.h"
 
 #include <string.h>
 #include "vibevoice/device.h"
 
-/* Forward declare CUDA functions */
+/** @brief One layer's store bytes, for `max_seq_len` positions. */
+static size_t store_bytes(int max_seq_len, int n_kv_heads, int bytes_per_vec) {
+    return (size_t)max_seq_len * (size_t)n_kv_heads * (size_t)bytes_per_vec;
+}
+
+/** @brief One layer's metadata bytes (FP16 scale per position and head). */
+static size_t meta_bytes(int max_seq_len, int n_kv_heads) {
+    return (size_t)max_seq_len * (size_t)n_kv_heads * sizeof(uint16_t);
+}
+
+size_t vv_kv_cache_bytes(int num_layers, int n_kv_heads, int head_dim,
+                         int max_seq_len, int format) {
+    const int bpv = vv_kv_bytes_per_vec((vv_kv_format_t)format, head_dim);
+    size_t per_layer = 2 * store_bytes(max_seq_len, n_kv_heads, bpv);
+    if (vv_kv_has_meta((vv_kv_format_t)format))
+        per_layer += 2 * meta_bytes(max_seq_len, n_kv_heads);
+    if (format != VV_KV_FP16)
+        per_layer += (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+    return per_layer * (size_t)num_layers;
+}
 
 vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
                                 int num_layers, int n_kv_heads,
                                 int head_dim, int max_seq_len,
-                                bool fp8, bool on_cpu) {
+                                int format, bool on_cpu) {
     if (!cache) return VV_ERR_NULL_PTR;
 
     vv_kv_cache_t* c = (vv_kv_cache_t*)vv_alloc(sizeof(vv_kv_cache_t));
     if (!c) return VV_ERR_OUT_OF_MEMORY;
     memset(c, 0, sizeof(*c));
 
-    c->num_layers = num_layers;
-    c->n_kv_heads = n_kv_heads;
-    c->head_dim = head_dim;
-    c->max_seq_len = max_seq_len;
-    c->current_len = 0;
-    c->fp8 = fp8;
-    c->on_cpu = on_cpu;
+    c->num_layers    = num_layers;
+    c->n_kv_heads    = n_kv_heads;
+    c->head_dim      = head_dim;
+    c->max_seq_len   = max_seq_len;
+    c->current_len   = 0;
+    c->format        = format;
+    c->bytes_per_vec = vv_kv_bytes_per_vec((vv_kv_format_t)format, head_dim);
+    c->on_cpu        = on_cpu;
 
-    /* Element size: FP16 = 2 bytes, FP8 = 1 byte */
-    size_t elem_size = fp8 ? 1 : 2;
-    size_t per_layer_size = (size_t)max_seq_len * (size_t)n_kv_heads *
-                             (size_t)head_dim * elem_size;
+    const bool has_meta = vv_kv_has_meta((vv_kv_format_t)format);
+    const size_t sb = store_bytes(max_seq_len, n_kv_heads, c->bytes_per_vec);
+    const size_t mb = has_meta ? meta_bytes(max_seq_len, n_kv_heads) : 0;
 
     c->k_cache = (void**)vv_alloc((size_t)num_layers * sizeof(void*));
     c->v_cache = (void**)vv_alloc((size_t)num_layers * sizeof(void*));
@@ -46,29 +67,65 @@ vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
     memset(c->k_cache, 0, (size_t)num_layers * sizeof(void*));
     memset(c->v_cache, 0, (size_t)num_layers * sizeof(void*));
 
-    for (int i = 0; i < num_layers; i++) {
-        vv_status_t s;
-        if (on_cpu) {
-            c->k_cache[i] = vv_alloc(per_layer_size);
-            if (!c->k_cache[i]) { vv_kv_cache_free(c); return VV_ERR_OUT_OF_MEMORY; }
-            memset(c->k_cache[i], 0, per_layer_size);
-            c->v_cache[i] = vv_alloc(per_layer_size);
-            if (!c->v_cache[i]) { vv_kv_cache_free(c); return VV_ERR_OUT_OF_MEMORY; }
-            memset(c->v_cache[i], 0, per_layer_size);
-        } else {
-            s = vv_dev_alloc(&c->k_cache[i], per_layer_size);
-            if (s != VV_OK) { vv_kv_cache_free(c); return s; }
-            s = vv_dev_alloc(&c->v_cache[i], per_layer_size);
-            if (s != VV_OK) { vv_kv_cache_free(c); return s; }
+    if (format != VV_KV_FP16) {
+        /* Reference key per layer: softmax is shift-invariant, so storing
+         * K relative to a fixed vector is free and cuts the magnitude the
+         * quantizer has to cover by more than 20x on this model. */
+        c->k_ref = (void**)vv_alloc((size_t)num_layers * sizeof(void*));
+        c->ref_ready = (bool*)vv_alloc((size_t)num_layers * sizeof(bool));
+        if (!c->k_ref || !c->ref_ready) {
+            vv_kv_cache_free(c);
+            return VV_ERR_OUT_OF_MEMORY;
         }
+        memset(c->k_ref, 0, (size_t)num_layers * sizeof(void*));
+        memset(c->ref_ready, 0, (size_t)num_layers * sizeof(bool));
     }
 
-    VV_LOG_I("kv_cache: allocated %d layers, %d heads, dim=%d, max_seq=%d, "
-             "fp%d, %s, total=%.1f MB",
+    if (has_meta) {
+        c->k_meta = (void**)vv_alloc((size_t)num_layers * sizeof(void*));
+        c->v_meta = (void**)vv_alloc((size_t)num_layers * sizeof(void*));
+        if (!c->k_meta || !c->v_meta) {
+            vv_kv_cache_free(c);
+            return VV_ERR_OUT_OF_MEMORY;
+        }
+        memset(c->k_meta, 0, (size_t)num_layers * sizeof(void*));
+        memset(c->v_meta, 0, (size_t)num_layers * sizeof(void*));
+    }
+
+    #define ALLOC_SLOT(dst, bytes) do {                                      \
+        if (on_cpu) {                                                        \
+            (dst) = vv_alloc(bytes);                                         \
+            if (!(dst)) { vv_kv_cache_free(c); return VV_ERR_OUT_OF_MEMORY; }\
+            memset((dst), 0, (bytes));                                       \
+        } else {                                                             \
+            vv_status_t s_ = vv_dev_alloc(&(dst), (bytes));                  \
+            if (s_ != VV_OK) { vv_kv_cache_free(c); return s_; }             \
+            vv_dev_memset((dst), 0, (bytes));                                \
+        }                                                                    \
+    } while (0)
+
+    for (int i = 0; i < num_layers; i++) {
+        ALLOC_SLOT(c->k_cache[i], sb);
+        ALLOC_SLOT(c->v_cache[i], sb);
+        if (has_meta) {
+            ALLOC_SLOT(c->k_meta[i], mb);
+            ALLOC_SLOT(c->v_meta[i], mb);
+        }
+        if (c->k_ref) {
+            const size_t rb = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+            ALLOC_SLOT(c->k_ref[i], rb);
+        }
+    }
+    #undef ALLOC_SLOT
+
+    c->bytes_total = (size_t)num_layers * 2 * (sb + mb);
+
+    VV_LOG_I("kv_cache: %d layers, %d heads, dim=%d, max_seq=%d, %s, %s, "
+             "%.1f MB",
              num_layers, n_kv_heads, head_dim, max_seq_len,
-             fp8 ? 8 : 16,
+             vv_kv_format_name((vv_kv_format_t)format),
              on_cpu ? "CPU" : "GPU",
-             (float)(2 * num_layers * per_layer_size) / (1024.0f * 1024.0f));
+             (double)c->bytes_total / (1024.0 * 1024.0));
 
     *cache = c;
     return VV_OK;
@@ -79,35 +136,38 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
                                 int seq_len, void* stream) {
     if (!cache || !k || !v) return VV_ERR_NULL_PTR;
     if (layer < 0 || layer >= cache->num_layers) return VV_ERR_INVALID_ARG;
-    if (cache->current_len + seq_len > cache->max_seq_len) {
-        return VV_ERR_OVERFLOW;
-    }
-
-    size_t elem_size = cache->fp8 ? 1 : 2;
-    size_t row_size = (size_t)cache->n_kv_heads * (size_t)cache->head_dim *
-                       elem_size;
-    size_t offset = (size_t)cache->current_len * row_size;
-    size_t copy_size = (size_t)seq_len * row_size;
+    if (cache->current_len + seq_len > cache->max_seq_len) return VV_ERR_OVERFLOW;
 
     vv_status_t s;
-    if (cache->on_cpu) {
-        memcpy((uint8_t*)cache->k_cache[layer] + offset, k, copy_size);
-        memcpy((uint8_t*)cache->v_cache[layer] + offset, v, copy_size);
-        s = VV_OK;
+    if (cache->format == VV_KV_FP16) {
+        const size_t row = (size_t)cache->n_kv_heads * (size_t)cache->bytes_per_vec;
+        const size_t off = (size_t)cache->current_len * row;
+        const size_t n   = (size_t)seq_len * row;
+        if (cache->on_cpu) {
+            memcpy((uint8_t*)cache->k_cache[layer] + off, k, n);
+            memcpy((uint8_t*)cache->v_cache[layer] + off, v, n);
+            s = VV_OK;
+        } else {
+            s = vv_dev_memcpy_d2d((uint8_t*)cache->k_cache[layer] + off, k, n, stream);
+            if (s == VV_OK)
+                s = vv_dev_memcpy_d2d((uint8_t*)cache->v_cache[layer] + off, v, n, stream);
+        }
     } else {
-        s = vv_dev_memcpy_d2d((uint8_t*)cache->k_cache[layer] + offset,
-                                k, copy_size, stream);
-        if (s != VV_OK) return s;
-        s = vv_dev_memcpy_d2d((uint8_t*)cache->v_cache[layer] + offset,
-                                v, copy_size, stream);
-        if (s != VV_OK) return s;
+        if (cache->on_cpu) return VV_ERR_UNSUPPORTED;
+        const bool build_ref = cache->ref_ready && !cache->ref_ready[layer];
+        s = vv_kv_quant_store_dev(
+            k, v, cache->k_cache[layer], cache->v_cache[layer],
+            cache->k_meta ? cache->k_meta[layer] : NULL,
+            cache->v_meta ? cache->v_meta[layer] : NULL,
+            cache->k_ref ? cache->k_ref[layer] : NULL, build_ref,
+            cache->n_kv_heads, cache->head_dim,
+            cache->current_len, seq_len, cache->format, stream);
+        if (s == VV_OK && build_ref) cache->ref_ready[layer] = true;
     }
+    if (s != VV_OK) return s;
 
-    /* Only increment on last layer to keep it consistent */
-    if (layer == cache->num_layers - 1) {
-        cache->current_len += seq_len;
-    }
-
+    /* current_len advances once per position, not once per layer. */
+    if (layer == cache->num_layers - 1) cache->current_len += seq_len;
     return VV_OK;
 }
 
@@ -122,33 +182,47 @@ vv_status_t vv_kv_cache_get(const vv_kv_cache_t* cache, int layer,
     return VV_OK;
 }
 
+vv_status_t vv_kv_cache_get_meta(const vv_kv_cache_t* cache, int layer,
+                                 const void** k_meta, const void** v_meta) {
+    if (!cache || !k_meta || !v_meta) return VV_ERR_NULL_PTR;
+    if (layer < 0 || layer >= cache->num_layers) return VV_ERR_INVALID_ARG;
+
+    *k_meta = cache->k_meta ? cache->k_meta[layer] : NULL;
+    *v_meta = cache->v_meta ? cache->v_meta[layer] : NULL;
+    return VV_OK;
+}
+
 vv_status_t vv_kv_cache_reset(vv_kv_cache_t* cache) {
     if (!cache) return VV_ERR_NULL_PTR;
     cache->current_len = 0;
+    /* The reference key is tied to the keys currently stored; a new session
+     * must derive a fresh one from its own first chunk. */
+    if (cache->ref_ready)
+        memset(cache->ref_ready, 0, (size_t)cache->num_layers * sizeof(bool));
     return VV_OK;
 }
 
 vv_status_t vv_kv_cache_free(vv_kv_cache_t* cache) {
     if (!cache) return VV_ERR_NULL_PTR;
 
-    if (cache->k_cache) {
-        for (int i = 0; i < cache->num_layers; i++) {
-            if (cache->k_cache[i]) {
-                if (cache->on_cpu) vv_free(cache->k_cache[i]);
-                else vv_dev_free(cache->k_cache[i]);
-            }
-        }
-        vv_free(cache->k_cache);
-    }
-    if (cache->v_cache) {
-        for (int i = 0; i < cache->num_layers; i++) {
-            if (cache->v_cache[i]) {
-                if (cache->on_cpu) vv_free(cache->v_cache[i]);
-                else vv_dev_free(cache->v_cache[i]);
-            }
-        }
-        vv_free(cache->v_cache);
-    }
+    #define FREE_ARRAY(arr) do {                                            \
+        if (arr) {                                                          \
+            for (int i = 0; i < cache->num_layers; i++)                     \
+                if ((arr)[i]) {                                             \
+                    if (cache->on_cpu) vv_free((arr)[i]);                   \
+                    else vv_dev_free((arr)[i]);                             \
+                }                                                           \
+            vv_free(arr);                                                   \
+        }                                                                   \
+    } while (0)
+
+    FREE_ARRAY(cache->k_cache);
+    FREE_ARRAY(cache->v_cache);
+    FREE_ARRAY(cache->k_meta);
+    FREE_ARRAY(cache->v_meta);
+    FREE_ARRAY(cache->k_ref);
+    #undef FREE_ARRAY
+    if (cache->ref_ready) vv_free(cache->ref_ready);
 
     vv_free(cache);
     return VV_OK;

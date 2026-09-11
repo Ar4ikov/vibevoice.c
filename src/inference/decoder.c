@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <time.h>
 #include "vibevoice/device.h"
+#include "vibevoice/kv_quant.h"
 
 
 /* ─── CUDA kernel forward declarations ──────────────────────────────────── */
@@ -413,16 +414,47 @@ static vv_status_t decoder_layer_impl(
          * length from this call's position instead.
          */
         const int actual_cache_len = position_offset + seq_len;
+        const vv_kv_format_t fmt = (vv_kv_format_t)kv_cache->format;
 
-        if (seq_len > 1) {
-            s = vv_gqa_attention_prefill_cached_dev(
-                q_buf, k_cached, v_cached, attn_out,
-                n_heads, n_kv_heads, head_dim,
-                seq_len, position_offset, actual_cache_len, true, stream);
+        if (fmt == VV_KV_FP16) {
+            if (seq_len > 1) {
+                s = vv_gqa_attention_prefill_cached_dev(
+                    q_buf, k_cached, v_cached, attn_out,
+                    n_heads, n_kv_heads, head_dim,
+                    seq_len, position_offset, actual_cache_len, true, stream);
+            } else {
+                s = vv_gqa_attention_decode_dev(
+                    q_buf, k_cached, v_cached, attn_out,
+                    n_heads, n_kv_heads, head_dim, actual_cache_len, stream);
+            }
         } else {
-            s = vv_gqa_attention_decode_dev(
-                q_buf, k_cached, v_cached, attn_out,
-                n_heads, n_kv_heads, head_dim, actual_cache_len, stream);
+            const void *k_meta, *v_meta;
+            vv_kv_cache_get_meta(kv_cache, layer_idx, &k_meta, &v_meta);
+            /*
+             * TurboQuant stores rotated vectors. The transform is orthogonal,
+             * so instead of inverting it per key we rotate Q once here and
+             * undo the rotation on the output; the kernels then read stored
+             * values directly.
+             */
+            if (vv_kv_rotates(fmt)) {
+                s = vv_kv_rotate_dev(q_buf, n_heads, head_dim, seq_len, stream);
+                if (s != VV_OK) return s;
+            }
+            if (seq_len > 1) {
+                s = vv_gqa_attention_prefill_q_dev(
+                    q_buf, k_cached, v_cached, k_meta, v_meta, attn_out,
+                    n_heads, n_kv_heads, head_dim,
+                    seq_len, position_offset, actual_cache_len, true,
+                    (int)fmt, stream);
+            } else {
+                s = vv_gqa_attention_decode_q_dev(
+                    q_buf, k_cached, v_cached, k_meta, v_meta, attn_out,
+                    n_heads, n_kv_heads, head_dim, actual_cache_len,
+                    (int)fmt, stream);
+            }
+            if (s == VV_OK && vv_kv_rotates(fmt))
+                s = vv_kv_unrotate_dev(attn_out, n_heads, head_dim,
+                                       seq_len, stream);
         }
     }
     if (s != VV_OK) return s;

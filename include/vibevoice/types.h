@@ -227,7 +227,7 @@ typedef enum vv_placement {
 /** @brief Parameters for vv_inference_init(). Pass NULL for defaults. */
 typedef struct vv_init_params {
     float  vram_budget;   /**< 0.0-1.0 fraction of free VRAM. Default: 1.0   */
-    bool   kv_fp8;        /**< Use FP8 KV-cache (halves KV memory)           */
+    int    kv_format;     /**< vv_kv_format_t for the KV cache. 0 = FP16     */
     bool   cpu_only;      /**< Force CPU-only mode (vram_budget=0 shortcut)  */
     int    max_seq_len;   /**< KV-cache window in tokens. Default: 32768     */
 } vv_init_params_t;
@@ -236,7 +236,7 @@ typedef struct vv_init_params {
 static inline vv_init_params_t vv_init_params_default(void) {
     vv_init_params_t p;
     p.vram_budget = 1.0f;
-    p.kv_fp8 = false;
+    p.kv_format = 0;
     p.cpu_only = false;
     p.max_seq_len = 32768;
     return p;
@@ -314,7 +314,7 @@ typedef struct vv_perf_metrics {
     /* Model info */
     int    num_layers;           /**< Transformer layers                    */
     int    hidden_size;          /**< Hidden dimension                      */
-    bool   kv_fp8;               /**< Whether KV cache uses FP8             */
+    int    kv_format;            /**< vv_kv_format_t of the KV cache        */
     size_t workspace_mb;         /**< Allocated workspace in MB             */
 } vv_perf_metrics_t;
 

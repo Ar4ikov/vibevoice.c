@@ -6,10 +6,11 @@
  *   vv_cli --model <path> --audio <file.wav> [--output <file.json>]
  *          [--gpu <id>] [--max-tokens <N>] [--hotwords "word1,word2"]
  *          [--trt-acoustic <plan>] [--trt-semantic <plan>]
- *          [--kv-fp8] [--verbose]
+ *          [--kv-cache FMT] [--verbose]
  */
 
 #include "vibevoice/vibevoice.h"
+#include "vibevoice/kv_quant.h"
 #include "vibevoice/audio.h"
 #include "vibevoice/inference.h"
 
@@ -43,7 +44,7 @@ typedef struct {
     int         gpu_id;
     int         max_tokens;
     int         max_seq_len;
-    bool        kv_fp8;
+    const char* kv_cache;
     bool        cpu_only;
     float       vram_budget;
     bool        verbose;
@@ -93,7 +94,8 @@ static void print_usage(const char* prog) {
         "  --hotwords <words>    Comma-separated hotwords\n"
         "  --trt-acoustic <plan> TensorRT engine for acoustic encoder\n"
         "  --trt-semantic <plan> TensorRT engine for semantic encoder\n"
-        "  --kv-fp8              FP8 KV-cache (NOT IMPLEMENTED — errors out)\n"
+        "  --kv-cache FMT        KV-cache storage: fp16 (default), fp8,\n"
+        "                        fp8-e5m2, tq4, tq3, tq2, tq1.5\n"
         "  --vram-budget <0-1>   VRAM fraction for model (default: 1.0)\n"
         "  --cpu                 CPU-only mode (no GPU)\n"
         "  --verbose             Enable debug logging\n"
@@ -125,8 +127,8 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->trt_acoustic = argv[++i];
         } else if (strcmp(argv[i], "--trt-semantic") == 0 && i + 1 < argc) {
             args->trt_semantic = argv[++i];
-        } else if (strcmp(argv[i], "--kv-fp8") == 0) {
-            args->kv_fp8 = true;
+        } else if (strcmp(argv[i], "--kv-cache") == 0 && i + 1 < argc) {
+            args->kv_cache = argv[++i];
         } else if (strcmp(argv[i], "--vram-budget") == 0 && i + 1 < argc) {
             args->vram_budget = (float)atof(argv[++i]);
             if (args->vram_budget < 0.0f) args->vram_budget = 0.0f;
@@ -193,7 +195,15 @@ int main(int argc, char** argv) {
     t0 = get_time_ms();
     vv_inference_ctx_t* ctx = NULL;
     vv_init_params_t init_params = vv_init_params_default();
-    init_params.kv_fp8 = args.kv_fp8;
+    if (args.kv_cache) {
+        vv_kv_format_t f = vv_kv_format_parse(args.kv_cache);
+        if (f >= VV_KV_FORMAT_COUNT) {
+            fprintf(stderr, "error: unknown --kv-cache format '%s'\n",
+                    args.kv_cache);
+            return 1;
+        }
+        init_params.kv_format = (int)f;
+    }
     init_params.vram_budget = args.vram_budget;
     init_params.cpu_only = args.cpu_only;
     if (args.max_seq_len > 0) init_params.max_seq_len = args.max_seq_len;
@@ -338,7 +348,7 @@ int main(int argc, char** argv) {
                perf->kv_cache_used, perf->kv_cache_max,
                perf->kv_cache_pct);
         printf("    Format               %8s\n",
-               perf->kv_fp8 ? "FP8" : "FP16");
+               vv_kv_format_name((vv_kv_format_t)perf->kv_format));
 
         /* GPU memory */
         if (perf->vram_total_bytes > 0) {

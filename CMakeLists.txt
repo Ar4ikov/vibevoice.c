@@ -142,6 +142,7 @@ add_library(vibevoice_core STATIC
     src/model/config.c
     src/model/loader.c
     src/quant/nf4_table.c
+    src/quant/kv_format.c
     src/quant/dequant_cpu.c
     src/cpu/cpu_kernels.c
     src/inference/pipeline.c
@@ -172,6 +173,7 @@ if(VV_HAS_CUDA)
     add_library(vibevoice_cuda STATIC
         src/cuda/dequant_nf4.cu
         src/cuda/nf4_gemv.cu
+        src/cuda/kv_quant.cu
         src/cuda/lm_head.cu
         src/cuda/conv1d.cu
         src/cuda/conv_vae.cu
@@ -250,6 +252,7 @@ if(VV_BUILD_TESTS)
     vv_add_test(test_nf4 tests/test_nf4.c)
     vv_add_test(test_conv_vae tests/test_conv_vae.c)
     vv_add_test(test_tokenizer tests/test_tokenizer.c)
+    vv_add_test(test_kv_quant tests/test_kv_quant.c)
     vv_add_test(test_e2e tests/test_e2e.c)
 endif()
 

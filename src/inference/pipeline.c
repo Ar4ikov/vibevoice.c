@@ -37,6 +37,7 @@ static double vv_time_ms(void) {
 #else
 #include <time.h>
 #include "vibevoice/device.h"
+#include "vibevoice/kv_quant.h"
 static double vv_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -286,17 +287,16 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     vv_init_params_t p = params ? *params : vv_init_params_default();
     bool cpu_only = p.cpu_only || p.vram_budget <= 0.0f;
 
-    /*
-     * FP8 KV is only wired into the allocator: nothing converts on append and
-     * the attention kernels read half. Half-sized rows would be read as FP16
-     * and produce silent garbage, so refuse instead. Use --max-seq-len to trim
-     * the window when VRAM is tight.
-     */
-    if (p.kv_fp8) {
-        VV_LOG_E("inference: --kv-fp8 is not implemented "
-                 "(attention kernels are FP16-only); "
-                 "use --max-seq-len to bound KV memory instead");
-        return VV_ERR_UNSUPPORTED;
+    if (p.kv_format < 0 || p.kv_format >= VV_KV_FORMAT_COUNT) {
+        VV_LOG_E("inference: unknown KV-cache format");
+        return VV_ERR_INVALID_ARG;
+    }
+    /* Only the FP16 store has a CPU implementation of the append path. */
+    if (cpu_only && p.kv_format != VV_KV_FP16) {
+        VV_LOG_W("inference: KV format %s needs a device; "
+                 "falling back to fp16 on CPU",
+                 vv_kv_format_name((vv_kv_format_t)p.kv_format));
+        p.kv_format = VV_KV_FP16;
     }
 
     VV_LOG_I("inference: initializing from '%s' %s (budget=%.0f%%)",
@@ -346,10 +346,9 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         size_t embed_sz = c->model->embed_tokens.size_bytes;
         size_t lm_head_sz = c->model->lm_head.size_bytes;
 
-        size_t kv_elem = p.kv_fp8 ? 1 : 2;
-        size_t kv_per_token = (size_t)2 * (size_t)llm->num_hidden_layers
-                            * (size_t)llm->num_key_value_heads
-                            * (size_t)llm->head_dim * kv_elem;
+        size_t kv_per_token = vv_kv_cache_bytes(
+            llm->num_hidden_layers, llm->num_key_value_heads,
+            llm->head_dim, 1, p.kv_format);
         size_t ws_target = (size_t)512 * 1024 * 1024;
 
         /*
@@ -384,12 +383,11 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     /* ── CPU-only path: skip all CUDA ── */
     if (c->placement == VV_PLACE_CPU_ONLY) {
         c->use_gpu = false;
-        /* KV cache on CPU — FP32 (no FP8 on CPU for simplicity) */
         s = vv_kv_cache_create(&c->kv_cache,
                                 llm->num_hidden_layers,
                                 llm->num_key_value_heads,
                                 llm->head_dim,
-                                max_seq, false, true);
+                                max_seq, VV_KV_FP16, true);
         if (s != VV_OK) {
             VV_LOG_E("inference: failed to create CPU KV-cache");
             vv_model_free(c->model);
@@ -437,7 +435,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
                             llm->num_hidden_layers,
                             llm->num_key_value_heads,
                             llm->head_dim,
-                            max_seq, p.kv_fp8, false);
+                            max_seq, p.kv_format, false);
     if (s != VV_OK) {
         VV_LOG_E("inference: failed to create KV-cache");
         goto fail_gpu;
@@ -830,7 +828,7 @@ static vv_status_t transcribe_gpu(
     perf->audio_duration_sec = (float)num_samples / 24000.0f;
     perf->num_layers = ctx->model->num_layers;
     perf->hidden_size = hs;
-    perf->kv_fp8 = ctx->kv_cache ? ctx->kv_cache->fp8 : false;
+    perf->kv_format = ctx->kv_cache ? ctx->kv_cache->format : VV_KV_FP16;
     perf->workspace_mb = ctx->workspace_size / (1024 * 1024);
 
     VV_LOG_I("inference: GPU transcribe %d samples (%.2f sec)",
@@ -1413,7 +1411,7 @@ static vv_status_t transcribe_cpu(
     perf->audio_duration_sec = (float)num_samples / 24000.0f;
     perf->num_layers = ctx->model->num_layers;
     perf->hidden_size = hs;
-    perf->kv_fp8 = false;
+    perf->kv_format = VV_KV_FP16;
     perf->workspace_mb = ctx->workspace_size / (1024 * 1024);
 
     VV_LOG_I("inference: CPU transcribe %d samples (%.2f sec)",

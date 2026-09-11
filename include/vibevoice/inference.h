@@ -21,25 +21,36 @@ extern "C" {
  * FP16 by default. FP8 option for memory savings.
  */
 typedef struct vv_kv_cache {
-    void**   k_cache;         /**< [num_layers] pointers to K cache          */
-    void**   v_cache;         /**< [num_layers] pointers to V cache          */
+    void**   k_cache;         /**< [num_layers] pointers to K store          */
+    void**   v_cache;         /**< [num_layers] pointers to V store          */
+    void**   k_meta;          /**< [num_layers] per-vector scales, or NULL   */
+    void**   v_meta;
+    void**   k_ref;           /**< [num_layers] reference key, or NULL       */
+    bool*    ref_ready;       /**< [num_layers] reference computed yet       */
     int      num_layers;
     int      n_kv_heads;
     int      head_dim;
     int      max_seq_len;     /**< Maximum cache capacity */
     int      current_len;     /**< Current number of cached positions */
-    bool     fp8;             /**< Use FP8 KV-cache for memory savings */
+    int      format;          /**< vv_kv_format_t storage format             */
+    int      bytes_per_vec;   /**< Store bytes for one head's vector         */
     bool     on_cpu;          /**< true = CPU RAM, false = GPU VRAM */
+    size_t   bytes_total;     /**< Store + metadata, all layers              */
 } vv_kv_cache_t;
 
 /**
  * @brief Allocate KV-cache (GPU or CPU).
+ * @param format  vv_kv_format_t: FP16, emulated FP8, or TurboQuant.
  * @param on_cpu  If true, allocate in CPU RAM instead of GPU VRAM.
  */
 vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
                                 int num_layers, int n_kv_heads,
                                 int head_dim, int max_seq_len,
-                                bool fp8, bool on_cpu);
+                                int format, bool on_cpu);
+
+/** @brief Bytes a cache of this shape and format would occupy. */
+size_t vv_kv_cache_bytes(int num_layers, int n_kv_heads, int head_dim,
+                         int max_seq_len, int format);
 
 /**
  * @brief Append new K, V to cache at current position.
@@ -53,6 +64,10 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
  */
 vv_status_t vv_kv_cache_get(const vv_kv_cache_t* cache, int layer,
                               const void** k, const void** v, int* len);
+
+/** @brief Metadata pointers for a layer; both NULL unless the format has any. */
+vv_status_t vv_kv_cache_get_meta(const vv_kv_cache_t* cache, int layer,
+                                 const void** k_meta, const void** v_meta);
 
 /**
  * @brief Reset cache (for new inference).

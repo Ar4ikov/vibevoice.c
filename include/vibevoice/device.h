@@ -154,12 +154,38 @@ vv_status_t vv_gqa_attention_decode_q_dev(
     int n_q_heads, int n_kv_heads, int head_dim, int cache_len,
     int kv_format, void* stream);
 
-/** @brief Quantize one position's K/V vectors into the packed cache. */
+/** @brief Flash prefill against a quantized KV cache (see kv_quant.h). */
+vv_status_t vv_gqa_attention_prefill_q_dev(
+    const void* q, const void* k_store, const void* v_store,
+    const void* k_meta, const void* v_meta, void* output,
+    int n_q_heads, int n_kv_heads, int head_dim,
+    int q_len, int q_offset, int kv_len, bool causal,
+    int kv_format, void* stream);
+
+/**
+ * @brief Quantize a run of K/V vectors into the packed cache.
+ *
+ * @param k_ref     Per-head reference key subtracted before quantizing K.
+ *                  Softmax is invariant to a constant shift of every key, so
+ *                  this costs nothing in accuracy and buys a great deal: in
+ *                  Qwen2 the keys share a large common component (|k| = 273
+ *                  against |k - mean| = 11), and quantizing the difference
+ *                  instead is the whole reason sub-byte KV is usable here.
+ * @param build_ref Compute k_ref from this run first (the first prefill
+ *                  chunk of a session); afterwards the same reference must
+ *                  be reused for every position in the cache.
+ */
 vv_status_t vv_kv_quant_store_dev(
     const void* k_fp16, const void* v_fp16,
     void* k_store, void* v_store, void* k_meta, void* v_meta,
-    int n_kv_heads, int head_dim, int pos, int max_pos,
+    void* k_ref, bool build_ref,
+    int n_kv_heads, int head_dim, int pos,
     int n_positions, int kv_format, void* stream);
+
+/** @brief Unpack a quantized KV store back to FP16 (tests, CPU offload). */
+vv_status_t vv_kv_dequant_dev(
+    const void* store, const void* meta, const void* ref, void* out_fp16,
+    int n_kv_heads, int head_dim, int n_pos, int kv_format, void* stream);
 
 /* ─── LM head ────────────────────────────────────────────────────────────── */
 
