@@ -7,36 +7,43 @@
 
 ---
 
-## 0. Статус (проверено на RTX 3090, CUDA 12.4)
+## 0. Статус (проверено на RTX 3090 + Ryzen 9 5900X, CUDA 12.4)
 
-Runtime работает end-to-end и **побайтово совпадает с PyTorch-эталоном**
-(`transformers` + `bitsandbytes`, тот же чекпоинт) на:
+Runtime работает end-to-end и **посимвольно совпадает с PyTorch-эталоном**
+(`transformers` + `bitsandbytes`, тот же чекпоинт) на 11 c, 120 c (два
+сегмента, два говорящих) и 32 минутах.
 
-* 11 c моно 24 кГц — транскрипт идентичен;
-* 120 c, два стриминговых сегмента, два говорящих — транскрипт идентичен,
-  диаризация и таймстемпы совпадают;
-* 274 c, 5 сегментов — валидный JSON, 24 сегмента.
+| Метрика | Факт |
+|---|---|
+| Загрузка модели | **9.5 c** (NF4), 14.0 c (AWQ, включая репак) |
+| Speech encoding | **243 мс** на 11 c аудио |
+| Prefill | **2127 tok/s** |
+| Decode | **123 tok/s** (0.2K ctx), 100 (1.5K), 57 (24K) |
+| RTF | **0.065** (120 c), **0.120** (32 мин) |
+| VRAM | 9.8 GB (3.2 веса + 1.8 KV на 32K) |
+| CPU-only | 7.9 tok/s, RTF 1.24, вывод идентичен GPU |
 
-Измерено (RTX 3090, `--max-seq-len 32768`, все веса резидентны в VRAM):
+Для сравнения: `transformers` + `bitsandbytes` на той же карте — 27.6 tok/s.
 
-| Метрика | Цель CLAUDE.md | Факт |
-|---|---|---|
-| Загрузка модели | < 10 c | **9.5 c** |
-| Speech encoding (11 c аудио) | < 500 мс | **243 мс** |
-| Prefill | < 300 мс / 1K | **82 мс / 143 tok**, ~490 мс / 1K |
-| Decode | > 50 tok/s | **123 tok/s** (контекст 0.2K), 106 (1.5K), 67 (24K) |
-| RTF | < 1.0 | **0.061** (120 c), **0.102** (32 мин) |
-| VRAM | < 10 GB | 9.8 GB (из них 1.8 GB — KV на 32K) |
+Релизный бинарник: **9.6 MB**, зависит только от libc и libm. Статический
+cudart, cuBLAS не используется (свои WMMA-ядра, быстрее cuBLAS на этих
+формах), cubin для sm_75..sm_90 + PTX. Стартует и без драйвера NVIDIA —
+тогда работает CPU-путь.
 
-Из 8.1 мс на токен (контекст 1.5K): 6.8 мс — 28 слоёв трансформера,
-1.26 мс — lm_head + argmax (это уже 865 GB/s, почти потолок 3090).
+### Что умеет
 
-Для сравнения: `transformers` + `bitsandbytes` на той же карте — 27.6 tok/s,
-то есть C-runtime быстрее в **3.9×**.
-
-Проверено на длинном аудио: 32 минуты (1918 c) → 32 стриминговых сегмента,
-14449 токенов prefill, 9524 сгенерированных, 168 сегментов в JSON,
-195 c общего времени, VRAM не растёт (9.8 GB).
+* `vv_cli` — транскрипция файла; `serve` — OpenAI-совместимый HTTP
+  (совместим с бэкендом speech-to-text в GPUStack); `chat` — интерактивный
+  цикл с горячей моделью; `mic` — живая транскрипция с VAD.
+* Веса: NF4 (bitsandbytes), AWQ, GPTQ. AWQ/GPTQ перепаковываются при
+  загрузке в row-major INT4G (иначе GEMV не коалесится).
+* KV-кэш: `--kv-cache fp16|fp8|fp8-e5m2|tq4|tq3|tq2|tq1.5`. На 32K позиций
+  1792 → 896 / 462 / 350 / 238 / 182 MB. fp8, fp8-e5m2 и tq4 дают
+  идентичный транскрипт.
+* `--gpu-layers N` — сколько слоёв держать в VRAM, остальные стримятся с
+  перекрытием копирования и pinned-памятью. Полный стриминг на PCIe 4.0 x16
+  даёт 6.6 tok/s при 21.8 GB/s — это насыщенная шина.
+* `--slots N` в сервере — N одновременных запросов на одной копии весов.
 
 ### Что было сломано (и почему это стоит помнить)
 
@@ -53,19 +60,39 @@ Runtime работает end-to-end и **побайтово совпадает �
    causal-лимита — варпы одного блока приходили к разному числу
    `__syncthreads()` и разносили общие K/V-тайлы.
 
+Позже нашлись ещё три:
+
+5. **Квантование K «как есть»** ломает вывод на любой разрядности, включая
+   FP8 (cos attention 0.86). У Qwen2 ключи имеют огромную общую компоненту:
+   ‖k‖ = 273 против ‖k − mean‖ = 11. Softmax инвариантен к сдвигу всех
+   ключей, поэтому кэш хранит K относительно опорного вектора слоя.
+6. **`vv_layer_prefetch_wait` определял резидентность слоя по `tensor.on_gpu`**,
+   который выставляет и staging — из-за этого compute-поток не ждал только
+   что начатое копирование. Проявилось после перехода на pinned-память.
+7. **Staging-буфер слоя** резервировал выравнивание на 16 тензоров при 20
+   живых — запись за границу слота.
+
 ### Формат промпта (точно как в `vibevoice_asr_processor.py`)
 
 ```
-<|im_start|>system\n
-You are a helpful assistant that transcribes audio input into text output in JSON format.<|im_end|>\n
-<|im_start|>user\n
-<|object_ref_start|>[<|box_start|> × ceil(N/3200)]<|object_ref_end|>\n
-This is a {dur:.2f} seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>\n
+<|im_start|>system
+
+You are a helpful assistant that transcribes audio input into text output in JSON format.<|im_end|>
+
+<|im_start|>user
+
+<|object_ref_start|>[<|box_start|> × ceil(N/3200)]<|object_ref_end|>
+
+This is a {dur:.2f} seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>
+
 ```
 
 **Generation prompt НЕ добавляется** — модель сама генерирует
-`<|im_start|>assistant\n`, а затем JSON-массив сегментов. С hotwords
-инструкция принимает вид `...seconds audio, with extra info: {ctx}\n\nPlease
+`<|im_start|>assistant
+`, а затем JSON-массив сегментов. С hotwords
+инструкция принимает вид `...seconds audio, with extra info: {ctx}
+
+Please
 transcribe it with these keys: ...`.
 
 Спец-токены (переиспользованные из Qwen2.5):
@@ -75,21 +102,18 @@ transcribe it with these keys: ...`.
 
 ### Что ещё не сделано
 
-* `--kv-fp8` — аллокатор умеет, ядра нет: флаг возвращает ошибку, а не тихий
-  мусор. Для экономии VRAM используйте `--max-seq-len`.
-* `src/trt/` — заглушки. CUDA-энкодер укладывается в 243 мс на 11 c аудио,
-  так что TensorRT может и не понадобиться.
-* Prefill-attention всё ещё O(S²) на самописном ядре без tensor cores:
-  до ~15K токенов нормально, дальше доминирует.
-* Decode делает ~500 запусков ядер на токен; CUDA Graphs и слияние
-  gate+up — очевидный следующий шаг.
-
-### Отличие от эталона, о котором надо знать
-
-Эталон при кодировании акустических латентов делает гауссову выборку
-(`fix_std/0.8 × randn` на батч, затем `mean + std × randn_like`). Runtime
-использует само среднее — детерминированно и воспроизводимо. На проверенных
-файлах транскрипт совпадает; при желании вернуть шум нужен seeded RNG.
+* **Metal.** На macOS работает CPU-путь (NEON, проверен под qemu-aarch64).
+  Бэкенд Metal не написан: его нельзя ни собрать, ни запустить с машины
+  разработки. Шов готов — `include/vibevoice/device.h` объявляет набор
+  операций, сборка линкует ровно одну реализацию, `src/device/device_none.c`
+  показывает форму.
+* **CUDA Graphs** — ~500 запусков ядер на токен.
+* **Tensor cores в prefill-attention** — всё ещё O(S²); до ~15K токенов
+  нормально, дальше доминирует (39 c из 231 c на 32-минутном файле).
+* **Упакованный CPU micro-kernel** — prefill на CPU идёт на ~20% пика FMA.
+  Тайлинг M и K пробовался и оказался медленнее.
+* `src/trt/` — заглушки.
+* Акустический латент берётся как среднее, без гауссовой выборки эталона.
 
 ---
 
@@ -346,6 +370,9 @@ vibevoice.c/
 │   │   ├── engine_runtime.c        # Engine load & execute
 │   │   └── trt_utils.c             # Error handling, logging for TRT
 │   │
+│   ├── device/                     # device_none.c — заглушка без ускорителя
+│   ├── engine/                     # пул слотов над одной копией весов
+│   ├── server/                     # HTTP + OpenAI-совместимый API
 │   └── inference/                  # Inference pipeline
 │       ├── pipeline.c              # Полный pipeline: audio → transcript
 │       ├── decoder.c               # Autoregressive decoder loop
@@ -354,7 +381,9 @@ vibevoice.c/
 │       └── postprocess.c           # Token stream → JSON transcription
 │
 ├── cli/
-│   └── main.c                      # CLI executable (vv_cli.exe)
+│   ├── main.c                      # транскрипция файла + диспетчер команд
+│   ├── cmd_serve.c                 # vv_cli serve
+│   └── cmd_chat.c                  # vv_cli chat / vv_cli mic
 │
 ├── tools/                          # Python утилиты (НЕ runtime)
 │   ├── convert_weights.py          # HF safetensors → .vvmodel
@@ -570,7 +599,19 @@ VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
 `ctest` без `VV_TEST_MODEL` тоже проходит — тесты, которым нужны веса,
-рапортуют SKIP.
+рапортуют SKIP. Всего 8 наборов.
+
+Релизная сборка (все архитектуры, статические рантаймы, без тестов):
+
+```bash
+scripts/build-release.sh          # Linux
+scripts/build-release.ps1         # Windows
+scripts/build-macos.sh            # macOS, CPU-путь
+```
+
+Кросс-проверка ARM64 (NEON) без Apple-железа: собрать с
+`-DCMAKE_TOOLCHAIN_FILE` на aarch64-linux-gnu и запустить
+`qemu-aarch64-static -L /usr/aarch64-linux-gnu build-arm64/test_cpu_kernels`.
 
 ### Windows
 
@@ -593,6 +634,19 @@ ctest --test-dir build --build-config Release --output-on-failure
 ```powershell
 # Базовая транскрипция
 vv_cli.exe --model ./model_hf --audio recording.wav --output transcript.json
+
+# HTTP-сервер (OpenAI-совместимый, годится как бэкенд GPUStack)
+vv_cli serve --model ./model_hf --port 8080 --slots 2 --kv-cache tq4
+
+# Интерактивный цикл с горячей моделью
+vv_cli chat --model ./model_hf
+
+# Живая транскрипция с микрофона (или WAV в реальном времени)
+vv_cli mic --model ./model_hf --timestamps
+vv_cli mic --model ./model_hf --from-file meeting.wav
+
+# Квантованный KV и частичный оффлоад
+vv_cli --model ./model_hf --audio long.wav --kv-cache tq4 --gpu-layers 20
 
 # С hotwords
 vv_cli.exe --model ./model_hf --audio meeting.wav --hotwords "VibeVoice,Azure"
