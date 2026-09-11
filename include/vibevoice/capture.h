@@ -103,6 +103,8 @@ typedef struct vv_vad_params {
     float hangover_ms;     /**< Silence needed to close a segment. Def. 700. */
     float pre_roll_ms;     /**< Audio kept before the trigger. Default 300.  */
     float max_segment_s;   /**< Force a cut after this long. Default 30.     */
+    float noise_margin_db; /**< Speech must beat the noise floor by this.    */
+    bool  adapt;           /**< Track the noise floor. Default true.         */
 } vv_vad_params_t;
 
 static inline vv_vad_params_t vv_vad_params_default(void) {
@@ -114,6 +116,8 @@ static inline vv_vad_params_t vv_vad_params_default(void) {
     p.hangover_ms = 700.0f;
     p.pre_roll_ms = 300.0f;
     p.max_segment_s = 30.0f;
+    p.noise_margin_db = 12.0f;
+    p.adapt = true;
     return p;
 }
 
@@ -146,6 +150,12 @@ bool vv_vad_active(const vv_vad_t* v);
 
 /** @brief Level of the most recent frame, in dBFS. */
 float vv_vad_level_db(const vv_vad_t* v);
+
+/** @brief Level a frame currently has to beat to open a segment, in dBFS. */
+float vv_vad_threshold_db(const vv_vad_t* v);
+
+/** @brief The tracked noise floor, in dBFS. */
+float vv_vad_noise_floor_db(const vv_vad_t* v);
 
 #ifdef __cplusplus
 }

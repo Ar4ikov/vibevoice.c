@@ -185,3 +185,58 @@ vv_status_t vv_audio_load_wav(const char* path, float** samples,
              total_samples, (int)fmt.sample_rate, n_channels, bps);
     return VV_OK;
 }
+
+/**
+ * @brief Write mono float samples as a 16-bit PCM WAV.
+ *
+ * Only used to save what the microphone actually captured, so 16-bit is
+ * enough: it is what every player and editor opens without questions.
+ */
+vv_status_t vv_audio_save_wav(const char* path, const float* pcm,
+                              int num_samples, int sample_rate) {
+    if (!path || !pcm) return VV_ERR_NULL_PTR;
+    if (num_samples <= 0 || sample_rate <= 0) return VV_ERR_INVALID_ARG;
+
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        VV_LOG_E("wav: cannot create %s", path);
+        return VV_ERR_IO;
+    }
+
+    const uint32_t data_bytes = (uint32_t)num_samples * 2u;
+    const uint32_t riff_size  = 36u + data_bytes;
+    const uint32_t byte_rate  = (uint32_t)sample_rate * 2u;
+
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&riff_size, 4, 1, f);
+    fwrite("WAVEfmt ", 1, 8, f);
+    const uint32_t fmt_size = 16;
+    const uint16_t fmt_tag = WAV_FORMAT_PCM, channels = 1;
+    const uint16_t block_align = 2, bits = 16;
+    const uint32_t sr = (uint32_t)sample_rate;
+    fwrite(&fmt_size, 4, 1, f);
+    fwrite(&fmt_tag, 2, 1, f);
+    fwrite(&channels, 2, 1, f);
+    fwrite(&sr, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    fwrite(&block_align, 2, 1, f);
+    fwrite(&bits, 2, 1, f);
+    fwrite("data", 1, 4, f);
+    fwrite(&data_bytes, 4, 1, f);
+
+    for (int i = 0; i < num_samples; i++) {
+        float v = pcm[i];
+        if (v > 1.0f) v = 1.0f;
+        if (v < -1.0f) v = -1.0f;
+        const int16_t s = (int16_t)(v * 32767.0f);
+        fwrite(&s, 2, 1, f);
+    }
+
+    const bool ok = (ferror(f) == 0);
+    fclose(f);
+    if (!ok) {
+        VV_LOG_E("wav: write failed for %s", path);
+        return VV_ERR_IO;
+    }
+    return VV_OK;
+}

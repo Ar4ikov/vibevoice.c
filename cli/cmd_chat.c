@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <math.h>
 
 static volatile int g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -29,7 +30,11 @@ typedef struct {
     const char* device;
     const char* mic_file;      /* feed a WAV instead of a device */
     const char* hotwords;
+    const char* save_dir;      /* write every captured utterance here */
     float start_db, stop_db, hangover_ms, max_segment_s;
+    float gain_db, noise_margin_db;
+    bool  no_adapt;
+    bool  meter;
     bool  timestamps;
     bool  list_devices;
     bool  verbose;
@@ -47,6 +52,13 @@ static void usage(const char* which) {
             "  --stop-db <dB>        Silence threshold (default: -45)\n"
             "  --hangover <ms>       Silence before a segment closes (700)\n"
             "  --max-segment <s>     Force a cut after this long (30)\n"
+            "  --gain <dB>           Amplify the captured signal\n"
+            "  --meter               Show the live input level and the gate\n"
+            "  --noise-margin <dB>   Speech must beat the noise floor by\n"
+            "                        this much (default: 12)\n"
+            "  --no-adapt            Take --start-db as-is, without tracking\n"
+            "                        the noise floor\n"
+            "  --save-audio <dir>    Write every captured utterance as WAV\n"
             "  --timestamps          Print segment start/end times\n");
     } else {
         fprintf(stderr,
@@ -79,6 +91,7 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
     a->stop_db = -45.0f;
     a->hangover_ms = 700.0f;
     a->max_segment_s = 30.0f;
+    a->noise_margin_db = vv_vad_params_default().noise_margin_db;
 
     for (int i = 0; i < argc; i++) {
         const char* s = argv[i];
@@ -104,6 +117,11 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
         else if (strcmp(s, "--stop-db") == 0 && next) a->stop_db = (float)atof(argv[++i]);
         else if (strcmp(s, "--hangover") == 0 && next) a->hangover_ms = (float)atof(argv[++i]);
         else if (strcmp(s, "--max-segment") == 0 && next) a->max_segment_s = (float)atof(argv[++i]);
+        else if (strcmp(s, "--gain") == 0 && next) a->gain_db = (float)atof(argv[++i]);
+        else if (strcmp(s, "--noise-margin") == 0 && next) a->noise_margin_db = (float)atof(argv[++i]);
+        else if (strcmp(s, "--no-adapt") == 0) a->no_adapt = true;
+        else if (strcmp(s, "--save-audio") == 0 && next) a->save_dir = argv[++i];
+        else if (strcmp(s, "--meter") == 0) a->meter = true;
         else if (strcmp(s, "--list-devices") == 0) a->list_devices = true;
         else if (strcmp(s, "--timestamps") == 0) a->timestamps = true;
         else if (strcmp(s, "--cpu") == 0) a->ep.cpu_only = true;
@@ -170,6 +188,56 @@ static void print_result(const vv_transcription_t* tr,
                 tr->duration, perf->total_ms, perf->rtf,
                 perf->decode_tok_per_sec);
     fflush(stdout);
+}
+
+/* ─── input level meter ──────────────────────────────────────────────────── */
+
+/**
+ * @brief Redraw the one-line level meter in place.
+ *
+ * Answers the question the transcript cannot: is anything reaching the
+ * microphone at all? A segment that comes back as `[Noise]` looks the same
+ * whether the speaker was too quiet, the wrong input was picked, or the room
+ * really was noisy -- the meter tells those apart while you speak.
+ */
+static void meter_draw(float db, float threshold_db, bool speech) {
+    const int width = 30;
+    /* -60 dBFS is inaudible, 0 is clipping; map that range onto the bar. */
+    float frac = (db + 60.0f) / 60.0f;
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    const int filled = (int)(frac * (float)width + 0.5f);
+
+    char bar[64];
+    for (int i = 0; i < width; i++) bar[i] = (i < filled) ? '#' : '.';
+    bar[width] = '\0';
+    /* The gate is what the level has to beat; seeing both explains silence. */
+    fprintf(stderr, "\r  %6.1f dBFS [%s] gate %6.1f  %-7s", db, bar,
+            threshold_db, speech ? "speech" : "");
+    fflush(stderr);
+}
+
+/** @brief Wipe the meter line so a transcript starts on clean ground. */
+static void meter_clear(bool on) {
+    if (on) { fprintf(stderr, "\r%*s\r", 76, ""); fflush(stderr); }
+}
+
+/**
+ * @brief Save one captured utterance, so it can be listened to afterwards.
+ *
+ * The pipeline normalizes to -25 dBFS before the model sees anything, so a
+ * quiet recording is not itself the problem -- but a recording of the wrong
+ * input sounds wrong, and that is only audible by playing it back.
+ */
+static void save_utterance(const char* dir, int index, const float* pcm,
+                           int len) {
+    if (!dir || !dir[0] || len <= 0) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/utt-%04d.wav", dir, index);
+    if (vv_audio_save_wav(path, pcm, len, 24000) == VV_OK)
+        fprintf(stderr, "  saved %s (%.2f s)\n", path, len / 24000.0f);
+    else
+        fprintf(stderr, "  cannot write %s\n", path);
 }
 
 /* ─── devices ────────────────────────────────────────────────────────────── */
@@ -259,6 +327,8 @@ int vv_cmd_mic(int argc, char** argv) {
     vp.stop_db = a.stop_db;
     vp.hangover_ms = a.hangover_ms;
     vp.max_segment_s = a.max_segment_s;
+    vp.noise_margin_db = a.noise_margin_db;
+    vp.adapt = !a.no_adapt;
 
     vv_vad_t* vad = NULL;
     if (vv_vad_create(&vp, &vad) != VV_OK) {
@@ -284,8 +354,11 @@ int vv_cmd_mic(int argc, char** argv) {
     build_params(&ip, a.hotwords, hot_scratch, sizeof(hot_scratch),
                  hot_list, 32);
 
+    const float gain = (a.gain_db != 0.0f) ? powf(10.0f, a.gain_db / 20.0f)
+                                           : 1.0f;
     float buf[4096];
     int n_segments = 0;
+    int since_meter = 0;
     while (!g_stop) {
         const int got = vv_mic_read(mic, buf, (int)(sizeof(buf) / sizeof(buf[0])));
         if (got == 0) {
@@ -293,11 +366,25 @@ int vv_cmd_mic(int argc, char** argv) {
             vv_msleep(5);
             continue;
         }
+        if (gain != 1.0f)
+            for (int i = 0; i < got; i++) buf[i] *= gain;
 
         float* seg = NULL;
         int seg_len = 0;
         bool have = vv_vad_push(vad, buf, got, &seg, &seg_len);
+
+        if (a.meter) {
+            since_meter += got;
+            if (since_meter >= 2400) {          /* ~10 redraws a second */
+                since_meter = 0;
+                meter_draw(vv_vad_level_db(vad), vv_vad_threshold_db(vad),
+                           vv_vad_active(vad));
+            }
+        }
+
         while (have) {
+            meter_clear(a.meter);
+            save_utterance(a.save_dir, n_segments, seg, seg_len);
             vv_transcription_t* tr = NULL;
             vv_perf_metrics_t perf;
             memset(&perf, 0, sizeof(perf));
@@ -312,12 +399,14 @@ int vv_cmd_mic(int argc, char** argv) {
             have = vv_vad_drain(vad, &seg, &seg_len);
         }
     }
+    meter_clear(a.meter);
 
     /* Whatever is still open at the end is still worth transcribing. */
     {
         float* seg = NULL;
         int seg_len = 0;
         if (vv_vad_flush(vad, &seg, &seg_len)) {
+            save_utterance(a.save_dir, n_segments, seg, seg_len);
             vv_transcription_t* tr = NULL;
             vv_perf_metrics_t perf;
             memset(&perf, 0, sizeof(perf));

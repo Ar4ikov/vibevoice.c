@@ -29,6 +29,17 @@ vv_status_t vv_audio_load_wav(const char* path, float** samples,
                                int* num_samples, int* sample_rate);
 
 /**
+ * @brief Write mono float samples as a 16-bit PCM WAV.
+ *
+ * @param path         Destination file, overwritten if it exists
+ * @param pcm          Mono samples in [-1, 1]; anything outside is clipped
+ * @param num_samples  Number of samples
+ * @param sample_rate  Sample rate to record in the header
+ */
+vv_status_t vv_audio_save_wav(const char* path, const float* pcm,
+                              int num_samples, int sample_rate);
+
+/**
  * @brief Resample audio to target sample rate using sinc interpolation.
  *
  * @param in         Input samples

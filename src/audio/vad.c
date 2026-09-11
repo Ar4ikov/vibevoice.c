@@ -46,7 +46,31 @@ struct vv_vad {
     int    silence_run;    /* samples below stop_db      */
     int    speech_run;     /* samples above start_db     */
     float  level_db;
+    float  floor_db;       /* tracked noise floor        */
+    bool   floor_init;     /* seeded from the first frame */
 };
+
+/**
+ * @brief Level a frame has to beat to open a segment, right now.
+ *
+ * A fixed threshold assumes a quiet room. Plug in an audio interface with its
+ * preamp up and the noise floor alone sits near -38 dBFS, so every frame
+ * looks like speech and the model dutifully transcribes `[Noise]`. Tracking
+ * the floor and asking speech to beat it by a margin makes the gate mean the
+ * same thing on a laptop mic and on a hot line input; the configured
+ * thresholds stay as a lower bound, so this can only make the gate stricter.
+ */
+static float start_threshold(const vv_vad_t* v) {
+    if (!v->p.adapt) return v->p.start_db;
+    const float adaptive = v->floor_db + v->p.noise_margin_db;
+    return adaptive > v->p.start_db ? adaptive : v->p.start_db;
+}
+
+/** @brief Closing threshold, keeping the configured hysteresis gap. */
+static float stop_threshold(const vv_vad_t* v) {
+    const float gap = v->p.start_db - v->p.stop_db;   /* usually 7 dB */
+    return start_threshold(v) - (gap > 0.0f ? gap : 0.0f);
+}
 
 static float frame_db(const float* x, int n) {
     double s = 0.0;
@@ -97,6 +121,8 @@ vv_status_t vv_vad_create(const vv_vad_params_t* params, vv_vad_t** out) {
     v->p = p;
     v->frame = p.sample_rate * FRAME_MS / 1000;
     v->level_db = -120.0f;
+    /* Start pessimistic: the first frames raise it to whatever the room is. */
+    v->floor_db = -90.0f;
 
     v->acc = (float*)vv_alloc((size_t)v->frame * sizeof(float));
     v->pre_cap = (int)(p.pre_roll_ms * 0.001f * (float)p.sample_rate) + 1;
@@ -119,6 +145,14 @@ void vv_vad_free(vv_vad_t* v) {
 bool vv_vad_active(const vv_vad_t* v) { return v && v->active; }
 float vv_vad_level_db(const vv_vad_t* v) { return v ? v->level_db : -120.0f; }
 
+float vv_vad_threshold_db(const vv_vad_t* v) {
+    return v ? start_threshold(v) : 0.0f;
+}
+
+float vv_vad_noise_floor_db(const vv_vad_t* v) {
+    return v ? v->floor_db : -120.0f;
+}
+
 /** @brief Hand the accumulated segment to the caller and start a new one. */
 static bool emit(vv_vad_t* v, float** out_pcm, int* out_len) {
     if (v->seg_len <= 0) { v->active = false; return false; }
@@ -136,6 +170,23 @@ static bool process_frame(vv_vad_t* v, const float* f, int n,
     const float db = frame_db(f, n);
     v->level_db = db;
 
+    /*
+     * Follow the floor down quickly and up slowly: a pause should re-learn a
+     * quieter room within a frame or two, while a burst of speech must not
+     * drag the floor up behind it. Only quiet frames are sampled, so the
+     * floor tracks the room rather than the talker.
+     */
+    if (!v->floor_init) {
+        /* Seed from the very first frame: a slow climb from silence would
+         * leave the gate wide open for the first seconds of a noisy input. */
+        v->floor_db = db;
+        v->floor_init = true;
+    } else if (!v->active && db < start_threshold(v)) {
+        const float rate = (db < v->floor_db) ? 0.5f : 0.05f;
+        v->floor_db += rate * (db - v->floor_db);
+    }
+    if (v->floor_db < -90.0f) v->floor_db = -90.0f;
+
     const int min_speech = (int)(v->p.min_speech_ms * 0.001f
                                  * (float)v->p.sample_rate);
     const int hangover = (int)(v->p.hangover_ms * 0.001f
@@ -144,7 +195,7 @@ static bool process_frame(vv_vad_t* v, const float* f, int n,
 
     if (!v->active) {
         pre_push(v, f, n);
-        if (db > v->p.start_db) {
+        if (db > start_threshold(v)) {
             v->speech_run += n;
             if (v->speech_run >= min_speech) {
                 v->active = true;
@@ -166,7 +217,7 @@ static bool process_frame(vv_vad_t* v, const float* f, int n,
         v->seg_len += n;
     }
 
-    if (db < v->p.stop_db) {
+    if (db < stop_threshold(v)) {
         v->silence_run += n;
         if (v->silence_run >= hangover) return emit(v, out_pcm, out_len);
     } else {
