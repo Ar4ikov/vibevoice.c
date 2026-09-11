@@ -11,10 +11,12 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /**
  * @brief Allocate GPU memory.
  */
-vv_status_t vv_cuda_alloc(void** ptr, size_t size) {
+vv_status_t vv_dev_alloc(void** ptr, size_t size) {
     if (!ptr) return VV_ERR_NULL_PTR;
     cudaError_t err = cudaMalloc(ptr, size);
     if (err == cudaErrorMemoryAllocation) return VV_ERR_CUDA_OOM;
@@ -25,7 +27,7 @@ vv_status_t vv_cuda_alloc(void** ptr, size_t size) {
 /**
  * @brief Allocate pinned (page-locked) host memory for fast transfers.
  */
-vv_status_t vv_cuda_alloc_pinned(void** ptr, size_t size) {
+vv_status_t vv_dev_alloc_pinned(void** ptr, size_t size) {
     if (!ptr) return VV_ERR_NULL_PTR;
     cudaError_t err = cudaMallocHost(ptr, size);
     if (err != cudaSuccess) return VV_ERR_CUDA;
@@ -35,7 +37,7 @@ vv_status_t vv_cuda_alloc_pinned(void** ptr, size_t size) {
 /**
  * @brief Free GPU memory.
  */
-vv_status_t vv_cuda_free(void* ptr) {
+vv_status_t vv_dev_free(void* ptr) {
     if (!ptr) return VV_OK;
     cudaError_t err = cudaFree(ptr);
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
@@ -44,7 +46,7 @@ vv_status_t vv_cuda_free(void* ptr) {
 /**
  * @brief Free pinned host memory.
  */
-vv_status_t vv_cuda_free_pinned(void* ptr) {
+vv_status_t vv_dev_free_pinned(void* ptr) {
     if (!ptr) return VV_OK;
     cudaError_t err = cudaFreeHost(ptr);
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
@@ -53,7 +55,7 @@ vv_status_t vv_cuda_free_pinned(void* ptr) {
 /**
  * @brief Copy host → device.
  */
-vv_status_t vv_cuda_memcpy_h2d(void* dst, const void* src, size_t size,
+vv_status_t vv_dev_memcpy_h2d(void* dst, const void* src, size_t size,
                                 void* stream) {
     cudaError_t err;
     if (stream) {
@@ -68,7 +70,7 @@ vv_status_t vv_cuda_memcpy_h2d(void* dst, const void* src, size_t size,
 /**
  * @brief Copy device → host.
  */
-vv_status_t vv_cuda_memcpy_d2h(void* dst, const void* src, size_t size,
+vv_status_t vv_dev_memcpy_d2h(void* dst, const void* src, size_t size,
                                 void* stream) {
     cudaError_t err;
     if (stream) {
@@ -83,7 +85,7 @@ vv_status_t vv_cuda_memcpy_d2h(void* dst, const void* src, size_t size,
 /**
  * @brief Copy device → device.
  */
-vv_status_t vv_cuda_memcpy_d2d(void* dst, const void* src, size_t size,
+vv_status_t vv_dev_memcpy_d2d(void* dst, const void* src, size_t size,
                                 void* stream) {
     cudaError_t err;
     if (stream) {
@@ -98,7 +100,7 @@ vv_status_t vv_cuda_memcpy_d2d(void* dst, const void* src, size_t size,
 /**
  * @brief Create a CUDA stream.
  */
-vv_status_t vv_cuda_stream_create(void** stream) {
+vv_status_t vv_dev_stream_create(void** stream) {
     if (!stream) return VV_ERR_NULL_PTR;
     cudaError_t err = cudaStreamCreate((cudaStream_t*)stream);
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
@@ -107,7 +109,7 @@ vv_status_t vv_cuda_stream_create(void** stream) {
 /**
  * @brief Destroy a CUDA stream.
  */
-vv_status_t vv_cuda_stream_destroy(void* stream) {
+vv_status_t vv_dev_stream_destroy(void* stream) {
     if (!stream) return VV_OK;
     cudaError_t err = cudaStreamDestroy((cudaStream_t)stream);
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
@@ -116,7 +118,7 @@ vv_status_t vv_cuda_stream_destroy(void* stream) {
 /**
  * @brief Synchronize a CUDA stream.
  */
-vv_status_t vv_cuda_stream_sync(void* stream) {
+vv_status_t vv_dev_stream_sync(void* stream) {
     cudaError_t err;
     if (stream) {
         err = cudaStreamSynchronize((cudaStream_t)stream);
@@ -129,7 +131,7 @@ vv_status_t vv_cuda_stream_sync(void* stream) {
 /**
  * @brief Get device properties.
  */
-vv_status_t vv_cuda_get_device_info(int device_id, size_t* total_mem,
+vv_status_t vv_dev_get_device_info(int device_id, size_t* total_mem,
                                      size_t* free_mem, int* sm_count) {
     cudaDeviceProp prop;
     cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
@@ -150,7 +152,7 @@ vv_status_t vv_cuda_get_device_info(int device_id, size_t* total_mem,
 /**
  * @brief Set current CUDA device.
  */
-vv_status_t vv_cuda_set_device(int device_id) {
+vv_status_t vv_dev_set_device(int device_id) {
     cudaError_t err = cudaSetDevice(device_id);
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
 }
@@ -159,7 +161,7 @@ vv_status_t vv_cuda_set_device(int device_id) {
 /**
  * @brief Fill device memory with a byte value (synchronous on the null stream).
  */
-vv_status_t vv_cuda_memset(void* ptr, int value, size_t size) {
+vv_status_t vv_dev_memset(void* ptr, int value, size_t size) {
     if (!ptr) return VV_ERR_NULL_PTR;
     return (cudaMemset(ptr, value, size) == cudaSuccess)
            ? VV_OK : VV_ERR_CUDA;

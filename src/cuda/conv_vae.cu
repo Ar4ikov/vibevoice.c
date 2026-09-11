@@ -20,6 +20,8 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /**
  * @brief Residual add kernel: x += y * scale
  *
@@ -73,7 +75,7 @@ static __global__ void silu_kernel(half* __restrict__ data, int total) {
 /**
  * @brief Launch residual add with layer scale.
  */
-vv_status_t vv_residual_add_scaled_cuda(
+vv_status_t vv_residual_add_scaled_dev(
     void* x, const void* y, const void* scale,
     int channels, int length, void* stream)
 {
@@ -90,7 +92,7 @@ vv_status_t vv_residual_add_scaled_cuda(
 /**
  * @brief Launch simple residual add.
  */
-vv_status_t vv_residual_add_cuda(void* x, const void* y, int total,
+vv_status_t vv_residual_add_dev(void* x, const void* y, int total,
                                    void* stream) {
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
@@ -105,7 +107,7 @@ vv_status_t vv_residual_add_cuda(void* x, const void* y, int total,
 /**
  * @brief Launch SiLU activation in-place.
  */
-vv_status_t vv_silu_cuda(void* data, int total, void* stream) {
+vv_status_t vv_silu_dev(void* data, int total, void* stream) {
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
 
@@ -132,7 +134,7 @@ static __global__ void gelu_kernel(half* __restrict__ data, int total) {
     data[idx] = __float2half(0.5f * x * (1.0f + erff(x * 0.7071067811865476f)));
 }
 
-vv_status_t vv_gelu_cuda(void* data, int total, void* stream) {
+vv_status_t vv_gelu_dev(void* data, int total, void* stream) {
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
 
@@ -166,7 +168,7 @@ static __global__ void bias_add_kernel(
 /**
  * @brief Add bias [N] to each row of [M, N] FP16 matrix in-place.
  */
-vv_status_t vv_bias_add_cuda(void* output, const void* bias,
+vv_status_t vv_bias_add_dev(void* output, const void* bias,
                               int M, int N, void* stream) {
     if (!output || !bias) return VV_ERR_NULL_PTR;
     int total = M * N;
@@ -194,7 +196,7 @@ static __global__ void fp16_to_fp32_kernel(const half* __restrict__ in,
     if (i < n) out[i] = __half2float(in[i]);
 }
 
-vv_status_t vv_fp32_to_fp16_cuda(const void* in_fp32, void* out_fp16,
+vv_status_t vv_fp32_to_fp16_dev(const void* in_fp32, void* out_fp16,
                                    int n, void* stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
@@ -203,7 +205,7 @@ vv_status_t vv_fp32_to_fp16_cuda(const void* in_fp32, void* out_fp16,
     return (cudaGetLastError() == cudaSuccess) ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
-vv_status_t vv_fp16_to_fp32_cuda(const void* in_fp16, void* out_fp32,
+vv_status_t vv_fp16_to_fp32_dev(const void* in_fp16, void* out_fp32,
                                    int n, void* stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
@@ -242,7 +244,7 @@ static __global__ void rmsnorm_channel_first_kernel(
     }
 }
 
-vv_status_t vv_rmsnorm_channel_first_cuda(
+vv_status_t vv_rmsnorm_channel_first_dev(
     const void* input, const void* weight, void* output,
     int channels, int length, float eps, void* stream) {
     int threads = 256;
@@ -276,7 +278,7 @@ static __global__ void channel_bias_add_kernel(
     output[idx] = __float2half(val + b);
 }
 
-vv_status_t vv_channel_bias_add_cuda(void* output, const void* bias,
+vv_status_t vv_channel_bias_add_dev(void* output, const void* bias,
                                       int channels, int length, void* stream) {
     if (!output || !bias) return VV_ERR_NULL_PTR;
 
@@ -325,7 +327,7 @@ static __global__ void scatter_tile_kernel(
     dst[(size_t)c * full_len + tile_offset + t] = src[i];
 }
 
-vv_status_t vv_gather_tile_cuda(const void* src, void* dst,
+vv_status_t vv_gather_tile_dev(const void* src, void* dst,
                                  int channels, int full_len,
                                  int tile_offset, int tile_len, void* stream) {
     int total = channels * tile_len;
@@ -336,7 +338,7 @@ vv_status_t vv_gather_tile_cuda(const void* src, void* dst,
     return (cudaGetLastError() == cudaSuccess) ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
-vv_status_t vv_scatter_tile_cuda(const void* src, void* dst,
+vv_status_t vv_scatter_tile_dev(const void* src, void* dst,
                                   int channels, int full_len,
                                   int tile_offset, int tile_len, void* stream) {
     int total = channels * tile_len;

@@ -21,71 +21,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include "vibevoice/device.h"
 
 
 /* ─── CUDA kernel forward declarations ──────────────────────────────────── */
 
-extern vv_status_t vv_rmsnorm_cuda(
-    const void* input, const void* weight, void* output,
-    int seq_len, int hidden_size, float eps, void* stream);
-
-extern vv_status_t vv_rope_cuda(
-    void* x, int seq_len, int n_heads, int head_dim,
-    int position_offset, float theta, void* stream);
-
-extern vv_status_t vv_gqa_attention_decode_cuda(
-    const void* q, const void* k_cache, const void* v_cache,
-    void* output,
-    int n_q_heads, int n_kv_heads, int head_dim,
-    int cache_len, void* stream);
-
-extern vv_status_t vv_gqa_attention_prefill_cached_cuda(
-    const void* q, const void* k_cache, const void* v_cache, void* output,
-    int n_q_heads, int n_kv_heads, int head_dim,
-    int q_len, int q_offset, int kv_len, bool causal, void* stream);
-
-extern vv_status_t vv_gqa_attention_prefill_cuda(
-    const void* q, const void* k, const void* v,
-    void* output,
-    int n_q_heads, int n_kv_heads, int head_dim,
-    int seq_len, bool causal, void* stream);
-
-extern vv_status_t vv_swiglu_cuda(
-    const void* gate, const void* up, void* output,
-    int n_elements, void* stream);
-
-extern vv_status_t vv_nf4_gemv_cuda(
-    const void* x, const uint8_t* packed, const void* scales,
-    const void* bias, void* y, int N, int K, void* stream);
-
-extern vv_status_t vv_nf4_gemm_cuda(
-    const void* input_fp16,
-    const uint8_t* weight_packed,
-    const void* weight_scales_fp16,
-    void* output_fp16,
-    void* temp_weight_fp16,
-    int M, int N, int K,
-    int block_size,
-    void* stream);
-
-extern vv_status_t vv_gemm_fp16_cuda(
-    const void* A, const void* B, void* C,
-    int M, int N, int K,
-    float alpha, float beta,
-    void* stream);
-
-extern vv_status_t vv_cuda_memcpy_d2d(void* dst, const void* src,
-                                        size_t size, void* stream);
-extern vv_status_t vv_cuda_memcpy_h2d(void* dst, const void* src,
-                                        size_t size, void* stream);
-extern vv_status_t vv_cuda_stream_sync(void* stream);
-extern vv_status_t vv_cuda_alloc(void** ptr, size_t size);
-extern vv_status_t vv_cuda_free(void* ptr);
-
-extern vv_status_t vv_residual_add_cuda(void* x, const void* y, int total,
-                                          void* stream);
-extern vv_status_t vv_bias_add_cuda(void* output, const void* bias,
-                                      int M, int N, void* stream);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Layer Pool — stage / unstage helpers
@@ -141,7 +81,7 @@ vv_status_t vv_layer_pool_create(vv_layer_pool_t** pool,
         p->buf_size = max_sz + 16 * 256;
 
         for (int s = 0; s < VV_LAYER_POOL_SLOTS; s++) {
-            vv_status_t st = vv_cuda_alloc(&p->gpu_buf[s], p->buf_size);
+            vv_status_t st = vv_dev_alloc(&p->gpu_buf[s], p->buf_size);
             if (st != VV_OK) {
                 /* Fall back to single buffer */
                 if (s == 1) {
@@ -191,7 +131,7 @@ vv_status_t vv_layer_pool_stage(vv_layer_pool_t* pool,
         if ((t).data && !(t).on_gpu && (t).size_bytes > 0) {           \
             /* Align to 256 bytes */                                    \
             off = (off + 255) & ~(size_t)255;                          \
-            vv_cuda_memcpy_h2d(buf + off, (t).data,                    \
+            vv_dev_memcpy_h2d(buf + off, (t).data,                    \
                                (t).size_bytes, stream);                \
             (t).data = buf + off;                                      \
             (t).on_gpu = true;                                         \
@@ -283,7 +223,7 @@ vv_status_t vv_layer_pool_unstage(vv_layer_pool_t* pool,
 vv_status_t vv_layer_pool_free(vv_layer_pool_t* pool) {
     if (!pool) return VV_OK;
     for (int s = 0; s < VV_LAYER_POOL_SLOTS; s++) {
-        if (pool->gpu_buf[s]) vv_cuda_free(pool->gpu_buf[s]);
+        if (pool->gpu_buf[s]) vv_dev_free(pool->gpu_buf[s]);
     }
     vv_free(pool);
     return VV_OK;
@@ -292,7 +232,6 @@ vv_status_t vv_layer_pool_free(vv_layer_pool_t* pool) {
 /* ═══════════════════════════════════════════════════════════════════════════
  * GPU decoder — per-layer forward (unchanged core logic)
  * ═══════════════════════════════════════════════════════════════════════════ */
-
 
 
 /**
@@ -310,23 +249,23 @@ static vv_status_t quant_linear(
 
     if (w->is_quantized) {
         if (M == 1) {
-            s = vv_nf4_gemv_cuda(x, (const uint8_t*)w->tensor.data,
+            s = vv_nf4_gemv_dev(x, (const uint8_t*)w->tensor.data,
                                  w->quant.scales.data, w->bias.data,
                                  y, N, K, stream);
             if (s == VV_OK) return VV_OK;      /* bias already folded in */
             if (s != VV_ERR_UNSUPPORTED) return s;
         }
-        s = vv_nf4_gemm_cuda(x, (const uint8_t*)w->tensor.data,
+        s = vv_nf4_gemm_dev(x, (const uint8_t*)w->tensor.data,
                              w->quant.scales.data, y, scratch,
                              M, N, K, 64, stream);
     } else {
-        s = vv_gemm_fp16_cuda(x, w->tensor.data, y, M, N, K,
+        s = vv_gemm_fp16_dev(x, w->tensor.data, y, M, N, K,
                               1.0f, 0.0f, stream);
     }
     if (s != VV_OK) return s;
 
     if (w->bias.data)
-        s = vv_bias_add_cuda(y, w->bias.data, M, N, stream);
+        s = vv_bias_add_dev(y, w->bias.data, M, N, stream);
     return s;
 }
 
@@ -338,8 +277,8 @@ static void dump_gpu_fp16(const char* name, const void* gpu, size_t n,
     if (!vv_debug_dump_dir() || !gpu || n == 0) return;
     uint16_t* h = (uint16_t*)vv_alloc(n * 2);
     if (!h) return;
-    vv_cuda_stream_sync(stream);
-    vv_cuda_memcpy_d2h(h, gpu, n * 2, NULL);
+    vv_dev_stream_sync(stream);
+    vv_dev_memcpy_d2h(h, gpu, n * 2, NULL);
     float* f = (float*)vv_alloc(n * sizeof(float));
     if (f) {
         for (size_t i = 0; i < n; i++) f[i] = vv_half_to_float(h[i]);
@@ -415,7 +354,7 @@ static vv_status_t decoder_layer_impl(
     void* temp_weight = wp + offset;
 
     /* 1. Input LayerNorm */
-    s = vv_rmsnorm_cuda(hidden_states, layer->input_layernorm.data,
+    s = vv_rmsnorm_dev(hidden_states, layer->input_layernorm.data,
                          norm_out, seq_len, hs,
                          config->rms_norm_eps, stream);
     if (s != VV_OK) return s;
@@ -444,10 +383,10 @@ static vv_status_t decoder_layer_impl(
     }
 
     /* 3. RoPE */
-    s = vv_rope_cuda(q_buf, seq_len, n_heads, head_dim,
+    s = vv_rope_dev(q_buf, seq_len, n_heads, head_dim,
                       position_offset, config->rope_theta, stream);
     if (s != VV_OK) return s;
-    s = vv_rope_cuda(k_buf, seq_len, n_kv_heads, head_dim,
+    s = vv_rope_dev(k_buf, seq_len, n_kv_heads, head_dim,
                       position_offset, config->rope_theta, stream);
     if (s != VV_OK) return s;
 
@@ -476,12 +415,12 @@ static vv_status_t decoder_layer_impl(
         const int actual_cache_len = position_offset + seq_len;
 
         if (seq_len > 1) {
-            s = vv_gqa_attention_prefill_cached_cuda(
+            s = vv_gqa_attention_prefill_cached_dev(
                 q_buf, k_cached, v_cached, attn_out,
                 n_heads, n_kv_heads, head_dim,
                 seq_len, position_offset, actual_cache_len, true, stream);
         } else {
-            s = vv_gqa_attention_decode_cuda(
+            s = vv_gqa_attention_decode_dev(
                 q_buf, k_cached, v_cached, attn_out,
                 n_heads, n_kv_heads, head_dim, actual_cache_len, stream);
         }
@@ -495,7 +434,7 @@ static vv_status_t decoder_layer_impl(
     s = quant_linear(&layer->attn.o_proj, attn_out, norm_out, temp_weight,
                      seq_len, hs, hs, stream);
     if (s != VV_OK) return s;
-    s = vv_residual_add_cuda(hidden_states, norm_out,
+    s = vv_residual_add_dev(hidden_states, norm_out,
                               seq_len * hs, stream);
     if (s != VV_OK) return s;
 
@@ -503,7 +442,7 @@ static vv_status_t decoder_layer_impl(
         dump_gpu_fp16("c_l0_postattn", hidden_states, (size_t)seq_len * hs, stream);
 
     /* 7. Post-attention LayerNorm */
-    s = vv_rmsnorm_cuda(hidden_states, layer->post_attn_layernorm.data,
+    s = vv_rmsnorm_dev(hidden_states, layer->post_attn_layernorm.data,
                          norm_out, seq_len, hs,
                          config->rms_norm_eps, stream);
     if (s != VV_OK) return s;
@@ -518,7 +457,7 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 9. SwiGLU */
-    s = vv_swiglu_cuda(gate_buf, up_buf, gate_buf,
+    s = vv_swiglu_dev(gate_buf, up_buf, gate_buf,
                         seq_len * inter_size, stream);
     if (s != VV_OK) return s;
 
@@ -526,7 +465,7 @@ static vv_status_t decoder_layer_impl(
     s = quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out, temp_weight,
                      seq_len, hs, inter_size, stream);
     if (s != VV_OK) return s;
-    s = vv_residual_add_cuda(hidden_states, mlp_out,
+    s = vv_residual_add_dev(hidden_states, mlp_out,
                               seq_len * hs, stream);
     return s;
 }
@@ -570,7 +509,7 @@ vv_status_t vv_decoder_step(
         /* Stage layer i if streaming */
         if (streaming) {
             vv_layer_pool_stage(pool, model, i, xfer_stream ? xfer_stream : compute_stream);
-            if (xfer_stream) vv_cuda_stream_sync(xfer_stream);
+            if (xfer_stream) vv_dev_stream_sync(xfer_stream);
         }
 
         vv_status_t s = decoder_layer_impl(
@@ -580,7 +519,7 @@ vv_status_t vv_decoder_step(
 
         /* Unstage after processing */
         if (streaming) {
-            vv_cuda_stream_sync(compute_stream);
+            vv_dev_stream_sync(compute_stream);
             vv_layer_pool_unstage(pool, model, i);
         }
 
@@ -648,7 +587,7 @@ vv_status_t vv_decoder_prefill(
         /* Stage layer i */
         if (streaming) {
             vv_layer_pool_stage(pool, model, i, xfer_stream ? xfer_stream : compute_stream);
-            if (xfer_stream) vv_cuda_stream_sync(xfer_stream);
+            if (xfer_stream) vv_dev_stream_sync(xfer_stream);
         }
 
         vv_status_t s = decoder_layer_impl(
@@ -658,7 +597,7 @@ vv_status_t vv_decoder_prefill(
 
         /* Unstage */
         if (streaming) {
-            vv_cuda_stream_sync(compute_stream);
+            vv_dev_stream_sync(compute_stream);
             vv_layer_pool_unstage(pool, model, i);
         }
 
@@ -672,8 +611,8 @@ vv_status_t vv_decoder_prefill(
             size_t n = (size_t)seq_len * (size_t)model->config.llm.hidden_size;
             uint16_t* h = (uint16_t*)vv_alloc(n * 2);
             if (h) {
-                vv_cuda_stream_sync(compute_stream);
-                vv_cuda_memcpy_d2h(h, hidden_states, n * 2, NULL);
+                vv_dev_stream_sync(compute_stream);
+                vv_dev_memcpy_d2h(h, hidden_states, n * 2, NULL);
                 float* f = (float*)vv_alloc(n * sizeof(float));
                 if (f) {
                     for (size_t j = 0; j < n; j++) f[j] = vv_half_to_float(h[j]);

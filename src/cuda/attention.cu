@@ -320,6 +320,8 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /*
  * Split-decode scratch: allocated on first use and reused for the session —
  * the decode hot path must never call cudaMalloc.
@@ -352,7 +354,7 @@ void vv_attention_cleanup(void) {
     s_part_heads = s_part_dim = 0;
 }
 
-vv_status_t vv_gqa_attention_decode_cuda(
+vv_status_t vv_gqa_attention_decode_dev(
     const void* q, const void* k_cache, const void* v_cache,
     void* output,
     int n_q_heads, int n_kv_heads, int head_dim,
@@ -402,7 +404,7 @@ vv_status_t vv_gqa_attention_decode_cuda(
  * Chunked prefill needs this: the queries of chunk N must see every key from
  * position 0, not just the ones inside the chunk.
  */
-vv_status_t vv_gqa_attention_prefill_cached_cuda(
+vv_status_t vv_gqa_attention_prefill_cached_dev(
     const void* q, const void* k_cache, const void* v_cache,
     void* output,
     int n_q_heads, int n_kv_heads, int head_dim,
@@ -430,13 +432,13 @@ vv_status_t vv_gqa_attention_prefill_cached_cuda(
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
-vv_status_t vv_gqa_attention_prefill_cuda(
+vv_status_t vv_gqa_attention_prefill_dev(
     const void* q, const void* k, const void* v,
     void* output,
     int n_q_heads, int n_kv_heads, int head_dim,
     int seq_len, bool causal, void* stream)
 {
-    return vv_gqa_attention_prefill_cached_cuda(
+    return vv_gqa_attention_prefill_cached_dev(
         q, k, v, output, n_q_heads, n_kv_heads, head_dim,
         seq_len, 0, seq_len, causal, stream);
 }

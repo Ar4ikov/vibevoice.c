@@ -66,6 +66,8 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /**
  * @brief Launch RMSNorm kernel.
  *
@@ -77,7 +79,7 @@ extern "C" {
  * @param eps         Epsilon (1e-6 for Qwen2)
  * @param stream      CUDA stream
  */
-vv_status_t vv_rmsnorm_cuda(
+vv_status_t vv_rmsnorm_dev(
     const void* input, const void* weight, void* output,
     int seq_len, int hidden_size, float eps, void* stream)
 {

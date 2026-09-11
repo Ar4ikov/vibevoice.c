@@ -36,6 +36,7 @@ static double vv_time_ms(void) {
 }
 #else
 #include <time.h>
+#include "vibevoice/device.h"
 static double vv_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -44,33 +45,7 @@ static double vv_time_ms(void) {
 #endif
 
 /* Forward declarations — CUDA helpers */
-extern vv_status_t vv_cuda_alloc(void** ptr, size_t size);
-extern vv_status_t vv_cuda_free(void* ptr);
-extern vv_status_t vv_cuda_memcpy_h2d(void* dst, const void* src,
-                                        size_t size, void* stream);
-extern vv_status_t vv_cuda_memcpy_d2h(void* dst, const void* src,
-                                        size_t size, void* stream);
-extern vv_status_t vv_cuda_stream_create(void** stream);
-extern vv_status_t vv_cuda_stream_destroy(void* stream);
-extern vv_status_t vv_cuda_stream_sync(void* stream);
-extern vv_status_t vv_cuda_set_device(int device_id);
-extern vv_status_t vv_cuda_get_device_info(int device_id, size_t* total_mem,
-                                            size_t* free_mem, int* sm_count);
 
-extern vv_status_t vv_embedding_cuda(
-    const void* table, const int32_t* ids, void* output,
-    int seq_len, int hidden_size, void* stream);
-
-extern vv_status_t vv_rmsnorm_cuda(
-    const void* input, const void* weight, void* output,
-    int seq_len, int hidden_size, float eps, void* stream);
-
-extern vv_status_t vv_gemm_fp16_cuda(
-    const void* A, const void* B, void* C,
-    int M, int N, int K,
-    float alpha, float beta, void* stream);
-
-extern void vv_gemm_cleanup(void);
 
 extern vv_status_t vv_postprocess_tokens(
     const char** token_texts, int n_tokens,
@@ -124,10 +99,10 @@ static float half_to_float_single(uint16_t h) {
 static vv_status_t upload_tensor_to_gpu(vv_tensor_t* t, void* stream) {
     if (!t || !t->data || t->on_gpu) return VV_OK;
     void* gpu_ptr = NULL;
-    vv_status_t s = vv_cuda_alloc(&gpu_ptr, t->size_bytes);
+    vv_status_t s = vv_dev_alloc(&gpu_ptr, t->size_bytes);
     if (s != VV_OK) return s;
-    s = vv_cuda_memcpy_h2d(gpu_ptr, t->data, t->size_bytes, stream);
-    if (s != VV_OK) { vv_cuda_free(gpu_ptr); return s; }
+    s = vv_dev_memcpy_h2d(gpu_ptr, t->data, t->size_bytes, stream);
+    if (s != VV_OK) { vv_dev_free(gpu_ptr); return s; }
     vv_free(t->data);
     t->data = gpu_ptr;
     t->on_gpu = true;
@@ -191,7 +166,7 @@ static void free_layer_gpu_weights(vv_model_t* model) {
         vv_layer_weights_t* L = &model->layers[i];
         #define FREE_GPU_TENSOR(t) do {                 \
             if ((t).on_gpu && (t).data) {               \
-                vv_cuda_free((t).data);                 \
+                vv_dev_free((t).data);                 \
                 (t).data = NULL;                        \
                 (t).on_gpu = false;                     \
             }                                           \
@@ -332,7 +307,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     /* Set GPU (skip if CPU-only) */
     vv_status_t s = VV_OK;
     if (!cpu_only) {
-        s = vv_cuda_set_device(gpu_id);
+        s = vv_dev_set_device(gpu_id);
         if (s != VV_OK) {
             VV_LOG_W("inference: failed to set GPU %d, falling back to CPU", gpu_id);
             cpu_only = true;
@@ -364,7 +339,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         c->placement = VV_PLACE_CPU_ONLY;
     } else {
         size_t free_vram = 0, total_vram = 0;
-        vv_cuda_get_device_info(gpu_id, &total_vram, &free_vram, NULL);
+        vv_dev_get_device_info(gpu_id, &total_vram, &free_vram, NULL);
 
         size_t per_layer = calc_per_layer_gpu_bytes(c->model);
         size_t all_layers = per_layer * (size_t)c->model->num_layers;
@@ -449,11 +424,11 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     }
 
     /* ── GPU path: create streams ── */
-    s = vv_cuda_stream_create(&c->compute_stream);
+    s = vv_dev_stream_create(&c->compute_stream);
     if (s != VV_OK) { vv_model_free(c->model); vv_free(c); return s; }
-    s = vv_cuda_stream_create(&c->transfer_stream);
+    s = vv_dev_stream_create(&c->transfer_stream);
     if (s != VV_OK) {
-        vv_cuda_stream_destroy(c->compute_stream);
+        vv_dev_stream_destroy(c->compute_stream);
         vv_model_free(c->model); vv_free(c); return s;
     }
 
@@ -496,7 +471,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         s = VV_ERR_CUDA_OOM;
         for (int wi = 0; wi < 3; wi++) {
             c->workspace_size = ws_sizes[wi];
-            s = vv_cuda_alloc(&c->workspace, c->workspace_size);
+            s = vv_dev_alloc(&c->workspace, c->workspace_size);
             if (s == VV_OK) break;
             VV_LOG_W("inference: failed to alloc %zu MB workspace, trying smaller",
                      c->workspace_size / (1024 * 1024));
@@ -511,15 +486,15 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     if (c->placement != VV_PLACE_STREAM_ALL &&
         c->model->embed_tokens.data) {
         size_t sz = c->model->embed_tokens.size_bytes;
-        s = vv_cuda_alloc(&c->embed_table_gpu, sz);
+        s = vv_dev_alloc(&c->embed_table_gpu, sz);
         if (s == VV_OK) {
-            s = vv_cuda_memcpy_h2d(c->embed_table_gpu,
+            s = vv_dev_memcpy_h2d(c->embed_table_gpu,
                                     c->model->embed_tokens.data, sz,
                                     c->transfer_stream);
         }
         if (s != VV_OK) {
             VV_LOG_W("inference: embed_tokens GPU upload failed, using CPU path");
-            if (c->embed_table_gpu) { vv_cuda_free(c->embed_table_gpu); c->embed_table_gpu = NULL; }
+            if (c->embed_table_gpu) { vv_dev_free(c->embed_table_gpu); c->embed_table_gpu = NULL; }
         } else {
             VV_LOG_I("inference: embed_tokens uploaded (%.1f MB)",
                      (double)sz / (1024.0 * 1024.0));
@@ -531,15 +506,15 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         c->placement != VV_PLACE_STREAM_ALL &&
         c->model->lm_head.data) {
         size_t sz = c->model->lm_head.size_bytes;
-        s = vv_cuda_alloc(&c->lm_head_gpu, sz);
+        s = vv_dev_alloc(&c->lm_head_gpu, sz);
         if (s == VV_OK) {
-            s = vv_cuda_memcpy_h2d(c->lm_head_gpu,
+            s = vv_dev_memcpy_h2d(c->lm_head_gpu,
                                     c->model->lm_head.data, sz,
                                     c->transfer_stream);
         }
         if (s != VV_OK) {
             VV_LOG_W("inference: lm_head GPU upload failed, using CPU path");
-            if (c->lm_head_gpu) { vv_cuda_free(c->lm_head_gpu); c->lm_head_gpu = NULL; }
+            if (c->lm_head_gpu) { vv_dev_free(c->lm_head_gpu); c->lm_head_gpu = NULL; }
         } else {
             VV_LOG_I("inference: lm_head uploaded (%.1f MB)",
                      (double)sz / (1024.0 * 1024.0));
@@ -549,9 +524,9 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     /* ── Final norm: always on GPU for GPU mode ── */
     if (c->model->final_norm.data) {
         size_t sz = c->model->final_norm.size_bytes;
-        s = vv_cuda_alloc(&c->final_norm_gpu, sz);
+        s = vv_dev_alloc(&c->final_norm_gpu, sz);
         if (s == VV_OK) {
-            s = vv_cuda_memcpy_h2d(c->final_norm_gpu,
+            s = vv_dev_memcpy_h2d(c->final_norm_gpu,
                                     c->model->final_norm.data, sz,
                                     c->transfer_stream);
         }
@@ -561,15 +536,15 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     }
 
     /* Sync transfers */
-    vv_cuda_stream_sync(c->transfer_stream);
+    vv_dev_stream_sync(c->transfer_stream);
     goto init_common;
 
 fail_gpu:
     if (c->layer_pool) vv_layer_pool_free(c->layer_pool);
     if (c->kv_cache) vv_kv_cache_free(c->kv_cache);
-    if (c->workspace && c->use_gpu) vv_cuda_free(c->workspace);
-    if (c->compute_stream) vv_cuda_stream_destroy(c->compute_stream);
-    if (c->transfer_stream) vv_cuda_stream_destroy(c->transfer_stream);
+    if (c->workspace && c->use_gpu) vv_dev_free(c->workspace);
+    if (c->compute_stream) vv_dev_stream_destroy(c->compute_stream);
+    if (c->transfer_stream) vv_dev_stream_destroy(c->transfer_stream);
     vv_model_free(c->model);
     vv_free(c);
     return s;
@@ -652,11 +627,6 @@ init_common:
  * the PyTorch reference dump element by element.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-extern vv_status_t vv_lm_head_gemv_cuda(
-    const void* x, const void* W, void* logits, int V, int K, void* stream);
-extern vv_status_t vv_argmax_cuda(
-    const void* logits, int V, void* scratch_v, void* scratch_i,
-    void* out_token, void* out_value, void* stream);
 
 #define VV_ARGMAX_PARTIALS 256
 
@@ -892,7 +862,7 @@ static vv_status_t transcribe_gpu(
     if (ctx->use_gpu && ctx->workspace) {
         saved_workspace = ctx->workspace;
         saved_workspace_size = ctx->workspace_size;
-        vv_cuda_free(ctx->workspace);
+        vv_dev_free(ctx->workspace);
         ctx->workspace = NULL;
         VV_LOG_D("inference: freed GPU workspace (%zu MB) for audio encoding",
                  saved_workspace_size / (1024*1024));
@@ -919,7 +889,7 @@ static vv_status_t transcribe_gpu(
 
     /* Re-allocate GPU workspace */
     if (saved_workspace_size > 0 && ctx->use_gpu) {
-        s = vv_cuda_alloc(&ctx->workspace, saved_workspace_size);
+        s = vv_dev_alloc(&ctx->workspace, saved_workspace_size);
         if (s != VV_OK) {
             VV_LOG_E("inference: failed to re-allocate GPU workspace");
             return s;
@@ -1029,27 +999,27 @@ static vv_status_t transcribe_gpu(
     void* hidden_states_gpu = NULL;
     int32_t* input_ids_gpu = NULL;
 
-    s = vv_cuda_alloc(&hidden_states_gpu, hidden_bytes);
+    s = vv_dev_alloc(&hidden_states_gpu, hidden_bytes);
     if (s != VV_OK) { vv_free(input_ids); vv_free(combined_fp16); return s; }
 
     /* Embedding: all tokens (text + speech_pad placeholders) */
     if (embed_on_cpu) {
         float* embed_fp32 = (float*)vv_alloc((size_t)seq_len * hs * sizeof(float));
-        if (!embed_fp32) { vv_cuda_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return VV_ERR_OUT_OF_MEMORY; }
+        if (!embed_fp32) { vv_dev_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return VV_ERR_OUT_OF_MEMORY; }
         vv_embedding_cpu(ctx->model->embed_tokens.data, input_ids, embed_fp32, seq_len, hs);
         uint16_t* embed_fp16 = (uint16_t*)vv_alloc(hidden_bytes);
-        if (!embed_fp16) { vv_free(embed_fp32); vv_cuda_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return VV_ERR_OUT_OF_MEMORY; }
+        if (!embed_fp16) { vv_free(embed_fp32); vv_dev_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return VV_ERR_OUT_OF_MEMORY; }
         float_to_half(embed_fp32, embed_fp16, seq_len * hs);
         vv_free(embed_fp32);
-        vv_cuda_memcpy_h2d(hidden_states_gpu, embed_fp16, hidden_bytes, ctx->compute_stream);
+        vv_dev_memcpy_h2d(hidden_states_gpu, embed_fp16, hidden_bytes, ctx->compute_stream);
         vv_free(embed_fp16);
     } else {
-        s = vv_cuda_alloc((void**)&input_ids_gpu, (size_t)seq_len * sizeof(int32_t));
-        if (s != VV_OK) { vv_cuda_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return s; }
-        vv_cuda_memcpy_h2d(input_ids_gpu, input_ids, (size_t)seq_len * sizeof(int32_t), ctx->compute_stream);
-        s = vv_embedding_cuda(ctx->embed_table_gpu, input_ids_gpu, hidden_states_gpu, seq_len, hs, ctx->compute_stream);
-        vv_cuda_free(input_ids_gpu);
-        if (s != VV_OK) { vv_cuda_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return s; }
+        s = vv_dev_alloc((void**)&input_ids_gpu, (size_t)seq_len * sizeof(int32_t));
+        if (s != VV_OK) { vv_dev_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return s; }
+        vv_dev_memcpy_h2d(input_ids_gpu, input_ids, (size_t)seq_len * sizeof(int32_t), ctx->compute_stream);
+        s = vv_embedding_dev(ctx->embed_table_gpu, input_ids_gpu, hidden_states_gpu, seq_len, hs, ctx->compute_stream);
+        vv_dev_free(input_ids_gpu);
+        if (s != VV_OK) { vv_dev_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return s; }
     }
     vv_free(input_ids);
 
@@ -1057,12 +1027,12 @@ static vv_status_t transcribe_gpu(
     if (n_audio_frames > 0) {
         void* audio_dst = (uint8_t*)hidden_states_gpu
                         + (size_t)audio_offset * (size_t)hs * 2;
-        vv_cuda_memcpy_h2d(audio_dst, combined_fp16,
+        vv_dev_memcpy_h2d(audio_dst, combined_fp16,
                             (size_t)n_audio_frames * (size_t)hs * 2,
                             ctx->compute_stream);
     }
     vv_free(combined_fp16);
-    vv_cuda_stream_sync(ctx->compute_stream);
+    vv_dev_stream_sync(ctx->compute_stream);
 
     /* ── Diagnostic: compare text-embedding vs audio-feature magnitudes ── */
     {
@@ -1071,7 +1041,7 @@ static vv_status_t transcribe_gpu(
         float sum_sq;
 
         /* Text embedding: read token at position 0 (im_start) */
-        vv_cuda_memcpy_d2h(diag_buf, hidden_states_gpu,
+        vv_dev_memcpy_d2h(diag_buf, hidden_states_gpu,
                             (size_t)sample_dim * 2, NULL);
         sum_sq = 0.0f;
         for (int d = 0; d < sample_dim; d++) {
@@ -1084,7 +1054,7 @@ static vv_status_t transcribe_gpu(
         if (n_audio_frames > 0) {
             void* audio_pos = (uint8_t*)hidden_states_gpu
                             + (size_t)audio_offset * (size_t)hs * 2;
-            vv_cuda_memcpy_d2h(diag_buf, audio_pos,
+            vv_dev_memcpy_d2h(diag_buf, audio_pos,
                                 (size_t)sample_dim * 2, NULL);
             sum_sq = 0.0f;
             for (int d = 0; d < sample_dim; d++) {
@@ -1101,8 +1071,8 @@ static vv_status_t transcribe_gpu(
         size_t n = (size_t)seq_len * (size_t)hs;
         uint16_t* h = (uint16_t*)vv_alloc(n * 2);
         if (h) {
-            vv_cuda_stream_sync(ctx->compute_stream);
-            vv_cuda_memcpy_d2h(h, hidden_states_gpu, n * 2, NULL);
+            vv_dev_stream_sync(ctx->compute_stream);
+            vv_dev_memcpy_d2h(h, hidden_states_gpu, n * 2, NULL);
             dump_f16_as_f32("c_embeds", h, n);
             vv_free(h);
         }
@@ -1118,7 +1088,7 @@ static vv_status_t transcribe_gpu(
                             ctx->compute_stream, ctx->transfer_stream);
     if (s != VV_OK) {
         VV_LOG_E("inference: prefill failed: %s", vv_status_str(s));
-        vv_cuda_free(hidden_states_gpu);
+        vv_dev_free(hidden_states_gpu);
         return s;
     }
 
@@ -1126,8 +1096,8 @@ static vv_status_t transcribe_gpu(
         size_t n = (size_t)seq_len * (size_t)hs;
         uint16_t* h = (uint16_t*)vv_alloc(n * 2);
         if (h) {
-            vv_cuda_stream_sync(ctx->compute_stream);
-            vv_cuda_memcpy_d2h(h, hidden_states_gpu, n * 2, NULL);
+            vv_dev_stream_sync(ctx->compute_stream);
+            vv_dev_memcpy_d2h(h, hidden_states_gpu, n * 2, NULL);
             dump_f16_as_f32("c_prefill_hidden", h, n);
             vv_free(h);
         }
@@ -1150,22 +1120,22 @@ static vv_status_t transcribe_gpu(
     void* argmax_i_gpu   = NULL;
     void* token_out_gpu  = NULL;
     int32_t* tok_id_gpu  = NULL;
-    s = vv_cuda_alloc(&normed_gpu, one_hidden);
-    if (s != VV_OK) { vv_cuda_free(hidden_states_gpu); return s; }
-    s = vv_cuda_alloc(&hidden_one_gpu, one_hidden);
-    if (s != VV_OK) { vv_cuda_free(normed_gpu); vv_cuda_free(hidden_states_gpu); return s; }
+    s = vv_dev_alloc(&normed_gpu, one_hidden);
+    if (s != VV_OK) { vv_dev_free(hidden_states_gpu); return s; }
+    s = vv_dev_alloc(&hidden_one_gpu, one_hidden);
+    if (s != VV_OK) { vv_dev_free(normed_gpu); vv_dev_free(hidden_states_gpu); return s; }
     if (!lm_head_on_cpu) {
-        if (vv_cuda_alloc(&logits_f32_gpu, (size_t)vocab_size * sizeof(float)) != VV_OK ||
-            vv_cuda_alloc(&argmax_v_gpu, VV_ARGMAX_PARTIALS * sizeof(float)) != VV_OK ||
-            vv_cuda_alloc(&argmax_i_gpu, VV_ARGMAX_PARTIALS * sizeof(int32_t)) != VV_OK ||
-            vv_cuda_alloc(&token_out_gpu, sizeof(int32_t)) != VV_OK ||
-            vv_cuda_alloc((void**)&tok_id_gpu, sizeof(int32_t)) != VV_OK) {
+        if (vv_dev_alloc(&logits_f32_gpu, (size_t)vocab_size * sizeof(float)) != VV_OK ||
+            vv_dev_alloc(&argmax_v_gpu, VV_ARGMAX_PARTIALS * sizeof(float)) != VV_OK ||
+            vv_dev_alloc(&argmax_i_gpu, VV_ARGMAX_PARTIALS * sizeof(int32_t)) != VV_OK ||
+            vv_dev_alloc(&token_out_gpu, sizeof(int32_t)) != VV_OK ||
+            vv_dev_alloc((void**)&tok_id_gpu, sizeof(int32_t)) != VV_OK) {
             s = VV_ERR_CUDA_OOM;
             goto cleanup_decode;
         }
     }
 
-    s = vv_rmsnorm_cuda(last_hidden_gpu, ctx->final_norm_gpu,
+    s = vv_rmsnorm_dev(last_hidden_gpu, ctx->final_norm_gpu,
                          normed_gpu, 1, hs, llm->rms_norm_eps,
                          ctx->compute_stream);
     if (s != VV_OK) goto cleanup_decode;
@@ -1176,8 +1146,8 @@ static vv_status_t transcribe_gpu(
         /* Download normed, do GEMM on CPU, argmax on CPU */
         uint16_t* normed_cpu = (uint16_t*)vv_alloc(one_hidden);
         if (!normed_cpu) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_decode; }
-        vv_cuda_stream_sync(ctx->compute_stream);
-        vv_cuda_memcpy_d2h(normed_cpu, normed_gpu, one_hidden, NULL);
+        vv_dev_stream_sync(ctx->compute_stream);
+        vv_dev_memcpy_d2h(normed_cpu, normed_gpu, one_hidden, NULL);
         /* FP16 → FP32 */
         float* normed_f32 = (float*)vv_alloc((size_t)hs * sizeof(float));
         float* logits_f32 = (float*)vv_alloc((size_t)vocab_size * sizeof(float));
@@ -1207,19 +1177,19 @@ static vv_status_t transcribe_gpu(
         vv_sample_greedy_cpu(logits_f32, vocab_size, &token_id);
         vv_free(logits_f32);
     } else {
-        s = vv_lm_head_gemv_cuda(normed_gpu, ctx->lm_head_gpu, logits_f32_gpu,
+        s = vv_lm_head_gemv_dev(normed_gpu, ctx->lm_head_gpu, logits_f32_gpu,
                                   vocab_size, hs, ctx->compute_stream);
         if (s != VV_OK) goto cleanup_decode;
-        s = vv_argmax_cuda(logits_f32_gpu, vocab_size, argmax_v_gpu,
+        s = vv_argmax_dev(logits_f32_gpu, vocab_size, argmax_v_gpu,
                             argmax_i_gpu, token_out_gpu, NULL,
                             ctx->compute_stream);
         if (s != VV_OK) goto cleanup_decode;
-        vv_cuda_stream_sync(ctx->compute_stream);
-        vv_cuda_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t), NULL);
+        vv_dev_stream_sync(ctx->compute_stream);
+        vv_dev_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t), NULL);
         if (dump_dir()) {
             float* lg = (float*)vv_alloc((size_t)vocab_size * sizeof(float));
             if (lg) {
-                vv_cuda_memcpy_d2h(lg, logits_f32_gpu,
+                vv_dev_memcpy_d2h(lg, logits_f32_gpu,
                                     (size_t)vocab_size * sizeof(float), NULL);
                 dump_f32("c_prefill_logits", lg, (size_t)vocab_size);
                 vv_free(lg);
@@ -1227,7 +1197,7 @@ static vv_status_t transcribe_gpu(
         }
     }
 
-    vv_cuda_free(hidden_states_gpu); hidden_states_gpu = NULL;
+    vv_dev_free(hidden_states_gpu); hidden_states_gpu = NULL;
 
     perf->prefill_ms = vv_time_ms() - t_step;
     perf->ttft_ms = vv_time_ms() - t_total_start;
@@ -1273,17 +1243,17 @@ static vv_status_t transcribe_gpu(
                               embed_f32, 1, hs);
             uint16_t embed_h[4096];
             float_to_half(embed_f32, embed_h, hs);
-            vv_cuda_memcpy_h2d(hidden_one_gpu, embed_h, one_hidden,
+            vv_dev_memcpy_h2d(hidden_one_gpu, embed_h, one_hidden,
                                 ctx->compute_stream);
         } else {
             int32_t tok_buf[1]; tok_buf[0] = token_id;
-            vv_cuda_memcpy_h2d(tok_id_gpu, tok_buf, sizeof(int32_t), ctx->compute_stream);
-            s = vv_embedding_cuda(ctx->embed_table_gpu, tok_id_gpu,
+            vv_dev_memcpy_h2d(tok_id_gpu, tok_buf, sizeof(int32_t), ctx->compute_stream);
+            s = vv_embedding_dev(ctx->embed_table_gpu, tok_id_gpu,
                                    hidden_one_gpu, 1, hs, ctx->compute_stream);
             if (s != VV_OK) break;
         }
 
-        vv_cuda_stream_sync(ctx->compute_stream);
+        vv_dev_stream_sync(ctx->compute_stream);
         t_embed_ms += vv_time_ms() - t_tok;
         t_tok = vv_time_ms();
 
@@ -1294,20 +1264,20 @@ static vv_status_t transcribe_gpu(
                              ctx->transfer_stream);
         if (s != VV_OK) { VV_LOG_E("inference: decode step %d failed", n_generated); break; }
 
-        vv_cuda_stream_sync(ctx->compute_stream);
+        vv_dev_stream_sync(ctx->compute_stream);
         t_layers_ms += vv_time_ms() - t_tok;
         t_tok = vv_time_ms();
 
         /* RMSNorm + LM head + sample */
-        s = vv_rmsnorm_cuda(hidden_one_gpu, ctx->final_norm_gpu,
+        s = vv_rmsnorm_dev(hidden_one_gpu, ctx->final_norm_gpu,
                              normed_gpu, 1, hs, llm->rms_norm_eps,
                              ctx->compute_stream);
         if (s != VV_OK) break;
 
         if (lm_head_on_cpu) {
             uint16_t normed_h[4096];
-            vv_cuda_stream_sync(ctx->compute_stream);
-            vv_cuda_memcpy_d2h(normed_h, normed_gpu, one_hidden, NULL);
+            vv_dev_stream_sync(ctx->compute_stream);
+            vv_dev_memcpy_d2h(normed_h, normed_gpu, one_hidden, NULL);
             float normed_f[4096], logits_f[152064]; /* max vocab */
             for (int d = 0; d < hs; d++) normed_f[d] = half_to_float_single(normed_h[d]);
             /* Simplified: use model->lm_head directly (FP16 on CPU) */
@@ -1320,16 +1290,16 @@ static vv_status_t transcribe_gpu(
             }
             vv_sample_greedy_cpu(logits_f, vocab_size, &token_id);
         } else {
-            s = vv_lm_head_gemv_cuda(normed_gpu, ctx->lm_head_gpu,
+            s = vv_lm_head_gemv_dev(normed_gpu, ctx->lm_head_gpu,
                                       logits_f32_gpu, vocab_size, hs,
                                       ctx->compute_stream);
             if (s != VV_OK) break;
-            s = vv_argmax_cuda(logits_f32_gpu, vocab_size, argmax_v_gpu,
+            s = vv_argmax_dev(logits_f32_gpu, vocab_size, argmax_v_gpu,
                                 argmax_i_gpu, token_out_gpu, NULL,
                                 ctx->compute_stream);
             if (s != VV_OK) break;
-            vv_cuda_stream_sync(ctx->compute_stream);
-            vv_cuda_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t), NULL);
+            vv_dev_stream_sync(ctx->compute_stream);
+            vv_dev_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t), NULL);
         }
 
         t_head_ms += vv_time_ms() - t_tok;
@@ -1401,7 +1371,7 @@ static vv_status_t transcribe_gpu(
     }
     {
         size_t vfree = 0, vtotal = 0;
-        if (vv_cuda_get_device_info(ctx->gpu_id, &vtotal, &vfree, NULL) == VV_OK) {
+        if (vv_dev_get_device_info(ctx->gpu_id, &vtotal, &vfree, NULL) == VV_OK) {
             perf->vram_total_bytes = vtotal;
             perf->vram_free_bytes  = vfree;
             perf->vram_used_bytes  = vtotal - vfree;
@@ -1409,15 +1379,15 @@ static vv_status_t transcribe_gpu(
     }
 
 cleanup_decode:
-    if (hidden_states_gpu) vv_cuda_free(hidden_states_gpu);
-    if (normed_gpu) vv_cuda_free(normed_gpu);
-    if (logits_gpu) vv_cuda_free(logits_gpu);
-    if (hidden_one_gpu) vv_cuda_free(hidden_one_gpu);
-    if (logits_f32_gpu) vv_cuda_free(logits_f32_gpu);
-    if (argmax_v_gpu) vv_cuda_free(argmax_v_gpu);
-    if (argmax_i_gpu) vv_cuda_free(argmax_i_gpu);
-    if (token_out_gpu) vv_cuda_free(token_out_gpu);
-    if (tok_id_gpu) vv_cuda_free(tok_id_gpu);
+    if (hidden_states_gpu) vv_dev_free(hidden_states_gpu);
+    if (normed_gpu) vv_dev_free(normed_gpu);
+    if (logits_gpu) vv_dev_free(logits_gpu);
+    if (hidden_one_gpu) vv_dev_free(hidden_one_gpu);
+    if (logits_f32_gpu) vv_dev_free(logits_f32_gpu);
+    if (argmax_v_gpu) vv_dev_free(argmax_v_gpu);
+    if (argmax_i_gpu) vv_dev_free(argmax_i_gpu);
+    if (token_out_gpu) vv_dev_free(token_out_gpu);
+    if (tok_id_gpu) vv_dev_free(tok_id_gpu);
     return s;
 }
 
@@ -1464,7 +1434,7 @@ static vv_status_t transcribe_cpu(
     if (ctx->use_gpu && ctx->workspace) {
         saved_ws2 = ctx->workspace;
         saved_ws2_size = ctx->workspace_size;
-        vv_cuda_free(ctx->workspace);
+        vv_dev_free(ctx->workspace);
         ctx->workspace = NULL;
     }
 
@@ -1480,7 +1450,7 @@ static vv_status_t transcribe_cpu(
     }
 
     if (saved_ws2_size > 0 && ctx->use_gpu) {
-        vv_cuda_alloc(&ctx->workspace, saved_ws2_size);
+        vv_dev_alloc(&ctx->workspace, saved_ws2_size);
         ctx->workspace_size = saved_ws2_size;
     }
 
@@ -1718,10 +1688,10 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
     if (!ctx) return VV_ERR_NULL_PTR;
 
     if (ctx->use_gpu) {
-        if (ctx->workspace) vv_cuda_free(ctx->workspace);
-        if (ctx->embed_table_gpu) vv_cuda_free(ctx->embed_table_gpu);
-        if (ctx->lm_head_gpu) vv_cuda_free(ctx->lm_head_gpu);
-        if (ctx->final_norm_gpu) vv_cuda_free(ctx->final_norm_gpu);
+        if (ctx->workspace) vv_dev_free(ctx->workspace);
+        if (ctx->embed_table_gpu) vv_dev_free(ctx->embed_table_gpu);
+        if (ctx->lm_head_gpu) vv_dev_free(ctx->lm_head_gpu);
+        if (ctx->final_norm_gpu) vv_dev_free(ctx->final_norm_gpu);
         if (ctx->layer_pool) vv_layer_pool_free(ctx->layer_pool);
     } else {
         if (ctx->workspace) vv_free(ctx->workspace);
@@ -1729,8 +1699,8 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
 
     if (ctx->kv_cache) vv_kv_cache_free(ctx->kv_cache);
     if (ctx->use_gpu) {
-        if (ctx->compute_stream) vv_cuda_stream_destroy(ctx->compute_stream);
-        if (ctx->transfer_stream) vv_cuda_stream_destroy(ctx->transfer_stream);
+        if (ctx->compute_stream) vv_dev_stream_destroy(ctx->compute_stream);
+        if (ctx->transfer_stream) vv_dev_stream_destroy(ctx->transfer_stream);
     }
 
     if (ctx->tokenizer) vv_tokenizer_free(ctx->tokenizer);

@@ -12,31 +12,10 @@
 
 #include <math.h>
 #include <string.h>
+#include "vibevoice/device.h"
 
 /* ─── CUDA extern declarations ─────────────────────────────────────────── */
 
-extern vv_status_t vv_cuda_alloc(void** ptr, size_t size);
-extern vv_status_t vv_cuda_free(void* ptr);
-extern vv_status_t vv_cuda_memcpy_h2d(void* dst, const void* src,
-                                        size_t size, void* stream);
-extern vv_status_t vv_cuda_memcpy_d2h(void* dst, const void* src,
-                                        size_t size, void* stream);
-extern vv_status_t vv_cuda_stream_sync(void* stream);
-extern vv_status_t vv_cuda_stream_create(void** stream);
-extern vv_status_t vv_cuda_stream_destroy(void* stream);
-extern vv_status_t vv_gemm_fp16_cuda(
-    const void* A, const void* B, void* C,
-    int M, int N, int K,
-    float alpha, float beta, void* stream);
-extern vv_status_t vv_bias_add_cuda(void* output, const void* bias,
-                                      int M, int N, void* stream);
-extern vv_status_t vv_rmsnorm_cuda(
-    const void* input, const void* weight, void* output,
-    int seq_len, int hidden_size, float eps, void* stream);
-extern vv_status_t vv_fp32_to_fp16_cuda(const void* in, void* out,
-                                          int n, void* stream);
-extern vv_status_t vv_fp16_to_fp32_cuda(const void* in, void* out,
-                                          int n, void* stream);
 
 /* ─── RMSNorm ───────────────────────────────────────────────────────────── */
 
@@ -150,14 +129,14 @@ static vv_status_t upload_fp32_as_fp16_conn(const float* cpu, size_t n,
     if (!cpu || n == 0) { *out_gpu = NULL; return VV_OK; }
     void *fp32_gpu = NULL, *fp16_gpu = NULL;
     vv_status_t s;
-    s = vv_cuda_alloc(&fp32_gpu, n * 4);
+    s = vv_dev_alloc(&fp32_gpu, n * 4);
     if (s != VV_OK) return s;
-    s = vv_cuda_alloc(&fp16_gpu, n * 2);
-    if (s != VV_OK) { vv_cuda_free(fp32_gpu); return s; }
-    vv_cuda_memcpy_h2d(fp32_gpu, cpu, n * 4, stream);
-    vv_fp32_to_fp16_cuda(fp32_gpu, fp16_gpu, (int)n, stream);
-    vv_cuda_stream_sync(stream);
-    vv_cuda_free(fp32_gpu);
+    s = vv_dev_alloc(&fp16_gpu, n * 2);
+    if (s != VV_OK) { vv_dev_free(fp32_gpu); return s; }
+    vv_dev_memcpy_h2d(fp32_gpu, cpu, n * 4, stream);
+    vv_fp32_to_fp16_dev(fp32_gpu, fp16_gpu, (int)n, stream);
+    vv_dev_stream_sync(stream);
+    vv_dev_free(fp32_gpu);
     *out_gpu = fp16_gpu;
     return VV_OK;
 }
@@ -173,7 +152,7 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
                                               float** output_cpu) {
     vv_status_t s;
     void* stream = NULL;
-    s = vv_cuda_stream_create(&stream);
+    s = vv_dev_stream_create(&stream);
     if (s != VV_OK) return s;
 
     int vd = conn->vae_dim;
@@ -184,7 +163,7 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
     /* Upload input as FP16 */
     void* input_gpu = NULL;
     s = upload_fp32_as_fp16_conn(input_cpu, in_elems, &input_gpu, stream);
-    if (s != VV_OK) { vv_cuda_stream_destroy(stream); return s; }
+    if (s != VV_OK) { vv_dev_stream_destroy(stream); return s; }
 
     /* Upload weights as FP16 */
     void *w1_gpu = NULL, *b1_gpu = NULL, *nw_gpu = NULL;
@@ -204,11 +183,11 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
 
     /* Allocate intermediate buffers */
     void *fc1_gpu = NULL, *norm_gpu = NULL, *fc2_gpu = NULL;
-    s = vv_cuda_alloc(&fc1_gpu, out_elems * 2);
+    s = vv_dev_alloc(&fc1_gpu, out_elems * 2);
     if (s != VV_OK) goto cleanup;
-    s = vv_cuda_alloc(&norm_gpu, out_elems * 2);
+    s = vv_dev_alloc(&norm_gpu, out_elems * 2);
     if (s != VV_OK) goto cleanup;
-    s = vv_cuda_alloc(&fc2_gpu, out_elems * 2);
+    s = vv_dev_alloc(&fc2_gpu, out_elems * 2);
     if (s != VV_OK) goto cleanup;
 
     /* ── Diagnostic: check input and weight stats ── */
@@ -253,21 +232,21 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
     }
 
     /* fc1: [n_frames, vd] @ [hs, vd]^T → [n_frames, hs] */
-    s = vv_gemm_fp16_cuda(input_gpu, w1_gpu, fc1_gpu,
+    s = vv_gemm_fp16_dev(input_gpu, w1_gpu, fc1_gpu,
                             n_frames, hs, vd, 1.0f, 0.0f, stream);
     if (s != VV_OK) goto cleanup;
 
     /* bias add */
     if (b1_gpu)
-        vv_bias_add_cuda(fc1_gpu, b1_gpu, n_frames, hs, stream);
+        vv_bias_add_dev(fc1_gpu, b1_gpu, n_frames, hs, stream);
 
     /* ── Diagnostic: dump intermediate stats ── */
     #define CONN_DIAG_N 256
     {
-        vv_cuda_stream_sync(stream);
+        vv_dev_stream_sync(stream);
         int diag_n = (int)out_elems < CONN_DIAG_N ? (int)out_elems : CONN_DIAG_N;
         uint16_t diag_h[CONN_DIAG_N];
-        vv_cuda_memcpy_d2h(diag_h, fc1_gpu, (size_t)diag_n * 2, NULL);
+        vv_dev_memcpy_d2h(diag_h, fc1_gpu, (size_t)diag_n * 2, NULL);
         float dmin = 1e30f, dmax = -1e30f, dsum = 0.0f;
         for (int i = 0; i < diag_n; i++) {
             /* inline fp16→fp32 */
@@ -289,14 +268,14 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
     }
 
     /* RMSNorm (no activation — matches Python: fc1 → norm → fc2) */
-    vv_rmsnorm_cuda(fc1_gpu, nw_gpu, norm_gpu,
+    vv_rmsnorm_dev(fc1_gpu, nw_gpu, norm_gpu,
                      n_frames, hs, conn->rms_eps, stream);
 
     {
-        vv_cuda_stream_sync(stream);
+        vv_dev_stream_sync(stream);
         int diag_n = (int)out_elems < CONN_DIAG_N ? (int)out_elems : CONN_DIAG_N;
         uint16_t diag_h[CONN_DIAG_N];
-        vv_cuda_memcpy_d2h(diag_h, norm_gpu, (size_t)diag_n * 2, NULL);
+        vv_dev_memcpy_d2h(diag_h, norm_gpu, (size_t)diag_n * 2, NULL);
         float dmin = 1e30f, dmax = -1e30f, dsum = 0.0f;
         for (int i = 0; i < diag_n; i++) {
             uint16_t h = diag_h[i];
@@ -317,19 +296,19 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
     }
 
     /* fc2: [n_frames, hs] @ [hs, hs]^T → [n_frames, hs] */
-    s = vv_gemm_fp16_cuda(norm_gpu, w2_gpu, fc2_gpu,
+    s = vv_gemm_fp16_dev(norm_gpu, w2_gpu, fc2_gpu,
                             n_frames, hs, hs, 1.0f, 0.0f, stream);
     if (s != VV_OK) goto cleanup;
 
     /* bias add */
     if (b2_gpu)
-        vv_bias_add_cuda(fc2_gpu, b2_gpu, n_frames, hs, stream);
+        vv_bias_add_dev(fc2_gpu, b2_gpu, n_frames, hs, stream);
 
     {
-        vv_cuda_stream_sync(stream);
+        vv_dev_stream_sync(stream);
         int diag_n = (int)out_elems < CONN_DIAG_N ? (int)out_elems : CONN_DIAG_N;
         uint16_t diag_h[CONN_DIAG_N];
-        vv_cuda_memcpy_d2h(diag_h, fc2_gpu, (size_t)diag_n * 2, NULL);
+        vv_dev_memcpy_d2h(diag_h, fc2_gpu, (size_t)diag_n * 2, NULL);
         float dmin = 1e30f, dmax = -1e30f, dsum = 0.0f;
         for (int i = 0; i < diag_n; i++) {
             uint16_t h = diag_h[i];
@@ -353,15 +332,15 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
     /* Download result as FP32 */
     {
         void* fp32_gpu = NULL;
-        s = vv_cuda_alloc(&fp32_gpu, out_elems * 4);
+        s = vv_dev_alloc(&fp32_gpu, out_elems * 4);
         if (s != VV_OK) goto cleanup;
-        vv_fp16_to_fp32_cuda(fc2_gpu, fp32_gpu, (int)out_elems, stream);
-        vv_cuda_stream_sync(stream);
+        vv_fp16_to_fp32_dev(fc2_gpu, fp32_gpu, (int)out_elems, stream);
+        vv_dev_stream_sync(stream);
 
         float* result = (float*)vv_alloc(out_elems * 4);
-        if (!result) { vv_cuda_free(fp32_gpu); s = VV_ERR_OUT_OF_MEMORY; goto cleanup; }
-        vv_cuda_memcpy_d2h(result, fp32_gpu, out_elems * 4, NULL);
-        vv_cuda_free(fp32_gpu);
+        if (!result) { vv_dev_free(fp32_gpu); s = VV_ERR_OUT_OF_MEMORY; goto cleanup; }
+        vv_dev_memcpy_d2h(result, fp32_gpu, out_elems * 4, NULL);
+        vv_dev_free(fp32_gpu);
         *output_cpu = result;
     }
 
@@ -369,16 +348,16 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
     s = VV_OK;
 
 cleanup:
-    if (input_gpu) vv_cuda_free(input_gpu);
-    if (w1_gpu) vv_cuda_free(w1_gpu);
-    if (b1_gpu) vv_cuda_free(b1_gpu);
-    if (nw_gpu) vv_cuda_free(nw_gpu);
-    if (w2_gpu) vv_cuda_free(w2_gpu);
-    if (b2_gpu) vv_cuda_free(b2_gpu);
-    if (fc1_gpu) vv_cuda_free(fc1_gpu);
-    if (norm_gpu) vv_cuda_free(norm_gpu);
-    if (fc2_gpu) vv_cuda_free(fc2_gpu);
-    vv_cuda_stream_destroy(stream);
+    if (input_gpu) vv_dev_free(input_gpu);
+    if (w1_gpu) vv_dev_free(w1_gpu);
+    if (b1_gpu) vv_dev_free(b1_gpu);
+    if (nw_gpu) vv_dev_free(nw_gpu);
+    if (w2_gpu) vv_dev_free(w2_gpu);
+    if (b2_gpu) vv_dev_free(b2_gpu);
+    if (fc1_gpu) vv_dev_free(fc1_gpu);
+    if (norm_gpu) vv_dev_free(norm_gpu);
+    if (fc2_gpu) vv_dev_free(fc2_gpu);
+    vv_dev_stream_destroy(stream);
     return s;
 }
 
@@ -392,8 +371,8 @@ vv_status_t vv_connector_forward_auto(const vv_connector_t* conn,
 
     /* Try GPU first */
     void* test_ptr = NULL;
-    if (vv_cuda_alloc(&test_ptr, 256) == VV_OK) {
-        vv_cuda_free(test_ptr);
+    if (vv_dev_alloc(&test_ptr, 256) == VV_OK) {
+        vv_dev_free(test_ptr);
         vv_status_t gs = vv_connector_forward_gpu(conn, input, n_frames, output);
         if (gs == VV_OK) return VV_OK;
         VV_LOG_W("connector: GPU forward failed (status=%d), falling back to CPU", gs);

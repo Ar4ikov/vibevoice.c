@@ -119,10 +119,12 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /**
  * @brief Launch NF4 dequantization kernel (simple, FP16 scales).
  */
-vv_status_t vv_dequant_nf4_cuda(
+vv_status_t vv_dequant_nf4_dev(
     const uint8_t* packed,
     const void*    scales_fp16,
     void*          output_fp16,
@@ -160,7 +162,7 @@ vv_status_t vv_dequant_nf4_cuda(
 /**
  * @brief Launch NF4 dequantization kernel with double quantization.
  */
-vv_status_t vv_dequant_nf4_double_cuda(
+vv_status_t vv_dequant_nf4_double_dev(
     const uint8_t* packed,
     const uint8_t* scales_fp8,
     const float*   scale_offsets,

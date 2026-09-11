@@ -1,117 +1,443 @@
 /**
  * @file gemm.cu
- * @brief GEMM wrappers: cuBLAS FP16 + NF4 dequant-then-GEMM.
+ * @brief FP16 GEMM on tensor cores — no cuBLAS.
  *
- * Two main operations:
- * 1. Standard FP16 GEMM via cuBLAS (for non-quantized layers)
- * 2. NF4 dequant → FP16 GEMM (for quantized LLM layers)
+ * The runtime ships as a single self-contained binary, so it cannot depend on
+ * libcublas (600 MB of redistributables, or a toolkit install on the target
+ * machine). These kernels use the WMMA API directly, which compiles into the
+ * same `mma.sync` instructions cuBLAS issues on Ampere.
+ *
+ * Two shapes are needed:
+ *   TN:  C[M,N] = A[M,K] @ B[N,K]^T   — a linear layer, weight in [out, in]
+ *   NN:  C[M,P] = A[M,K] @ B[K,P]     — Conv-VAE FFN, weight @ activations
+ *
+ * Both use a 128x128x32 block tile split over 8 warps (each warp owns a 64x32
+ * quadrant = 4x2 WMMA fragments), double-buffered through shared memory so the
+ * global loads for step k+1 are in flight while step k is on the tensor cores.
  *
  * IMPORTANT: All linear-layer callers pass weight in [N, K] layout
  * (i.e., [out_features, in_features], the standard PyTorch convention).
- * The GEMM functions compute:  C = A @ B^T  where B is [N, K].
  */
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cublas_v2.h>
+#include <mma.h>
 #include <stdint.h>
 
-/* Forward declare the dequant kernel launch */
+#include "vibevoice/device.h"
+
+using namespace nvcuda;
+
 extern "C" {
     #include "vibevoice/types.h"
 
-    vv_status_t vv_dequant_nf4_cuda(
+    vv_status_t vv_dequant_nf4_dev(
         const uint8_t* packed, const void* scales_fp16,
         void* output_fp16, int n_elements, int block_size, void* stream);
 }
 
-/**
- * @brief cuBLAS handle management.
- * One handle per GPU, created on first use.
- */
-static cublasHandle_t s_cublas_handle = NULL;
+/* ─── Tile geometry ──────────────────────────────────────────────────────── */
 
-static cublasHandle_t get_cublas_handle(void) {
-    if (!s_cublas_handle) {
-        cublasCreate(&s_cublas_handle);
-        cublasSetMathMode(s_cublas_handle, CUBLAS_TENSOR_OP_MATH);
+#define BM        128
+#define BN        128
+#define BK        32
+#define WARPS     8
+#define THREADS   (WARPS * 32)
+
+#define WARP_M    64            /* BM / 2 warp rows */
+#define WARP_N    32            /* BN / 4 warp cols */
+#define FRAG_M    (WARP_M / 16) /* 4 */
+#define FRAG_N    (WARP_N / 16) /* 2 */
+#define KSTEPS    (BK / 16)     /* 2 */
+
+/* Row stride of a K-major shared tile. +8 keeps the 16-byte stores aligned
+ * (80 bytes per row) while breaking the power-of-two bank pattern. */
+#define LDK       (BK + 8)      /* 40 */
+/* Row stride of an N-major shared tile (NN kernel's B). */
+#define LDN       (BN + 8)      /* 136 */
+
+/* ─── Shared-memory tile loaders ─────────────────────────────────────────── */
+
+/**
+ * Load a [rows x BK] slab of a K-major matrix into shared memory.
+ * Four threads cover one row (8 halves each), two passes cover 128 rows.
+ */
+template <int ROWS>
+__device__ __forceinline__ void load_k_major(
+    const half* __restrict__ src, int row_base, int row_limit,
+    int K, int k0, bool k_aligned, half* __restrict__ dst)
+{
+    const int tid = threadIdx.x;
+    #pragma unroll
+    for (int p = 0; p < ROWS / 64; ++p) {
+        const int r  = (tid >> 2) + p * 64;
+        const int c  = (tid & 3) * 8;
+        const int gr = row_base + r;
+        half* d = dst + r * LDK + c;
+
+        if (gr < row_limit && k_aligned && k0 + c + 8 <= K) {
+            *(float4*)d = *(const float4*)(src + (size_t)gr * K + k0 + c);
+        } else {
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const int kk = k0 + c + t;
+                d[t] = (gr < row_limit && kk < K)
+                     ? src[(size_t)gr * K + kk] : __float2half(0.f);
+            }
+        }
     }
-    return s_cublas_handle;
 }
+
+/**
+ * Load a [BK x BN] slab of an N-major matrix (B of the NN shape) into shared.
+ * Sixteen threads cover one row of 128 halves; two passes cover 32 rows.
+ */
+__device__ __forceinline__ void load_n_major(
+    const half* __restrict__ src, int k0, int K,
+    int col_base, int P, bool p_aligned, half* __restrict__ dst)
+{
+    const int tid = threadIdx.x;
+    #pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r  = (tid >> 4) + p * 16;
+        const int c  = (tid & 15) * 8;
+        const int gk = k0 + r;
+        const int gc = col_base + c;
+        half* d = dst + r * LDN + c;
+
+        if (gk < K && p_aligned && gc + 8 <= P) {
+            *(float4*)d = *(const float4*)(src + (size_t)gk * P + gc);
+        } else {
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                d[t] = (gk < K && gc + t < P)
+                     ? src[(size_t)gk * P + gc + t] : __float2half(0.f);
+            }
+        }
+    }
+}
+
+/* ─── Epilogue ───────────────────────────────────────────────────────────── */
+
+/**
+ * Spill one 16x16 accumulator through shared memory and write it out with
+ * bounds checks. WMMA fragment layout is implementation-defined, so going
+ * through store_matrix_sync is the only portable way to index the results.
+ */
+__device__ __forceinline__ void store_frag(
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float>& c_frag,
+    float* stage, half* __restrict__ C, int ldc,
+    int row0, int col0, int rows, int cols,
+    float alpha, float beta)
+{
+    wmma::store_matrix_sync(stage, c_frag, 16, wmma::mem_row_major);
+    __syncwarp();
+
+    const int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int i = lane; i < 256; i += 32) {
+        const int r = row0 + (i >> 4);
+        const int c = col0 + (i & 15);
+        if (r < rows && c < cols) {
+            const size_t off = (size_t)r * ldc + c;
+            float v = alpha * stage[i];
+            if (beta != 0.f) v += beta * __half2float(C[off]);
+            C[off] = __float2half(v);
+        }
+    }
+    __syncwarp();
+}
+
+/* ─── TN kernel: C[M,N] = A[M,K] @ B[N,K]^T ──────────────────────────────── */
+
+__global__ __launch_bounds__(THREADS) void gemm_tn_kernel(
+    const half* __restrict__ A, const half* __restrict__ B,
+    half* __restrict__ C, int M, int N, int K,
+    float alpha, float beta)
+{
+    extern __shared__ char smem_raw[];
+    half* As = (half*)smem_raw;                 /* [2][BM][LDK] */
+    half* Bs = As + 2 * BM * LDK;               /* [2][BN][LDK] */
+
+    const int warp   = threadIdx.x >> 5;
+    const int warp_m = warp >> 2;               /* 0..1 */
+    const int warp_n = warp & 3;                /* 0..3 */
+    const int row_base = blockIdx.y * BM;
+    const int col_base = blockIdx.x * BN;
+    const bool k_aligned = (K & 7) == 0;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[FRAG_M][FRAG_N];
+    #pragma unroll
+    for (int i = 0; i < FRAG_M; ++i)
+        #pragma unroll
+        for (int j = 0; j < FRAG_N; ++j)
+            wmma::fill_fragment(acc[i][j], 0.f);
+
+    load_k_major<BM>(A, row_base, M, K, 0, k_aligned, As);
+    load_k_major<BN>(B, col_base, N, K, 0, k_aligned, Bs);
+    __syncthreads();
+
+    int stage = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const half* Ac = As + stage * BM * LDK;
+        const half* Bc = Bs + stage * BN * LDK;
+
+        #pragma unroll
+        for (int ks = 0; ks < KSTEPS; ++ks) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af[FRAG_M];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf[FRAG_N];
+            #pragma unroll
+            for (int i = 0; i < FRAG_M; ++i)
+                wmma::load_matrix_sync(af[i],
+                    Ac + (warp_m * WARP_M + i * 16) * LDK + ks * 16, LDK);
+            #pragma unroll
+            for (int j = 0; j < FRAG_N; ++j)
+                wmma::load_matrix_sync(bf[j],
+                    Bc + (warp_n * WARP_N + j * 16) * LDK + ks * 16, LDK);
+            #pragma unroll
+            for (int i = 0; i < FRAG_M; ++i)
+                #pragma unroll
+                for (int j = 0; j < FRAG_N; ++j)
+                    wmma::mma_sync(acc[i][j], af[i], bf[j], acc[i][j]);
+        }
+
+        if (k0 + BK < K) {
+            const int nx = stage ^ 1;
+            load_k_major<BM>(A, row_base, M, K, k0 + BK, k_aligned,
+                             As + nx * BM * LDK);
+            load_k_major<BN>(B, col_base, N, K, k0 + BK, k_aligned,
+                             Bs + nx * BN * LDK);
+            __syncthreads();
+            stage = nx;
+        }
+    }
+
+    __syncthreads();
+    float* stg = (float*)smem_raw + warp * 256;
+    #pragma unroll
+    for (int i = 0; i < FRAG_M; ++i)
+        #pragma unroll
+        for (int j = 0; j < FRAG_N; ++j)
+            store_frag(acc[i][j], stg, C, N,
+                       row_base + warp_m * WARP_M + i * 16,
+                       col_base + warp_n * WARP_N + j * 16,
+                       M, N, alpha, beta);
+}
+
+/* ─── NN kernel: C[M,P] = A[M,K] @ B[K,P] ────────────────────────────────── */
+
+__global__ __launch_bounds__(THREADS) void gemm_nn_kernel(
+    const half* __restrict__ A, const half* __restrict__ B,
+    half* __restrict__ C, int M, int K, int P,
+    float alpha, float beta)
+{
+    extern __shared__ char smem_raw[];
+    half* As = (half*)smem_raw;                 /* [2][BM][LDK] */
+    half* Bs = As + 2 * BM * LDK;               /* [2][BK][LDN] */
+
+    const int warp   = threadIdx.x >> 5;
+    const int warp_m = warp >> 2;
+    const int warp_n = warp & 3;
+    const int row_base = blockIdx.y * BM;
+    const int col_base = blockIdx.x * BN;
+    const bool k_aligned = (K & 7) == 0;
+    const bool p_aligned = (P & 7) == 0;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[FRAG_M][FRAG_N];
+    #pragma unroll
+    for (int i = 0; i < FRAG_M; ++i)
+        #pragma unroll
+        for (int j = 0; j < FRAG_N; ++j)
+            wmma::fill_fragment(acc[i][j], 0.f);
+
+    load_k_major<BM>(A, row_base, M, K, 0, k_aligned, As);
+    load_n_major(B, 0, K, col_base, P, p_aligned, Bs);
+    __syncthreads();
+
+    int stage = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const half* Ac = As + stage * BM * LDK;
+        const half* Bc = Bs + stage * BK * LDN;
+
+        #pragma unroll
+        for (int ks = 0; ks < KSTEPS; ++ks) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af[FRAG_M];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> bf[FRAG_N];
+            #pragma unroll
+            for (int i = 0; i < FRAG_M; ++i)
+                wmma::load_matrix_sync(af[i],
+                    Ac + (warp_m * WARP_M + i * 16) * LDK + ks * 16, LDK);
+            #pragma unroll
+            for (int j = 0; j < FRAG_N; ++j)
+                wmma::load_matrix_sync(bf[j],
+                    Bc + (ks * 16) * LDN + warp_n * WARP_N + j * 16, LDN);
+            #pragma unroll
+            for (int i = 0; i < FRAG_M; ++i)
+                #pragma unroll
+                for (int j = 0; j < FRAG_N; ++j)
+                    wmma::mma_sync(acc[i][j], af[i], bf[j], acc[i][j]);
+        }
+
+        if (k0 + BK < K) {
+            const int nx = stage ^ 1;
+            load_k_major<BM>(A, row_base, M, K, k0 + BK, k_aligned,
+                             As + nx * BM * LDK);
+            load_n_major(B, k0 + BK, K, col_base, P, p_aligned,
+                         Bs + nx * BK * LDN);
+            __syncthreads();
+            stage = nx;
+        }
+    }
+
+    __syncthreads();
+    float* stg = (float*)smem_raw + warp * 256;
+    #pragma unroll
+    for (int i = 0; i < FRAG_M; ++i)
+        #pragma unroll
+        for (int j = 0; j < FRAG_N; ++j)
+            store_frag(acc[i][j], stg, C, P,
+                       row_base + warp_m * WARP_M + i * 16,
+                       col_base + warp_n * WARP_N + j * 16,
+                       M, P, alpha, beta);
+}
+
+/* ─── Skinny-M path ──────────────────────────────────────────────────────── */
+
+/**
+ * For M <= 8 the tensor-core tile is 94% padding, so fall back to a
+ * bandwidth-bound dot-product kernel: one warp streams one row of B and
+ * accumulates against every row of A, which stays resident in L2.
+ */
+#define SMALL_M_MAX 8
+
+__global__ void gemm_tn_skinny_kernel(
+    const half* __restrict__ A, const half* __restrict__ B,
+    half* __restrict__ C, int M, int N, int K,
+    float alpha, float beta)
+{
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (n >= N) return;
+
+    float acc[SMALL_M_MAX];
+    #pragma unroll
+    for (int m = 0; m < SMALL_M_MAX; ++m) acc[m] = 0.f;
+
+    const half* brow = B + (size_t)n * K;
+    const int k_vec = (K / 8) * 8;
+
+    for (int k = lane * 8; k < k_vec; k += 32 * 8) {
+        const float4 bv = *(const float4*)(brow + k);
+        const half2* bh = (const half2*)&bv;
+        for (int m = 0; m < M; ++m) {
+            const float4 av = *(const float4*)(A + (size_t)m * K + k);
+            const half2* ah = (const half2*)&av;
+            float s = 0.f;
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const float2 a = __half22float2(ah[t]);
+                const float2 b = __half22float2(bh[t]);
+                s += a.x * b.x + a.y * b.y;
+            }
+            acc[m] += s;
+        }
+    }
+    for (int k = k_vec + lane; k < K; k += 32) {
+        const float b = __half2float(brow[k]);
+        for (int m = 0; m < M; ++m)
+            acc[m] += __half2float(A[(size_t)m * K + k]) * b;
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        for (int m = 0; m < M; ++m)
+            acc[m] += __shfl_down_sync(0xffffffffu, acc[m], off);
+
+    if (lane == 0) {
+        for (int m = 0; m < M; ++m) {
+            const size_t o = (size_t)m * N + n;
+            float v = alpha * acc[m];
+            if (beta != 0.f) v += beta * __half2float(C[o]);
+            C[o] = __float2half(v);
+        }
+    }
+}
+
+/* ─── Public API ─────────────────────────────────────────────────────────── */
 
 extern "C" {
 
 /**
- * @brief FP16 GEMM via cuBLAS:  C = alpha * A @ B^T + beta * C
+ * @brief FP16 GEMM on tensor cores:  C = alpha * A @ B^T + beta * C
  *
- * A: [M, K] FP16 (row-major)
- * B: [N, K] FP16 (row-major) — weight in [out_features, in_features] layout
- * C: [M, N] FP16 (row-major)
+ * A: [M, K] FP16 row-major
+ * B: [N, K] FP16 row-major — weight in [out_features, in_features] layout
+ * C: [M, N] FP16 row-major
  *
- * Uses Tensor Cores on Ampere+ (FP16 with FP32 accumulation).
+ * FP32 accumulation throughout (critical at K = 3584).
  */
-vv_status_t vv_gemm_fp16_cuda(
+vv_status_t vv_gemm_fp16_dev(
     const void* A, const void* B, void* C,
     int M, int N, int K,
     float alpha, float beta,
     void* stream)
 {
     if (!A || !B || !C) return VV_ERR_NULL_PTR;
+    if (M <= 0 || N <= 0 || K <= 0) return VV_ERR_INVALID_ARG;
 
-    cublasHandle_t handle = get_cublas_handle();
-    if (!handle) return VV_ERR_CUDA;
+    cudaStream_t st = (cudaStream_t)stream;
 
-    cublasSetStream(handle, (cudaStream_t)stream);
+    if (M <= SMALL_M_MAX && (K & 7) == 0) {
+        const int warps_per_block = 8;
+        dim3 grid((N + warps_per_block - 1) / warps_per_block);
+        gemm_tn_skinny_kernel<<<grid, warps_per_block * 32, 0, st>>>(
+            (const half*)A, (const half*)B, (half*)C, M, N, K, alpha, beta);
+        return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+    }
 
-    /*
-     * We want (row-major): C[M,N] = alpha * A[M,K] @ B[N,K]^T + beta * C
-     *
-     * Row-major → column-major duality:
-     *   A[M,K] rm = A^T[K,M] cm  (pointer A, ld=K)
-     *   B[N,K] rm = B^T[K,N] cm  (pointer B, ld=K)
-     *   C[M,N] rm = C^T[N,M] cm  (pointer C, ld=N)
-     *
-     * Transpose identity:  C^T = (A @ B^T)^T = B @ A^T
-     *
-     * In cuBLAS column-major terms:
-     *   C_cm[N,M] = B_cm[N,K] @ A_cm[K,M]
-     *
-     * B_cm[N,K] = OP_T(B_stored_cm[K,N]) — transpose the stored B^T
-     * A_cm[K,M] = OP_N(A_stored_cm[K,M]) — use A^T as-is
-     *
-     * cuBLAS call: gemm(OP_T, OP_N, N, M, K, B_ptr:ld=K, A_ptr:ld=K, C_ptr:ld=N)
-     *
-     * Use CUBLAS_COMPUTE_32F for FP32 accumulation (critical for K=3584).
-     */
-    cublasStatus_t status = cublasGemmEx(
-        handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        N, M, K,
-        &alpha,
-        B, CUDA_R_16F, K,    /* B[N,K] rm → B^T[K,N] cm, ld=K; transposed to B[N,K] */
-        A, CUDA_R_16F, K,    /* A[M,K] rm → A^T[K,M] cm, ld=K                       */
-        &beta,
-        C, CUDA_R_16F, N,    /* C[M,N] rm → C^T[N,M] cm, ld=N                       */
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
+    const size_t shmem = (size_t)2 * (BM + BN) * LDK * sizeof(half);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    gemm_tn_kernel<<<grid, THREADS, shmem, st>>>(
+        (const half*)A, (const half*)B, (half*)C, M, N, K, alpha, beta);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
 
-    return (status == CUBLAS_STATUS_SUCCESS) ? VV_OK : VV_ERR_CUDA;
+/**
+ * @brief FP16 GEMM on tensor cores:  C = alpha * A @ B + beta * C
+ *
+ * A: [M, K] FP16 row-major
+ * B: [K, P] FP16 row-major
+ * C: [M, P] FP16 row-major
+ *
+ * Used by the Conv-VAE FFN: output[out_ch, len] = weight[out_ch, in_ch] @ input[in_ch, len].
+ */
+vv_status_t vv_gemm_fp16_nn_dev(
+    const void* A, const void* B, void* C,
+    int M, int K, int P,
+    float alpha, float beta,
+    void* stream)
+{
+    if (!A || !B || !C) return VV_ERR_NULL_PTR;
+    if (M <= 0 || K <= 0 || P <= 0) return VV_ERR_INVALID_ARG;
+
+    const size_t shmem = (size_t)2 * (BM * LDK + BK * LDN) * sizeof(half);
+    dim3 grid((P + BN - 1) / BN, (M + BM - 1) / BM);
+    gemm_nn_kernel<<<grid, THREADS, shmem, (cudaStream_t)stream>>>(
+        (const half*)A, (const half*)B, (half*)C, M, K, P, alpha, beta);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
 /**
  * @brief NF4 dequant + FP16 GEMM.
  *
- * Dequantizes NF4 weight matrix to FP16, then performs GEMM.
- * output = input @ dequant(weight)^T
- *
  * input:  [M, K] FP16
  * weight: [N, K/2] uint8 (NF4 packed, row-major [out, in/2])
  * scales: [N*K/block_size] FP16
  * output: [M, N] FP16
- * temp:   [N, K] FP16 (pre-allocated temporary for dequantized weight)
+ * temp:   [N, K] FP16 (pre-allocated scratch for the dequantized weight)
  */
-vv_status_t vv_nf4_gemm_cuda(
+vv_status_t vv_nf4_gemm_dev(
     const void* input_fp16,
     const uint8_t* weight_packed,
     const void* weight_scales_fp16,
@@ -126,83 +452,16 @@ vv_status_t vv_nf4_gemm_cuda(
         return VV_ERR_NULL_PTR;
     }
 
-    /* Step 1: Dequantize weight from NF4 to FP16 → temp_weight[N, K] */
-    int total_elements = N * K;
-    vv_status_t s = vv_dequant_nf4_cuda(
+    vv_status_t s = vv_dequant_nf4_dev(
         weight_packed, weight_scales_fp16,
-        temp_weight_fp16, total_elements, block_size, stream);
+        temp_weight_fp16, N * K, block_size, stream);
     if (s != VV_OK) return s;
 
-    /* Step 2: FP16 GEMM: output = input @ temp_weight^T
-     * input[M,K], temp_weight[N,K] → output[M,N]
-     */
-    s = vv_gemm_fp16_cuda(
-        input_fp16, temp_weight_fp16, output_fp16,
-        M, N, K,
-        1.0f, 0.0f, stream);
-
-    return s;
+    return vv_gemm_fp16_dev(input_fp16, temp_weight_fp16, output_fp16,
+                             M, N, K, 1.0f, 0.0f, stream);
 }
 
-/**
- * @brief FP16 GEMM via cuBLAS:  C = alpha * A @ B + beta * C   (no transpose)
- *
- * A: [M, K] FP16 (row-major)
- * B: [K, P] FP16 (row-major)
- * C: [M, P] FP16 (row-major)
- *
- * This is useful for Conv-VAE FFN: output[out_ch, len] = weight[out_ch, in_ch] @ input[in_ch, len]
- *   → M=out_ch, K=in_ch, P=len
- */
-vv_status_t vv_gemm_fp16_nn_cuda(
-    const void* A, const void* B, void* C,
-    int M, int K, int P,
-    float alpha, float beta,
-    void* stream)
-{
-    if (!A || !B || !C) return VV_ERR_NULL_PTR;
-
-    cublasHandle_t handle = get_cublas_handle();
-    if (!handle) return VV_ERR_CUDA;
-
-    cublasSetStream(handle, (cudaStream_t)stream);
-
-    /*
-     * Row-major C[M,P] = A[M,K] @ B[K,P]
-     *
-     * Transpose identity:  C^T = B^T @ A^T
-     *
-     * In cuBLAS column-major terms:
-     *   A_ptr stores A[M,K] rm = A^T[K,M] cm  (ld=K)
-     *   B_ptr stores B[K,P] rm = B^T[P,K] cm  (ld=P)
-     *   C_ptr stores C[M,P] rm = C^T[P,M] cm  (ld=P)
-     *
-     *   C^T = B^T @ A^T  →  gemm(OP_N, OP_N, P, M, K, B:ld=P, A:ld=K, C:ld=P)
-     */
-    cublasStatus_t status = cublasGemmEx(
-        handle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        P, M, K,
-        &alpha,
-        B, CUDA_R_16F, P,
-        A, CUDA_R_16F, K,
-        &beta,
-        C, CUDA_R_16F, P,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
-
-    return (status == CUBLAS_STATUS_SUCCESS) ? VV_OK : VV_ERR_CUDA;
-}
-
-/**
- * @brief Cleanup cuBLAS handle (call at shutdown).
- */
-void vv_gemm_cleanup(void) {
-    if (s_cublas_handle) {
-        cublasDestroy(s_cublas_handle);
-        s_cublas_handle = NULL;
-    }
-}
+/** @brief Retained for API compatibility; there is no handle to release. */
+void vv_gemm_cleanup(void) {}
 
 } /* extern "C" */

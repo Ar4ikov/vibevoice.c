@@ -183,10 +183,7 @@ if(VV_HAS_CUDA)
         src/cuda/embedding.cu
         src/cuda/cuda_utils.cu
     )
-    target_link_libraries(vibevoice_cuda PUBLIC
-        CUDA::cudart
-        CUDA::cublas
-    )
+    target_link_libraries(vibevoice_cuda PUBLIC CUDA::cudart_static)
     if(VV_ENABLE_NVTX)
         target_compile_definitions(vibevoice_cuda PUBLIC VV_ENABLE_NVTX)
         target_link_libraries(vibevoice_cuda PUBLIC CUDA::nvToolsExt)

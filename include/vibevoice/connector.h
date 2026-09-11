@@ -58,7 +58,7 @@ vv_status_t vv_connector_forward_cpu(const vv_connector_t* conn,
  * @param output_gpu Output: [n_frames, hidden_size] FP16 on GPU
  * @param stream     CUDA stream
  */
-vv_status_t vv_connector_forward_cuda(const vv_connector_t* conn,
+vv_status_t vv_connector_forward_dev(const vv_connector_t* conn,
                                        const void* input_gpu, int n_frames,
                                        void* output_gpu, void* stream);
 

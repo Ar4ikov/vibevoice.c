@@ -69,33 +69,33 @@ vv_status_t vv_profiler_free(vv_profiler_t* profiler);
 /**
  * @brief Opaque CUDA graph handle.
  */
-typedef struct vv_cuda_graph {
+typedef struct vv_dev_graph {
     void* graph;           /**< cudaGraph_t */
     void* graph_exec;      /**< cudaGraphExec_t */
     void* stream;          /**< Capture stream */
     bool  captured;
-} vv_cuda_graph_t;
+} vv_dev_graph_t;
 
 /**
  * @brief Begin CUDA graph capture on a stream.
  */
-vv_status_t vv_cuda_graph_begin_capture(vv_cuda_graph_t** graph,
+vv_status_t vv_dev_graph_begin_capture(vv_dev_graph_t** graph,
                                          void* stream);
 
 /**
  * @brief End graph capture and instantiate for replay.
  */
-vv_status_t vv_cuda_graph_end_capture(vv_cuda_graph_t* graph);
+vv_status_t vv_dev_graph_end_capture(vv_dev_graph_t* graph);
 
 /**
  * @brief Launch (replay) a captured graph.
  */
-vv_status_t vv_cuda_graph_launch(vv_cuda_graph_t* graph, void* stream);
+vv_status_t vv_dev_graph_launch(vv_dev_graph_t* graph, void* stream);
 
 /**
  * @brief Free CUDA graph.
  */
-vv_status_t vv_cuda_graph_free(vv_cuda_graph_t* graph);
+vv_status_t vv_dev_graph_free(vv_dev_graph_t* graph);
 
 #ifdef __cplusplus
 }

@@ -106,6 +106,8 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /**
  * @brief 1D convolution with caller-supplied padding and output length.
  *
@@ -113,7 +115,7 @@ extern "C" {
  * chunk instead of zero padding and the right padding is expressed by asking
  * for more output positions (out-of-range reads yield zero).
  */
-vv_status_t vv_conv1d_raw_cuda(
+vv_status_t vv_conv1d_raw_dev(
     const void* input_fp16,
     const void* weight_fp16,
     const void* bias_fp16,
@@ -152,7 +154,7 @@ vv_status_t vv_conv1d_raw_cuda(
 /**
  * @brief Launch 1D convolution (FP16).
  */
-vv_status_t vv_conv1d_cuda(
+vv_status_t vv_conv1d_dev(
     const void* input_fp16,
     const void* weight_fp16,
     const void* bias_fp16,

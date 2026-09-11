@@ -127,6 +127,8 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /**
  * @brief LM head GEMV into FP32 logits.
  *
@@ -134,7 +136,7 @@ extern "C" {
  * @param W       [V, K] FP16 device
  * @param logits  [V] FP32 device
  */
-vv_status_t vv_lm_head_gemv_cuda(
+vv_status_t vv_lm_head_gemv_dev(
     const void* x, const void* W, void* logits,
     int V, int K, void* stream)
 {
@@ -158,7 +160,7 @@ vv_status_t vv_lm_head_gemv_cuda(
  * @param out_token  [1] int32 device
  * @param out_value  [1] FP32 device or NULL
  */
-vv_status_t vv_argmax_cuda(
+vv_status_t vv_argmax_dev(
     const void* logits, int V,
     void* scratch_v, void* scratch_i,
     void* out_token, void* out_value, void* stream)

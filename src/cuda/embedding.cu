@@ -44,6 +44,8 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /**
  * @brief Embedding lookup.
  *
@@ -54,7 +56,7 @@ extern "C" {
  * @param hidden_size Embedding dimension
  * @param stream     CUDA stream
  */
-vv_status_t vv_embedding_cuda(
+vv_status_t vv_embedding_dev(
     const void* table, const int32_t* ids, void* output,
     int seq_len, int hidden_size, void* stream)
 {

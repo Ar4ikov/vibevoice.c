@@ -156,6 +156,8 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /**
  * @brief Fused NF4 GEMV: y[N] = dequant(W)[N,K] @ x[K] + bias.
  *
@@ -165,7 +167,7 @@ extern "C" {
  * @param bias    Optional [N] FP16 (device) or NULL
  * @param y       Output [N] FP16 (device)
  */
-vv_status_t vv_nf4_gemv_cuda(
+vv_status_t vv_nf4_gemv_dev(
     const void* x, const uint8_t* packed, const void* scales,
     const void* bias, void* y, int N, int K, void* stream)
 {
@@ -185,7 +187,7 @@ vv_status_t vv_nf4_gemv_cuda(
 /**
  * @brief Fused NF4 GEMM for a small number of tokens (M <= 8).
  */
-vv_status_t vv_nf4_gemm_small_cuda(
+vv_status_t vv_nf4_gemm_small_dev(
     const void* x, const uint8_t* packed, const void* scales,
     const void* bias, void* y, int M, int N, int K, void* stream)
 {

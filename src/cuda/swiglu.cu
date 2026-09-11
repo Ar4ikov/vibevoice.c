@@ -69,12 +69,14 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /**
  * @brief Launch fused SwiGLU kernel.
  *
  * output = SiLU(gate) * up
  */
-vv_status_t vv_swiglu_cuda(
+vv_status_t vv_swiglu_dev(
     const void* gate, const void* up, void* output,
     int n_elements, void* stream)
 {

@@ -10,12 +10,9 @@
 #include "vibevoice/vibevoice.h"
 
 #include <string.h>
+#include "vibevoice/device.h"
 
 /* Forward declare CUDA functions */
-extern vv_status_t vv_cuda_alloc(void** ptr, size_t size);
-extern vv_status_t vv_cuda_free(void* ptr);
-extern vv_status_t vv_cuda_memcpy_d2d(void* dst, const void* src,
-                                        size_t size, void* stream);
 
 vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
                                 int num_layers, int n_kv_heads,
@@ -59,9 +56,9 @@ vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
             if (!c->v_cache[i]) { vv_kv_cache_free(c); return VV_ERR_OUT_OF_MEMORY; }
             memset(c->v_cache[i], 0, per_layer_size);
         } else {
-            s = vv_cuda_alloc(&c->k_cache[i], per_layer_size);
+            s = vv_dev_alloc(&c->k_cache[i], per_layer_size);
             if (s != VV_OK) { vv_kv_cache_free(c); return s; }
-            s = vv_cuda_alloc(&c->v_cache[i], per_layer_size);
+            s = vv_dev_alloc(&c->v_cache[i], per_layer_size);
             if (s != VV_OK) { vv_kv_cache_free(c); return s; }
         }
     }
@@ -98,10 +95,10 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
         memcpy((uint8_t*)cache->v_cache[layer] + offset, v, copy_size);
         s = VV_OK;
     } else {
-        s = vv_cuda_memcpy_d2d((uint8_t*)cache->k_cache[layer] + offset,
+        s = vv_dev_memcpy_d2d((uint8_t*)cache->k_cache[layer] + offset,
                                 k, copy_size, stream);
         if (s != VV_OK) return s;
-        s = vv_cuda_memcpy_d2d((uint8_t*)cache->v_cache[layer] + offset,
+        s = vv_dev_memcpy_d2d((uint8_t*)cache->v_cache[layer] + offset,
                                 v, copy_size, stream);
         if (s != VV_OK) return s;
     }
@@ -138,7 +135,7 @@ vv_status_t vv_kv_cache_free(vv_kv_cache_t* cache) {
         for (int i = 0; i < cache->num_layers; i++) {
             if (cache->k_cache[i]) {
                 if (cache->on_cpu) vv_free(cache->k_cache[i]);
-                else vv_cuda_free(cache->k_cache[i]);
+                else vv_dev_free(cache->k_cache[i]);
             }
         }
         vv_free(cache->k_cache);
@@ -147,7 +144,7 @@ vv_status_t vv_kv_cache_free(vv_kv_cache_t* cache) {
         for (int i = 0; i < cache->num_layers; i++) {
             if (cache->v_cache[i]) {
                 if (cache->on_cpu) vv_free(cache->v_cache[i]);
-                else vv_cuda_free(cache->v_cache[i]);
+                else vv_dev_free(cache->v_cache[i]);
             }
         }
         vv_free(cache->v_cache);

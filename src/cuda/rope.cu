@@ -69,6 +69,8 @@ extern "C" {
 
 #include "vibevoice/types.h"
 
+#include "vibevoice/device.h"
+
 /**
  * @brief Apply RoPE to Q or K tensor.
  *
@@ -80,7 +82,7 @@ extern "C" {
  * @param theta          RoPE base frequency (1e6 for Qwen2)
  * @param stream         CUDA stream
  */
-vv_status_t vv_rope_cuda(
+vv_status_t vv_rope_dev(
     void* x, int seq_len, int n_heads, int head_dim,
     int position_offset, float theta, void* stream)
 {

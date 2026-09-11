@@ -40,6 +40,7 @@ static double vv_time_ms_enc(void) {
 }
 #else
 #include <time.h>
+#include "vibevoice/device.h"
 static double vv_time_ms_enc(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -49,57 +50,6 @@ static double vv_time_ms_enc(void) {
 
 /* ─── CUDA function declarations ────────────────────────────────────────── */
 
-extern vv_status_t vv_cuda_alloc(void** ptr, size_t size);
-extern vv_status_t vv_cuda_free(void* ptr);
-extern vv_status_t vv_cuda_memcpy_h2d(void* dst, const void* src,
-                                        size_t size, void* stream);
-extern vv_status_t vv_cuda_memcpy_d2h(void* dst, const void* src,
-                                        size_t size, void* stream);
-extern vv_status_t vv_cuda_stream_sync(void* stream);
-extern vv_status_t vv_cuda_stream_create(void** stream);
-extern vv_status_t vv_cuda_stream_destroy(void* stream);
-
-extern vv_status_t vv_gemm_fp16_nn_cuda(
-    const void* A, const void* B, void* C,
-    int M, int K, int P,
-    float alpha, float beta,
-    void* stream);
-
-extern vv_status_t vv_silu_cuda(void* data, int total, void* stream);
-extern vv_status_t vv_gelu_cuda(void* data, int total, void* stream);
-extern vv_status_t vv_cuda_memset(void* ptr, int value, size_t size);
-extern vv_status_t vv_conv1d_raw_cuda(
-    const void* input_fp16, const void* weight_fp16, const void* bias_fp16,
-    void* output_fp16,
-    int in_channels, int in_length, int out_channels, int kernel_size,
-    int stride, int groups, int pad_left, int out_length, void* stream);
-extern vv_status_t vv_channel_bias_add_cuda(void* output, const void* bias,
-                                              int channels, int length,
-                                              void* stream);
-extern vv_status_t vv_conv1d_cuda(
-    const void* input_fp16, const void* weight_fp16, const void* bias_fp16,
-    void* output_fp16,
-    int in_channels, int in_length, int out_channels, int kernel_size,
-    int stride, int groups, bool causal,
-    int* out_length, void* stream);
-extern vv_status_t vv_rmsnorm_channel_first_cuda(
-    const void* input, const void* weight, void* output,
-    int channels, int length, float eps, void* stream);
-extern vv_status_t vv_residual_add_scaled_cuda(
-    void* x, const void* y, const void* scale,
-    int channels, int length, void* stream);
-extern vv_status_t vv_residual_add_cuda(void* x, const void* y, int total,
-                                          void* stream);
-extern vv_status_t vv_fp32_to_fp16_cuda(const void* in_fp32, void* out_fp16,
-                                          int n, void* stream);
-extern vv_status_t vv_fp16_to_fp32_cuda(const void* in_fp16, void* out_fp32,
-                                          int n, void* stream);
-extern vv_status_t vv_gather_tile_cuda(const void* src, void* dst,
-                                        int channels, int full_len,
-                                        int tile_offset, int tile_len, void* stream);
-extern vv_status_t vv_scatter_tile_cuda(const void* src, void* dst,
-                                         int channels, int full_len,
-                                         int tile_offset, int tile_len, void* stream);
 
 /* ─── FP32 ↔ FP16 conversion (CPU-side) ────────────────────────────────── */
 
@@ -163,8 +113,8 @@ static int s_gpu_ffn_available = -1; /* -1 = untested, 0 = no, 1 = yes */
 static int check_gpu_ffn(void) {
     if (s_gpu_ffn_available >= 0) return s_gpu_ffn_available;
     void* test_ptr = NULL;
-    if (vv_cuda_alloc(&test_ptr, 256) == VV_OK) {
-        vv_cuda_free(test_ptr);
+    if (vv_dev_alloc(&test_ptr, 256) == VV_OK) {
+        vv_dev_free(test_ptr);
         s_gpu_ffn_available = 1;
     } else {
         s_gpu_ffn_available = 0;
@@ -174,7 +124,7 @@ static int check_gpu_ffn(void) {
 
 /* ─── GPU tensor helpers ───────────────────────────────────────────────── */
 
-/** Upload a FP32 CPU tensor to GPU as FP16. Caller must vv_cuda_free the result. */
+/** Upload a FP32 CPU tensor to GPU as FP16. Caller must vv_dev_free the result. */
 static vv_status_t upload_fp32_as_fp16(const float* cpu, size_t n_elements,
                                         void** out_gpu, void* stream) {
     if (!cpu || n_elements == 0) { *out_gpu = NULL; return VV_OK; }
@@ -182,15 +132,15 @@ static vv_status_t upload_fp32_as_fp16(const float* cpu, size_t n_elements,
     void* fp32_gpu = NULL;
     void* fp16_gpu = NULL;
 
-    s = vv_cuda_alloc(&fp32_gpu, n_elements * sizeof(float));
+    s = vv_dev_alloc(&fp32_gpu, n_elements * sizeof(float));
     if (s != VV_OK) return s;
-    s = vv_cuda_alloc(&fp16_gpu, n_elements * 2);
-    if (s != VV_OK) { vv_cuda_free(fp32_gpu); return s; }
+    s = vv_dev_alloc(&fp16_gpu, n_elements * 2);
+    if (s != VV_OK) { vv_dev_free(fp32_gpu); return s; }
 
-    vv_cuda_memcpy_h2d(fp32_gpu, cpu, n_elements * sizeof(float), stream);
-    vv_fp32_to_fp16_cuda(fp32_gpu, fp16_gpu, (int)n_elements, stream);
-    vv_cuda_stream_sync(stream);
-    vv_cuda_free(fp32_gpu);
+    vv_dev_memcpy_h2d(fp32_gpu, cpu, n_elements * sizeof(float), stream);
+    vv_fp32_to_fp16_dev(fp32_gpu, fp16_gpu, (int)n_elements, stream);
+    vv_dev_stream_sync(stream);
+    vv_dev_free(fp32_gpu);
 
     *out_gpu = fp16_gpu;
     return VV_OK;
@@ -288,32 +238,32 @@ static vv_status_t ensure_gpu_weights(vv_conv_vae_encoder_t* enc, void* stream) 
 /** @brief Release the GPU weight mirrors. */
 static void free_gpu_weights(vv_conv_vae_encoder_t* enc) {
     if (!enc->gpu_weights_ready) return;
-    if (enc->input_w_gpu) vv_cuda_free(enc->input_w_gpu);
-    if (enc->input_b_gpu) vv_cuda_free(enc->input_b_gpu);
-    if (enc->proj_w_gpu)  vv_cuda_free(enc->proj_w_gpu);
-    if (enc->proj_b_gpu)  vv_cuda_free(enc->proj_b_gpu);
-    if (enc->input_cache) vv_cuda_free(enc->input_cache);
-    if (enc->proj_cache)  vv_cuda_free(enc->proj_cache);
+    if (enc->input_w_gpu) vv_dev_free(enc->input_w_gpu);
+    if (enc->input_b_gpu) vv_dev_free(enc->input_b_gpu);
+    if (enc->proj_w_gpu)  vv_dev_free(enc->proj_w_gpu);
+    if (enc->proj_b_gpu)  vv_dev_free(enc->proj_b_gpu);
+    if (enc->input_cache) vv_dev_free(enc->input_cache);
+    if (enc->proj_cache)  vv_dev_free(enc->proj_cache);
     if (enc->gpu_stages) {
         for (int st = 0; st < enc->n_stages; st++) {
             vv_encoder_stage_gpu_t* g = &enc->gpu_stages[st];
-            if (g->ds_w) vv_cuda_free(g->ds_w);
-            if (g->ds_b) vv_cuda_free(g->ds_b);
-            if (g->ds_cache) vv_cuda_free(g->ds_cache);
+            if (g->ds_w) vv_dev_free(g->ds_w);
+            if (g->ds_b) vv_dev_free(g->ds_b);
+            if (g->ds_cache) vv_dev_free(g->ds_cache);
             if (g->blocks) {
                 for (int b = 0; b < enc->stages[st].n_blocks; b++) {
                     vv_encoder_block_gpu_t* gb = &g->blocks[b];
-                    if (gb->norm_w) vv_cuda_free(gb->norm_w);
-                    if (gb->conv_w) vv_cuda_free(gb->conv_w);
-                    if (gb->conv_b) vv_cuda_free(gb->conv_b);
-                    if (gb->gamma)  vv_cuda_free(gb->gamma);
-                    if (gb->ffn_norm_w) vv_cuda_free(gb->ffn_norm_w);
-                    if (gb->ffn_gamma)  vv_cuda_free(gb->ffn_gamma);
-                    if (gb->l1_w) vv_cuda_free(gb->l1_w);
-                    if (gb->l1_b) vv_cuda_free(gb->l1_b);
-                    if (gb->l2_w) vv_cuda_free(gb->l2_w);
-                    if (gb->l2_b) vv_cuda_free(gb->l2_b);
-                    if (gb->cache) vv_cuda_free(gb->cache);
+                    if (gb->norm_w) vv_dev_free(gb->norm_w);
+                    if (gb->conv_w) vv_dev_free(gb->conv_w);
+                    if (gb->conv_b) vv_dev_free(gb->conv_b);
+                    if (gb->gamma)  vv_dev_free(gb->gamma);
+                    if (gb->ffn_norm_w) vv_dev_free(gb->ffn_norm_w);
+                    if (gb->ffn_gamma)  vv_dev_free(gb->ffn_gamma);
+                    if (gb->l1_w) vv_dev_free(gb->l1_w);
+                    if (gb->l1_b) vv_dev_free(gb->l1_b);
+                    if (gb->l2_w) vv_dev_free(gb->l2_w);
+                    if (gb->l2_b) vv_dev_free(gb->l2_b);
+                    if (gb->cache) vv_dev_free(gb->cache);
                 }
                 vv_free(g->blocks);
             }
@@ -370,10 +320,10 @@ static vv_status_t sconv_chunk(
     /* First chunk starts from zeros — same as the non-streaming left pad. */
     if (ctx > 0 && *cache_len == 0) {
         if (!*cache) {
-            s = vv_cuda_alloc(cache, (size_t)in_ch * ctx * 2);
+            s = vv_dev_alloc(cache, (size_t)in_ch * ctx * 2);
             if (s != VV_OK) return s;
         }
-        vv_cuda_memset(*cache, 0, (size_t)in_ch * ctx * 2);
+        vv_dev_memset(*cache, 0, (size_t)in_ch * ctx * 2);
         *cache_len = ctx;
     }
 
@@ -382,10 +332,10 @@ static vv_status_t sconv_chunk(
 
     void* cat = NULL;
     if (have > 0) {
-        s = vv_cuda_alloc(&cat, (size_t)in_ch * total * 2);
+        s = vv_dev_alloc(&cat, (size_t)in_ch * total * 2);
         if (s != VV_OK) return s;
-        vv_scatter_tile_cuda(*cache, cat, in_ch, total, 0, have, stream);
-        vv_scatter_tile_cuda(x, cat, in_ch, total, have, in_len, stream);
+        vv_scatter_tile_dev(*cache, cat, in_ch, total, 0, have, stream);
+        vv_scatter_tile_dev(x, cat, in_ch, total, have, in_len, stream);
     }
     const void* src = have > 0 ? cat : x;
 
@@ -398,15 +348,15 @@ static vv_status_t sconv_chunk(
     }
     if (ol < 0) ol = 0;
 
-    s = vv_cuda_alloc(out, (size_t)out_ch * (size_t)(ol > 0 ? ol : 1) * 2);
-    if (s != VV_OK) { if (cat) vv_cuda_free(cat); return s; }
+    s = vv_dev_alloc(out, (size_t)out_ch * (size_t)(ol > 0 ? ol : 1) * 2);
+    if (s != VV_OK) { if (cat) vv_dev_free(cat); return s; }
 
     if (ol > 0) {
-        s = vv_conv1d_raw_cuda(src, w, b, *out, in_ch, total, out_ch,
+        s = vv_conv1d_raw_dev(src, w, b, *out, in_ch, total, out_ch,
                                k, stride, groups, 0, ol, stream);
         if (s != VV_OK) {
-            vv_cuda_free(*out); *out = NULL;
-            if (cat) vv_cuda_free(cat);
+            vv_dev_free(*out); *out = NULL;
+            if (cat) vv_dev_free(cat);
             return s;
         }
     }
@@ -415,14 +365,14 @@ static vv_status_t sconv_chunk(
     if (ctx > 0) {
         const int keep = total < ctx ? total : ctx;
         if (!*cache) {
-            s = vv_cuda_alloc(cache, (size_t)in_ch * ctx * 2);
-            if (s != VV_OK) { if (cat) vv_cuda_free(cat); return s; }
+            s = vv_dev_alloc(cache, (size_t)in_ch * ctx * 2);
+            if (s != VV_OK) { if (cat) vv_dev_free(cat); return s; }
         }
-        vv_gather_tile_cuda(src, *cache, in_ch, total, total - keep, keep, stream);
+        vv_gather_tile_dev(src, *cache, in_ch, total, total - keep, keep, stream);
         *cache_len = keep;
     }
 
-    if (cat) vv_cuda_free(cat);
+    if (cat) vv_dev_free(cat);
     return VV_OK;
 }
 
@@ -468,10 +418,10 @@ static vv_status_t encode_gpu_chunk(
         const size_t buf_elems = (size_t)cur_ch * (size_t)cur_len;
         const size_t buf_bytes = buf_elems * 2;
         void *work1 = NULL, *work2 = NULL;
-        s = vv_cuda_alloc(&work1, buf_bytes);
+        s = vv_dev_alloc(&work1, buf_bytes);
         if (s != VV_OK) goto fail;
-        s = vv_cuda_alloc(&work2, buf_bytes);
-        if (s != VV_OK) { vv_cuda_free(work1); goto fail; }
+        s = vv_dev_alloc(&work2, buf_bytes);
+        if (s != VV_OK) { vv_dev_free(work1); goto fail; }
 
         for (int b = 0; b < stage->n_blocks; b++) {
             vv_encoder_block_gpu_t* gb = &encoder->gpu_stages[st].blocks[b];
@@ -479,7 +429,7 @@ static vv_status_t encode_gpu_chunk(
             const int ffn_hidden = gb->ffn_hidden;
 
             /* ── Mixer: RMSNorm → depthwise conv → γ·residual ── */
-            vv_rmsnorm_channel_first_cuda(cur_gpu, gb->norm_w, work1,
+            vv_rmsnorm_channel_first_dev(cur_gpu, gb->norm_w, work1,
                                           cur_ch, cur_len, eps, stream);
             {
                 void* mix = NULL;
@@ -490,75 +440,75 @@ static vv_status_t encode_gpu_chunk(
                                 cur_ch, blk->mixer_conv.kernel_size,
                                 1, cur_ch, is_final,
                                 &mix, &mix_len, stream);
-                if (s != VV_OK) { vv_cuda_free(work1); vv_cuda_free(work2); goto fail; }
+                if (s != VV_OK) { vv_dev_free(work1); vv_dev_free(work2); goto fail; }
                 if (gb->gamma)
-                    vv_residual_add_scaled_cuda(cur_gpu, mix, gb->gamma,
+                    vv_residual_add_scaled_dev(cur_gpu, mix, gb->gamma,
                                                 cur_ch, cur_len, stream);
                 else
-                    vv_residual_add_cuda(cur_gpu, mix, (int)buf_elems, stream);
-                vv_cuda_free(mix);
+                    vv_residual_add_dev(cur_gpu, mix, (int)buf_elems, stream);
+                vv_dev_free(mix);
             }
 
             /* ── FFN: RMSNorm → linear → GELU → linear → γ·residual ── */
-            vv_rmsnorm_channel_first_cuda(cur_gpu, gb->ffn_norm_w, work1,
+            vv_rmsnorm_channel_first_dev(cur_gpu, gb->ffn_norm_w, work1,
                                           cur_ch, cur_len, eps, stream);
             {
                 void* ffn = NULL;
-                s = vv_cuda_alloc(&ffn, (size_t)ffn_hidden * cur_len * 2);
+                s = vv_dev_alloc(&ffn, (size_t)ffn_hidden * cur_len * 2);
                 if (s == VV_OK) {
-                    vv_gemm_fp16_nn_cuda(gb->l1_w, work1, ffn,
+                    vv_gemm_fp16_nn_dev(gb->l1_w, work1, ffn,
                                          ffn_hidden, cur_ch, cur_len,
                                          1.0f, 0.0f, stream);
                     if (gb->l1_b)
-                        vv_channel_bias_add_cuda(ffn, gb->l1_b, ffn_hidden,
+                        vv_channel_bias_add_dev(ffn, gb->l1_b, ffn_hidden,
                                                  cur_len, stream);
-                    vv_gelu_cuda(ffn, ffn_hidden * cur_len, stream);
-                    vv_gemm_fp16_nn_cuda(gb->l2_w, ffn, work2,
+                    vv_gelu_dev(ffn, ffn_hidden * cur_len, stream);
+                    vv_gemm_fp16_nn_dev(gb->l2_w, ffn, work2,
                                          cur_ch, ffn_hidden, cur_len,
                                          1.0f, 0.0f, stream);
                     if (gb->l2_b)
-                        vv_channel_bias_add_cuda(work2, gb->l2_b, cur_ch,
+                        vv_channel_bias_add_dev(work2, gb->l2_b, cur_ch,
                                                  cur_len, stream);
-                    vv_cuda_free(ffn);
+                    vv_dev_free(ffn);
                 } else {
                     /* Not enough VRAM for the whole segment — tile over time. */
                     int tile = FFN_TILE_GPU;
                     if (tile > cur_len) tile = cur_len;
                     void *tin = NULL, *tff = NULL, *tout = NULL;
-                    s = vv_cuda_alloc(&tin, (size_t)cur_ch * tile * 2);
-                    if (s == VV_OK) s = vv_cuda_alloc(&tff, (size_t)ffn_hidden * tile * 2);
-                    if (s == VV_OK) s = vv_cuda_alloc(&tout, (size_t)cur_ch * tile * 2);
+                    s = vv_dev_alloc(&tin, (size_t)cur_ch * tile * 2);
+                    if (s == VV_OK) s = vv_dev_alloc(&tff, (size_t)ffn_hidden * tile * 2);
+                    if (s == VV_OK) s = vv_dev_alloc(&tout, (size_t)cur_ch * tile * 2);
                     if (s != VV_OK) {
-                        if (tin) vv_cuda_free(tin);
-                        if (tff) vv_cuda_free(tff);
-                        vv_cuda_free(work1); vv_cuda_free(work2);
+                        if (tin) vv_dev_free(tin);
+                        if (tff) vv_dev_free(tff);
+                        vv_dev_free(work1); vv_dev_free(work2);
                         goto fail;
                     }
                     for (int off = 0; off < cur_len; off += tile) {
                         const int tl = (off + tile <= cur_len) ? tile : (cur_len - off);
-                        vv_gather_tile_cuda(work1, tin, cur_ch, cur_len, off, tl, stream);
-                        vv_gemm_fp16_nn_cuda(gb->l1_w, tin, tff,
+                        vv_gather_tile_dev(work1, tin, cur_ch, cur_len, off, tl, stream);
+                        vv_gemm_fp16_nn_dev(gb->l1_w, tin, tff,
                                              ffn_hidden, cur_ch, tl, 1.0f, 0.0f, stream);
                         if (gb->l1_b)
-                            vv_channel_bias_add_cuda(tff, gb->l1_b, ffn_hidden, tl, stream);
-                        vv_gelu_cuda(tff, ffn_hidden * tl, stream);
-                        vv_gemm_fp16_nn_cuda(gb->l2_w, tff, tout,
+                            vv_channel_bias_add_dev(tff, gb->l1_b, ffn_hidden, tl, stream);
+                        vv_gelu_dev(tff, ffn_hidden * tl, stream);
+                        vv_gemm_fp16_nn_dev(gb->l2_w, tff, tout,
                                              cur_ch, ffn_hidden, tl, 1.0f, 0.0f, stream);
                         if (gb->l2_b)
-                            vv_channel_bias_add_cuda(tout, gb->l2_b, cur_ch, tl, stream);
-                        vv_scatter_tile_cuda(tout, work2, cur_ch, cur_len, off, tl, stream);
+                            vv_channel_bias_add_dev(tout, gb->l2_b, cur_ch, tl, stream);
+                        vv_scatter_tile_dev(tout, work2, cur_ch, cur_len, off, tl, stream);
                     }
-                    vv_cuda_free(tin); vv_cuda_free(tff); vv_cuda_free(tout);
+                    vv_dev_free(tin); vv_dev_free(tff); vv_dev_free(tout);
                 }
                 if (gb->ffn_gamma)
-                    vv_residual_add_scaled_cuda(cur_gpu, work2, gb->ffn_gamma,
+                    vv_residual_add_scaled_dev(cur_gpu, work2, gb->ffn_gamma,
                                                 cur_ch, cur_len, stream);
                 else
-                    vv_residual_add_cuda(cur_gpu, work2, (int)buf_elems, stream);
+                    vv_residual_add_dev(cur_gpu, work2, (int)buf_elems, stream);
             }
         }
-        vv_cuda_free(work1);
-        vv_cuda_free(work2);
+        vv_dev_free(work1);
+        vv_dev_free(work2);
 
         /* Downsample into the next stage */
         if (stage->downsample.weight.data) {
@@ -574,13 +524,13 @@ static vv_status_t encode_gpu_chunk(
                             stage->downsample.stride, 1, is_final,
                             &ds_out, &ds_len, stream);
             if (s != VV_OK) goto fail;
-            vv_cuda_free(cur_gpu);
+            vv_dev_free(cur_gpu);
             cur_gpu = ds_out;
             cur_ch  = out_ch;
             cur_len = ds_len;
         }
 
-        vv_cuda_stream_sync(stream);
+        vv_dev_stream_sync(stream);
         VV_LOG_D("conv_vae_gpu: stage %d/%d (%d blocks, %d ch x %d len) %.0f ms",
                  st + 1, encoder->n_stages, stage->n_blocks,
                  cur_ch, cur_len, vv_time_ms_enc() - stage_t0);
@@ -596,14 +546,14 @@ static vv_status_t encode_gpu_chunk(
                         encoder->vae_dim, encoder->proj_mean.kernel_size,
                         1, 1, is_final, &proj, &proj_len, stream);
         if (s != VV_OK) goto fail;
-        vv_cuda_free(cur_gpu);
+        vv_dev_free(cur_gpu);
         *out_gpu = proj;
         *out_frames = proj_len;
     }
     return VV_OK;
 
 fail:
-    if (cur_gpu) vv_cuda_free(cur_gpu);
+    if (cur_gpu) vv_dev_free(cur_gpu);
     return s;
 }
 
@@ -623,11 +573,11 @@ static vv_status_t vv_conv_vae_encode_gpu_full(
 {
     vv_status_t s;
     void* stream = NULL;
-    s = vv_cuda_stream_create(&stream);
+    s = vv_dev_stream_create(&stream);
     if (s != VV_OK) return s;
 
     s = ensure_gpu_weights(encoder, stream);
-    if (s != VV_OK) { vv_cuda_stream_destroy(stream); return s; }
+    if (s != VV_OK) { vv_dev_stream_destroy(stream); return s; }
     reset_stream_caches(encoder);
 
     const double t0 = vv_time_ms_enc();
@@ -638,7 +588,7 @@ static vv_status_t vv_conv_vae_encode_gpu_full(
     /* ceil() over the whole signal is what the processor assumes */
     const int cap_frames = (n_samples + 3199) / 3200 + 8;
     float* result = (float*)vv_alloc((size_t)cap_frames * vae_dim * sizeof(float));
-    if (!result) { vv_cuda_stream_destroy(stream); return VV_ERR_OUT_OF_MEMORY; }
+    if (!result) { vv_dev_stream_destroy(stream); return VV_ERR_OUT_OF_MEMORY; }
     int total_frames = 0;
 
     void* audio_gpu = NULL;
@@ -650,36 +600,36 @@ static vv_status_t vv_conv_vae_encode_gpu_full(
         const int len   = (start + seg <= n_samples) ? seg : (n_samples - start);
         const bool is_final = (i == n_seg - 1);
 
-        s = vv_cuda_alloc(&fp32_gpu, (size_t)len * 4);
+        s = vv_dev_alloc(&fp32_gpu, (size_t)len * 4);
         if (s != VV_OK) goto cleanup;
-        s = vv_cuda_alloc(&audio_gpu, (size_t)len * 2);
+        s = vv_dev_alloc(&audio_gpu, (size_t)len * 2);
         if (s != VV_OK) goto cleanup;
-        vv_cuda_memcpy_h2d(fp32_gpu, audio_cpu + start, (size_t)len * 4, stream);
-        vv_fp32_to_fp16_cuda(fp32_gpu, audio_gpu, len, stream);
-        vv_cuda_stream_sync(stream);
-        vv_cuda_free(fp32_gpu);
+        vv_dev_memcpy_h2d(fp32_gpu, audio_cpu + start, (size_t)len * 4, stream);
+        vv_fp32_to_fp16_dev(fp32_gpu, audio_gpu, len, stream);
+        vv_dev_stream_sync(stream);
+        vv_dev_free(fp32_gpu);
         fp32_gpu = NULL;
 
         void* lat_gpu = NULL;
         int   lat_len = 0;
         s = encode_gpu_chunk(encoder, stream, audio_gpu, len, is_final,
                              &lat_gpu, &lat_len);
-        vv_cuda_free(audio_gpu);
+        vv_dev_free(audio_gpu);
         audio_gpu = NULL;
         if (s != VV_OK) goto cleanup;
 
         /* Download [vae_dim, lat_len] and transpose into [frame, vae_dim] */
         const size_t n_elem = (size_t)vae_dim * (size_t)lat_len;
-        s = vv_cuda_alloc(&fp32_gpu, n_elem * 4);
-        if (s != VV_OK) { vv_cuda_free(lat_gpu); goto cleanup; }
-        vv_fp16_to_fp32_cuda(lat_gpu, fp32_gpu, (int)n_elem, stream);
-        vv_cuda_stream_sync(stream);
-        vv_cuda_free(lat_gpu);
+        s = vv_dev_alloc(&fp32_gpu, n_elem * 4);
+        if (s != VV_OK) { vv_dev_free(lat_gpu); goto cleanup; }
+        vv_fp16_to_fp32_dev(lat_gpu, fp32_gpu, (int)n_elem, stream);
+        vv_dev_stream_sync(stream);
+        vv_dev_free(lat_gpu);
 
         ch_first = (float*)vv_alloc(n_elem * 4);
         if (!ch_first) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup; }
-        vv_cuda_memcpy_d2h(ch_first, fp32_gpu, n_elem * 4, NULL);
-        vv_cuda_free(fp32_gpu);
+        vv_dev_memcpy_d2h(ch_first, fp32_gpu, n_elem * 4, NULL);
+        vv_dev_free(fp32_gpu);
         fp32_gpu = NULL;
 
         if (total_frames + lat_len > cap_frames) lat_len = cap_frames - total_frames;
@@ -702,11 +652,11 @@ static vv_status_t vv_conv_vae_encode_gpu_full(
     s = VV_OK;
 
 cleanup:
-    if (fp32_gpu)  vv_cuda_free(fp32_gpu);
-    if (audio_gpu) vv_cuda_free(audio_gpu);
+    if (fp32_gpu)  vv_dev_free(fp32_gpu);
+    if (audio_gpu) vv_dev_free(audio_gpu);
     if (ch_first)  vv_free(ch_first);
     if (result)    vv_free(result);
-    vv_cuda_stream_destroy(stream);
+    vv_dev_stream_destroy(stream);
     return s;
 }
 
@@ -727,7 +677,7 @@ static void conv1d_forward(
     int stride, int groups, bool causal,
     float* output, int* out_len)
 {
-    /* See vv_conv1d_cuda: causal pad is (k - stride), output is ceil(L/s). */
+    /* See vv_conv1d_dev: causal pad is (k - stride), output is ceil(L/s). */
     int pad;
     if (causal) {
         pad = kernel_size - stride;
@@ -884,7 +834,7 @@ static vv_status_t ffn_forward_gpu(
     void* stream = NULL;
 
     /* Create a temporary CUDA stream */
-    s = vv_cuda_stream_create(&stream);
+    s = vv_dev_stream_create(&stream);
     if (s != VV_OK) return s;
 
     /* --- Upload weights (once, persist across all tiles) --- */
@@ -902,20 +852,20 @@ static vv_status_t ffn_forward_gpu(
     if (!w1_h || !w2_h) {
         if (w1_h) vv_free(w1_h);
         if (w2_h) vv_free(w2_h);
-        vv_cuda_stream_destroy(stream);
+        vv_dev_stream_destroy(stream);
         return VV_ERR_OUT_OF_MEMORY;
     }
 
     for (size_t i = 0; i < w1_n; i++) w1_h[i] = fp32_to_fp16(w1[i]);
     for (size_t i = 0; i < w2_n; i++) w2_h[i] = fp32_to_fp16(w2[i]);
 
-    s = vv_cuda_alloc(&w1_gpu, w1_gpu_bytes);
+    s = vv_dev_alloc(&w1_gpu, w1_gpu_bytes);
     if (s != VV_OK) goto fail_weights;
-    s = vv_cuda_alloc(&w2_gpu, w2_gpu_bytes);
+    s = vv_dev_alloc(&w2_gpu, w2_gpu_bytes);
     if (s != VV_OK) goto fail_weights;
 
-    vv_cuda_memcpy_h2d(w1_gpu, w1_h, w1_gpu_bytes, stream);
-    vv_cuda_memcpy_h2d(w2_gpu, w2_h, w2_gpu_bytes, stream);
+    vv_dev_memcpy_h2d(w1_gpu, w1_h, w1_gpu_bytes, stream);
+    vv_dev_memcpy_h2d(w2_gpu, w2_h, w2_gpu_bytes, stream);
     vv_free(w1_h); w1_h = NULL;
     vv_free(w2_h); w2_h = NULL;
 
@@ -925,9 +875,9 @@ static vv_status_t ffn_forward_gpu(
         uint16_t* b1_h = (uint16_t*)vv_alloc(b1_bytes);
         if (!b1_h) goto fail_weights;
         for (int i = 0; i < ffn_hidden; i++) b1_h[i] = fp32_to_fp16(b1[i]);
-        s = vv_cuda_alloc(&b1_gpu, b1_bytes);
+        s = vv_dev_alloc(&b1_gpu, b1_bytes);
         if (s != VV_OK) { vv_free(b1_h); goto fail_weights; }
-        vv_cuda_memcpy_h2d(b1_gpu, b1_h, b1_bytes, stream);
+        vv_dev_memcpy_h2d(b1_gpu, b1_h, b1_bytes, stream);
         vv_free(b1_h);
     }
     if (b2) {
@@ -935,9 +885,9 @@ static vv_status_t ffn_forward_gpu(
         uint16_t* b2_h = (uint16_t*)vv_alloc(b2_bytes);
         if (!b2_h) goto fail_weights;
         for (int i = 0; i < in_ch; i++) b2_h[i] = fp32_to_fp16(b2[i]);
-        s = vv_cuda_alloc(&b2_gpu, b2_bytes);
+        s = vv_dev_alloc(&b2_gpu, b2_bytes);
         if (s != VV_OK) { vv_free(b2_h); goto fail_weights; }
-        vv_cuda_memcpy_h2d(b2_gpu, b2_h, b2_bytes, stream);
+        vv_dev_memcpy_h2d(b2_gpu, b2_h, b2_bytes, stream);
         vv_free(b2_h);
     }
 
@@ -949,11 +899,11 @@ static vv_status_t ffn_forward_gpu(
     size_t ffn_tile_bytes = (size_t)ffn_hidden * tile_len * 2;
     size_t out_tile_bytes = (size_t)in_ch    * tile_len * 2;
 
-    s = vv_cuda_alloc(&in_tile_gpu,  in_tile_bytes);
+    s = vv_dev_alloc(&in_tile_gpu,  in_tile_bytes);
     if (s != VV_OK) goto fail_weights;
-    s = vv_cuda_alloc(&ffn_tile_gpu, ffn_tile_bytes);
+    s = vv_dev_alloc(&ffn_tile_gpu, ffn_tile_bytes);
     if (s != VV_OK) goto fail_tiles;
-    s = vv_cuda_alloc(&out_tile_gpu, out_tile_bytes);
+    s = vv_dev_alloc(&out_tile_gpu, out_tile_bytes);
     if (s != VV_OK) goto fail_tiles;
 
     /* CPU staging buffers for FP32↔FP16 conversion */
@@ -980,41 +930,41 @@ static vv_status_t ffn_forward_gpu(
         }
 
         /* Upload input tile to GPU */
-        vv_cuda_memcpy_h2d(in_tile_gpu, stage_in, cur_in_bytes, stream);
+        vv_dev_memcpy_h2d(in_tile_gpu, stage_in, cur_in_bytes, stream);
 
         /* GEMM1: ffn_tile[ffn_hidden, cur_tile] = w1[ffn_hidden, in_ch] @ in_tile[in_ch, cur_tile] */
-        s = vv_gemm_fp16_nn_cuda(w1_gpu, in_tile_gpu, ffn_tile_gpu,
+        s = vv_gemm_fp16_nn_dev(w1_gpu, in_tile_gpu, ffn_tile_gpu,
                                   ffn_hidden, in_ch, cur_tile,
                                   1.0f, 0.0f, stream);
         if (s != VV_OK) goto fail_process;
 
         /* Bias add (per-channel) */
         if (b1_gpu) {
-            s = vv_channel_bias_add_cuda(ffn_tile_gpu, b1_gpu,
+            s = vv_channel_bias_add_dev(ffn_tile_gpu, b1_gpu,
                                           ffn_hidden, cur_tile, stream);
             if (s != VV_OK) goto fail_process;
         }
 
         /* SiLU activation in-place */
-        s = vv_gelu_cuda(ffn_tile_gpu, ffn_hidden * cur_tile, stream);
+        s = vv_gelu_dev(ffn_tile_gpu, ffn_hidden * cur_tile, stream);
         if (s != VV_OK) goto fail_process;
 
         /* GEMM2: out_tile[in_ch, cur_tile] = w2[in_ch, ffn_hidden] @ ffn_tile[ffn_hidden, cur_tile] */
-        s = vv_gemm_fp16_nn_cuda(w2_gpu, ffn_tile_gpu, out_tile_gpu,
+        s = vv_gemm_fp16_nn_dev(w2_gpu, ffn_tile_gpu, out_tile_gpu,
                                   in_ch, ffn_hidden, cur_tile,
                                   1.0f, 0.0f, stream);
         if (s != VV_OK) goto fail_process;
 
         /* Bias add (per-channel) */
         if (b2_gpu) {
-            s = vv_channel_bias_add_cuda(out_tile_gpu, b2_gpu,
+            s = vv_channel_bias_add_dev(out_tile_gpu, b2_gpu,
                                           in_ch, cur_tile, stream);
             if (s != VV_OK) goto fail_process;
         }
 
         /* Download output tile */
-        vv_cuda_stream_sync(stream);
-        vv_cuda_memcpy_d2h(stage_out, out_tile_gpu, cur_out_bytes, NULL);
+        vv_dev_stream_sync(stream);
+        vv_dev_memcpy_d2h(stage_out, out_tile_gpu, cur_out_bytes, NULL);
 
         /* Convert output tile: FP16 → FP32 into final output */
         for (int c = 0; c < in_ch; c++) {
@@ -1030,17 +980,17 @@ fail_process:
     vv_free(stage_in);
     vv_free(stage_out);
 fail_tiles:
-    if (in_tile_gpu)  vv_cuda_free(in_tile_gpu);
-    if (ffn_tile_gpu) vv_cuda_free(ffn_tile_gpu);
-    if (out_tile_gpu) vv_cuda_free(out_tile_gpu);
+    if (in_tile_gpu)  vv_dev_free(in_tile_gpu);
+    if (ffn_tile_gpu) vv_dev_free(ffn_tile_gpu);
+    if (out_tile_gpu) vv_dev_free(out_tile_gpu);
 fail_weights:
     if (w1_h) vv_free(w1_h);
     if (w2_h) vv_free(w2_h);
-    if (w1_gpu) vv_cuda_free(w1_gpu);
-    if (w2_gpu) vv_cuda_free(w2_gpu);
-    if (b1_gpu) vv_cuda_free(b1_gpu);
-    if (b2_gpu) vv_cuda_free(b2_gpu);
-    vv_cuda_stream_destroy(stream);
+    if (w1_gpu) vv_dev_free(w1_gpu);
+    if (w2_gpu) vv_dev_free(w2_gpu);
+    if (b1_gpu) vv_dev_free(b1_gpu);
+    if (b2_gpu) vv_dev_free(b2_gpu);
+    vv_dev_stream_destroy(stream);
     return s;
 }
 
@@ -1623,11 +1573,11 @@ vv_status_t vv_conv_vae_warmup(vv_conv_vae_encoder_t* encoder) {
     if (!check_gpu_ffn()) return VV_OK;
 
     void* stream = NULL;
-    vv_status_t s = vv_cuda_stream_create(&stream);
+    vv_status_t s = vv_dev_stream_create(&stream);
     if (s != VV_OK) return s;
     s = ensure_gpu_weights(encoder, stream);
-    vv_cuda_stream_sync(stream);
-    vv_cuda_stream_destroy(stream);
+    vv_dev_stream_sync(stream);
+    vv_dev_stream_destroy(stream);
     return s;
 }
 

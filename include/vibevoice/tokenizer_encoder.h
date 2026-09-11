@@ -161,7 +161,7 @@ vv_status_t vv_conv_vae_encode_cpu(vv_conv_vae_encoder_t* encoder,
  * @param n_frames     Output: number of frames
  * @param stream       CUDA stream
  */
-vv_status_t vv_conv_vae_encode_cuda(const vv_conv_vae_encoder_t* encoder,
+vv_status_t vv_conv_vae_encode_dev(const vv_conv_vae_encoder_t* encoder,
                                      const void* audio_gpu, int n_samples,
                                      void** output_gpu, int* n_frames,
                                      void* stream);
