@@ -129,7 +129,9 @@ it overlaps. With `--kv-cache tq4 --max-seq-len 8192` a slot is 116 MB.
 ### Live microphone
 
 ```bash
+vv_cli devices                                          # what can record
 vv_cli mic --model ./model_hf --timestamps
+vv_cli mic --model ./model_hf --device 1                # index, name, or part of one
 vv_cli mic --model ./model_hf --from-file meeting.wav   # replayed in real time
 ```
 
@@ -138,6 +140,13 @@ on an energy VAD with hysteresis, pre-roll and hangover. Capture is ALSA
 (loaded with `dlopen`, so the binary still runs without it), falling back to
 an external recorder on a pipe — `arecord` on Linux, ffmpeg's `dshow` on
 Windows, `avfoundation` on macOS.
+
+`vv_cli devices` lists what the active backend can open, and `--device` takes
+an index from that list, a device name, or any fragment of one. dshow has no
+device called "default", so on Windows the first device is resolved by name
+before ffmpeg is started; what actually gets passed is the alternative name
+(`@device_cm_{...}`), which stays unambiguous when two endpoints share a
+label — a combined headset, or two identical ones on the same machine.
 
 `--from-file` replays a WAV at wall-clock speed through the identical path,
 which is how the streaming path is tested without a sound card.

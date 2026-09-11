@@ -642,7 +642,9 @@ vv_cli serve --model ./model_hf --port 8080 --slots 2 --kv-cache tq4
 vv_cli chat --model ./model_hf
 
 # Живая транскрипция с микрофона (или WAV в реальном времени)
+vv_cli devices                       # список устройств захвата
 vv_cli mic --model ./model_hf --timestamps
+vv_cli mic --model ./model_hf --device 1      # индекс, имя или его фрагмент
 vv_cli mic --model ./model_hf --from-file meeting.wav
 
 # Квантованный KV и частичный оффлоад

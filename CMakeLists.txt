@@ -145,6 +145,7 @@ add_library(vibevoice_core STATIC
     src/audio/normalize.c
     src/audio/decode.c
     src/audio/mic.c
+    src/audio/mic_devices.c
     src/audio/vad.c
     src/engine/engine.c
     src/server/http.c

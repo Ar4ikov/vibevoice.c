@@ -106,6 +106,7 @@ static void print_usage(const char* prog) {
         "  serve                 Run the OpenAI-compatible HTTP server\n"
         "  chat                  Interactive prompt, model stays loaded\n"
         "  mic                   Live microphone transcription\n"
+        "  devices               List the capture devices mic/chat can use\n"
         "  (none)                Transcribe one file and exit\n\n"
         "Run `%s <command> --help` for that command's own options.\n",
         VV_VERSION_STRING, prog, prog);
@@ -168,6 +169,7 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
 int vv_cmd_serve(int argc, char** argv);
 int vv_cmd_chat(int argc, char** argv);
 int vv_cmd_mic(int argc, char** argv);
+int vv_cmd_devices(int argc, char** argv);
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
@@ -187,6 +189,8 @@ int main(int argc, char** argv) {
             return vv_cmd_chat(argc - 2, argv + 2);
         if (strcmp(argv[1], "mic") == 0)
             return vv_cmd_mic(argc - 2, argv + 2);
+        if (strcmp(argv[1], "devices") == 0)
+            return vv_cmd_devices(argc - 2, argv + 2);
         if (strcmp(argv[1], "transcribe") == 0) { argc--; argv++; }
         else {
             fprintf(stderr, "unknown command '%s'\n\n", argv[1]);

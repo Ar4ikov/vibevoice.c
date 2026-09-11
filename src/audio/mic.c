@@ -42,6 +42,7 @@ struct vv_mic {
     src_kind_t kind;
     int        sample_rate;
     const char* backend_name;
+    char       device_label[256];
 
     /* ring buffer */
     float*     ring;
@@ -49,6 +50,7 @@ struct vv_mic {
     volatile int head;      /* written by the capture thread */
     volatile int tail;      /* read by the consumer          */
     uint64_t    overruns;
+    uint64_t    captured;
 
     vv_thread_t thread;
     volatile int running;
@@ -67,6 +69,7 @@ struct vv_mic {
 /* ─── Ring buffer ────────────────────────────────────────────────────────── */
 
 static void ring_write(vv_mic_t* m, const float* src, int n) {
+    m->captured += (uint64_t)n;
     for (int i = 0; i < n; i++) {
         const int nh = (m->head + 1) % m->cap;
         if (nh == m->tail) {          /* full: drop the oldest sample */
@@ -97,6 +100,12 @@ uint64_t vv_mic_overruns(const vv_mic_t* m) { return m ? m->overruns : 0; }
 const char* vv_mic_backend(const vv_mic_t* m) {
     return m && m->backend_name ? m->backend_name : "none";
 }
+
+const char* vv_mic_device_label(const vv_mic_t* m) {
+    return m ? m->device_label : "";
+}
+
+uint64_t vv_mic_captured(const vv_mic_t* m) { return m ? m->captured : 0; }
 
 /* ─── ALSA, loaded at runtime ────────────────────────────────────────────── */
 
@@ -220,6 +229,10 @@ static const char* recorder_cmd(int rate, const char* device, char* buf,
                      "-f f32le -ac 1 -ar %d - 2>/dev/null",
              device && device[0] ? device : "0", rate);
 #elif defined(_WIN32)
+    /*
+     * dshow has no device called "default", so an unresolved name is a hard
+     * error rather than a fallback -- vv_mic_open resolves it first.
+     */
     snprintf(buf, n, "ffmpeg -v error -f dshow -i audio=\"%s\" "
                      "-f f32le -ac 1 -ar %d -",
              device && device[0] ? device : "default", rate);
@@ -250,6 +263,7 @@ vv_status_t vv_mic_open(int sample_rate, const char* device, vv_mic_t** out) {
                 m->alsa_handle = h;
                 m->kind = SRC_ALSA;
                 m->backend_name = "ALSA";
+                snprintf(m->device_label, sizeof(m->device_label), "%s", dev);
                 if (vv_thread_start(&m->thread, (vv_thread_fn)alsa_thread, m)) {
                     *out = m;
                     return VV_OK;
@@ -262,8 +276,19 @@ vv_status_t vv_mic_open(int sample_rate, const char* device, vv_mic_t** out) {
 
     /* Fall back to an external recorder. */
     {
-        char cmd[512];
-        recorder_cmd(sample_rate, device, cmd, sizeof(cmd));
+        char cmd[1024];
+        char resolved[384];
+        if (!vv_mic_resolve_device(device, resolved, sizeof(resolved),
+                                   m->device_label,
+                                   sizeof(m->device_label))) {
+            VV_LOG_E("mic: no capture device found "
+                     "(run `vv_cli devices`; on Windows this needs ffmpeg "
+                     "on PATH)");
+            vv_free(m->ring);
+            vv_free(m);
+            return VV_ERR_NOT_FOUND;
+        }
+        recorder_cmd(sample_rate, resolved, cmd, sizeof(cmd));
 #ifdef _WIN32
         m->pipe = _popen(cmd, "rb");
 #else

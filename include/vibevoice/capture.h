@@ -24,11 +24,41 @@ extern "C" {
 
 typedef struct vv_mic vv_mic_t;
 
+/** @brief One capture device, as reported by the platform's enumerator. */
+typedef struct vv_mic_device {
+    char id[384];    /**< What to pass as --device. Stable across reboots. */
+    char name[256];  /**< Human-readable label, UTF-8.                     */
+    bool is_default; /**< The one picked when --device is absent.          */
+} vv_mic_device_t;
+
 /**
- * @brief Open the default input device.
+ * @brief List the capture devices the active backend can open.
+ *
+ * @param out    vv_alloc'd array the caller releases with vv_free()
+ * @param count  number of entries written
+ * @return VV_ERR_NOT_FOUND when nothing could be enumerated (no ffmpeg on
+ *         Windows/macOS, no libasound on Linux)
+ */
+vv_status_t vv_mic_list_devices(vv_mic_device_t** out, int* count);
+
+/**
+ * @brief Turn a --device argument into a name the backend accepts.
+ *
+ * Accepts an index from the listing, an exact id or name, or a case-
+ * insensitive fragment of either; an empty request means the first device.
+ * Unmatched text is passed through so a hand-written device name still works.
+ *
+ * @return false only when no device could be chosen at all
+ */
+bool vv_mic_resolve_device(const char* request, char* out, size_t n,
+                           char* label, size_t label_n);
+
+/**
+ * @brief Open an input device.
  *
  * @param sample_rate  requested rate; 24000 avoids a resample later
- * @param device       backend-specific name, or NULL for the default
+ * @param device       index, name or fragment per vv_mic_resolve_device(),
+ *                     or NULL for the default
  */
 vv_status_t vv_mic_open(int sample_rate, const char* device, vv_mic_t** out);
 
@@ -52,6 +82,12 @@ uint64_t vv_mic_overruns(const vv_mic_t* m);
 
 /** @brief Name of the backend in use, for logs. */
 const char* vv_mic_backend(const vv_mic_t* m);
+
+/** @brief Label of the device in use, for logs. Empty when unknown. */
+const char* vv_mic_device_label(const vv_mic_t* m);
+
+/** @brief Samples handed over by the backend so far. Zero means silence. */
+uint64_t vv_mic_captured(const vv_mic_t* m);
 
 void vv_mic_close(vv_mic_t* m);
 

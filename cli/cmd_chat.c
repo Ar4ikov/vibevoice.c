@@ -31,6 +31,7 @@ typedef struct {
     const char* hotwords;
     float start_db, stop_db, hangover_ms, max_segment_s;
     bool  timestamps;
+    bool  list_devices;
     bool  verbose;
 } chat_args_t;
 
@@ -38,7 +39,9 @@ static void usage(const char* which) {
     if (strcmp(which, "mic") == 0) {
         fprintf(stderr,
             "Usage: vv_cli mic --model <dir> [options]\n\n"
-            "  --device <name>       Capture device (ALSA/dshow/avfoundation)\n"
+            "  --device <sel>        Capture device: an index from\n"
+            "                        --list-devices, its name, or part of one\n"
+            "  --list-devices        Print the capture devices and exit\n"
             "  --from-file <wav>     Replay a WAV in real time instead of a mic\n"
             "  --start-db <dB>       Speech threshold (default: -38)\n"
             "  --stop-db <dB>        Silence threshold (default: -45)\n"
@@ -51,6 +54,8 @@ static void usage(const char* which) {
             "Commands inside the prompt:\n"
             "  <path>                Transcribe an audio file\n"
             "  rec <seconds>         Record from the microphone, then transcribe\n"
+            "  devices               List capture devices\n"
+            "  device <sel>          Pick the one `rec` records from\n"
             "  hotwords a,b,c        Set hotwords for later requests\n"
             "  stats                 Engine counters\n"
             "  quit                  Exit\n");
@@ -99,6 +104,7 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
         else if (strcmp(s, "--stop-db") == 0 && next) a->stop_db = (float)atof(argv[++i]);
         else if (strcmp(s, "--hangover") == 0 && next) a->hangover_ms = (float)atof(argv[++i]);
         else if (strcmp(s, "--max-segment") == 0 && next) a->max_segment_s = (float)atof(argv[++i]);
+        else if (strcmp(s, "--list-devices") == 0) a->list_devices = true;
         else if (strcmp(s, "--timestamps") == 0) a->timestamps = true;
         else if (strcmp(s, "--cpu") == 0) a->ep.cpu_only = true;
         else if (strcmp(s, "--verbose") == 0) a->verbose = true;
@@ -109,7 +115,7 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
             return -1;
         }
     }
-    if (!a->ep.model_dir) {
+    if (!a->ep.model_dir && !a->list_devices) {
         fprintf(stderr, "%s: --model is required\n\n", which);
         usage(which);
         return -1;
@@ -166,6 +172,55 @@ static void print_result(const vv_transcription_t* tr,
     fflush(stdout);
 }
 
+/* ─── devices ────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief Print the capture devices, with what to pass back as --device.
+ *
+ * The id is shown only when it differs from the friendly name: on Windows it
+ * is the dshow alternative name, which stays unambiguous when two endpoints
+ * share a label — a combined headset, say, whose mic and output carry one
+ * name, or two identical headsets on the same machine.
+ */
+static int print_devices(void) {
+    vv_mic_device_t* d = NULL;
+    int n = 0;
+    if (vv_mic_list_devices(&d, &n) != VV_OK) {
+        fprintf(stderr, "no capture devices found.\n");
+#if defined(_WIN32) || defined(__APPLE__)
+        fprintf(stderr, "Enumeration goes through ffmpeg: check that ffmpeg "
+                        "is on PATH and that microphone access is allowed.\n");
+#else
+        fprintf(stderr, "Enumeration needs libasound (ALSA). Without it, pass "
+                        "an arecord device name to --device directly.\n");
+#endif
+        return 1;
+    }
+    printf("capture devices (pass the index, the name, or part of it "
+           "to --device):\n");
+    for (int i = 0; i < n; i++) {
+        printf("  [%d] %s%s\n", i, d[i].name,
+               d[i].is_default ? "   (used when --device is absent)" : "");
+        if (strcmp(d[i].id, d[i].name) != 0)
+            printf("      id: %s\n", d[i].id);
+    }
+    vv_free(d);
+    return 0;
+}
+
+int vv_cmd_devices(int argc, char** argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            fprintf(stderr,
+                    "Usage: vv_cli devices\n\n"
+                    "Lists the microphones `mic` and `chat` can open.\n");
+            return 0;
+        }
+    }
+    vv_log_set_level(VV_LOG_WARN);
+    return print_devices();
+}
+
 /* ─── mic ────────────────────────────────────────────────────────────────── */
 
 int vv_cmd_mic(int argc, char** argv) {
@@ -175,6 +230,8 @@ int vv_cmd_mic(int argc, char** argv) {
     if (pr != 0) return pr > 0 ? 0 : 1;
 
     vv_log_set_level(a.verbose ? VV_LOG_DEBUG : VV_LOG_WARN);
+
+    if (a.list_devices) return print_devices();
 
     vv_engine_t* engine = NULL;
     vv_status_t s = vv_engine_create(&a.ep, &engine);
@@ -190,6 +247,8 @@ int vv_cmd_mic(int argc, char** argv) {
         s = vv_mic_open(24000, a.device, &mic);
     if (s != VV_OK) {
         fprintf(stderr, "mic: cannot open capture: %s\n", vv_status_str(s));
+        fprintf(stderr, "mic: run `vv_cli devices` to see what is available, "
+                        "then pass one to --device\n");
         vv_engine_free(engine);
         return 1;
     }
@@ -209,7 +268,15 @@ int vv_cmd_mic(int argc, char** argv) {
     }
 
     signal(SIGINT, on_signal);
-    fprintf(stderr, "listening via %s (Ctrl-C to stop)\n", vv_mic_backend(mic));
+    {
+        const char* label = vv_mic_device_label(mic);
+        if (label && label[0])
+            fprintf(stderr, "listening to %s via %s (Ctrl-C to stop)\n",
+                    label, vv_mic_backend(mic));
+        else
+            fprintf(stderr, "listening via %s (Ctrl-C to stop)\n",
+                    vv_mic_backend(mic));
+    }
 
     char hot_scratch[512];
     const char* hot_list[32];
@@ -263,6 +330,17 @@ int vv_cmd_mic(int argc, char** argv) {
             vv_free(seg);
         }
     }
+
+    /*
+     * A recorder that fails to start still hands back a healthy-looking pipe
+     * that closes at once, so silence is the only symptom. Say so, instead of
+     * reporting zero utterances and leaving the user to guess.
+     */
+    if (vv_mic_captured(mic) == 0)
+        fprintf(stderr,
+                "mic: no audio arrived from the capture device. Run "
+                "`vv_cli devices` and pass one to --device; the recorder's "
+                "own error, if any, is above.\n");
 
     const uint64_t over = vv_mic_overruns(mic);
     if (over)
@@ -341,6 +419,8 @@ int vv_cmd_chat(int argc, char** argv) {
 
     vv_log_set_level(a.verbose ? VV_LOG_DEBUG : VV_LOG_WARN);
 
+    if (a.list_devices) return print_devices();
+
     vv_engine_t* engine = NULL;
     vv_status_t s = vv_engine_create(&a.ep, &engine);
     if (s != VV_OK) {
@@ -356,11 +436,12 @@ int vv_cmd_chat(int argc, char** argv) {
     build_params(&ip, hot_csv, hot_scratch, sizeof(hot_scratch), hot_list, 32);
 
     printf("vibevoice.c %s — model ready, %d slot(s).\n"
-           "Type a file path, `rec <seconds>`, `hotwords a,b`, `stats`, "
-           "or `quit`.\n",
+           "Type a file path, `rec <seconds>`, `devices`, `device <sel>`, "
+           "`hotwords a,b`, `stats`, or `quit`.\n",
            VV_VERSION_STRING, vv_engine_slots(engine));
 
     char line[1024];
+    char device_sel[256];
     for (;;) {
         printf("\n> ");
         fflush(stdout);
@@ -376,6 +457,22 @@ int vv_cmd_chat(int argc, char** argv) {
         if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0 ||
             strcmp(cmd, "/quit") == 0) break;
 
+        if (strcmp(cmd, "devices") == 0) {
+            print_devices();
+            continue;
+        }
+        if (strncmp(cmd, "device", 6) == 0 &&
+            (cmd[6] == ' ' || cmd[6] == '\0')) {
+            const char* rest = cmd + 6;
+            while (*rest == ' ') rest++;
+            if (*rest) {
+                /* `line` is reused by the next prompt, so keep a copy. */
+                snprintf(device_sel, sizeof(device_sel), "%s", rest);
+                a.device = device_sel;
+            }
+            printf("device: %s\n", a.device ? a.device : "(default)");
+            continue;
+        }
         if (strcmp(cmd, "stats") == 0) {
             uint64_t done = 0;
             int busy = 0;
