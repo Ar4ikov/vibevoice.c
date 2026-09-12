@@ -294,6 +294,7 @@ if(VV_BUILD_TESTS)
     endfunction()
 
     vv_add_test(test_audio tests/test_audio.c)
+    vv_add_test(test_queue tests/test_queue.c)
     vv_add_test(test_safetensors tests/test_safetensors.c)
     vv_add_test(test_nf4 tests/test_nf4.c)
     vv_add_test(test_conv_vae tests/test_conv_vae.c)

@@ -29,6 +29,8 @@ static void usage(void) {
         "  --host <addr>         Bind address (default: 0.0.0.0)\n"
         "  --port <n>            Port (default: 8080)\n"
         "  --slots <n>           Concurrent transcriptions (default: 1)\n"
+        "  --queue-size <n>      Waiting requests (default: 16; 0 disables)\n"
+        "  --max-conns <n>       HTTP connections (default: slots + queue + 8)\n"
         "  --model-name <name>   Name reported by /v1/models\n"
         "  --api-key <key>       Require this bearer token\n"
         "  --gpu <id>            GPU device id (default: 0)\n"
@@ -53,6 +55,8 @@ int vv_cmd_serve(int argc, char** argv) {
         else if (strcmp(a, "--host") == 0 && next) { sp.host = argv[++i]; }
         else if (strcmp(a, "--port") == 0 && next) { sp.port = atoi(argv[++i]); }
         else if (strcmp(a, "--slots") == 0 && next) { ep.n_slots = atoi(argv[++i]); }
+        else if (strcmp(a, "--queue-size") == 0 && next) { sp.queue_size = atoi(argv[++i]); }
+        else if (strcmp(a, "--max-conns") == 0 && next) { sp.max_conns = atoi(argv[++i]); }
         else if (strcmp(a, "--model-name") == 0 && next) { sp.model_name = argv[++i]; }
         else if (strcmp(a, "--api-key") == 0 && next) { sp.api_key = argv[++i]; }
         else if (strcmp(a, "--gpu") == 0 && next) { ep.gpu_id = atoi(argv[++i]); }
@@ -85,6 +89,12 @@ int vv_cmd_serve(int argc, char** argv) {
         return 1;
     }
 
+    if (ep.n_slots < 1 || ep.n_slots > 128 || sp.queue_size < 0 ||
+        sp.queue_size > 4096 || sp.max_conns < 0 || sp.max_conns > 8192 ||
+        sp.port < 1 || sp.port > 65535) {
+        VV_LOG_E("serve: invalid slots, queue size, connection limit or port");
+        return 1;
+    }
     vv_log_set_level(verbose ? VV_LOG_DEBUG : VV_LOG_INFO);
 
     vv_engine_t* engine = NULL;

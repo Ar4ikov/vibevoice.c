@@ -7,6 +7,7 @@
 
 #include "vibevoice/vibevoice.h"
 #include "vibevoice/safetensors.h"
+#include "vibevoice/model.h"
 
 #include <stdio.h>
 #include <string.h>

@@ -1,0 +1,7 @@
+**
+!CMakeLists.txt
+!include/**
+!src/**
+!cli/**
+!third_party/**
+!tests/**

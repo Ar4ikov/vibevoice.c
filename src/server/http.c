@@ -412,13 +412,23 @@ vv_status_t vv_http_serve(const char* host, int port, int max_conns,
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&nod, sizeof(nod));
 
         vv_mutex_lock(&s->lock);
-        while (s->n_conns >= s->max_conns && s->running)
-            vv_cond_wait(&s->conn_done, &s->lock);
+        if (s->n_conns >= s->max_conns || !s->running) {
+            vv_mutex_unlock(&s->lock);
+            vv_http_res_t res = {0};
+            res.fd = (void*)(intptr_t)fd;
+            vv_http_error(&res, 503, "server_overloaded", "connection limit reached");
+            close_socket(fd);
+            continue;
+        }
         s->n_conns++;
         vv_mutex_unlock(&s->lock);
 
         conn_arg_t* ca = (conn_arg_t*)vv_alloc(sizeof(conn_arg_t));
-        if (!ca) { close_socket(fd); continue; }
+        if (!ca) {
+            close_socket(fd);
+            vv_mutex_lock(&s->lock); s->n_conns--; vv_mutex_unlock(&s->lock);
+            continue;
+        }
         ca->srv = s;
         ca->fd = fd;
 

@@ -1,0 +1,26 @@
+backend_name: vibevoice-custom
+description: VibeVoice ASR in C with CUDA, diarization and bounded FIFO admission
+default_version: latest
+health_check_path: /health
+parameter_format: space
+default_run_command: 'serve --model "{{model_path}}" --host 0.0.0.0 --port {{port}} --model-name "{{model_name}}"'
+default_backend_param:
+  - --slots 1
+  - --queue-size 16
+  - --kv-cache tq4
+  - --max-seq-len 32768
+common_parameters:
+  - --slots
+  - --queue-size
+  - --max-conns
+  - --kv-cache
+  - --max-seq-len
+  - --gpu-layers
+  - --vram-budget
+default_env:
+  OMP_NUM_THREADS: '8'
+version_configs:
+  latest:
+    image_name: ghcr.io/ar4ikov/vibevoice.c:latest
+    entrypoint: /usr/local/bin/vv_cli
+    custom_framework: cuda

@@ -31,7 +31,8 @@ typedef struct vv_server vv_server_t;
 typedef struct vv_server_params {
     const char* host;        /**< Bind address. Default "0.0.0.0".         */
     int         port;        /**< Default 8080.                            */
-    int         max_conns;   /**< Connection threads. Default 4 * slots.   */
+    int         max_conns;   /**< Connection threads; 0 = slots + queue + 8. */
+    int         queue_size;  /**< Waiting transcriptions. Default 16; 0 = reject when busy. */
     const char* model_name;  /**< Name reported by /v1/models.             */
     const char* api_key;     /**< If set, require this bearer token.       */
     size_t      max_body;    /**< Upload cap in bytes. Default 512 MB.     */
@@ -42,6 +43,7 @@ static inline vv_server_params_t vv_server_params_default(void) {
     p.host = "0.0.0.0";
     p.port = 8080;
     p.max_conns = 0;
+    p.queue_size = 16;
     p.model_name = NULL;
     p.api_key = NULL;
     p.max_body = (size_t)512 * 1024 * 1024;
