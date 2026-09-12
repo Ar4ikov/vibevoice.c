@@ -1,286 +1,187 @@
 <#
 .SYNOPSIS
-    Download VibeVoice-ASR model from HuggingFace.
-
+    Download a complete Hugging Face model repository.
 .DESCRIPTION
-    Downloads the 4-bit NF4 quantized model weights and tokenizer files
-    needed to run vv_cli.exe. Uses huggingface-cli if available, otherwise
-    falls back to curl.exe (ships with Windows 10+).
-
-.PARAMETER OutputDir
-    Target directory for model files. Default: .\model_hf
-
-.PARAMETER Repo
-    HuggingFace repo for model weights. Default: scerz/VibeVoice-ASR-4bit
-
+    Downloads every file at one resolved commit, preserving subdirectories.
+    Uses hf (or huggingface-cli), with a resumable curl.exe fallback. Existing
+    files are checked against Hub sizes and hashes, not just their presence.
 .PARAMETER TokenizerRepo
-    HuggingFace repo for tokenizer.json (not included in the 4-bit repo).
-    VibeVoice uses Qwen2.5 tokenizer as base, patched with audio tokens.
-    Default: Qwen/Qwen2.5-7B
-
+    Fallback for tokenizer.json only when the model repo lacks it. Set to an
+    empty string to disable. Never replaces the model's own tokenizer.
 .PARAMETER Token
-    HuggingFace access token (for gated/private repos). Optional.
-
+    Access token. Defaults to HF_TOKEN, then the Hugging Face login token file.
 .PARAMETER Force
-    Re-download files even if they already exist.
-
+    Download fresh copies, ignoring existing files and partial downloads.
 .EXAMPLE
-    .\scripts\download_model.ps1
-    .\scripts\download_model.ps1 -OutputDir D:\models\vibevoice
-    .\scripts\download_model.ps1 -Token hf_xxxxxxxxxxxx
+    .\scripts\download_model.ps1 -Repo Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM
+.EXAMPLE
+    .\scripts\download_model.ps1 -Repo owner/model -Revision main -OutputDir D:\models\vv
 #>
 [CmdletBinding()]
 param(
-    [string]$OutputDir    = "model_hf",
-    [string]$Repo         = "scerz/VibeVoice-ASR-4bit",
+    [string]$OutputDir = "model_hf",
+    [string]$Repo = "scerz/VibeVoice-ASR-4bit",
     [string]$TokenizerRepo = "Qwen/Qwen2.5-7B",
-    [string]$Token        = "",
+    [string]$Token = $env:HF_TOKEN,
+    [string]$Revision = "main",
     [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
+$PreviousToken = $env:HF_TOKEN
+$Endpoint = "https://huggingface.co"
+if ($env:HF_ENDPOINT) { $Endpoint = $env:HF_ENDPOINT.TrimEnd('/') }
+$Headers = @{}
 
-# ─── File manifest ────────────────────────────────────────────────────────────
-# Files from the 4-bit repo
-$ModelFiles = @(
-    @{ Name = "config.json";                       Size = "4 KB"   }
-    @{ Name = "generation_config.json";            Size = "73 B"   }
-    @{ Name = "preprocessor_config.json";          Size = "189 B"  }
-    @{ Name = "model.safetensors.index.json";      Size = "232 KB" }
-    @{ Name = "model-00001-of-00002.safetensors";  Size = "4.97 GB"}
-    @{ Name = "model-00002-of-00002.safetensors";  Size = "2.69 GB"}
-)
-
-# Tokenizer file from the base model repo
-$TokenizerFiles = @(
-    @{ Name = "tokenizer.json"; Size = "~7 MB" }
-)
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function Write-Header {
-    param([string]$Text)
-    Write-Host ""
-    Write-Host "========================================================================" -ForegroundColor Cyan
-    Write-Host "  $Text" -ForegroundColor Cyan
-    Write-Host "========================================================================" -ForegroundColor Cyan
+function Encode-Path([string]$Value) {
+    return (($Value.Split('/') | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/')
 }
 
-function Write-Step {
-    param([string]$Text)
-    Write-Host "[vibevoice] $Text" -ForegroundColor Green
-}
-
-function Write-Warn {
-    param([string]$Text)
-    Write-Host "[vibevoice] WARNING: $Text" -ForegroundColor Yellow
-}
-
-function Write-Err {
-    param([string]$Text)
-    Write-Host "[vibevoice] ERROR: $Text" -ForegroundColor Red
-}
-
-function Test-FileComplete {
-    param([string]$Path)
-    # Consider file present if it exists and is non-empty
-    return (Test-Path $Path) -and ((Get-Item $Path).Length -gt 0)
-}
-
-# ─── Detect download method ──────────────────────────────────────────────────
-
-$UseHfCli = $false
-$HfCliPath = $null
-$CurlPath = $null
-
-# Check for huggingface-cli
-$HfCliPath = Get-Command "huggingface-cli" -ErrorAction SilentlyContinue |
-             Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue
-if ($HfCliPath) {
-    $UseHfCli = $true
-    Write-Step "Using huggingface-cli: $HfCliPath"
-} else {
-    # Fall back to curl.exe (ships with Windows 10 1803+)
-    $CurlPath = Get-Command "curl.exe" -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue
-    if (-not $CurlPath) {
-        Write-Err "Neither huggingface-cli nor curl.exe found."
-        Write-Err "Install huggingface-hub:  pip install huggingface-hub"
-        Write-Err "Or ensure curl.exe is in PATH (ships with Windows 10+)."
-        exit 1
+function Get-Snapshot([string]$RepoId, [string]$Ref) {
+    $url = "$Endpoint/api/models/$(Encode-Path $RepoId)/revision/$([Uri]::EscapeDataString($Ref))?blobs=true"
+    $info = Invoke-RestMethod -Uri $url -Headers $Headers -TimeoutSec 60
+    if ($info.sha -notmatch '^[a-fA-F0-9]{40}$' -or $null -eq $info.siblings) {
+        throw "Hub returned an invalid file listing for $RepoId."
     }
-    Write-Step "Using curl.exe: $CurlPath"
+    return $info
+}
+
+function Get-TargetPath([string]$Name) {
+    $path = $OutputDir
+    foreach ($part in $Name.Split('/')) {
+        if (-not $part -or $part -in @('.', '..') -or
+            $part.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+            throw "Unsupported repository path: $Name"
+        }
+        $path = Join-Path $path $part
+        if ((Test-Path -LiteralPath $path) -and
+            ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Refusing to write through a symbolic link: $path"
+        }
+    }
+    return $path
+}
+
+function Test-Complete([string]$Path, $File) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $length = (Get-Item -LiteralPath $Path -Force).Length
+    if ($null -eq $File.size -or $length -ne [long]$File.size) { return $false }
+    if ($File.lfs.sha256) {
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $stream = [IO.File]::OpenRead($Path)
+        try {
+            return ([BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '')) -eq $File.lfs.sha256
+        } finally { $stream.Dispose(); $sha.Dispose() }
+    }
+    if (-not $File.blobId) { throw "Missing checksum for $($File.rfilename)." }
+    # Git blob IDs hash the header as well as the file contents.
+    $sha = [Security.Cryptography.SHA1]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $header = [Text.Encoding]::UTF8.GetBytes("blob $length" + [char]0)
+        [void]$sha.TransformBlock($header, 0, $header.Length, $header, 0)
+        $buffer = New-Object byte[] (1MB)
+        while (($count = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            [void]$sha.TransformBlock($buffer, 0, $count, $buffer, 0)
+        }
+        [void]$sha.TransformFinalBlock($buffer, 0, 0)
+        return ([BitConverter]::ToString($sha.Hash).Replace('-', '')) -eq $File.blobId
+    } finally { $stream.Dispose(); $sha.Dispose() }
+}
+
+function Download-File([string]$RepoId, [string]$Commit, $File, [bool]$Fresh) {
+    if (-not $CurlPath) { throw "curl.exe is required to download/repair $($File.rfilename)." }
+    $target = Get-TargetPath $File.rfilename
+    # A commit-specific cache prevents resuming bytes from another revision.
+    $key = [Security.Cryptography.SHA256]::Create()
+    try {
+        $id = [BitConverter]::ToString($key.ComputeHash([Text.Encoding]::UTF8.GetBytes("$RepoId/$($File.rfilename)"))).Replace('-', '')
+    } finally { $key.Dispose() }
+    $cache = Get-TargetPath ".cache/vibevoice-download/$Commit"
+    [IO.Directory]::CreateDirectory($cache) | Out-Null
+    $partial = Get-TargetPath ".cache/vibevoice-download/$Commit/$id.partial"
+    if (Test-Path -LiteralPath $partial) {
+        if ($Fresh -or (Get-Item -LiteralPath $partial).Length -gt [long]$File.size) {
+            Remove-Item -LiteralPath $partial
+        } elseif ((Get-Item -LiteralPath $partial).Length -eq [long]$File.size -and
+                  -not (Test-Complete $partial $File)) {
+            Remove-Item -LiteralPath $partial
+        }
+    }
+    $url = "$Endpoint/$(Encode-Path $RepoId)/resolve/$Commit/$(Encode-Path $File.rfilename)"
+    Write-Host "[vibevoice] GET $($File.rfilename) ($($File.size) bytes)"
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        if (Test-Complete $partial $File) { break }
+        $curlArgs = @('--fail', '--location', '--retry', '3', '--connect-timeout', '30',
+                      '--progress-bar', '--continue-at', '-', '--output', $partial, $url)
+        if ($Token) {
+            # Keep the credential out of curl's command line.
+            $config = 'header = "Authorization: Bearer ' + $Token.Replace('\', '\\').Replace('"', '\"') + '"'
+            $config | & $CurlPath --config - @curlArgs
+        } else { & $CurlPath @curlArgs }
+        $code = $LASTEXITCODE
+        if ($code -eq 0 -and (Test-Complete $partial $File)) { break }
+        # A server without Range support or a corrupt partial needs a fresh retry.
+        if ($code -notin @(0, 33, 36) -or $attempt -eq 1) {
+            throw "Download failed for $($File.rfilename) (curl $code). Re-run to resume."
+        }
+        if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial }
+    }
+    if (-not (Test-Complete $partial $File)) { throw "Checksum mismatch: $($File.rfilename)" }
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
+    Move-Item -LiteralPath $partial -Destination $target -Force
+}
+
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     if (-not $Token) {
-        Write-Warn "No --Token provided. If the repo is gated, set -Token hf_xxx"
-    }
-}
-
-# ─── Prepare output directory ─────────────────────────────────────────────────
-
-$OutputDir = [System.IO.Path]::GetFullPath($OutputDir)
-if (-not (Test-Path $OutputDir)) {
-    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-    Write-Step "Created output directory: $OutputDir"
-} else {
-    Write-Step "Output directory: $OutputDir"
-}
-
-# ─── Download functions ───────────────────────────────────────────────────────
-
-function Download-WithHfCli {
-    param(
-        [string]$RepoId,
-        [string[]]$Files,
-        [string]$TargetDir
-    )
-    $args_ = @("download", $RepoId)
-    $args_ += $Files
-    $args_ += @("--local-dir", $TargetDir)
-
-    if ($Token) {
-        $args_ += @("--token", $Token)
-    }
-
-    Write-Step "huggingface-cli download $RepoId -> $TargetDir"
-    Write-Step "  Files: $($Files -join ', ')"
-
-    & huggingface-cli @args_
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "huggingface-cli failed (exit code $LASTEXITCODE)"
-        return $false
-    }
-    return $true
-}
-
-function Download-WithCurl {
-    param(
-        [string]$RepoId,
-        [string]$FileName,
-        [string]$TargetDir,
-        [string]$DisplaySize
-    )
-    $url = "https://huggingface.co/$RepoId/resolve/main/$FileName"
-    $outPath = Join-Path $TargetDir $FileName
-
-    if (-not $Force -and (Test-FileComplete $outPath)) {
-        Write-Step "  SKIP $FileName (already exists, use -Force to re-download)"
-        return $true
-    }
-
-    Write-Step "  GET  $FileName ($DisplaySize)"
-
-    $curlArgs = @("-L", "--progress-bar", "-o", $outPath, $url)
-    if ($Token) {
-        $curlArgs += @("-H", "Authorization: Bearer $Token")
-    }
-    # Resume partial downloads for large files
-    $curlArgs += @("-C", "-")
-
-    & curl.exe @curlArgs
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "Failed to download $FileName"
-        return $false
-    }
-    return $true
-}
-
-# ─── Main download ────────────────────────────────────────────────────────────
-
-$TotalSize = "~7.66 GB"
-Write-Header "Downloading VibeVoice-ASR model ($TotalSize)"
-Write-Step "Model weights:  $Repo"
-Write-Step "Tokenizer:      $TokenizerRepo"
-Write-Step "Output:         $OutputDir"
-
-$Failed = $false
-
-if ($UseHfCli) {
-    # ── huggingface-cli: batch download ──
-    $modelFileNames = $ModelFiles | ForEach-Object { $_.Name }
-
-    # Skip already-downloaded files unless -Force
-    if (-not $Force) {
-        $toDownload = @()
-        foreach ($f in $modelFileNames) {
-            $p = Join-Path $OutputDir $f
-            if (Test-FileComplete $p) {
-                Write-Step "  SKIP $f (already exists)"
-            } else {
-                $toDownload += $f
-            }
+        $tokenPath = $env:HF_TOKEN_PATH
+        if (-not $tokenPath) {
+            $hfDir = $env:HF_HOME
+            if (-not $hfDir) { $hfDir = Join-Path $HOME '.cache/huggingface' }
+            $tokenPath = Join-Path $hfDir 'token'
         }
-        $modelFileNames = $toDownload
+        if (Test-Path -LiteralPath $tokenPath -PathType Leaf) { $Token = [IO.File]::ReadAllText($tokenPath).Trim() }
     }
-
-    if ($modelFileNames.Count -gt 0) {
-        Write-Header "Downloading model weights from $Repo"
-        $ok = Download-WithHfCli -RepoId $Repo -Files $modelFileNames -TargetDir $OutputDir
-        if (-not $ok) { $Failed = $true }
-    } else {
-        Write-Step "All model weight files already present."
+    if ($Token) {
+        if ($Token -match '[\r\n]') { throw 'Invalid token: contains a newline.' }
+        $Headers.Authorization = "Bearer $Token"
+        $env:HF_TOKEN = $Token
     }
-
-    # Tokenizer
-    $tokPath = Join-Path $OutputDir "tokenizer.json"
-    if ($Force -or -not (Test-FileComplete $tokPath)) {
-        Write-Header "Downloading tokenizer from $TokenizerRepo"
-        $ok = Download-WithHfCli -RepoId $TokenizerRepo -Files @("tokenizer.json") -TargetDir $OutputDir
-        if (-not $ok) { $Failed = $true }
-    } else {
-        Write-Step "tokenizer.json already present."
+    $OutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir)
+    [IO.Directory]::CreateDirectory($OutputDir) | Out-Null
+    $CurlPath = (Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    $cli = Get-Command hf, huggingface-cli -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $snapshot = Get-Snapshot $Repo $Revision
+    $files = @($snapshot.siblings)
+    foreach ($file in $files) { $null = Get-TargetPath $file.rfilename }
+    Write-Host "[vibevoice] Entire repository: $Repo @ $($snapshot.sha) ($($files.Count) files)"
+    Write-Host "[vibevoice] Output: $OutputDir"
+    $cliSucceeded = $false
+    if ($cli) {
+        $cliArgs = @('download', $Repo, '--revision', $snapshot.sha, '--local-dir', $OutputDir)
+        if ($Force) { $cliArgs += '--force-download' }
+        & $cli.Source @cliArgs
+        $cliSucceeded = $LASTEXITCODE -eq 0
+        if (-not $cliSucceeded) { Write-Warning 'Hugging Face CLI failed; continuing with curl.' }
     }
-
-} else {
-    # ── curl.exe: file-by-file ──
-    Write-Header "Downloading model weights from $Repo"
-    foreach ($file in $ModelFiles) {
-        $ok = Download-WithCurl -RepoId $Repo -FileName $file.Name `
-                                -TargetDir $OutputDir -DisplaySize $file.Size
-        if (-not $ok) { $Failed = $true; break }
+    foreach ($file in $files) {
+        $target = Get-TargetPath $file.rfilename
+        if (($Force -and -not $cliSucceeded) -or -not (Test-Complete $target $file)) {
+            Download-File $Repo $snapshot.sha $file ([bool]$Force)
+        } else { Write-Host "[vibevoice] OK $($file.rfilename)" }
     }
-
-    if (-not $Failed) {
-        Write-Header "Downloading tokenizer from $TokenizerRepo"
-        foreach ($file in $TokenizerFiles) {
-            $ok = Download-WithCurl -RepoId $TokenizerRepo -FileName $file.Name `
-                                    -TargetDir $OutputDir -DisplaySize $file.Size
-            if (-not $ok) { $Failed = $true }
+    if ($TokenizerRepo -and 'tokenizer.json' -notin @($files.rfilename)) {
+        Write-Host "[vibevoice] No tokenizer.json in $Repo; fetching fallback from $TokenizerRepo."
+        $fallback = Get-Snapshot $TokenizerRepo 'main'
+        $tokenizer = $fallback.siblings | Where-Object { $_.rfilename -eq 'tokenizer.json' } | Select-Object -First 1
+        if (-not $tokenizer) { throw "No tokenizer.json in fallback repository $TokenizerRepo." }
+        if ($Force -or -not (Test-Complete (Get-TargetPath 'tokenizer.json') $tokenizer)) {
+            Download-File $TokenizerRepo $fallback.sha $tokenizer ([bool]$Force)
         }
     }
-}
-
-# ─── Verify ───────────────────────────────────────────────────────────────────
-
-Write-Header "Verifying downloaded files"
-
-$AllFiles = $ModelFiles + $TokenizerFiles
-$Missing = @()
-foreach ($file in $AllFiles) {
-    $p = Join-Path $OutputDir $file.Name
-    if (Test-FileComplete $p) {
-        $sz = (Get-Item $p).Length
-        $szMB = [math]::Round($sz / 1MB, 1)
-        Write-Step "  OK   $($file.Name) ($szMB MB)"
-    } else {
-        Write-Err "  MISS $($file.Name)"
-        $Missing += $file.Name
-    }
-}
-
-if ($Missing.Count -gt 0) {
-    Write-Host ""
-    Write-Err "$($Missing.Count) file(s) missing. Re-run the script or download manually."
+    Write-Host "[vibevoice] Complete repository downloaded and verified."
+} catch {
+    Write-Host "[vibevoice] ERROR: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
-}
-
-if ($Failed) {
-    Write-Err "Some downloads may have failed. Check the files above."
-    exit 1
-}
-
-Write-Host ""
-Write-Step "All files downloaded successfully!"
-Write-Host ""
-Write-Host "  Run inference:" -ForegroundColor White
-Write-Host "    build\vv_cli.exe --model $OutputDir --audio recording.wav" -ForegroundColor Gray
-Write-Host ""
+} finally { $env:HF_TOKEN = $PreviousToken }
