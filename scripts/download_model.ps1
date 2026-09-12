@@ -62,6 +62,21 @@ function Get-TargetPath([string]$Name) {
     return $path
 }
 
+function Get-FreeSpace([string]$Path) {
+    try { return (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path)))).AvailableFreeSpace }
+    catch { return $null }
+}
+
+function Assert-FreeSpace([string]$Path, [long]$Needed) {
+    # curl reports a full disk as a plain write failure, so refuse before asking.
+    $free = Get-FreeSpace $Path
+    if ($null -ne $free -and $free -lt $Needed) {
+        throw ("Not enough free space on {0}: {1:N1} GB needed, {2:N1} GB available. " -f
+               [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path)), ($Needed / 1GB), ($free / 1GB)) +
+              "Free up space or pass -OutputDir on another drive."
+    }
+}
+
 function Test-Complete([string]$Path, $File) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     $length = (Get-Item -LiteralPath $Path -Force).Length
@@ -108,6 +123,9 @@ function Download-File([string]$RepoId, [string]$Commit, $File, [bool]$Fresh) {
             Remove-Item -LiteralPath $partial
         }
     }
+    $have = if (Test-Path -LiteralPath $partial) { (Get-Item -LiteralPath $partial).Length } else { 0 }
+    # The partial is moved onto the target, so the file is only paid for once.
+    Assert-FreeSpace $cache ([long]$File.size - $have)
     $url = "$Endpoint/$(Encode-Path $RepoId)/resolve/$Commit/$(Encode-Path $File.rfilename)"
     Write-Host "[vibevoice] GET $($File.rfilename) ($($File.size) bytes)"
     for ($attempt = 0; $attempt -lt 2; $attempt++) {
@@ -115,14 +133,24 @@ function Download-File([string]$RepoId, [string]$Commit, $File, [bool]$Fresh) {
         $curlArgs = @('--fail', '--location', '--retry', '3', '--connect-timeout', '30',
                       '--progress-bar', '--continue-at', '-', '--output', $partial, $url)
         if ($Token) {
-            # Keep the credential out of curl's command line.
+            # Keep the credential out of curl's command line. The config goes
+            # through a file because PowerShell would give stdin a BOM, which
+            # curl reads as part of the first option name.
             $config = 'header = "Authorization: Bearer ' + $Token.Replace('\', '\\').Replace('"', '\"') + '"'
-            $config | & $CurlPath --config - @curlArgs
+            $configFile = [IO.Path]::Combine([IO.Path]::GetTempPath(), [IO.Path]::GetRandomFileName())
+            try {
+                [IO.File]::WriteAllText($configFile, $config, (New-Object Text.UTF8Encoding $false))
+                & $CurlPath --config $configFile @curlArgs
+            } finally { Remove-Item -LiteralPath $configFile -Force -ErrorAction SilentlyContinue }
         } else { & $CurlPath @curlArgs }
         $code = $LASTEXITCODE
         if ($code -eq 0 -and (Test-Complete $partial $File)) { break }
         # A server without Range support or a corrupt partial needs a fresh retry.
         if ($code -notin @(0, 33, 36) -or $attempt -eq 1) {
+            if ($code -eq 23) {
+                Assert-FreeSpace $cache ([long]$File.size)
+                throw "Could not write $($File.rfilename): the download destination rejected the write."
+            }
             throw "Download failed for $($File.rfilename) (curl $code). Re-run to resume."
         }
         if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial }
@@ -157,6 +185,9 @@ try {
     foreach ($file in $files) { $null = Get-TargetPath $file.rfilename }
     Write-Host "[vibevoice] Entire repository: $Repo @ $($snapshot.sha) ($($files.Count) files)"
     Write-Host "[vibevoice] Output: $OutputDir"
+    $missing = [long](($files | Where-Object { -not (Test-Path -LiteralPath (Get-TargetPath $_.rfilename)) } |
+                       Measure-Object -Property size -Sum).Sum)
+    Assert-FreeSpace $OutputDir $missing
     $cliSucceeded = $false
     if ($cli) {
         $cliArgs = @('download', $Repo, '--revision', $snapshot.sha, '--local-dir', $OutputDir)
