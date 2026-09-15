@@ -186,10 +186,18 @@ On the same audio, AWQ gives an identical transcript and 2% faster decode
 (102.3 vs 100.0 tok/s) for 3% more VRAM — NF4's own scales are
 double-quantized, so it is already at 4.13 bits against AWQ's 4.16.
 
-`tools/convert_awq.py` re-quantizes an NF4 checkpoint into the AWQ container
-if you do not have an AWQ build. It does not do AWQ's activation-aware scale
-search, which needs calibration data; a real AutoAWQ checkpoint will be
-slightly better and the runtime treats both identically.
+[`Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM`](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM)
+is a real activation-aware build: `llm-compressor`'s `AWQModifier` over 256
+calibration samples (64 audio, 192 text), group 128, asymmetric, exported into
+the AWQ GEMM container this runtime reads. 7.0 GB against the BF16 original's
+17.3 GB. On nine held-out LibriSpeech clips it scores 14 word errors out of
+135 against the BF16 baseline's 16, and the C runtime reproduces the PyTorch
+AWQ answer on all nine — a smoke test, not a benchmark.
+
+`tools/convert_awq.py` re-quantizes an NF4 checkpoint into the same container
+if you would rather not download a second set of weights. It does not do the
+activation-aware scale search, so it is the weaker of the two; the runtime
+treats both identically.
 
 ### KV cache
 
@@ -317,11 +325,13 @@ relative.
 
 | what | where |
 |---|---|
-| 4-bit weights | [`scerz/VibeVoice-ASR-4bit`](https://huggingface.co/scerz/VibeVoice-ASR-4bit) |
+| NF4 weights (bitsandbytes) | [`scerz/VibeVoice-ASR-4bit`](https://huggingface.co/scerz/VibeVoice-ASR-4bit) |
+| AWQ weights (W4A16, asymmetric) | [`Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM`](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM) |
 | `tokenizer.json` | [`microsoft/VibeVoice-ASR`](https://huggingface.co/microsoft/VibeVoice-ASR) or Qwen2.5-7B |
 
-The 4-bit repo does not ship tokenizer files; drop `tokenizer.json` next to
-the safetensors.
+Either checkpoint works; point `--model` at the directory. The NF4 repo does
+not ship tokenizer files, so drop `tokenizer.json` next to the safetensors.
+The AWQ repo already carries its own.
 
 ---
 

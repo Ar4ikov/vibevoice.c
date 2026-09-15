@@ -152,6 +152,7 @@ TensorFlow, ONNX Runtime в runtime-коде. Python допустим тольк
 | Оригинальное репо | https://github.com/microsoft/VibeVoice |
 | Оригинальные веса (BF16) | https://huggingface.co/microsoft/VibeVoice-ASR |
 | 4-bit квантованные веса | https://huggingface.co/scerz/VibeVoice-ASR-4bit |
+| AWQ W4A16 (asym) веса | https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM |
 | Технический отчёт ASR | https://arxiv.org/pdf/2601.18184 |
 | Лицензия модели | MIT |
 
