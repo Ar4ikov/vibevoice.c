@@ -420,9 +420,11 @@ self-attention with 28 heads at head_dim 128:
 | 8192 | 288.2 ms (1.7 TFLOP/s) | **8.03 ms (59.9 TFLOP/s)** |
 
 59.9 TFLOP/s is 84% of the card's 71 TFLOP/s ceiling for FP16 multiply with
-FP32 accumulate; an RTX 3070 reaches 31.8 against its own 40.7, and the same
-35x against the scalar kernel. End to end on the 32-minute file, prefill goes from 30.7 s to
-4.7 s (471 → 3056 tok/s) and the whole transcription from 182 s to 155 s.
+FP32 accumulate. An RTX 3070 reaches 31.8 of its own 40.7, the same 35× over
+the scalar kernel.
+
+End to end on the 32-minute file, prefill goes from 30.7 s to 4.7 s
+(471 → 3056 tok/s) and the whole transcription from 182 s to 155 s.
 
 The text is identical. Four of the 336 timestamps the model emits move by
 10 ms, which is FP16 rounding inside the P·V product landing on the other side
@@ -454,17 +456,19 @@ two dozen times across a 24K decode against thousands of replays.
 | 1.5K context, fp16 KV | 107.4 tok/s | **111.6** |
 | 0.2K context, tq4 KV | 117.5 tok/s | **122.2** |
 | 1.5K context, tq4 KV | 96.7 tok/s | **100.2** |
+| the 32-minute file | 73.4 tok/s, 156.7 s | **75.6 tok/s, 152.4 s** |
 
-Transcripts are byte-identical either way. `VV_CUDA_GRAPH=0` turns it off,
-which is also automatic when weights are streamed (a streaming pool patches
-host pointers between layers, and no graph can record that).
+Transcripts are byte-identical either way, that last one included.
+`VV_CUDA_GRAPH=0` turns it off, which is also automatic when weights are
+streamed (a streaming pool patches host pointers between layers, and no graph
+can record that).
 
 Getting this right needed one other thing. Anything issued to CUDA's legacy
 default stream synchronises with every blocking stream in the process, so a
 four-byte read-back in one request used to stall every other slot — and knock
-any capture in flight out of capture mode, which discarded a token's work and
-returned a transcript of one garbage token. Nothing in the pipeline touches the
-default stream any more.
+any capture in flight out of capture mode, which discards that token's work
+and returned a transcript of one garbage token. Nothing in the pipeline, the
+speech encoder or the connectors touches the default stream any more.
 
 ---
 
