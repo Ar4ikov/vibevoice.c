@@ -329,6 +329,7 @@ spent:
 ```bash
 vv_cli serve --model ./model_hf --gpus 0,1 --slots 4      # one replica each
 vv_cli serve --model ./model_hf --gpus all --gpu-memory 80%
+vv_cli --model ./model_hf --audio a.wav --gpus 0,1        # one model, split
 vv_cli --model ./model_hf --audio a.wav --gpus 1 --gpu-memory 18GiB
 ```
 
@@ -347,10 +348,13 @@ scratch, the KV cache and the workspace, not just the transformer. On a 3090,
 `--gpu-memory 6GiB` peaks at 4.5 GB with seven layers resident and a 8192-token
 window; without the flag the same run holds all 28 and a 32768-token window.
 
-`serve` puts one replica on each selected device — its own weights, its own
-slots — and spreads the slot pool over them. Nothing crosses between
-replicas, so this is the shape that actually multiplies throughput. Eight
-30-second clips, four slots, two 3090s:
+### Replicas, or one model split
+
+There are two ways to use several cards and they are not alternatives.
+
+**Replicas** put a full copy of the model on each device with its own slots.
+Nothing crosses between them, so this is the shape that multiplies
+throughput. Eight 30-second clips, four slots, two 3090s:
 
 | | 8 requests |
 |---|---|
@@ -360,10 +364,40 @@ replicas, so this is the shape that actually multiplies throughput. Eight
 1.75x rather than 2x because the per-request work that is not on the GPU —
 audio decode, prompt building, JSON — is shared.
 
-Sharding one model across cards is
-[#7](https://github.com/Ar4ikov/vibevoice.c/issues/7) and is not done; a
-single transcription runs on a single device, and `vv_cli --audio` says so if
-it is given more than one.
+**Layer sharding** splits one model: layers 0..k on the first device, the
+rest on the next, each owning the KV cache for its own layers. The devices
+take turns rather than working at once, so it buys capacity, not speed —
+what crosses a boundary is one hidden state, 3584 halves, against the ~8 ms
+of compute that token costs. On two 3090s a 30-second file measures 124.7
+tok/s decode and RTF 0.059 sharded against 122.0 and 0.060 on one card.
+
+Capacity is the point. Give each card a 6 GiB budget:
+
+| | resident | decode | RTF |
+|---|---|---|---|
+| `--gpus 1 --gpu-memory 6GiB` | 7/28 layers | 8.7 tok/s | 0.595 |
+| `--gpus 0,1 --gpu-memory 6GiB` | **28/28** | **122.9 tok/s** | **0.059** |
+
+Two cards that each hold a quarter of the model hold all of it between them,
+and the streaming that made the first case slow stops entirely.
+
+The split is proportional to what each device can give to layers, not even:
+the primary also carries the embedding table, the head and the speech
+encoder, which is 3.4 GB before a layer lands, so it gets fewer. At 6 GiB
+each that is 7 layers on the first card and 21 on the second.
+
+`--split-mode` picks:
+
+```
+auto      replicate while there is a slot for every device, shard otherwise
+replica   a full copy on each device
+layer     one model, its layers spread over them
+```
+
+`auto` is the default. A single file is one request and cannot be in two
+places at once, so `vv_cli --audio` with several devices shards; `serve
+--slots 4` on two devices replicates; `serve --slots 1` on two devices
+shards, because the second replica would only sit idle.
 
 ---
 

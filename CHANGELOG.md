@@ -6,6 +6,12 @@ container images — see [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Unreleased
 
+- One model can be split across devices: layers 0..k on the first, the rest
+  on the next, each owning the KV cache for its own layers and only the
+  hidden state crossing between them. `--split-mode auto|replica|layer`
+  chooses; `auto` replicates while there is a slot per device and shards
+  otherwise. On two 3090s with a 6 GiB budget each, a 30 s file goes from
+  7 of 28 layers resident and RTF 0.595 to all 28 and RTF 0.059.
 - `--gpus 0,1` / `--gpus all` selects devices, `--gpu-memory` caps what each
   one may hold (`80%`, `18GiB`, `8192M`, a byte count, or one value per
   device). The cap covers the CUDA context, the speech encoder and its

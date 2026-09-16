@@ -90,6 +90,19 @@ vv_status_t vv_dev_get_device_info(int id, size_t* total, size_t* freem,
 
 int vv_dev_device_count(void) { return 0; }
 
+vv_status_t vv_dev_memcpy_peer(void* dst, int dd, const void* src, int sd,
+                               size_t size, void* stream) {
+    (void)dd; (void)sd; (void)stream;
+    if (!dst || !src) return VV_ERR_NULL_PTR;
+    memcpy(dst, src, size);
+    return VV_OK;
+}
+
+vv_status_t vv_dev_enable_peer(int device, int peer) {
+    (void)device; (void)peer;
+    return VV_ERR_UNSUPPORTED;
+}
+
 vv_status_t vv_dev_get_device_name(int id, char* buf, size_t n) {
     (void)id;
     if (buf && n) buf[0] = '\0';

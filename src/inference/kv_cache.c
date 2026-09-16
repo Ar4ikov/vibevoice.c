@@ -39,13 +39,26 @@ vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
                                 int num_layers, int n_kv_heads,
                                 int head_dim, int max_seq_len,
                                 int format, bool on_cpu) {
+    return vv_kv_cache_create_range(cache, num_layers, 0, num_layers,
+                                    n_kv_heads, head_dim, max_seq_len,
+                                    format, on_cpu);
+}
+
+vv_status_t vv_kv_cache_create_range(vv_kv_cache_t** cache,
+                                     int num_layers, int first, int count,
+                                     int n_kv_heads, int head_dim,
+                                     int max_seq_len, int format, bool on_cpu) {
     if (!cache) return VV_ERR_NULL_PTR;
+    if (first < 0 || count <= 0 || first + count > num_layers)
+        return VV_ERR_INVALID_ARG;
 
     vv_kv_cache_t* c = (vv_kv_cache_t*)vv_alloc(sizeof(vv_kv_cache_t));
     if (!c) return VV_ERR_OUT_OF_MEMORY;
     memset(c, 0, sizeof(*c));
 
     c->num_layers    = num_layers;
+    c->first_layer   = first;
+    c->last_layer    = first + count - 1;
     c->n_kv_heads    = n_kv_heads;
     c->head_dim      = head_dim;
     c->max_seq_len   = max_seq_len;
@@ -104,7 +117,7 @@ vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
         }                                                                    \
     } while (0)
 
-    for (int i = 0; i < num_layers; i++) {
+    for (int i = first; i <= c->last_layer; i++) {
         ALLOC_SLOT(c->k_cache[i], sb);
         ALLOC_SLOT(c->v_cache[i], sb);
         if (has_meta) {
@@ -126,14 +139,21 @@ vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
         vv_dev_memset(c->d_len_next, 0, sizeof(int));
     }
 
-    c->bytes_total = (size_t)num_layers * 2 * (sb + mb);
+    c->bytes_total = (size_t)count * 2 * (sb + mb);
 
-    VV_LOG_I("kv_cache: %d layers, %d heads, dim=%d, max_seq=%d, %s, %s, "
-             "%.1f MB",
-             num_layers, n_kv_heads, head_dim, max_seq_len,
-             vv_kv_format_name((vv_kv_format_t)format),
-             on_cpu ? "CPU" : "GPU",
-             (double)c->bytes_total / (1024.0 * 1024.0));
+    if (count == num_layers)
+        VV_LOG_I("kv_cache: %d layers, %d heads, dim=%d, max_seq=%d, %s, %s, "
+                 "%.1f MB",
+                 num_layers, n_kv_heads, head_dim, max_seq_len,
+                 vv_kv_format_name((vv_kv_format_t)format),
+                 on_cpu ? "CPU" : "GPU",
+                 (double)c->bytes_total / (1024.0 * 1024.0));
+    else
+        VV_LOG_I("kv_cache: layers %d..%d of %d, max_seq=%d, %s, %s, %.1f MB",
+                 first, c->last_layer, num_layers, max_seq_len,
+                 vv_kv_format_name((vv_kv_format_t)format),
+                 on_cpu ? "CPU" : "GPU",
+                 (double)c->bytes_total / (1024.0 * 1024.0));
 
     *cache = c;
     return VV_OK;
@@ -185,7 +205,7 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
     if (s != VV_OK) return s;
 
     /* current_len advances once per position, not once per layer. */
-    if (layer == cache->num_layers - 1) cache->current_len += seq_len;
+    if (layer == cache->last_layer) cache->current_len += seq_len;
     return VV_OK;
 }
 

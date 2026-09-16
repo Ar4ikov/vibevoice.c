@@ -268,6 +268,28 @@ typedef struct vv_gpu_set {
     int          n;       /**< 0 = nothing asked for; use the default device */
 } vv_gpu_set_t;
 
+/**
+ * @brief What to do with more than one device.
+ *
+ * Replicas multiply throughput and shards do not: a replica shares nothing,
+ * while a shard passes the hidden state along a chain and the devices take
+ * turns. Shards buy capacity instead — the KV cache and the weights are
+ * spread, so a window or a model that did not fit now does.
+ */
+typedef enum vv_split_mode {
+    VV_SPLIT_AUTO = 0,  /**< replicate while each device holds a copy       */
+    VV_SPLIT_REPLICA,   /**< a full copy on every device                    */
+    VV_SPLIT_LAYER,     /**< one model, its layers spread over the devices  */
+} vv_split_mode_t;
+
+/** @brief Parse "auto" | "replica" | "layer"; count on failure. */
+vv_split_mode_t vv_split_mode_parse(const char* name);
+
+/** @brief Name for logging. */
+const char* vv_split_mode_name(vv_split_mode_t mode);
+
+#define VV_SPLIT_MODE_COUNT 3
+
 /** @brief Parameters for vv_inference_init(). Pass NULL for defaults. */
 typedef struct vv_init_params {
     float  vram_budget;   /**< 0.0-1.0 fraction of free VRAM. Default: 1.0   */
@@ -276,6 +298,7 @@ typedef struct vv_init_params {
     int    max_seq_len;   /**< KV-cache window in tokens. Default: 32768     */
     int    gpu_layers;    /**< Layers to keep on the GPU. -1 = fit to VRAM   */
     vv_gpu_set_t gpus;    /**< Devices and their caps. n = 0: use `gpu_id`   */
+    int    split_mode;    /**< vv_split_mode_t across those devices          */
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -287,6 +310,7 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.max_seq_len = 32768;
     p.gpu_layers = -1;
     p.gpus.n = 0;
+    p.split_mode = VV_SPLIT_AUTO;
     return p;
 }
 

@@ -277,6 +277,32 @@ vv_status_t vv_dev_get_device_info(int device_id, size_t* total_mem,
  * driver at all, which is the case the CPU path exists for, so the error is
  * folded into the count.
  */
+vv_status_t vv_dev_memcpy_peer(void* dst, int dst_device,
+                               const void* src, int src_device,
+                               size_t size, void* stream) {
+    if (!dst || !src) return VV_ERR_NULL_PTR;
+    if (size == 0) return VV_OK;
+    const cudaError_t err = cudaMemcpyPeerAsync(dst, dst_device, src,
+                                                src_device, size,
+                                                (cudaStream_t)stream);
+    return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
+}
+
+vv_status_t vv_dev_enable_peer(int device, int peer) {
+    if (device == peer) return VV_OK;
+    int can = 0;
+    if (cudaDeviceCanAccessPeer(&can, device, peer) != cudaSuccess || !can)
+        return VV_ERR_UNSUPPORTED;
+    int prev = 0;
+    cudaGetDevice(&prev);
+    if (cudaSetDevice(device) != cudaSuccess) return VV_ERR_CUDA;
+    const cudaError_t err = cudaDeviceEnablePeerAccess(peer, 0);
+    cudaSetDevice(prev);
+    /* Already enabled is the state we wanted, not a failure. */
+    if (err == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); return VV_OK; }
+    return (err == cudaSuccess) ? VV_OK : VV_ERR_UNSUPPORTED;
+}
+
 int vv_dev_device_count(void) {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess) return 0;

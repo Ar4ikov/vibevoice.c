@@ -80,6 +80,7 @@ static void usage(const char* which) {
         "  --gpu <id>            GPU device id\n"
         "  --gpus <list>         Devices to spread slots over: 0,1 | all\n"
         "  --gpu-memory <size>   Cap per device: 80%% | 18GiB | 8192M | bytes\n"
+        "  --split-mode <how>    auto (default) | replica | layer\n"
         "  --slots <n>           Concurrent transcriptions\n"
         "  --max-seq-len <n>     KV window\n"
         "  --kv-cache <fmt>      fp16 | fp8 | tq4 | ...\n"
@@ -114,6 +115,15 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
         else if (strcmp(s, "--gpu") == 0 && next) a->ep.gpu_id = atoi(argv[++i]);
         else if (strcmp(s, "--gpus") == 0 && next) a->gpus = argv[++i];
         else if (strcmp(s, "--gpu-memory") == 0 && next) a->gpu_memory = argv[++i];
+        else if (strcmp(s, "--split-mode") == 0 && next) {
+            const vv_split_mode_t m = vv_split_mode_parse(argv[++i]);
+            if (m >= VV_SPLIT_MODE_COUNT) {
+                fprintf(stderr, "error: --split-mode is auto, replica or "
+                                "layer, not '%s'\n", argv[i]);
+                return -1;
+            }
+            a->ep.split_mode = (int)m;
+        }
         else if (strcmp(s, "--slots") == 0 && next) a->ep.n_slots = atoi(argv[++i]);
         else if (strcmp(s, "--max-seq-len") == 0 && next) a->ep.max_seq_len = atoi(argv[++i]);
         else if (strcmp(s, "--gpu-layers") == 0 && next) a->ep.gpu_layers = atoi(argv[++i]);
