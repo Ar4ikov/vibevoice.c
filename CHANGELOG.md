@@ -6,6 +6,17 @@ container images — see [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Unreleased
 
+- `--gpus 0,1` / `--gpus all` selects devices, `--gpu-memory` caps what each
+  one may hold (`80%`, `18GiB`, `8192M`, a byte count, or one value per
+  device). The cap covers the CUDA context, the speech encoder and its
+  scratch as well as the transformer, and it steers the placement decision
+  instead of being checked after the fact.
+- `serve` puts one replica per selected device and spreads its slots over
+  them: eight 30 s clips through four slots take 13.2 s on one 3090 and
+  7.6 s on two.
+- When the budget is tight the KV window is now halved down to 8192 tokens
+  before layers start streaming, instead of only being trimmed in the case
+  where everything already fitted.
 - CPU prefill is a packed GEMM: k-major panels, a 6x16 AVX2 register tile and
   cache blocking sized off L1 and L2. 283 → 991 GFLOP/s on a 5900X, prefill
   22 → 77 tok/s, and a 30 s file goes from RTF 1.125 to 0.809 with a

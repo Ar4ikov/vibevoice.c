@@ -43,6 +43,8 @@ typedef struct {
     const char* trt_acoustic;
     const char* trt_semantic;
     int         gpu_id;
+    const char* gpus;
+    const char* gpu_memory;
     int         max_tokens;
     int         max_seq_len;
     int         gpu_layers;
@@ -93,6 +95,9 @@ static void print_usage(const char* prog) {
         "Optional:\n"
         "  --output <file>       Output JSON file (default: stdout)\n"
         "  --gpu <id>            GPU device ID (default: 0)\n"
+        "  --gpus <list>         Devices to use: 0,1 | all (default: --gpu)\n"
+        "  --gpu-memory <size>   Cap per device: 80%% | 18GiB | 8192M | bytes,\n"
+        "                        or one value per device, comma-separated\n"
         "  --max-tokens <N>      Max decode tokens (default: 64000)\n"
         "  --max-seq-len <N>     KV-cache window in tokens (default: 32768)\n"
         "  --hotwords <words>    Comma-separated hotwords\n"
@@ -134,6 +139,10 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->output_path = argv[++i];
         } else if (strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
             args->gpu_id = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--gpus") == 0 && i + 1 < argc) {
+            args->gpus = argv[++i];
+        } else if (strcmp(argv[i], "--gpu-memory") == 0 && i + 1 < argc) {
+            args->gpu_memory = argv[++i];
         } else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
             args->max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-seq-len") == 0 && i + 1 < argc) {
@@ -233,7 +242,24 @@ int main(int argc, char** argv) {
     VV_LOG_I("vibevoice.c %s (%s)", vv_version(), vv_build_ref());
     VV_LOG_I("Model: %s", args.model_dir);
     VV_LOG_I("Audio: %s", args.audio_path);
-    VV_LOG_I("GPU: %d", args.gpu_id);
+
+    vv_gpu_set_t gpus;
+    memset(&gpus, 0, sizeof(gpus));
+    if (args.gpus && vv_gpu_set_parse(args.gpus, &gpus) != VV_OK) return 1;
+    if (args.gpu_memory && vv_gpu_set_caps(args.gpu_memory, &gpus) != VV_OK)
+        return 1;
+    if (gpus.n > 0) args.gpu_id = gpus.id[0];
+    if (vv_gpu_set_resolve(&gpus, args.gpu_id, args.cpu_only) != VV_OK)
+        return 1;
+    /*
+     * One file is one request, and a request runs on one device until layer
+     * sharding lands. Say so rather than quietly using the first.
+     */
+    if (gpus.n > 1 && !args.cpu_only) {
+        VV_LOG_W("gpus: %d devices given; one transcription uses one of them "
+                 "(gpu %d). Several devices pay off under `serve --slots`.",
+                 gpus.n, gpus.id[0]);
+    }
 
     double t_start = get_time_ms();
 
@@ -268,6 +294,7 @@ int main(int argc, char** argv) {
     init_params.cpu_only = args.cpu_only;
     if (args.max_seq_len > 0) init_params.max_seq_len = args.max_seq_len;
     init_params.gpu_layers = args.gpu_layers;
+    init_params.gpus = gpus;
     s = vv_inference_init(args.model_dir, args.gpu_id, &init_params, &ctx);
     if (s != VV_OK) {
         VV_LOG_E("Failed to initialize inference: %s", vv_status_str(s));

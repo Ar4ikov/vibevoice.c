@@ -224,9 +224,47 @@ static size_t calc_per_layer_gpu_bytes(const vv_model_t* model) {
     return total;
 }
 
+/*
+ * The Conv-VAE encoder allocates its activations per call and frees them
+ * again, so this never shows up in a steady-state reading — but it is real
+ * while a segment is encoding, and a budget that ignores it hands the
+ * encoder a card with nothing left. Measured at 174 MB for the 60 s segment
+ * the streaming path uses, which is the longest one there is.
+ */
+#define VV_ENCODER_SCRATCH_BYTES ((size_t)256 * 1024 * 1024)
+
+/**
+ * @brief Bytes the speech front end will take on the device.
+ *
+ * The two Conv-VAE encoders and the two connectors are uploaded after
+ * placement has been decided, so the budget has to reserve for them or the
+ * cap is one the process quietly walks past.
+ */
+static size_t calc_frontend_gpu_bytes(const vv_model_t* model) {
+    /* Host copies are FP32 and land as FP16, so the device pays half. */
+    size_t total = 0;
+    for (int i = 0; i < model->n_acoustic_weights; i++) {
+        total += model->acoustic_weights[i].tensor.size_bytes;
+        total += model->acoustic_weights[i].bias.size_bytes;
+    }
+    for (int i = 0; i < model->n_semantic_weights; i++) {
+        total += model->semantic_weights[i].tensor.size_bytes;
+        total += model->semantic_weights[i].bias.size_bytes;
+    }
+    #define ADD_T(w) do { total += (w).tensor.size_bytes; \
+                          total += (w).bias.size_bytes; } while (0)
+    ADD_T(model->acoustic_connector_fc1);
+    ADD_T(model->acoustic_connector_norm);
+    ADD_T(model->acoustic_connector_fc2);
+    ADD_T(model->semantic_connector_fc1);
+    ADD_T(model->semantic_connector_norm);
+    ADD_T(model->semantic_connector_fc2);
+    #undef ADD_T
+    return total / 2;
+}
+
 static vv_placement_t decide_placement(
-    float vram_budget, bool cpu_only,
-    size_t free_vram,
+    size_t available, bool cpu_only,
     size_t all_layers_bytes,   /* total for 28 layers */
     size_t embed_bytes,
     size_t lm_head_bytes,
@@ -234,13 +272,12 @@ static vv_placement_t decide_placement(
     size_t kv_cache_bytes,
     size_t workspace_bytes)
 {
-    if (cpu_only || vram_budget <= 0.0f) return VV_PLACE_CPU_ONLY;
+    if (cpu_only || available == 0) return VV_PLACE_CPU_ONLY;
 
-    size_t available = (size_t)((double)free_vram * (double)vram_budget);
     size_t base = workspace_bytes + kv_cache_bytes;
     size_t staging_2 = per_layer_bytes * 2 + 16 * 256 * 2; /* 2 buffers */
 
-    VV_LOG_I("budget: available %.1f MB, base %.1f MB (ws+kv), "
+    VV_LOG_D("budget: available %.1f MB, base %.1f MB (ws+kv), "
              "all_layers %.1f MB, embed %.1f MB, lm_head %.1f MB",
              (double)available / (1024.0*1024.0),
              (double)base / (1024.0*1024.0),
@@ -323,7 +360,17 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         sizeof(vv_inference_ctx_t));
     if (!c) return VV_ERR_OUT_OF_MEMORY;
     memset(c, 0, sizeof(*c));
+    /*
+     * An empty set means the caller only named a device; give it one entry
+     * so everything downstream reads the same structure. Validation and the
+     * one-line-per-device log belong to whoever parsed the flags.
+     */
+    if (p.gpus.n == 0) { p.gpus.n = 1; p.gpus.id[0] = gpu_id; }
+    c->gpus = p.gpus;
     c->gpu_id = gpu_id;
+    c->gpu_index = 0;
+    for (int i = 0; i < p.gpus.n; i++)
+        if (p.gpus.id[i] == gpu_id) c->gpu_index = i;
     c->use_gpu = !cpu_only;
     strncpy(c->model_dir, model_dir, sizeof(c->model_dir) - 1);
 
@@ -342,8 +389,33 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     if (cpu_only) {
         c->placement = VV_PLACE_CPU_ONLY;
     } else {
-        size_t free_vram = 0, total_vram = 0;
-        vv_dev_get_device_info(gpu_id, &total_vram, &free_vram, NULL);
+        /*
+         * What is free, scaled by --vram-budget, and then never more than
+         * --gpu-memory allows. Everything below works off `available`, so
+         * the cap is honoured by the placement decision itself rather than
+         * checked once the weights are already uploaded.
+         */
+        size_t available = vv_gpu_budget(&p.gpus, c->gpu_index,
+                                         p.vram_budget);
+        /*
+         * Three things come out of the budget before anything is placed,
+         * because all three are spent on the device and none of them are
+         * decided here: what the device already holds (this process's CUDA
+         * context, the driver, anyone else), the speech front end, and the
+         * scratch its encoder needs for the longest segment it will see.
+         * Leave them out and a cap overshoots by about 2 GB, which makes it
+         * no cap at all.
+         */
+        const size_t frontend = calc_frontend_gpu_bytes(c->model);
+        const size_t reserve = vv_gpu_reserved(&p.gpus, c->gpu_index)
+                             + frontend + VV_ENCODER_SCRATCH_BYTES;
+        VV_LOG_I("budget: reserving %.1f MB (in use %.1f, front end %.1f, "
+                 "encoder scratch %.1f)",
+                 (double)reserve / (1024.0*1024.0),
+                 (double)vv_gpu_reserved(&p.gpus, c->gpu_index) / (1024.0*1024.0),
+                 (double)frontend / (1024.0*1024.0),
+                 (double)VV_ENCODER_SCRATCH_BYTES / (1024.0*1024.0));
+        available = available > reserve ? available - reserve : 0;
 
         size_t per_layer = calc_per_layer_gpu_bytes(c->model);
         size_t all_layers = per_layer * (size_t)c->model->num_layers;
@@ -356,30 +428,47 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         size_t ws_target = (size_t)512 * 1024 * 1024;
 
         /*
-         * Shrink the KV window before giving up on resident weights: a
-         * shorter context costs one long recording, while streaming the
-         * layers costs every single token.
+         * The context is the first thing to give up. A shorter window costs
+         * one long recording; streaming the layers costs every token of
+         * every recording. So trim it — to whatever the budget leaves when
+         * the weights stay put, and failing that by halving until they fit,
+         * down to a floor below which a transcription is not worth starting.
          */
-        size_t available = (size_t)((double)free_vram * (double)p.vram_budget);
-        size_t resident = ws_target + all_layers + embed_sz + lm_head_sz;
+        const int kv_floor = 8192;
+        const size_t resident = ws_target + all_layers + embed_sz + lm_head_sz;
+        const int max_seq_asked = max_seq;
         if (available > resident) {
             size_t kv_room = (available - resident) / kv_per_token;
             if (kv_room < (size_t)max_seq) {
                 int fitted = (int)(kv_room & ~(size_t)255);
-                if (fitted >= 2048) {
-                    VV_LOG_W("inference: KV window trimmed %d -> %d tokens to "
-                             "keep the weights resident", max_seq, fitted);
-                    max_seq = fitted;
-                }
+                if (fitted >= 2048) max_seq = fitted;
             }
         }
 
         size_t kv_total = (size_t)max_seq * kv_per_token;
-
-        c->placement = decide_placement(
-            p.vram_budget, false, free_vram,
-            all_layers, embed_sz, lm_head_sz,
-            per_layer, kv_total, ws_target);
+        for (;;) {
+            c->placement = decide_placement(
+                available, false,
+                all_layers, embed_sz, lm_head_sz,
+                per_layer, kv_total, ws_target);
+            if (c->placement == VV_PLACE_ALL_GPU || max_seq <= kv_floor) break;
+            max_seq = max_seq / 2 < kv_floor ? kv_floor : max_seq / 2;
+            kv_total = (size_t)max_seq * kv_per_token;
+        }
+        /* One line at the end, not one per attempt around the loop. */
+        VV_LOG_I("budget: %.1f MB for %.1f MB of layers, %.1f embed, "
+                 "%.1f lm_head, %.1f KV and %.1f workspace",
+                 (double)available / (1024.0*1024.0),
+                 (double)all_layers / (1024.0*1024.0),
+                 (double)embed_sz / (1024.0*1024.0),
+                 (double)lm_head_sz / (1024.0*1024.0),
+                 (double)kv_total / (1024.0*1024.0),
+                 (double)ws_target / (1024.0*1024.0));
+        if (max_seq != max_seq_asked)
+            VV_LOG_W("inference: KV window trimmed %d -> %d tokens to keep "
+                     "%s", max_seq_asked, max_seq,
+                     c->placement == VV_PLACE_ALL_GPU
+                     ? "the weights resident" : "as many layers resident as fit");
 
         /*
          * When not everything fits, work out how many layers do. Two staging
@@ -661,10 +750,17 @@ static void attach_frontend(vv_inference_ctx_t* c) {
 
     if (c->use_gpu) {
         double t_w = vv_time_ms();
+        size_t before = 0, after = 0;
+        vv_dev_get_device_info(c->gpu_id, NULL, &before, NULL);
         if (c->acoustic_encoder) vv_conv_vae_warmup(c->acoustic_encoder);
         if (c->semantic_encoder) vv_conv_vae_warmup(c->semantic_encoder);
-        VV_LOG_I("inference: speech encoder weights staged to GPU (%.0f ms)",
-                 vv_time_ms() - t_w);
+        vv_dev_get_device_info(c->gpu_id, NULL, &after, NULL);
+        /* Measured, not predicted: the budget above reserves for this, and
+           a reserve nobody ever checks is a reserve that drifts. */
+        VV_LOG_I("inference: speech encoder weights staged to GPU "
+                 "(%.0f ms, %.1f MB)", vv_time_ms() - t_w,
+                 before > after ? (double)(before - after) / (1024.0*1024.0)
+                                : 0.0);
     }
 }
 
@@ -688,6 +784,8 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
 
     c->is_clone  = true;
     c->gpu_id    = parent->gpu_id;
+    c->gpu_index = parent->gpu_index;
+    c->gpus      = parent->gpus;
     c->use_gpu   = true;
     c->placement = parent->placement;
     c->model     = parent->model;

@@ -18,11 +18,41 @@ struct vv_engine {
     int                  n_slots;
     int                  n_busy;
     uint64_t             completed;
+    int                  n_replicas;  /**< devices holding a copy of the weights */
 
     vv_mutex_t           lock;
     vv_cond_t            slot_free;
     char                 model_dir[512];
 };
+
+/**
+ * @brief Bring up `want` slots on one device, the first owning the weights.
+ *
+ * Returns how many were actually made. Running with fewer slots beats not
+ * running: a clone usually fails because the KV caches stopped fitting, and
+ * the caller only loses concurrency.
+ */
+static int fill_device(vv_engine_t* e, const char* model_dir, int gpu_id,
+                       vv_init_params_t* ip, int want) {
+    const int base = e->n_slots;
+    vv_status_t s = vv_inference_init(model_dir, gpu_id, ip, &e->slots[base]);
+    if (s != VV_OK) {
+        VV_LOG_W("engine: gpu %d unusable (%s)", gpu_id, vv_status_str(s));
+        return 0;
+    }
+    e->n_slots = base + 1;
+
+    for (int i = 1; i < want; i++) {
+        s = vv_inference_clone(e->slots[base], ip, &e->slots[base + i]);
+        if (s != VV_OK) {
+            VV_LOG_W("engine: gpu %d holds %d of %d slot(s) (%s)",
+                     gpu_id, i, want, vv_status_str(s));
+            return i;
+        }
+        e->n_slots = base + i + 1;
+    }
+    return want;
+}
 
 vv_status_t vv_engine_create(const vv_engine_params_t* params,
                              vv_engine_t** out) {
@@ -41,6 +71,8 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
     ip.max_seq_len = params->max_seq_len;
     ip.kv_format   = params->kv_format;
     ip.gpu_layers  = params->gpu_layers;
+    ip.gpus        = params->gpus;
+    if (ip.gpus.n == 0) { ip.gpus.n = 1; ip.gpus.id[0] = params->gpu_id; }
 
     e->slots = (vv_inference_ctx_t**)vv_alloc((size_t)n * sizeof(void*));
     e->busy  = (bool*)vv_alloc((size_t)n * sizeof(bool));
@@ -48,25 +80,25 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
     memset(e->slots, 0, (size_t)n * sizeof(void*));
     memset(e->busy, 0, (size_t)n * sizeof(bool));
 
-    vv_status_t s = vv_inference_init(params->model_dir, params->gpu_id,
-                                      &ip, &e->slots[0]);
-    if (s != VV_OK) { vv_engine_free(e); return s; }
-    e->n_slots = 1;
-
-    for (int i = 1; i < n; i++) {
-        s = vv_inference_clone(e->slots[0], &ip, &e->slots[i]);
-        if (s != VV_OK) {
-            /*
-             * Running with fewer slots is better than not running: a clone
-             * usually fails because the KV caches no longer fit, and the
-             * caller only loses concurrency.
-             */
-            VV_LOG_W("engine: only %d of %d slots available (%s)",
-                     i, n, vv_status_str(s));
-            break;
-        }
-        e->n_slots = i + 1;
+    /*
+     * One replica per device, each with its own copy of the weights and the
+     * slots spread evenly over them. The model is 3.2 GB against 24 GB of
+     * card, so a second device is not there for capacity — it is there
+     * because a slot's KV cache is 1.8 GB and because two decodes on one
+     * card interleave on the same weight bandwidth while two on separate
+     * cards do not. Nothing crosses between them, which is why this scales
+     * and layer sharding (#7) does not.
+     */
+    const int devices = params->cpu_only ? 1 : ip.gpus.n;
+    for (int d = 0; d < devices && e->n_slots < n; d++) {
+        /* Spread the remainder over the first devices, not the last. */
+        int want = n / devices + (d < n % devices ? 1 : 0);
+        if (want <= 0) continue;
+        if (e->n_slots + want > n) want = n - e->n_slots;
+        if (fill_device(e, params->model_dir, ip.gpus.id[d], &ip, want) > 0)
+            e->n_replicas++;
     }
+    if (e->n_slots == 0) { vv_engine_free(e); return VV_ERR_CUDA; }
 
     /*
      * Two slots writing their token streams to the same stderr produce
@@ -80,9 +112,16 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
     vv_mutex_init(&e->lock);
     vv_cond_init(&e->slot_free);
 
-    VV_LOG_I("engine: ready with %d slot(s), kv=%s, max_seq=%d",
-             e->n_slots, vv_kv_format_name((vv_kv_format_t)params->kv_format),
-             ip.max_seq_len);
+    if (e->n_replicas > 1)
+        VV_LOG_I("engine: ready with %d slot(s) over %d device(s), kv=%s, "
+                 "max_seq=%d", e->n_slots, e->n_replicas,
+                 vv_kv_format_name((vv_kv_format_t)params->kv_format),
+                 ip.max_seq_len);
+    else
+        VV_LOG_I("engine: ready with %d slot(s), kv=%s, max_seq=%d",
+                 e->n_slots,
+                 vv_kv_format_name((vv_kv_format_t)params->kv_format),
+                 ip.max_seq_len);
 
     *out = e;
     return VV_OK;
@@ -91,7 +130,7 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
 void vv_engine_free(vv_engine_t* e) {
     if (!e) return;
     if (e->slots) {
-        /* Clones borrow slot 0's weights, so they must go first. */
+        /* A clone borrows its device's first slot, so it must go first. */
         for (int i = e->n_slots - 1; i >= 0; i--)
             if (e->slots[i]) vv_inference_free(e->slots[i]);
         vv_free(e->slots);

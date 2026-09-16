@@ -262,6 +262,8 @@ typedef struct vv_inference_ctx {
     void*          workspace;
     size_t         workspace_size;
     int            gpu_id;
+    int            gpu_index;         /**< this device's slot in the set  */
+    vv_gpu_set_t   gpus;              /**< devices and their memory caps  */
 
     /* Placement strategy (auto-selected from VRAM budget) */
     vv_placement_t placement;

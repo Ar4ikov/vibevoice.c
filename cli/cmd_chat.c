@@ -27,6 +27,8 @@ static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 typedef struct {
     vv_engine_params_t ep;
+    const char* gpus;
+    const char* gpu_memory;
     const char* device;
     const char* mic_file;      /* feed a WAV instead of a device */
     const char* hotwords;
@@ -76,12 +78,24 @@ static void usage(const char* which) {
         "\nCommon:\n"
         "  --model <dir>         Model directory (required)\n"
         "  --gpu <id>            GPU device id\n"
+        "  --gpus <list>         Devices to spread slots over: 0,1 | all\n"
+        "  --gpu-memory <size>   Cap per device: 80%% | 18GiB | 8192M | bytes\n"
         "  --slots <n>           Concurrent transcriptions\n"
         "  --max-seq-len <n>     KV window\n"
         "  --kv-cache <fmt>      fp16 | fp8 | tq4 | ...\n"
         "  --hotwords a,b,c      Hotwords\n"
         "  --cpu                 CPU-only\n"
         "  --verbose\n");
+}
+
+/** @brief Turn --gpus/--gpu-memory into the engine's device set. */
+static int resolve_gpus(chat_args_t* a) {
+    if (a->gpus && vv_gpu_set_parse(a->gpus, &a->ep.gpus) != VV_OK) return 1;
+    if (a->gpu_memory && vv_gpu_set_caps(a->gpu_memory, &a->ep.gpus) != VV_OK)
+        return 1;
+    if (a->ep.gpus.n > 0) a->ep.gpu_id = a->ep.gpus.id[0];
+    return vv_gpu_set_resolve(&a->ep.gpus, a->ep.gpu_id, a->ep.cpu_only)
+           == VV_OK ? 0 : 1;
 }
 
 static int parse_common(int argc, char** argv, chat_args_t* a,
@@ -98,6 +112,8 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
         const char* next = (i + 1 < argc) ? argv[i + 1] : NULL;
         if (strcmp(s, "--model") == 0 && next) a->ep.model_dir = argv[++i];
         else if (strcmp(s, "--gpu") == 0 && next) a->ep.gpu_id = atoi(argv[++i]);
+        else if (strcmp(s, "--gpus") == 0 && next) a->gpus = argv[++i];
+        else if (strcmp(s, "--gpu-memory") == 0 && next) a->gpu_memory = argv[++i];
         else if (strcmp(s, "--slots") == 0 && next) a->ep.n_slots = atoi(argv[++i]);
         else if (strcmp(s, "--max-seq-len") == 0 && next) a->ep.max_seq_len = atoi(argv[++i]);
         else if (strcmp(s, "--gpu-layers") == 0 && next) a->ep.gpu_layers = atoi(argv[++i]);
@@ -300,6 +316,7 @@ int vv_cmd_mic(int argc, char** argv) {
     vv_log_set_level(a.verbose ? VV_LOG_DEBUG : VV_LOG_WARN);
 
     if (a.list_devices) return print_devices();
+    if (resolve_gpus(&a) != 0) return 1;
 
     vv_engine_t* engine = NULL;
     vv_status_t s = vv_engine_create(&a.ep, &engine);
@@ -509,6 +526,7 @@ int vv_cmd_chat(int argc, char** argv) {
     vv_log_set_level(a.verbose ? VV_LOG_DEBUG : VV_LOG_WARN);
 
     if (a.list_devices) return print_devices();
+    if (resolve_gpus(&a) != 0) return 1;
 
     vv_engine_t* engine = NULL;
     vv_status_t s = vv_engine_create(&a.ep, &engine);

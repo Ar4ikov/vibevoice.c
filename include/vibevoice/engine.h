@@ -10,8 +10,11 @@
  * This buys real concurrency for the parts of a request that are not weight
  * reads — audio decoding, the Conv-VAE encoder, prompt building, JSON
  * post-processing — which is most of the wall clock on short clips. Decode
- * itself is bandwidth-bound on the weights, so two simultaneous decodes do
- * not go twice as fast; they interleave.
+ * itself is bandwidth-bound on the weights, so two simultaneous decodes on
+ * one card do not go twice as fast; they interleave.
+ *
+ * Give it several devices and it puts a replica on each — its own weights,
+ * its own slots — and then they do, because nothing is shared between them.
  *
  * Every entry point is thread-safe.
  */
@@ -36,6 +39,11 @@ typedef struct vv_engine_params {
     float       vram_budget;  /**< Fraction of free VRAM. Default 1.0       */
     int         gpu_layers;   /**< Layers on the GPU. -1 = fit to VRAM      */
     bool        cpu_only;
+    /**
+     * Devices to spread the slots over, each with its own copy of the
+     * weights. Empty means the single device named by `gpu_id`.
+     */
+    vv_gpu_set_t gpus;
 } vv_engine_params_t;
 
 static inline vv_engine_params_t vv_engine_params_default(void) {
@@ -48,6 +56,7 @@ static inline vv_engine_params_t vv_engine_params_default(void) {
     p.vram_budget = 1.0f;
     p.gpu_layers = -1;
     p.cpu_only = false;
+    p.gpus.n = 0;
     return p;
 }
 

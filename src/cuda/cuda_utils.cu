@@ -271,6 +271,30 @@ vv_status_t vv_dev_get_device_info(int device_id, size_t* total_mem,
 }
 
 /**
+ * @brief Devices this process can use; 0 when the driver is missing.
+ *
+ * cudaGetDeviceCount fails rather than returning zero when there is no
+ * driver at all, which is the case the CPU path exists for, so the error is
+ * folded into the count.
+ */
+int vv_dev_device_count(void) {
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess) return 0;
+    return n;
+}
+
+vv_status_t vv_dev_get_device_name(int device_id, char* buf, size_t buf_size) {
+    if (!buf || buf_size == 0) return VV_ERR_NULL_PTR;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device_id) != cudaSuccess) {
+        buf[0] = '\0';
+        return VV_ERR_CUDA;
+    }
+    snprintf(buf, buf_size, "%s", prop.name);
+    return VV_OK;
+}
+
+/**
  * @brief Set current CUDA device.
  */
 vv_status_t vv_dev_set_device(int device_id) {
