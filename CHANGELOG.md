@@ -6,6 +6,15 @@ container images — see [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Unreleased
 
+- CPU prefill is a packed GEMM: k-major panels, a 6x16 AVX2 register tile and
+  cache blocking sized off L1 and L2. 283 → 991 GFLOP/s on a 5900X, prefill
+  22 → 77 tok/s, and a 30 s file goes from RTF 1.125 to 0.809 with a
+  character-identical transcript.
+- CPU worker threads are pinned one per physical core. Without it the OS
+  regularly stacks two of them on one core's hyperthreads, which cost up to
+  40% at random. `VV_CPU_BIND=0` or any OpenMP affinity variable opts out.
+- The physical-core count now respects a cpuset or taskset instead of
+  counting every core on the host.
 - Container images are versioned: `0.2.1`, `0.2`, `master`, `sha-…` and
   `pr-…` alongside `latest`, which still points at the newest published
   build. The workflow refuses a `v*` tag that disagrees with the header, and

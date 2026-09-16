@@ -85,12 +85,28 @@ defaulted to physical cores.
 
 | | |
 |---|---|
+| Prefill | **77 tok/s**, 991 GFLOP/s across the quantized GEMMs |
 | Decode | **7.9 tok/s** (12 cores, AVX2) |
-| RTF | **1.24** on an 11 s file |
+| RTF | **0.81** on a 30 s file |
 
-Output is identical to the GPU path. Hyperthreads are deliberately not used:
-these kernels are bandwidth bound and a second thread per core takes decode
-from 7.9 to 4.3 tok/s. `OMP_NUM_THREADS` still overrides.
+Output is identical to the GPU path.
+
+Prefill is a packed GEMM: both operands are copied into k-major panels and a
+6x16 register tile accumulates over the k-block, with the panels sized so the
+activation block sits in L2 and the dequantized weights in L1. That is 3.5x
+the row-at-a-time kernel it replaced and 65% of this machine's measured FMA
+peak. Decode is a different problem — one token reads all 3.2 GB of packed
+weights, so 7.9 tok/s is 26 GB/s against about 30 GB/s of usable
+dual-channel DDR4, and there is no headroom there worth chasing.
+
+Threads default to physical cores and are pinned to them. Hyperthreads are
+deliberately unused: these kernels are bandwidth bound and a second thread
+per core takes decode from 7.9 to 4.3 tok/s. Pinning matters for the same
+reason and is easy to miss, because without it the OS puts two workers on one
+core's siblings often enough that the same prefill measured 650 and 1120
+GFLOP/s on consecutive runs. `OMP_NUM_THREADS` still sets the count, any of
+the OpenMP affinity variables take over placement, and `VV_CPU_BIND=0` turns
+pinning off.
 
 ---
 
@@ -565,9 +581,6 @@ speech encoder or the connectors touches the default stream any more.
   claim that cannot be stood behind. The seam exists:
   `include/vibevoice/device.h` declares the op set, a build links exactly one
   implementation of it, and `src/device/device_none.c` shows the shape.
-- **A packed CPU micro-kernel.** CPU prefill runs at ~20% of peak FMA.
-  Tiling the M and K loops was tried and measured slower; beating it needs a
-  proper packed micro-kernel.
 - **`src/trt/`** is stubs. The CUDA encoder does 11 s of audio in 243 ms, so
   TensorRT may never be worth it.
 

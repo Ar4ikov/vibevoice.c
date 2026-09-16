@@ -16,6 +16,19 @@
 #ifndef VV_THREAD_H
 #define VV_THREAD_H
 
+/*
+ * Thread-local storage. C11 spells it _Thread_local, but MSVC only learned
+ * that keyword in 2019 16.8 and the compiler extensions predate it
+ * everywhere, so use those.
+ */
+#if defined(_MSC_VER)
+#define VV_TLS __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#define VV_TLS __thread
+#else
+#define VV_TLS _Thread_local
+#endif
+
 #include <stdbool.h>
 
 #ifdef _WIN32
