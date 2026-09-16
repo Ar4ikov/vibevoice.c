@@ -45,6 +45,7 @@ typedef struct {
     int         gpu_id;
     const char* gpus;
     const char* gpu_memory;
+    const char* split_mode;
     int         max_tokens;
     int         max_seq_len;
     int         gpu_layers;
@@ -98,6 +99,8 @@ static void print_usage(const char* prog) {
         "  --gpus <list>         Devices to use: 0,1 | all (default: --gpu)\n"
         "  --gpu-memory <size>   Cap per device: 80%% | 18GiB | 8192M | bytes,\n"
         "                        or one value per device, comma-separated\n"
+        "  --split-mode <how>    auto (default) | layer — how to use several\n"
+        "                        devices; a single file can only use layer\n"
         "  --max-tokens <N>      Max decode tokens (default: 64000)\n"
         "  --max-seq-len <N>     KV-cache window in tokens (default: 32768)\n"
         "  --hotwords <words>    Comma-separated hotwords\n"
@@ -143,6 +146,8 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->gpus = argv[++i];
         } else if (strcmp(argv[i], "--gpu-memory") == 0 && i + 1 < argc) {
             args->gpu_memory = argv[++i];
+        } else if (strcmp(argv[i], "--split-mode") == 0 && i + 1 < argc) {
+            args->split_mode = argv[++i];
         } else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
             args->max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-seq-len") == 0 && i + 1 < argc) {
@@ -252,13 +257,24 @@ int main(int argc, char** argv) {
     if (vv_gpu_set_resolve(&gpus, args.gpu_id, args.cpu_only) != VV_OK)
         return 1;
     /*
-     * One file is one request, and a request runs on one device until layer
-     * sharding lands. Say so rather than quietly using the first.
+     * One file is one request, and a request cannot be in two places at
+     * once: replicas would leave every device but the first idle, so the
+     * only thing a second card can do here is hold part of the model.
      */
+    vv_split_mode_t split = VV_SPLIT_AUTO;
+    if (args.split_mode) {
+        split = vv_split_mode_parse(args.split_mode);
+        if (split >= VV_SPLIT_MODE_COUNT) {
+            VV_LOG_E("split-mode: '%s' is not auto, replica or layer",
+                     args.split_mode);
+            return 1;
+        }
+    }
     if (gpus.n > 1 && !args.cpu_only) {
-        VV_LOG_W("gpus: %d devices given; one transcription uses one of them "
-                 "(gpu %d). Several devices pay off under `serve --slots`.",
-                 gpus.n, gpus.id[0]);
+        if (split == VV_SPLIT_AUTO) split = VV_SPLIT_LAYER;
+        if (split == VV_SPLIT_REPLICA)
+            VV_LOG_W("gpus: replicas do nothing for a single file; gpu %d "
+                     "will do the work", gpus.id[0]);
     }
 
     double t_start = get_time_ms();
@@ -295,6 +311,7 @@ int main(int argc, char** argv) {
     if (args.max_seq_len > 0) init_params.max_seq_len = args.max_seq_len;
     init_params.gpu_layers = args.gpu_layers;
     init_params.gpus = gpus;
+    init_params.split_mode = (int)split;
     s = vv_inference_init(args.model_dir, args.gpu_id, &init_params, &ctx);
     if (s != VV_OK) {
         VV_LOG_E("Failed to initialize inference: %s", vv_status_str(s));

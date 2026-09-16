@@ -44,6 +44,7 @@ typedef struct vv_engine_params {
      * weights. Empty means the single device named by `gpu_id`.
      */
     vv_gpu_set_t gpus;
+    int          split_mode;  /**< vv_split_mode_t across those devices     */
 } vv_engine_params_t;
 
 static inline vv_engine_params_t vv_engine_params_default(void) {
@@ -57,6 +58,7 @@ static inline vv_engine_params_t vv_engine_params_default(void) {
     p.gpu_layers = -1;
     p.cpu_only = false;
     p.gpus.n = 0;
+    p.split_mode = VV_SPLIT_AUTO;
     return p;
 }
 

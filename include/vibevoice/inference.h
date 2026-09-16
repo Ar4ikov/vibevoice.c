@@ -28,6 +28,14 @@ typedef struct vv_kv_cache {
     void**   k_ref;           /**< [num_layers] reference key, or NULL       */
     bool*    ref_ready;       /**< [num_layers] reference computed yet       */
     int      num_layers;
+    /*
+     * The slice of those layers this cache actually holds. A cache that is
+     * not sharded holds all of them, so these are 0 and num_layers - 1 and
+     * every index below stays global — which is the point: nothing that
+     * walks layers has to know whether the model was split.
+     */
+    int      first_layer;
+    int      last_layer;
     int      n_kv_heads;
     int      head_dim;
     int      max_seq_len;     /**< Maximum cache capacity */
@@ -57,6 +65,18 @@ vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
                                 int num_layers, int n_kv_heads,
                                 int head_dim, int max_seq_len,
                                 int format, bool on_cpu);
+
+/**
+ * @brief A cache for layers [first, first + count) of a `num_layers` model.
+ *
+ * Allocates only that slice; the pointer arrays still have one entry per
+ * model layer, so callers index by the layer number they already have. This
+ * is what puts each shard's KV on its own device.
+ */
+vv_status_t vv_kv_cache_create_range(vv_kv_cache_t** cache,
+                                     int num_layers, int first, int count,
+                                     int n_kv_heads, int head_dim,
+                                     int max_seq_len, int format, bool on_cpu);
 
 /** @brief Bytes a cache of this shape and format would occupy. */
 size_t vv_kv_cache_bytes(int num_layers, int n_kv_heads, int head_dim,
@@ -169,6 +189,15 @@ vv_status_t vv_layer_prefetch_done(vv_layer_pool_t* pool, int layer_idx,
 /** @brief Page-lock the host copies of the layers that will be streamed. */
 vv_status_t vv_layer_pool_pin_host(vv_model_t* model, int first_streamed);
 
+/**
+ * @brief The same, for one range of layers.
+ *
+ * A shard must not page-lock the layers another device is about to upload
+ * and free: registration outlives the free, and the driver is then holding
+ * a mapping of memory nobody owns.
+ */
+vv_status_t vv_layer_pool_pin_range(vv_model_t* model, int first, int count);
+
 /* ─── Decoder ───────────────────────────────────────────────────────────── */
 
 /**
@@ -186,7 +215,15 @@ vv_status_t vv_decoder_layer_forward(
     void* stream);
 
 /**
- * @brief Full prefill through all 28 layers.
+ * @brief Prefill through layers [first_layer, first_layer + n_layers).
+ *
+ * The range is the whole model unless it has been sharded across devices,
+ * in which case each shard runs its own slice over the whole sequence and
+ * hands the hidden state on. Running a layer for every position before
+ * moving to the next layer is the same computation as running every layer
+ * for one chunk of positions: causality lives inside a layer, and the cache
+ * a layer reads is the one it just wrote.
+ *
  * @param pool  Optional layer pool for streaming (NULL = weights on GPU).
  * @param xfer  Transfer stream for async upload (NULL = use compute).
  */
@@ -199,10 +236,12 @@ vv_status_t vv_decoder_prefill(
     void* workspace,
     size_t workspace_size,
     void* compute_stream,
-    void* xfer_stream);
+    void* xfer_stream,
+    int first_layer,
+    int n_layers);
 
 /**
- * @brief Single decode step through all 28 layers.
+ * @brief One decode step through layers [first_layer, first_layer+n_layers).
  * @param pool  Optional layer pool for streaming (NULL = weights on GPU).
  * @param xfer  Transfer stream for async upload (NULL = use compute).
  */
@@ -214,7 +253,9 @@ vv_status_t vv_decoder_step(
     void* workspace,
     size_t workspace_size,
     void* compute_stream,
-    void* xfer_stream);
+    void* xfer_stream,
+    int first_layer,
+    int n_layers);
 
 /* ─── CPU-mode decoder (Phase 3) ───────────────────────────────────────── */
 
@@ -247,6 +288,38 @@ vv_status_t vv_sample_greedy(const void* logits_fp16, int vocab_size,
 vv_status_t vv_sample_topk(const void* logits_fp16, int vocab_size,
                              int k, float temperature, int32_t* token_id);
 
+/* ─── Layer shards ──────────────────────────────────────────────────────── */
+
+/**
+ * @brief A slice of the transformer living on a device other than the primary.
+ *
+ * The primary device keeps the embedding table, the final norm, the LM head
+ * and the first slice of layers, and it is where a request starts and ends.
+ * Each further shard owns its own layers, the KV cache for exactly those
+ * layers, its own workspace and streams, and a buffer for the hidden state
+ * that arrives from the shard before it.
+ *
+ * What crosses a boundary is one hidden state — 3584 halves, 7 KB — per
+ * token per boundary, against the ~8 ms of compute that token costs. That
+ * is why this is worth doing at all: the devices take turns rather than
+ * working at once, so it buys capacity, not speed.
+ */
+typedef struct vv_shard {
+    int              gpu_id;
+    int              first_layer;
+    int              n_layers;
+    int              n_resident;      /**< of those, held in VRAM          */
+    void*            compute_stream;
+    void*            transfer_stream;
+    void*            workspace;
+    size_t           workspace_size;
+    vv_kv_cache_t*   kv_cache;        /**< this shard's layers only        */
+    vv_layer_pool_t* layer_pool;
+    void*            hidden;          /**< the state handed to this shard  */
+    size_t           hidden_bytes;
+    void*            done;            /**< event: its layers have finished */
+} vv_shard_t;
+
 /* ─── Full inference context ────────────────────────────────────────────── */
 
 /* Forward declarations for opaque types */
@@ -264,6 +337,16 @@ typedef struct vv_inference_ctx {
     int            gpu_id;
     int            gpu_index;         /**< this device's slot in the set  */
     vv_gpu_set_t   gpus;              /**< devices and their memory caps  */
+
+    /*
+     * Layers 0..primary_layers-1 run on `gpu_id` with the fields above;
+     * `shards` covers every device after that. With one device n_shards is
+     * 0, primary_layers is every layer, and not one line below changes.
+     */
+    vv_shard_t*    shards;
+    int            n_shards;
+    int            primary_layers;
+    void*          shard_done;        /**< event on the primary's stream  */
 
     /* Placement strategy (auto-selected from VRAM budget) */
     vv_placement_t placement;

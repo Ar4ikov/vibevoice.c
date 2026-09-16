@@ -89,14 +89,41 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
      * cards do not. Nothing crosses between them, which is why this scales
      * and layer sharding (#7) does not.
      */
-    const int devices = params->cpu_only ? 1 : ip.gpus.n;
-    for (int d = 0; d < devices && e->n_slots < n; d++) {
-        /* Spread the remainder over the first devices, not the last. */
-        int want = n / devices + (d < n % devices ? 1 : 0);
-        if (want <= 0) continue;
-        if (e->n_slots + want > n) want = n - e->n_slots;
-        if (fill_device(e, params->model_dir, ip.gpus.id[d], &ip, want) > 0)
-            e->n_replicas++;
+    int devices = params->cpu_only ? 1 : ip.gpus.n;
+
+    /*
+     * Auto: replicate while there is a slot for every device, shard when
+     * there is not. More devices than slots means replicas that would sit
+     * idle, and a single-request caller (n_slots == 1) is exactly that case
+     * — the only way a second card helps it is by holding some of the model.
+     */
+    vv_split_mode_t mode = (vv_split_mode_t)params->split_mode;
+    if (devices > 1 && mode == VV_SPLIT_AUTO)
+        mode = (n >= devices) ? VV_SPLIT_REPLICA : VV_SPLIT_LAYER;
+    ip.split_mode = (int)mode;
+    if (devices > 1)
+        VV_LOG_I("engine: %d devices, %s split", devices,
+                 vv_split_mode_name(mode));
+
+    if (devices > 1 && mode == VV_SPLIT_LAYER) {
+        /* One model spread over every device; the slots clone it. */
+        if (fill_device(e, params->model_dir, ip.gpus.id[0], &ip, n) > 0)
+            e->n_replicas = 1;
+    } else {
+        for (int d = 0; d < devices && e->n_slots < n; d++) {
+            /* Spread the remainder over the first devices, not the last. */
+            int want = n / devices + (d < n % devices ? 1 : 0);
+            if (want <= 0) continue;
+            if (e->n_slots + want > n) want = n - e->n_slots;
+            /* A replica owns one device, so it is capped by that one. */
+            ip.gpus.n = 1;
+            ip.gpus.id[0] = params->gpus.n ? params->gpus.id[d] : params->gpu_id;
+            ip.gpus.cap[0] = params->gpus.n ? params->gpus.cap[d]
+                                            : params->gpus.cap[0];
+            if (fill_device(e, params->model_dir, ip.gpus.id[0], &ip, want) > 0)
+                e->n_replicas++;
+        }
+        ip.gpus = params->gpus;
     }
     if (e->n_slots == 0) { vv_engine_free(e); return VV_ERR_CUDA; }
 

@@ -354,7 +354,15 @@ vv_status_t vv_layer_prefetch_done(vv_layer_pool_t* pool, int layer_idx,
 
 vv_status_t vv_layer_pool_pin_host(vv_model_t* model, int first_streamed) {
     if (!model) return VV_ERR_NULL_PTR;
-    if (first_streamed >= model->num_layers) return VV_OK;
+    return vv_layer_pool_pin_range(model, first_streamed,
+                                   model->num_layers - first_streamed);
+}
+
+vv_status_t vv_layer_pool_pin_range(vv_model_t* model, int first, int count) {
+    if (!model) return VV_ERR_NULL_PTR;
+    if (first < 0) first = 0;
+    if (first + count > model->num_layers) count = model->num_layers - first;
+    if (count <= 0) return VV_OK;
 
     size_t pinned = 0;
     const double t0 = vv_time_ms();
@@ -362,7 +370,7 @@ vv_status_t vv_layer_pool_pin_host(vv_model_t* model, int first_streamed) {
     #define PIN(t) do {                                                             if ((t).data && !(t).on_gpu && (t).size_bytes >= 65536) {                       if (vv_dev_host_register((t).data, (t).size_bytes) == VV_OK)                    pinned += (t).size_bytes;                                           }                                                                       } while (0)
     #define PIN_W(w) do { PIN((w).tensor); PIN((w).quant.scales);                                     PIN((w).mins); PIN((w).bias); } while (0)
 
-    for (int i = first_streamed; i < model->num_layers; i++) {
+    for (int i = first; i < first + count; i++) {
         vv_layer_weights_t* L = &model->layers[i];
         PIN_W(L->attn.q_proj); PIN_W(L->attn.k_proj);
         PIN_W(L->attn.v_proj); PIN_W(L->attn.o_proj);
@@ -727,9 +735,14 @@ vv_status_t vv_decoder_step(
     void* workspace,
     size_t workspace_size,
     void* compute_stream,
-    void* xfer_stream)
+    void* xfer_stream,
+    int first_layer,
+    int n_layers)
 {
     if (!model || !hidden_state || !kv_cache) return VV_ERR_NULL_PTR;
+    const int last_layer = first_layer + n_layers;
+    if (first_layer < 0 || n_layers <= 0 || last_layer > model->num_layers)
+        return VV_ERR_INVALID_ARG;
 
     int position = kv_cache->current_len;
     bool streaming = pool && !pool->all_resident;
@@ -748,12 +761,13 @@ vv_status_t vv_decoder_step(
         if (ps != VV_OK) return ps;
     }
 
-    if (streaming) vv_layer_prefetch_begin(pool, model, 0, xfer_stream);
+    if (streaming)
+        vv_layer_prefetch_begin(pool, model, first_layer, xfer_stream);
 
-    for (int i = 0; i < model->num_layers; i++) {
+    for (int i = first_layer; i < last_layer; i++) {
         if (streaming) {
             vv_layer_prefetch_wait(pool, model, i, compute_stream);
-            if (i + 1 < model->num_layers)
+            if (i + 1 < last_layer)
                 vv_layer_prefetch_begin(pool, model, i + 1, xfer_stream);
         }
 
@@ -789,13 +803,23 @@ vv_status_t vv_decoder_prefill(
     void* workspace,
     size_t workspace_size,
     void* compute_stream,
-    void* xfer_stream)
+    void* xfer_stream,
+    int first_layer,
+    int n_layers)
 {
     if (!model || !hidden_states || !kv_cache) return VV_ERR_NULL_PTR;
+    const int last_layer = first_layer + n_layers;
+    if (first_layer < 0 || n_layers <= 0 || last_layer > model->num_layers)
+        return VV_ERR_INVALID_ARG;
 
-    VV_LOG_I("decoder: prefill %d tokens through %d layers%s",
-             seq_len, model->num_layers,
-             (pool && !pool->all_resident) ? " (streaming)" : "");
+    if (n_layers == model->num_layers)
+        VV_LOG_I("decoder: prefill %d tokens through %d layers%s",
+                 seq_len, n_layers,
+                 (pool && !pool->all_resident) ? " (streaming)" : "");
+    else
+        VV_LOG_I("decoder: prefill %d tokens through layers %d..%d%s",
+                 seq_len, first_layer, last_layer - 1,
+                 (pool && !pool->all_resident) ? " (streaming)" : "");
 
     bool streaming = pool && !pool->all_resident;
 
@@ -831,13 +855,14 @@ vv_status_t vv_decoder_prefill(
       const int len = (start + chunk <= seq_len) ? chunk : (seq_len - start);
       void* chunk_hidden = (uint8_t*)hidden_states + (size_t)start * hs * 2;
 
-      if (streaming) vv_layer_prefetch_begin(pool, model, 0, xfer_stream);
+      if (streaming)
+          vv_layer_prefetch_begin(pool, model, first_layer, xfer_stream);
 
-      for (int i = 0; i < model->num_layers; i++) {
+      for (int i = first_layer; i < last_layer; i++) {
 
         if (streaming) {
             vv_layer_prefetch_wait(pool, model, i, compute_stream);
-            if (i + 1 < model->num_layers)
+            if (i + 1 < last_layer)
                 vv_layer_prefetch_begin(pool, model, i + 1, xfer_stream);
         }
 

@@ -82,6 +82,26 @@ int vv_dev_device_count(void);
 /** @brief The device's name, e.g. "NVIDIA GeForce RTX 3090". */
 vv_status_t vv_dev_get_device_name(int device_id, char* buf, size_t buf_size);
 
+/**
+ * @brief Copy between two devices, ordered on `stream`.
+ *
+ * Works whether or not the two can address each other: without peer access
+ * the driver stages through host memory, which is slower but not wrong. The
+ * stream belongs to whichever device is current; ordering against work on
+ * the *other* device is the caller's business, through an event.
+ */
+vv_status_t vv_dev_memcpy_peer(void* dst, int dst_device,
+                               const void* src, int src_device,
+                               size_t size, void* stream);
+
+/**
+ * @brief Let `device` read `peer` directly, if the pair supports it.
+ *
+ * Returns VV_ERR_UNSUPPORTED when they do not, which is not a failure —
+ * vv_dev_memcpy_peer still works, just through the host.
+ */
+vv_status_t vv_dev_enable_peer(int device, int peer);
+
 /* Events order the copy stream against the compute stream when weights are
  * streamed layer by layer; host registration makes those copies DMA. */
 vv_status_t vv_dev_event_create(void** ev);

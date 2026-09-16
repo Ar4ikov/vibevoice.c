@@ -38,6 +38,8 @@ static void usage(void) {
         "  --gpus <list>         Devices to spread slots over: 0,1 | all\n"
         "  --gpu-memory <size>   Cap per device: 80%% | 18GiB | 8192M | bytes,\n"
         "                        or one value per device, comma-separated\n"
+        "  --split-mode <how>    auto (default) | replica | layer — a copy of\n"
+        "                        the model on each device, or one split across\n"
         "  --max-seq-len <n>     Per-slot KV window (default: 32768)\n"
         "  --kv-cache <fmt>      fp16 | fp8 | fp8-e5m2 | tq4 | tq3 | tq2 | tq1.5\n"
         "  --acoustic-sampling M mode (default) | fix | gaussian; a draw per\n"
@@ -70,6 +72,15 @@ int vv_cmd_serve(int argc, char** argv) {
         else if (strcmp(a, "--gpu") == 0 && next) { ep.gpu_id = atoi(argv[++i]); }
         else if (strcmp(a, "--gpus") == 0 && next) { gpus_arg = argv[++i]; }
         else if (strcmp(a, "--gpu-memory") == 0 && next) { mem_arg = argv[++i]; }
+        else if (strcmp(a, "--split-mode") == 0 && next) {
+            const vv_split_mode_t m = vv_split_mode_parse(argv[++i]);
+            if (m >= VV_SPLIT_MODE_COUNT) {
+                fprintf(stderr, "serve: --split-mode is auto, replica or "
+                                "layer, not '%s'\n", argv[i]);
+                return 1;
+            }
+            ep.split_mode = (int)m;
+        }
         else if (strcmp(a, "--max-seq-len") == 0 && next) { ep.max_seq_len = atoi(argv[++i]); }
         else if (strcmp(a, "--gpu-layers") == 0 && next) { ep.gpu_layers = atoi(argv[++i]); }
         else if (strcmp(a, "--vram-budget") == 0 && next) { ep.vram_budget = (float)atof(argv[++i]); }

@@ -108,11 +108,13 @@ static void attach_frontend(vv_inference_ctx_t* c);
  * layers that fit stay put and only the remainder is streamed per token, so
  * the PCIe cost scales with what is missing rather than with the whole model.
  */
-static vv_status_t upload_layer_weights(vv_model_t* model, int n_layers,
-                                        void* stream) {
+static vv_status_t upload_layer_range(vv_model_t* model, int first,
+                                      int count, void* stream) {
     size_t total_bytes = 0;
-    if (n_layers > model->num_layers) n_layers = model->num_layers;
-    for (int i = 0; i < n_layers; i++) {
+    if (first < 0) first = 0;
+    if (first + count > model->num_layers) count = model->num_layers - first;
+    if (count <= 0) return VV_OK;
+    for (int i = first; i < first + count; i++) {
         vv_layer_weights_t* L = &model->layers[i];
         vv_status_t s;
 
@@ -154,10 +156,20 @@ static vv_status_t upload_layer_weights(vv_model_t* model, int n_layers,
         UPLOAD_WEIGHT(L->mlp.down_proj);
         #undef UPLOAD_WEIGHT
     }
-    VV_LOG_I("inference: %d/%d layers resident on GPU (%.1f MB)",
-             n_layers, model->num_layers,
-             (double)total_bytes / (1024.0 * 1024.0));
+    if (count == model->num_layers)
+        VV_LOG_I("inference: %d/%d layers resident on GPU (%.1f MB)",
+                 count, model->num_layers,
+                 (double)total_bytes / (1024.0 * 1024.0));
+    else
+        VV_LOG_I("inference: layers %d..%d resident on GPU (%.1f MB)",
+                 first, first + count - 1,
+                 (double)total_bytes / (1024.0 * 1024.0));
     return VV_OK;
+}
+
+static vv_status_t upload_layer_weights(vv_model_t* model, int n_layers,
+                                        void* stream) {
+    return upload_layer_range(model, 0, n_layers, stream);
 }
 
 /**
@@ -261,6 +273,196 @@ static size_t calc_frontend_gpu_bytes(const vv_model_t* model) {
     ADD_T(model->semantic_connector_fc2);
     #undef ADD_T
     return total / 2;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Layer shards
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+vv_split_mode_t vv_split_mode_parse(const char* name) {
+    if (!name) return VV_SPLIT_MODE_COUNT;
+    if (strcmp(name, "auto") == 0)    return VV_SPLIT_AUTO;
+    if (strcmp(name, "replica") == 0) return VV_SPLIT_REPLICA;
+    if (strcmp(name, "layer") == 0)   return VV_SPLIT_LAYER;
+    return VV_SPLIT_MODE_COUNT;
+}
+
+const char* vv_split_mode_name(vv_split_mode_t mode) {
+    switch (mode) {
+        case VV_SPLIT_AUTO:    return "auto";
+        case VV_SPLIT_REPLICA: return "replica";
+        case VV_SPLIT_LAYER:   return "layer";
+        default:               return "?";
+    }
+}
+
+/**
+ * @brief Split `n_layers` by how much each device can give to layers.
+ *
+ * Proportional to `room`, not even, and `room` is what is left of a device's
+ * budget after everything that is not a layer. Two reasons that matters. A
+ * 24 GB and a 12 GB card should not be handed fourteen layers each, or the
+ * smaller one streams while the larger one sits half empty. And the primary
+ * is never the equal of the others even when the cards are identical: it
+ * also carries the embedding table, the head and the speech encoder, which
+ * on this model is 3.4 GB before a single layer lands.
+ *
+ * Every device gets at least one layer, so a device named on the command
+ * line is always a device that does some work.
+ */
+static void split_layers(const size_t* room, int n_dev, int n_layers,
+                         int* out) {
+    double total = 0.0;
+    for (int i = 0; i < n_dev; i++) total += (double)room[i] + 1.0;
+
+    int assigned = 0;
+    for (int i = 0; i < n_dev; i++) {
+        out[i] = (int)((double)n_layers * ((double)room[i] + 1.0) / total + 0.5);
+        if (out[i] < 1) out[i] = 1;
+        assigned += out[i];
+    }
+    /* Rounding never lands exactly; settle it against the largest share. */
+    while (assigned != n_layers) {
+        int pick = 0;
+        for (int i = 1; i < n_dev; i++)
+            if (assigned > n_layers ? out[i] > out[pick] : out[i] < out[pick])
+                pick = i;
+        if (assigned > n_layers) {
+            if (out[pick] <= 1) break;
+            out[pick]--; assigned--;
+        } else {
+            out[pick]++; assigned++;
+        }
+    }
+}
+
+/**
+ * @brief Bring up one shard: its streams, KV slice, weights and workspace.
+ */
+static vv_status_t shard_init(vv_shard_t* sh, vv_model_t* model,
+                              const vv_llm_config_t* llm, int max_seq,
+                              int kv_format, size_t ws_target) {
+    vv_status_t s = vv_dev_set_device(sh->gpu_id);
+    if (s != VV_OK) return s;
+
+    s = vv_dev_stream_create(&sh->compute_stream);
+    if (s != VV_OK) return s;
+    s = vv_dev_stream_create(&sh->transfer_stream);
+    if (s != VV_OK) return s;
+    s = vv_dev_event_create(&sh->done);
+    if (s != VV_OK) return s;
+
+    s = vv_kv_cache_create_range(&sh->kv_cache, llm->num_hidden_layers,
+                                 sh->first_layer, sh->n_layers,
+                                 llm->num_key_value_heads, llm->head_dim,
+                                 max_seq, kv_format, false);
+    if (s != VV_OK) return s;
+
+    s = upload_layer_range(model, sh->first_layer, sh->n_resident,
+                           sh->transfer_stream);
+    if (s != VV_OK) return s;
+    vv_dev_stream_sync(sh->transfer_stream);
+
+    for (size_t want = ws_target; ; want /= 2) {
+        if (want < (size_t)64 * 1024 * 1024) return VV_ERR_CUDA_OOM;
+        if (vv_dev_alloc(&sh->workspace, want) == VV_OK) {
+            sh->workspace_size = want;
+            break;
+        }
+    }
+
+    VV_LOG_I("shard: gpu %d holds layers %d..%d (%d resident), workspace %zu MB",
+             sh->gpu_id, sh->first_layer, sh->first_layer + sh->n_layers - 1,
+             sh->n_resident, sh->workspace_size / (1024 * 1024));
+    return VV_OK;
+}
+
+static void shard_free(vv_shard_t* sh) {
+    if (!sh || sh->gpu_id < 0) return;
+    vv_dev_set_device(sh->gpu_id);
+    if (sh->kv_cache) vv_kv_cache_free(sh->kv_cache);
+    if (sh->layer_pool) vv_layer_pool_free(sh->layer_pool);
+    if (sh->workspace) vv_dev_free(sh->workspace);
+    if (sh->hidden) vv_dev_free(sh->hidden);
+    if (sh->done) vv_dev_event_destroy(sh->done);
+    if (sh->compute_stream) vv_dev_stream_destroy(sh->compute_stream);
+    if (sh->transfer_stream) vv_dev_stream_destroy(sh->transfer_stream);
+    memset(sh, 0, sizeof(*sh));
+    sh->gpu_id = -1;
+}
+
+/** @brief Grow the shard's landing buffer to hold `bytes` of hidden state. */
+static vv_status_t shard_hidden(vv_shard_t* sh, size_t bytes) {
+    if (sh->hidden && sh->hidden_bytes >= bytes) return VV_OK;
+    if (sh->hidden) { vv_dev_free(sh->hidden); sh->hidden = NULL; }
+    const vv_status_t s = vv_dev_alloc(&sh->hidden, bytes);
+    sh->hidden_bytes = (s == VV_OK) ? bytes : 0;
+    return s;
+}
+
+/**
+ * @brief Hand the hidden state to `dst_gpu` and make its stream wait for it.
+ *
+ * The receiving stream cannot start before the sending device has finished
+ * writing, and the two are on different devices, so the ordering goes
+ * through an event rather than through the stream itself. Leaves `dst_gpu`
+ * current, which is what the caller wants next.
+ */
+static vv_status_t hand_off(int dst_gpu, void* dst, void* dst_stream,
+                            int src_gpu, const void* src, void* src_stream,
+                            void* src_done, size_t bytes) {
+    vv_status_t s = vv_dev_event_record(src_done, src_stream);
+    if (s != VV_OK) return s;
+    s = vv_dev_set_device(dst_gpu);
+    if (s != VV_OK) return s;
+    s = vv_dev_stream_wait_event(dst_stream, src_done);
+    if (s != VV_OK) return s;
+    return vv_dev_memcpy_peer(dst, dst_gpu, src, src_gpu, bytes, dst_stream);
+}
+
+/**
+ * @brief Prefill every layer, walking the shards in order.
+ *
+ * With no shards this is the single call it always was.
+ */
+static vv_status_t prefill_all_shards(vv_inference_ctx_t* ctx, void* hidden,
+                                      int seq_len) {
+    const size_t bytes = (size_t)seq_len *
+                         (size_t)ctx->model->config.llm.hidden_size * 2;
+    vv_status_t s = vv_decoder_prefill(ctx->model, hidden, seq_len,
+                                       ctx->kv_cache, ctx->layer_pool,
+                                       ctx->workspace, ctx->workspace_size,
+                                       ctx->compute_stream,
+                                       ctx->transfer_stream,
+                                       0, ctx->primary_layers);
+    if (s != VV_OK || ctx->n_shards == 0) return s;
+
+    int src_gpu = ctx->gpu_id;
+    void *src = hidden, *src_stream = ctx->compute_stream,
+         *src_done = ctx->shard_done;
+
+    for (int i = 0; i < ctx->n_shards; i++) {
+        vv_shard_t* sh = &ctx->shards[i];
+        s = vv_dev_set_device(sh->gpu_id);
+        if (s == VV_OK) s = shard_hidden(sh, bytes);
+        if (s == VV_OK)
+            s = hand_off(sh->gpu_id, sh->hidden, sh->compute_stream,
+                         src_gpu, src, src_stream, src_done, bytes);
+        if (s == VV_OK)
+            s = vv_decoder_prefill(ctx->model, sh->hidden, seq_len,
+                                   sh->kv_cache, sh->layer_pool,
+                                   sh->workspace, sh->workspace_size,
+                                   sh->compute_stream, sh->transfer_stream,
+                                   sh->first_layer, sh->n_layers);
+        if (s != VV_OK) { vv_dev_set_device(ctx->gpu_id); return s; }
+        src_gpu = sh->gpu_id; src = sh->hidden;
+        src_stream = sh->compute_stream; src_done = sh->done;
+    }
+
+    /* Back to the primary: the final norm and the head live there. */
+    s = hand_off(ctx->gpu_id, hidden, ctx->compute_stream,
+                 src_gpu, src, src_stream, src_done, bytes);
+    return s;
 }
 
 static vv_placement_t decide_placement(
@@ -385,6 +587,48 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     const vv_llm_config_t* llm = &c->model->config.llm;
     int max_seq = (p.max_seq_len > 0) ? p.max_seq_len : 32768;
 
+    /*
+     * How the model is spread. Layer sharding only makes sense with more
+     * than one device, and only for the layers: the embedding table, the
+     * final norm and the head stay on the primary, because moving them
+     * would buy nothing and cost a round trip per token.
+     */
+    c->primary_layers = llm->num_hidden_layers;
+    int split[VV_MAX_GPUS] = {0};
+    const int gpu_layers_total = p.gpu_layers;   /* before it is shared out */
+    const bool sharding = !cpu_only && p.gpus.n > 1 &&
+                          p.split_mode == VV_SPLIT_LAYER;
+    if (sharding) {
+        if (c->gpu_index != 0) {
+            VV_LOG_W("shard: layers are laid out from gpu %d onwards; "
+                     "starting there rather than on gpu %d",
+                     p.gpus.id[0], gpu_id);
+            c->gpu_index = 0;
+            c->gpu_id = gpu_id = p.gpus.id[0];
+        }
+
+        const size_t ws = (size_t)512 * 1024 * 1024;
+        const size_t head = c->model->embed_tokens.size_bytes
+                          + c->model->lm_head.size_bytes
+                          + calc_frontend_gpu_bytes(c->model)
+                          + VV_ENCODER_SCRATCH_BYTES;
+        size_t room[VV_MAX_GPUS];
+        for (int i = 0; i < p.gpus.n; i++) {
+            size_t b = vv_gpu_budget(&p.gpus, i, p.vram_budget);
+            const size_t held = vv_gpu_reserved(&p.gpus, i);
+            b = b > held ? b - held : 0;
+            const size_t fixed = ws + (i == 0 ? head : 0);
+            room[i] = b > fixed ? b - fixed : 0;
+        }
+        split_layers(room, p.gpus.n, llm->num_hidden_layers, split);
+        c->primary_layers = split[0];
+        if (p.gpu_layers >= 0) {
+            /* --gpu-layers counts the whole model; share it out. */
+            p.gpu_layers = (int)((double)gpu_layers_total * c->primary_layers
+                                 / llm->num_hidden_layers + 0.5);
+        }
+    }
+
     /* ── Decide placement strategy ── */
     if (cpu_only) {
         c->placement = VV_PLACE_CPU_ONLY;
@@ -418,12 +662,12 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         available = available > reserve ? available - reserve : 0;
 
         size_t per_layer = calc_per_layer_gpu_bytes(c->model);
-        size_t all_layers = per_layer * (size_t)c->model->num_layers;
+        size_t all_layers = per_layer * (size_t)c->primary_layers;
         size_t embed_sz = c->model->embed_tokens.size_bytes;
         size_t lm_head_sz = c->model->lm_head.size_bytes;
 
         size_t kv_per_token = vv_kv_cache_bytes(
-            llm->num_hidden_layers, llm->num_key_value_heads,
+            c->primary_layers, llm->num_key_value_heads,
             llm->head_dim, 1, p.kv_format);
         size_t ws_target = (size_t)512 * 1024 * 1024;
 
@@ -497,17 +741,17 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     if (c->placement == VV_PLACE_CPU_ONLY) {
         c->n_resident_layers = 0;
     } else if (p.gpu_layers >= 0) {
-        c->n_resident_layers = p.gpu_layers < llm->num_hidden_layers
-                               ? p.gpu_layers : llm->num_hidden_layers;
+        c->n_resident_layers = p.gpu_layers < c->primary_layers
+                               ? p.gpu_layers : c->primary_layers;
     } else if (c->placement == VV_PLACE_ALL_GPU) {
-        c->n_resident_layers = llm->num_hidden_layers;
+        c->n_resident_layers = c->primary_layers;
     } else {
         c->n_resident_layers = c->auto_resident_layers;
     }
 
     VV_LOG_I("inference: placement strategy = %s, %d/%d layers resident",
              placement_str(c->placement), c->n_resident_layers,
-             llm->num_hidden_layers);
+             c->primary_layers);
 
     /* ── CPU-only path: skip all CUDA ── */
     if (c->placement == VV_PLACE_CPU_ONLY) {
@@ -563,11 +807,11 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     }
 
     /* ── KV-cache on GPU ── */
-    s = vv_kv_cache_create(&c->kv_cache,
-                            llm->num_hidden_layers,
-                            llm->num_key_value_heads,
-                            llm->head_dim,
-                            max_seq, p.kv_format, false);
+    s = vv_kv_cache_create_range(&c->kv_cache,
+                                 llm->num_hidden_layers, 0, c->primary_layers,
+                                 llm->num_key_value_heads,
+                                 llm->head_dim,
+                                 max_seq, p.kv_format, false);
     if (s != VV_OK) {
         VV_LOG_E("inference: failed to create KV-cache");
         goto fail_gpu;
@@ -583,9 +827,10 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         }
     }
     s = vv_layer_pool_create(&c->layer_pool, c->model,
-                             c->n_resident_layers >= c->model->num_layers);
-    if (s == VV_OK && c->n_resident_layers < c->model->num_layers)
-        vv_layer_pool_pin_host(c->model, c->n_resident_layers);
+                             c->n_resident_layers >= c->primary_layers);
+    if (s == VV_OK && c->n_resident_layers < c->primary_layers)
+        vv_layer_pool_pin_range(c->model, c->n_resident_layers,
+                                c->primary_layers - c->n_resident_layers);
     if (s != VV_OK) {
         VV_LOG_E("inference: failed to create layer pool");
         goto fail_gpu;
@@ -610,6 +855,73 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
             VV_LOG_E("inference: cannot allocate workspace");
             goto fail_gpu;
         }
+    }
+
+    /* ── The rest of the layers, on the other devices ── */
+    if (sharding) {
+        c->shards = (vv_shard_t*)vv_alloc(
+            (size_t)(p.gpus.n - 1) * sizeof(vv_shard_t));
+        if (!c->shards) { s = VV_ERR_OUT_OF_MEMORY; goto fail_gpu; }
+        memset(c->shards, 0, (size_t)(p.gpus.n - 1) * sizeof(vv_shard_t));
+        s = vv_dev_event_create(&c->shard_done);
+        if (s != VV_OK) goto fail_gpu;
+
+        int next = c->primary_layers;
+        for (int i = 1; i < p.gpus.n; i++) {
+            vv_shard_t* sh = &c->shards[c->n_shards];
+            sh->gpu_id = p.gpus.id[i];
+            sh->first_layer = next;
+            sh->n_layers = split[i];
+            next += split[i];
+
+            /*
+             * Each device sizes its own residency from its own budget, the
+             * same ladder the primary just went through, only for its slice.
+             */
+            size_t budget = vv_gpu_budget(&p.gpus, i, p.vram_budget);
+            const size_t held = vv_gpu_reserved(&p.gpus, i);
+            budget = budget > held ? budget - held : 0;
+            const size_t per_layer = calc_per_layer_gpu_bytes(c->model);
+            const size_t kv = vv_kv_cache_bytes(sh->n_layers,
+                                                llm->num_key_value_heads,
+                                                llm->head_dim, max_seq,
+                                                p.kv_format);
+            size_t ws = (size_t)512 * 1024 * 1024;
+            size_t room = budget > kv + ws ? budget - kv - ws : 0;
+            sh->n_resident = (int)(room / per_layer);
+            if (sh->n_resident > sh->n_layers) sh->n_resident = sh->n_layers;
+            if (gpu_layers_total >= 0) {
+                const int want = (int)((double)gpu_layers_total * sh->n_layers
+                                       / llm->num_hidden_layers + 0.5);
+                if (want < sh->n_resident) sh->n_resident = want;
+            }
+
+            s = shard_init(sh, c->model, llm, max_seq, p.kv_format, ws);
+            if (s != VV_OK) {
+                VV_LOG_E("shard: gpu %d unusable (%s)", sh->gpu_id,
+                         vv_status_str(s));
+                shard_free(sh);
+                goto fail_gpu;
+            }
+            s = vv_layer_pool_create(&sh->layer_pool, c->model,
+                                     sh->n_resident >= sh->n_layers);
+            if (s != VV_OK) { shard_free(sh); goto fail_gpu; }
+            if (sh->n_resident < sh->n_layers)
+                vv_layer_pool_pin_range(c->model,
+                                        sh->first_layer + sh->n_resident,
+                                        sh->n_layers - sh->n_resident);
+            c->n_shards++;
+        }
+        vv_dev_set_device(c->gpu_id);
+
+        /* Direct peer copies where the pair allows it; through the host
+           where it does not, which is slower but not different. */
+        for (int i = 0; i < p.gpus.n; i++)
+            for (int j = 0; j < p.gpus.n; j++)
+                if (i != j) vv_dev_enable_peer(p.gpus.id[i], p.gpus.id[j]);
+
+        VV_LOG_I("shard: %d devices, layers 0..%d on gpu %d and %d more shard(s)",
+                 p.gpus.n, c->primary_layers - 1, c->gpu_id, c->n_shards);
     }
 
     /* ── Embed table: on GPU unless STREAM_ALL ── */
@@ -772,6 +1084,16 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
         VV_LOG_E("inference: clone needs a parent with all layers resident");
         return VV_ERR_UNSUPPORTED;
     }
+    for (int i = 0; i < parent->n_shards; i++) {
+        if (parent->shards[i].n_resident < parent->shards[i].n_layers) {
+            VV_LOG_E("inference: clone needs every shard resident; gpu %d "
+                     "streams %d of its %d layers", parent->shards[i].gpu_id,
+                     parent->shards[i].n_layers
+                     - parent->shards[i].n_resident,
+                     parent->shards[i].n_layers);
+            return VV_ERR_UNSUPPORTED;
+        }
+    }
 
     vv_init_params_t p = params ? *params : vv_init_params_default();
     const vv_llm_config_t* llm = &parent->model->config.llm;
@@ -786,6 +1108,7 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
     c->gpu_id    = parent->gpu_id;
     c->gpu_index = parent->gpu_index;
     c->gpus      = parent->gpus;
+    c->primary_layers = parent->primary_layers;
     c->use_gpu   = true;
     c->placement = parent->placement;
     c->model     = parent->model;
@@ -804,9 +1127,10 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
         return s;
     }
 
-    s = vv_kv_cache_create(&c->kv_cache, llm->num_hidden_layers,
-                           llm->num_key_value_heads, llm->head_dim,
-                           max_seq, p.kv_format, false);
+    s = vv_kv_cache_create_range(&c->kv_cache, llm->num_hidden_layers,
+                                 0, c->primary_layers,
+                                 llm->num_key_value_heads, llm->head_dim,
+                                 max_seq, p.kv_format, false);
     if (s != VV_OK) goto fail;
 
     c->workspace_size = parent->workspace_size;
@@ -817,6 +1141,54 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
     }
     if (s != VV_OK) goto fail;
 
+    /*
+     * A sharded parent hands out its layer layout and its pools; what a
+     * clone needs of its own on each device is a KV cache, a workspace, a
+     * pair of streams and somewhere for the hidden state to land.
+     */
+    if (parent->n_shards > 0) {
+        c->shards = (vv_shard_t*)vv_alloc(
+            (size_t)parent->n_shards * sizeof(vv_shard_t));
+        if (!c->shards) { s = VV_ERR_OUT_OF_MEMORY; goto fail; }
+        memset(c->shards, 0, (size_t)parent->n_shards * sizeof(vv_shard_t));
+        s = vv_dev_event_create(&c->shard_done);
+        if (s != VV_OK) goto fail;
+
+        for (int i = 0; i < parent->n_shards; i++) {
+            const vv_shard_t* ps = &parent->shards[i];
+            vv_shard_t* sh = &c->shards[i];
+            sh->gpu_id      = ps->gpu_id;
+            sh->first_layer = ps->first_layer;
+            sh->n_layers    = ps->n_layers;
+            sh->n_resident  = ps->n_resident;
+            sh->layer_pool  = ps->layer_pool;   /* all resident: stateless */
+
+            s = vv_dev_set_device(sh->gpu_id);
+            if (s == VV_OK) s = vv_dev_stream_create(&sh->compute_stream);
+            if (s == VV_OK) s = vv_dev_stream_create(&sh->transfer_stream);
+            if (s == VV_OK) s = vv_dev_event_create(&sh->done);
+            if (s == VV_OK)
+                s = vv_kv_cache_create_range(&sh->kv_cache,
+                                             llm->num_hidden_layers,
+                                             sh->first_layer, sh->n_layers,
+                                             llm->num_key_value_heads,
+                                             llm->head_dim, max_seq,
+                                             p.kv_format, false);
+            if (s == VV_OK) {
+                sh->workspace_size = ps->workspace_size;
+                s = vv_dev_alloc(&sh->workspace, sh->workspace_size);
+            }
+            if (s != VV_OK) {
+                sh->layer_pool = NULL;
+                shard_free(sh);
+                vv_dev_set_device(c->gpu_id);
+                goto fail;
+            }
+            c->n_shards++;
+        }
+        vv_dev_set_device(c->gpu_id);
+    }
+
     attach_frontend(c);
 
     VV_LOG_I("inference: cloned context (workspace=%zu MB, kv=%.0f MB)",
@@ -826,6 +1198,13 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
     return VV_OK;
 
 fail:
+    for (int i = 0; i < c->n_shards; i++) {
+        c->shards[i].layer_pool = NULL;
+        shard_free(&c->shards[i]);
+    }
+    if (c->shards) vv_free(c->shards);
+    if (c->shard_done) vv_dev_event_destroy(c->shard_done);
+    vv_dev_set_device(c->gpu_id);
     if (c->kv_cache) vv_kv_cache_free(c->kv_cache);
     if (c->workspace) vv_dev_free(c->workspace);
     vv_dev_stream_destroy(c->compute_stream);
@@ -1113,44 +1492,97 @@ static bool decode_graph_enabled(void) {
  */
 #define VV_GRAPH_GAVE_UP (-2)
 
-static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
-                                        bool graph_ok, void** exec, int* shape)
+/** @brief One captured step, and the launch shape it was captured for. */
+typedef struct { void* exec; int shape; } graph_slot_t;
+
+/**
+ * @brief One shard's slice of a decode step, replayed when it can be.
+ *
+ * Every argument that used to come from the context is passed instead,
+ * because with a sharded model each device has its own streams, workspace,
+ * KV cache and captured graph, and the loop below walks them in turn.
+ */
+static vv_status_t step_slice(vv_model_t* model, void* hidden,
+                              vv_kv_cache_t* kv, vv_layer_pool_t* pool,
+                              void* ws, size_t ws_size,
+                              void* compute, void* xfer,
+                              int first_layer, int n_layers,
+                              bool graph_ok, graph_slot_t* g)
 {
     #define VV_STEP_DIRECT()                                                 \
-        vv_decoder_step(ctx->model, hidden, ctx->kv_cache, ctx->layer_pool,  \
-                        ctx->workspace, ctx->workspace_size,                 \
-                        ctx->compute_stream, ctx->transfer_stream)
+        vv_decoder_step(model, hidden, kv, pool, ws, ws_size,                \
+                        compute, xfer, first_layer, n_layers)
 
-    if (!graph_ok || *shape == VV_GRAPH_GAVE_UP) return VV_STEP_DIRECT();
+    if (!graph_ok || g->shape == VV_GRAPH_GAVE_UP) return VV_STEP_DIRECT();
 
-    const int want = vv_gqa_decode_shape(ctx->kv_cache->current_len + 1);
-    if (want != *shape) {
-        if (*exec) { vv_dev_graph_destroy(*exec); *exec = NULL; }
+    const int want = vv_gqa_decode_shape(kv->current_len + 1);
+    if (want != g->shape) {
+        if (g->exec) { vv_dev_graph_destroy(g->exec); g->exec = NULL; }
 
-        const int len = ctx->kv_cache->current_len;
-        vv_status_t cs = vv_dev_graph_begin(ctx->compute_stream);
+        const int len = kv->current_len;
+        vv_status_t cs = vv_dev_graph_begin(compute);
         if (cs == VV_OK) {
             void* got = NULL;
             cs = VV_STEP_DIRECT();
-            const vv_status_t es = vv_dev_graph_end(ctx->compute_stream, &got);
-            if (cs == VV_OK && es == VV_OK && got) *exec = got;
+            const vv_status_t es = vv_dev_graph_end(compute, &got);
+            if (cs == VV_OK && es == VV_OK && got) g->exec = got;
             else if (got)                          vv_dev_graph_destroy(got);
         }
-        ctx->kv_cache->current_len = len;
+        kv->current_len = len;
 
-        if (!*exec) {
+        if (!g->exec) {
             VV_LOG_W("decode: cannot capture the step, launching each kernel");
-            *shape = VV_GRAPH_GAVE_UP;
+            g->shape = VV_GRAPH_GAVE_UP;
             return VV_STEP_DIRECT();
         }
         VV_LOG_D("decode: captured the step at %d cached positions", len);
-        *shape = want;
+        g->shape = want;
     }
 
-    const vv_status_t s = vv_dev_graph_launch(*exec, ctx->compute_stream);
-    if (s == VV_OK) ctx->kv_cache->current_len++;
+    const vv_status_t s = vv_dev_graph_launch(g->exec, compute);
+    if (s == VV_OK) kv->current_len++;
     return s;
     #undef VV_STEP_DIRECT
+}
+
+/**
+ * @brief A whole decode step: the primary's layers, then each shard's.
+ *
+ * `graphs` holds one slot for the primary and one per shard. With no shards
+ * this is exactly the single captured step it was before.
+ */
+static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
+                                        bool graph_ok, graph_slot_t* graphs)
+{
+    vv_status_t s = step_slice(ctx->model, hidden, ctx->kv_cache,
+                               ctx->layer_pool, ctx->workspace,
+                               ctx->workspace_size, ctx->compute_stream,
+                               ctx->transfer_stream, 0, ctx->primary_layers,
+                               graph_ok, &graphs[0]);
+    if (s != VV_OK || ctx->n_shards == 0) return s;
+
+    const size_t bytes = (size_t)ctx->model->config.llm.hidden_size * 2;
+    int src_gpu = ctx->gpu_id;
+    void *src = hidden, *src_stream = ctx->compute_stream,
+         *src_done = ctx->shard_done;
+
+    for (int i = 0; i < ctx->n_shards; i++) {
+        vv_shard_t* sh = &ctx->shards[i];
+        s = hand_off(sh->gpu_id, sh->hidden, sh->compute_stream,
+                     src_gpu, src, src_stream, src_done, bytes);
+        if (s == VV_OK)
+            s = step_slice(ctx->model, sh->hidden, sh->kv_cache,
+                           sh->layer_pool, sh->workspace, sh->workspace_size,
+                           sh->compute_stream, sh->transfer_stream,
+                           sh->first_layer, sh->n_layers,
+                           graph_ok, &graphs[i + 1]);
+        if (s != VV_OK) { vv_dev_set_device(ctx->gpu_id); return s; }
+        src_gpu = sh->gpu_id; src = sh->hidden;
+        src_stream = sh->compute_stream; src_done = sh->done;
+    }
+
+    return hand_off(ctx->gpu_id, hidden, ctx->compute_stream,
+                    src_gpu, src, src_stream, src_done, bytes);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1191,6 +1623,12 @@ static vv_status_t transcribe_gpu(
     bool lm_head_on_cpu = (ctx->lm_head_gpu == NULL);
 
     vv_kv_cache_reset(ctx->kv_cache, ctx->compute_stream);
+    for (int i = 0; i < ctx->n_shards; i++) {
+        vv_dev_set_device(ctx->shards[i].gpu_id);
+        vv_kv_cache_reset(ctx->shards[i].kv_cache,
+                          ctx->shards[i].compute_stream);
+    }
+    vv_dev_set_device(ctx->gpu_id);
 
     /* ═══ STEP 1: Audio encoding ═══ */
     double t_step = vv_time_ms();
@@ -1415,10 +1853,7 @@ static vv_status_t transcribe_gpu(
     t_step = vv_time_ms();
     VV_LOG_I("inference: prefill %d tokens, %d layers", seq_len, ctx->model->num_layers);
 
-    s = vv_decoder_prefill(ctx->model, hidden_states_gpu, seq_len,
-                            ctx->kv_cache, ctx->layer_pool,
-                            ctx->workspace, ctx->workspace_size,
-                            ctx->compute_stream, ctx->transfer_stream);
+    s = prefill_all_shards(ctx, hidden_states_gpu, seq_len);
     if (s != VV_OK) {
         VV_LOG_E("inference: prefill failed: %s", vv_status_str(s));
         vv_dev_free(hidden_states_gpu);
@@ -1563,6 +1998,12 @@ static vv_status_t transcribe_gpu(
      * on the device, so hand it over.
      */
     vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+    for (int i = 0; i < ctx->n_shards; i++) {
+        vv_dev_set_device(ctx->shards[i].gpu_id);
+        vv_kv_cache_publish_len(ctx->shards[i].kv_cache,
+                                ctx->shards[i].compute_stream);
+    }
+    vv_dev_set_device(ctx->gpu_id);
 
     /*
      * Replaying the step needs every layer resident (a streaming pool patches
@@ -1571,8 +2012,9 @@ static vv_status_t transcribe_gpu(
      * timing wants a drained stream between phases, which a single submission
      * does not give, so the two are mutually exclusive.
      */
-    void* step_graph = NULL;
-    int   step_shape = -1;
+    graph_slot_t graphs[VV_MAX_GPUS];
+    for (int i = 0; i <= ctx->n_shards; i++) { graphs[i].exec = NULL;
+                                               graphs[i].shape = -1; }
     const bool graph_ok = decode_graph_enabled() &&
                           ctx->layer_pool && ctx->layer_pool->all_resident &&
                           ctx->kv_cache && ctx->kv_cache->d_len && !prof;
@@ -1636,8 +2078,7 @@ static vv_status_t transcribe_gpu(
         }
 
         /* Decoder step */
-        s = decoder_step_graphed(ctx, hidden_one_gpu, graph_ok,
-                                 &step_graph, &step_shape);
+        s = decoder_step_graphed(ctx, hidden_one_gpu, graph_ok, graphs);
         if (s != VV_OK) { VV_LOG_E("inference: decode step %d failed", n_generated); break; }
 
         if (prof) {
@@ -1721,7 +2162,8 @@ static vv_status_t transcribe_gpu(
                 n_generated);
     fflush(stderr);
 
-    if (step_graph) vv_dev_graph_destroy(step_graph);
+    for (int i = 0; i <= ctx->n_shards; i++)
+        if (graphs[i].exec) vv_dev_graph_destroy(graphs[i].exec);
 
     /* Zero unless VV_PROFILE_DECODE asked for the extra stalls. */
     perf->decode_layers_ms = t_layers_ms;
@@ -2066,6 +2508,18 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
         if (ctx->workspace) vv_free(ctx->workspace);
     }
 
+    if (ctx->shards) {
+        for (int i = 0; i < ctx->n_shards; i++) {
+            /* A clone borrows the parent's weights and pool, but owns its
+               own cache, workspace, streams and landing buffer. */
+            if (ctx->is_clone) ctx->shards[i].layer_pool = NULL;
+            shard_free(&ctx->shards[i]);
+        }
+        vv_free(ctx->shards);
+        vv_dev_set_device(ctx->gpu_id);
+    }
+    if (ctx->shard_done) vv_dev_event_destroy(ctx->shard_done);
+
     if (ctx->kv_cache) vv_kv_cache_free(ctx->kv_cache);
     if (ctx->use_gpu) {
         if (ctx->compute_stream) vv_dev_stream_destroy(ctx->compute_stream);
@@ -2083,6 +2537,7 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
             free_layer_gpu_weights(ctx->model);
         vv_model_free(ctx->model);
     }
+
 
     if (ctx->use_gpu && !ctx->is_clone) vv_gemm_cleanup();
     vv_free(ctx);
