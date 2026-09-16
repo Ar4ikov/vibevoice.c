@@ -19,7 +19,10 @@
 #include <math.h>
 #include <float.h>
 
+#include <stdlib.h>
+
 #include "decode_split.h"
+#include "attention_mma.cuh"
 
 /* ─── Tile sizes ─────────────────────────────────────────────────────────── */
 
@@ -366,6 +369,38 @@ vv_status_t vv_gqa_attention_decode_dev(
  * Chunked prefill needs this: the queries of chunk N must see every key from
  * position 0, not just the ones inside the chunk.
  */
+/**
+ * @brief Whether the current device can run the tensor-core prefill kernel.
+ *
+ * `mma.sync.m16n8k16` and `ldmatrix.trans` both need sm_80, so Turing keeps
+ * the scalar kernel. Cached per thread and per device, because a thread binds
+ * one device per request and a process may hold two engines on two cards.
+ * VV_ATTN_MMA=0 forces the scalar path, which is how the two are compared.
+ */
+static bool prefill_use_mma(void) {
+    static thread_local int cached_dev = -1;
+    static thread_local int usable = 0;
+    static thread_local int allowed = -1;
+
+    if (allowed < 0) {
+        const char* e = getenv("VV_ATTN_MMA");
+        allowed = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (!allowed) return false;
+
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (dev != cached_dev) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                                   dev) != cudaSuccess)
+            return false;
+        usable = (major >= 8);
+        cached_dev = dev;
+    }
+    return usable != 0;
+}
+
 vv_status_t vv_gqa_attention_prefill_cached_dev(
     const void* q, const void* k_cache, const void* v_cache,
     void* output,
@@ -376,6 +411,18 @@ vv_status_t vv_gqa_attention_prefill_cached_dev(
     if (q_len == 0 || kv_len == 0) return VV_OK;
 
     float scale = 1.0f / sqrtf((float)head_dim);
+
+    if (head_dim == MMA_D && prefill_use_mma()) {
+        dim3 grid(n_q_heads, (q_len + MMA_BR - 1) / MMA_BR);
+        dim3 block(32, MMA_WARPS);
+        flash_attn_prefill_mma_kernel<<<grid, block, MMA_SMEM_BYTES,
+                                        (cudaStream_t)stream>>>(
+            (const half*)q, (const half*)k_cache, (const half*)v_cache,
+            (half*)output, n_q_heads, n_kv_heads,
+            q_len, q_offset, kv_len, scale, causal);
+        return cudaGetLastError() == cudaSuccess ? VV_OK
+                                                 : VV_ERR_CUDA_LAUNCH;
+    }
 
     int num_q_tiles = (q_len + FA2_BR - 1) / FA2_BR;
     dim3 grid(n_q_heads, num_q_tiles);

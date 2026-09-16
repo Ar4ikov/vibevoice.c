@@ -55,14 +55,14 @@ RTX 3090, CUDA 12.4, Ryzen 9 5900X. Defaults unless noted.
 |---|---|
 | Model load | **9.5 s** |
 | Speech encoding | **243 ms** per 11 s of audio |
-| Prefill | **2127 tok/s** |
+| Prefill | **3056 tok/s** on a 14449-token prompt |
 | Decode | **123 tok/s** at 0.2K context, 100 at 1.5K, 57 at 24K |
-| RTF | **0.065** on a 120 s file, **0.120** on 32 minutes |
+| RTF | **0.065** on a 120 s file, **0.081** on 32 minutes |
 | VRAM | 9.8 GB (3.2 GB weights + 1.8 GB KV at a 32K window) |
 
 `transformers` + `bitsandbytes` on the same GPU and checkpoint: 27.6 tok/s.
 
-A 32-minute recording transcribes in 231 s: 14449 prompt tokens, 9522
+A 32-minute recording transcribes in 155 s: 14449 prompt tokens, 9522
 generated, 168 segments, flat memory throughout.
 
 ### CPU only
@@ -317,7 +317,7 @@ the performance cores. **There is no Metal backend.** See "Not done" below.
 VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
-Ten suites. The ones that need weights report SKIP without
+Eleven suites. The ones that need weights report SKIP without
 `VV_TEST_MODEL`. `test_cpu_kernels` checks every CPU kernel against a scalar
 reference, which is what makes the SIMD paths verifiable per architecture —
 it passes natively on AVX2 and under `qemu-aarch64` on NEON, both to 4e-7
@@ -384,9 +384,15 @@ The kernels that matter:
   The generic path (expand to FP16 scratch, then GEMM) moves 5× the bytes;
   single-token decode is purely bandwidth bound, so the weights stay 4-bit
   all the way into the multiply.
-- **`attention.cu`** — flash prefill with online softmax, and a split-KV
-  flash decode where each warp owns a slice of the cache and a second kernel
-  merges the partial softmax states.
+- **`attention.cu`**, **`attention_mma.cuh`** — FlashAttention-2 prefill with
+  both matmuls on tensor cores, and a split-KV flash decode where each warp
+  owns a slice of the cache and a second kernel merges the partial softmax
+  states. The prefill kernel issues `mma.sync` as PTX rather than through the
+  WMMA API, because the online softmax has to rescale the output accumulator
+  per row and only `mma.sync` documents which row each accumulator register
+  holds. That layout pays twice: the A operand of the next matmul is laid out
+  exactly like the accumulator of the previous one, so the softmax
+  probabilities feed P·V from the registers they were computed in.
 - **`kv_quant.cu`** — the FP8 and TurboQuant stores, plus attention kernels
   that read them. Sub-byte codes are laid out so lane L owns dims 4L..4L+3,
   putting its bits in a contiguous run the warp fetches with one coalesced
@@ -400,6 +406,31 @@ BPE, the causal `SConv1d` padding formula, exact GELU versus SiLU, and warps
 of one block reaching different numbers of `__syncthreads()` in flash
 attention.
 
+### Prefill attention
+
+Both matmuls in attention are O(S²) and the first version of the kernel ran
+them as scalar FP32 FMAs, one warp per query row. On a 3090, causal
+self-attention with 28 heads at head_dim 128:
+
+| sequence | scalar | tensor cores |
+|---|---|---|
+| 1024 | 4.58 ms (1.6 TFLOP/s) | **0.18 ms (42.1 TFLOP/s)** |
+| 4096 | 72.1 ms (1.7 TFLOP/s) | **2.10 ms (57.3 TFLOP/s)** |
+| 8192 | 288.2 ms (1.7 TFLOP/s) | **8.03 ms (59.9 TFLOP/s)** |
+
+59.9 TFLOP/s is 84% of the card's 71 TFLOP/s ceiling for FP16 multiply with
+FP32 accumulate. End to end on the 32-minute file, prefill goes from 30.7 s to
+4.7 s (471 → 3056 tok/s) and the whole transcription from 182 s to 155 s.
+
+The text is identical. Four of the 336 timestamps the model emits move by
+10 ms, which is FP16 rounding inside the P·V product landing on the other side
+of a digit, and is inside the ±100 ms the timestamps are held to.
+
+`VV_ATTN_MMA=0` forces the scalar kernel, which is also what `ctest` runs the
+attention suite a second time under: both have to agree with an FP64 reference
+across fourteen shapes, on and off every tile boundary, with and without the
+chunked-prefill offset.
+
 ---
 
 ## Not done
@@ -412,9 +443,6 @@ attention.
   implementation of it, and `src/device/device_none.c` shows the shape.
 - **CUDA Graphs.** Decode issues ~500 kernel launches per token. Capturing
   them would take a chunk out of the per-token floor.
-- **Tensor cores in prefill attention.** Still O(S²) on a hand-written
-  kernel; fine to ~15K tokens, dominant past that (39 s of the 32-minute
-  run's 231 s).
 - **A packed CPU micro-kernel.** CPU prefill runs at ~20% of peak FMA.
   Tiling the M and K loops was tried and measured slower; beating it needs a
   proper packed micro-kernel.

@@ -302,6 +302,13 @@ if(VV_BUILD_TESTS)
     vv_add_test(test_tokenizer tests/test_tokenizer.c)
     vv_add_test(test_kv_quant tests/test_kv_quant.c)
     vv_add_test(test_concurrent_decode tests/test_concurrent_decode.c)
+    vv_add_test(test_attention tests/test_attention.c)
+    # The same suite again with the tensor-core prefill kernel switched off:
+    # the scalar fallback has to agree with the reference too, and the two
+    # timings side by side are what the speedup is measured from.
+    add_test(NAME test_attention_scalar COMMAND test_attention)
+    set_tests_properties(test_attention_scalar PROPERTIES
+                         ENVIRONMENT "VV_ATTN_MMA=0")
     vv_add_test(test_cpu_kernels tests/test_cpu_kernels.c)
     vv_add_test(test_e2e tests/test_e2e.c)
 endif()
