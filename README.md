@@ -1,4 +1,17 @@
-# vibevoice.c
+<p align="center">
+  <img src="assets/brand/banner.svg" alt="vibevoice.c" width="820">
+</p>
+
+<p align="center">
+  <a href="https://github.com/Ar4ikov/vibevoice.c/actions/workflows/container.yml"><img alt="build" src="https://img.shields.io/github/actions/workflow/status/Ar4ikov/vibevoice.c/container.yml?branch=master&label=build&labelColor=0B0D12"></a>
+  <a href="https://github.com/Ar4ikov/vibevoice.c/tags"><img alt="version" src="https://img.shields.io/github/v/tag/Ar4ikov/vibevoice.c?label=version&labelColor=0B0D12&color=0E9E74"></a>
+  <a href="https://github.com/Ar4ikov/vibevoice.c/pkgs/container/vibevoice.c"><img alt="image" src="https://img.shields.io/badge/ghcr.io-vibevoice.c-0E9E74?labelColor=0B0D12&logo=docker&logoColor=F7F8FA"></a>
+  <img alt="runtime" src="https://img.shields.io/badge/runtime-C11%20%2B%20CUDA%2012-0E9E74?labelColor=0B0D12">
+  <img alt="links against" src="https://img.shields.io/badge/links%20against-libc%20%2B%20libm-0E9E74?labelColor=0B0D12">
+  <img alt="parity" src="https://img.shields.io/badge/vs%20PyTorch-character--identical-0E9E74?labelColor=0B0D12">
+  <a href="LICENSES"><img alt="licence" src="https://img.shields.io/badge/licence-MIT-0E9E74?labelColor=0B0D12"></a>
+</p>
+
 
 A runtime for Microsoft's **VibeVoice-ASR** written in C and CUDA, with no
 Python, PyTorch, ONNX Runtime or cuBLAS anywhere in the inference path. One
@@ -130,6 +143,23 @@ finish in 4.2 s together against 5.8 s back to back, returning identical
 transcripts either way. Not 2×, because decode
 is bandwidth-bound on the weights and interleaves — everything either side of
 it overlaps. With `--kv-cache tq4 --max-seq-len 8192` a slot is 115 MB.
+
+```mermaid
+sequenceDiagram
+  participant C as client
+  participant H as HTTP thread
+  participant Q as admission queue
+  participant S as slot
+  C->>H: POST /v1/audio/transcriptions
+  H->>Q: admit, FIFO, after upload and auth
+  alt slots and queue both full
+    Q--)C: 503, OpenAI error envelope
+  else a slot is free, or frees up
+    Q->>S: hand over
+    S->>S: encode speech, prefill, decode
+    S--)C: transcript
+  end
+```
 
 ### Live microphone
 
@@ -275,6 +305,57 @@ the CPU path.
 
 ---
 
+## Container images
+
+```bash
+docker run --rm --gpus all -p 8080:8080 -v /models:/model:ro \
+  ghcr.io/ar4ikov/vibevoice.c:latest serve --model /model --host 0.0.0.0
+```
+
+Built and tested by the Container workflow, which runs `ctest` inside the
+build stage and then starts the published image to check that it reports the
+tag it was published under.
+
+| tag | published on | moves |
+|---|---|---|
+| `0.2.1` | the `v0.2.1` git tag | never |
+| `0.2` | the same tag | to the newest patch of 0.2 |
+| `latest` | a release, or a push to master | to whichever is newer |
+| `master` | a push to master | with the branch |
+| `sha-1a2b3c4` | any push | never |
+| `pr-7` | a pull request | built and tested, never pushed |
+
+```mermaid
+flowchart TD
+  subgraph pinned["safe to pin: never moves"]
+    S["sha-1a2b3c4"]
+    V["0.2.1"]
+  end
+  subgraph moving["follows: repointed by a later build"]
+    M["0.2"]
+    B["master"]
+    L["latest"]
+  end
+  pinned -.-> R["a deployment you have to reproduce"]
+  moving -.-> U["a deployment that should pick up fixes"]
+```
+
+The tag is stamped into the image, so the binary can be asked rather than
+trusted — `--version`, `GET /health` and the `vibevoice_build_info` metric
+all report it, and the version itself lives in one place,
+`VV_VERSION_STRING`:
+
+```bash
+$ docker run --rm ghcr.io/ar4ikov/vibevoice.c:0.1.0 --version
+vibevoice.c 0.1.0 (0.1.0) [cuda openmp]
+```
+
+Tagging, what each tag guarantees, and how to cut a release:
+[docs/RELEASING.md](docs/RELEASING.md). GPUStack deployment:
+[deploy/gpustack/](deploy/gpustack/README.md).
+
+---
+
 ## Building
 
 ### Linux (CUDA)
@@ -342,13 +423,17 @@ The AWQ repo already carries its own.
 
 ## How it works
 
-```
-audio ──> resample 24 kHz ──> normalize -25 dBFS
-              │
-              ├──> acoustic Conv-VAE ──> connector ──┐
-              │    (vae_dim 64)                      ├──> +  ──> Qwen2-7B ──> JSON
-              └──> semantic Conv-VAE ──> connector ──┘            28 layers
-                   (vae_dim 128)
+```mermaid
+flowchart LR
+  A["audio<br/>any rate, any format"] --> B["resample 24 kHz<br/>normalize -25 dBFS"]
+  B --> C["acoustic Conv-VAE<br/>vae_dim 64"]
+  B --> D["semantic Conv-VAE<br/>vae_dim 128"]
+  C --> E["connector<br/>64 to 3584"]
+  D --> F["connector<br/>128 to 3584"]
+  E --> G(("+"))
+  F --> G
+  G --> H["Qwen2-7B, 28 layers<br/>4-bit weights, KV cache"]
+  H --> I["JSON segments<br/>speaker, start, end, text"]
 ```
 
 No mel spectrogram, no FFT. Raw 24 kHz PCM goes straight into two Conv-VAE

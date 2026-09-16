@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320"
+     role="img" aria-label="vibevoice.c">
+  <title>vibevoice.c</title>
+  <!--
+    Repository header. The plate is part of the asset, so it reads the same
+    on a light or a dark page and needs no theme switching.
+  -->
+  <rect width="1200" height="320" fill="#0B0D12"/>
+
+  <g transform="translate(319.9 57.425) scale(0.95)">
+    <g transform="translate(0 38.5) scale(1.354)">
+      <g fill="none" stroke="#F7F8FA" stroke-width="8"
+         stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 4 L19 44 L34 4"/>
+        <path d="M47.9 4 L37.4 32"/>
+        <path d="M61.8 4 L55.05 22"/>
+      </g>
+      <circle cx="61.8" cy="44" r="4" fill="#4AE3B5"/>
+    </g>
+    <g transform="translate(122.4 0)">
+      <g fill="none" stroke="#F7F8FA" stroke-width="7"
+         stroke-linecap="round" stroke-linejoin="round">
+        <path   transform="translate(0,0)"   d="M3.5 60 L20.5 100 L37.5 60"/>
+        <path   transform="translate(50,0)"  d="M3.5 60 L3.5 100"/>
+        <path   transform="translate(66,0)"  d="M3.5 42 L3.5 100"/>
+        <circle transform="translate(66,0)"  cx="23.5" cy="80" r="20"/>
+        <path   transform="translate(122,0)" d="M3.5 80 L43.5 80 A20 20 0 1 0 38.82 92.86"/>
+        <path   transform="translate(178,0)" d="M3.5 60 L20.5 100 L37.5 60"/>
+        <circle transform="translate(228,0)" cx="23.5" cy="80" r="20"/>
+        <path   transform="translate(284,0)" d="M3.5 60 L3.5 100"/>
+        <path   transform="translate(300,0)" d="M38.82 67.14 A20 20 0 1 0 38.82 92.86"/>
+        <path   transform="translate(353,0)" d="M3.5 80 L43.5 80 A20 20 0 1 0 38.82 92.86"/>
+      </g>
+      <g fill="#F7F8FA">
+        <circle cx="53.5" cy="48" r="3.5"/>
+        <circle cx="287.5" cy="48" r="3.5"/>
+      </g>
+      <circle cx="412.5" cy="96.5" r="3.5" fill="#4AE3B5"/>
+      <g fill="none" stroke="#4AE3B5" stroke-width="7" stroke-linecap="round">
+        <path transform="translate(425,0)" d="M38.82 67.14 A20 20 0 1 0 38.82 92.86"/>
+      </g>
+    </g>
+  </g>
+
+  <path d="M564 184 L636 184" stroke="#4AE3B5" stroke-width="3" stroke-linecap="round"/>
+  <text x="602" y="226" fill="#78859B" text-anchor="middle"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="19" letter-spacing="4">VIBEVOICE-ASR RUNTIME IN C AND CUDA</text>
+</svg>

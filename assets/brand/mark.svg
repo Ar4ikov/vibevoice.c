@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 66 48" width="66" height="48"
+     role="img" aria-label="vibevoice.c">
+  <title>vibevoice.c</title>
+  <!--
+    The mark, for light surfaces. Geometry and rules: docs/BRAND.md.
+
+    A V whose right arm repeats twice, each repeat cut shorter: that is the
+    family resemblance to VibeVoice. The dot on the baseline is the period
+    in vibevoice.c, and it is the one part of the mark that takes the
+    accent. Stroke 8 over a cap height of 40, round caps and joins.
+  -->
+  <g fill="none" stroke="#0B0D12" stroke-width="8"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 4 L19 44 L34 4"/>
+    <path d="M47.9 4 L37.4 32"/>
+    <path d="M61.8 4 L55.05 22"/>
+  </g>
+  <circle cx="61.8" cy="44" r="4" fill="#0E9E74"/>
+</svg>

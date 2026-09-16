@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256"
+     role="img" aria-label="vibevoice.c">
+  <title>vibevoice.c</title>
+  <!-- Square app mark: avatar, favicon, container registry. -->
+  <rect width="256" height="256" rx="52" fill="#0B0D12"/>
+  <g transform="translate(52 72.75) scale(2.303)">
+    <g fill="none" stroke="#F7F8FA" stroke-width="8"
+       stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 4 L19 44 L34 4"/>
+      <path d="M47.9 4 L37.4 32"/>
+      <path d="M61.8 4 L55.05 22"/>
+    </g>
+    <circle cx="61.8" cy="44" r="4" fill="#4AE3B5"/>
+  </g>
+</svg>
