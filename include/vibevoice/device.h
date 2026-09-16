@@ -42,7 +42,27 @@ vv_status_t vv_dev_free_pinned(void* ptr);
 vv_status_t vv_dev_memcpy_h2d(void* dst, const void* src, size_t size, void* stream);
 vv_status_t vv_dev_memcpy_d2h(void* dst, const void* src, size_t size, void* stream);
 vv_status_t vv_dev_memcpy_d2d(void* dst, const void* src, size_t size, void* stream);
+
+/**
+ * @brief Copy one row into `dst_base + (*d_index) * size`.
+ *
+ * The same copy as vv_dev_memcpy_d2d with the destination index read on the
+ * device, so that a graph replay writes to this token's slot rather than to
+ * the one its capture happened to see.
+ */
+vv_status_t vv_dev_memcpy_d2d_at(void* dst_base, const void* src, size_t size,
+                                 const int* d_index, void* stream);
 vv_status_t vv_dev_memset(void* ptr, int value, size_t size);
+
+/**
+ * @brief vv_dev_memset, ordered on a stream rather than device-wide.
+ *
+ * The unstreamed form runs on the legacy default stream, which synchronises
+ * with every blocking stream in the process: on anything with more than one
+ * request in flight it stalls the others and invalidates a graph capture.
+ */
+vv_status_t vv_dev_memset_async(void* ptr, int value, size_t size,
+                                void* stream);
 vv_status_t vv_dev_stream_create(void** stream);
 vv_status_t vv_dev_stream_destroy(void* stream);
 vv_status_t vv_dev_stream_sync(void* stream);
@@ -61,6 +81,36 @@ vv_status_t vv_dev_host_unregister(void* p);
 
 /** @brief Short name of the compiled-in backend ("CUDA", "Metal", "none"). */
 const char* vv_dev_backend_name(void);
+
+/* ─── Graph capture ──────────────────────────────────────────────────────── */
+
+/*
+ * A decode token issues around 450 kernels, and consecutive kernels on one
+ * stream cannot overlap, so each pays a dispatch gap whether or not the host
+ * keeps up. Recording the sequence once and replaying it submits the whole
+ * thing at once.
+ *
+ * Between begin and end the stream may receive only capturable work: no
+ * synchronisation, no allocation, nothing read back to the host, and no
+ * pageable host memory (which drains the stream behind your back). Anything
+ * whose kernel arguments change from one token to the next has to read them
+ * from device memory instead, because a replay reuses the arguments it
+ * recorded.
+ */
+
+/** @brief Start recording work issued to `stream` instead of running it. */
+vv_status_t vv_dev_graph_begin(void* stream);
+
+/** @brief Stop recording and instantiate what was recorded. */
+vv_status_t vv_dev_graph_end(void* stream, void** graph_exec);
+
+/** @brief Submit a recorded graph to `stream`. */
+vv_status_t vv_dev_graph_launch(void* graph_exec, void* stream);
+
+void vv_dev_graph_destroy(void* graph_exec);
+
+/** @brief `*dst = *src + delta`, on the stream. Both are device ints. */
+vv_status_t vv_pos_add_dev(int* dst, const int* src, int delta, void* stream);
 
 /* ─── Quantized linear ───────────────────────────────────────────────────── */
 
@@ -130,9 +180,15 @@ vv_status_t vv_rmsnorm_dev(
     const void* input, const void* weight, void* output,
     int seq_len, int hidden_size, float eps, void* stream);
 
+/**
+ * @brief RoPE in place over [seq_len, n_heads, head_dim].
+ * @param position_offset Position of the first row, when `d_position` is NULL.
+ * @param d_position      Device int holding it instead. Decode uses this so
+ *                        the launch can be captured once and replayed.
+ */
 vv_status_t vv_rope_dev(
     void* x, int seq_len, int n_heads, int head_dim,
-    int position_offset, float theta, void* stream);
+    int position_offset, const int* d_position, float theta, void* stream);
 
 vv_status_t vv_swiglu_dev(
     const void* gate, const void* up, void* output,
@@ -159,13 +215,26 @@ size_t vv_gqa_decode_scratch_bytes(int n_q_heads, int head_dim);
 
 /**
  * @brief Flash decode: one query row against a KV cache of `cache_len`.
- * @param scratch  vv_gqa_decode_scratch_bytes() of device memory, owned by
- *                 the caller and not touched by any other stream.
+ * @param cache_len     Sizes the launch; with `d_cache_len` set it need only
+ *                      be the length the capture was made at.
+ * @param d_cache_len   Device int holding the exact length, or NULL to use
+ *                      `cache_len` itself.
+ * @param scratch       vv_gqa_decode_scratch_bytes() of device memory, owned
+ *                      by the caller and not touched by any other stream.
  */
 vv_status_t vv_gqa_attention_decode_dev(
     const void* q, const void* k_cache, const void* v_cache, void* output,
     int n_q_heads, int n_kv_heads, int head_dim, int cache_len,
-    void* scratch, void* stream);
+    const int* d_cache_len, void* scratch, void* stream);
+
+/**
+ * @brief The decode attention's launch shape at this cache length.
+ *
+ * The split count moves in steps as the cache grows, and a captured graph
+ * holds only while it does not move. The caller compares this between tokens
+ * and re-captures when it changes; the value itself means nothing else.
+ */
+int vv_gqa_decode_shape(int cache_len);
 
 /** @brief Flash prefill of `q_len` rows at `q_offset` against a KV cache. */
 vv_status_t vv_gqa_attention_prefill_cached_dev(
@@ -187,7 +256,7 @@ vv_status_t vv_gqa_attention_decode_q_dev(
     const void* q, const void* k_store, const void* v_store,
     const void* k_meta, const void* v_meta, void* output,
     int n_q_heads, int n_kv_heads, int head_dim, int cache_len,
-    int kv_format, void* scratch, void* stream);
+    const int* d_cache_len, int kv_format, void* scratch, void* stream);
 
 /** @brief Flash prefill against a quantized KV cache (see kv_quant.h). */
 vv_status_t vv_gqa_attention_prefill_q_dev(
@@ -209,12 +278,14 @@ vv_status_t vv_gqa_attention_prefill_q_dev(
  * @param build_ref Compute k_ref from this run first (the first prefill
  *                  chunk of a session); afterwards the same reference must
  *                  be reused for every position in the cache.
+ * @param d_pos     Device int holding the first position, or NULL to use
+ *                  `pos`. Decode uses this so the launch can be captured.
  */
 vv_status_t vv_kv_quant_store_dev(
     const void* k_fp16, const void* v_fp16,
     void* k_store, void* v_store, void* k_meta, void* v_meta,
     void* k_ref, bool build_ref,
-    int n_kv_heads, int head_dim, int pos,
+    int n_kv_heads, int head_dim, int pos, const int* d_pos,
     int n_positions, int kv_format, void* stream);
 
 /** @brief Unpack a quantized KV store back to FP16 (tests, CPU offload). */

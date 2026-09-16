@@ -331,7 +331,7 @@ static vv_status_t sconv_chunk(
             s = vv_dev_alloc(cache, (size_t)in_ch * ctx * 2);
             if (s != VV_OK) return s;
         }
-        vv_dev_memset(*cache, 0, (size_t)in_ch * ctx * 2);
+        vv_dev_memset_async(*cache, 0, (size_t)in_ch * ctx * 2, stream);
         *cache_len = ctx;
     }
 
@@ -679,7 +679,7 @@ static vv_status_t vv_conv_vae_encode_gpu_full(
 
         ch_first = (float*)vv_alloc(n_elem * 4);
         if (!ch_first) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup; }
-        vv_dev_memcpy_d2h(ch_first, fp32_gpu, n_elem * 4, NULL);
+        vv_dev_memcpy_d2h(ch_first, fp32_gpu, n_elem * 4, stream);
         vv_dev_free(fp32_gpu);
         fp32_gpu = NULL;
 
@@ -1038,7 +1038,7 @@ static vv_status_t ffn_forward_gpu(
 
         /* Download output tile */
         vv_dev_stream_sync(stream);
-        vv_dev_memcpy_d2h(stage_out, out_tile_gpu, cur_out_bytes, NULL);
+        vv_dev_memcpy_d2h(stage_out, out_tile_gpu, cur_out_bytes, stream);
 
         /* Convert output tile: FP16 → FP32 into final output */
         for (int c = 0; c < in_ch; c++) {

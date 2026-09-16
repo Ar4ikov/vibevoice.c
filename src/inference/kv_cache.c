@@ -118,6 +118,14 @@ vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
     }
     #undef ALLOC_SLOT
 
+    if (!on_cpu) {
+        vv_status_t sp = vv_dev_alloc(&c->d_len, sizeof(int));
+        if (sp == VV_OK) sp = vv_dev_alloc(&c->d_len_next, sizeof(int));
+        if (sp != VV_OK) { vv_kv_cache_free(c); return sp; }
+        vv_dev_memset(c->d_len, 0, sizeof(int));
+        vv_dev_memset(c->d_len_next, 0, sizeof(int));
+    }
+
     c->bytes_total = (size_t)num_layers * 2 * (sb + mb);
 
     VV_LOG_I("kv_cache: %d layers, %d heads, dim=%d, max_seq=%d, %s, %s, "
@@ -133,10 +141,15 @@ vv_status_t vv_kv_cache_create(vv_kv_cache_t** cache,
 
 vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
                                 const void* k, const void* v,
-                                int seq_len, void* stream) {
+                                int seq_len, bool use_device_pos,
+                                void* stream) {
     if (!cache || !k || !v) return VV_ERR_NULL_PTR;
     if (layer < 0 || layer >= cache->num_layers) return VV_ERR_INVALID_ARG;
     if (cache->current_len + seq_len > cache->max_seq_len) return VV_ERR_OVERFLOW;
+    if (use_device_pos && (cache->on_cpu || !cache->d_len || seq_len != 1))
+        return VV_ERR_INVALID_ARG;
+
+    const int* d_pos = use_device_pos ? (const int*)cache->d_len : NULL;
 
     vv_status_t s;
     if (vv_kv_is_raw((vv_kv_format_t)cache->format)) {
@@ -147,6 +160,11 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
             memcpy((uint8_t*)cache->k_cache[layer] + off, k, n);
             memcpy((uint8_t*)cache->v_cache[layer] + off, v, n);
             s = VV_OK;
+        } else if (d_pos) {
+            s = vv_dev_memcpy_d2d_at(cache->k_cache[layer], k, n, d_pos, stream);
+            if (s == VV_OK)
+                s = vv_dev_memcpy_d2d_at(cache->v_cache[layer], v, n, d_pos,
+                                         stream);
         } else {
             s = vv_dev_memcpy_d2d((uint8_t*)cache->k_cache[layer] + off, k, n, stream);
             if (s == VV_OK)
@@ -161,7 +179,7 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
             cache->v_meta ? cache->v_meta[layer] : NULL,
             cache->k_ref ? cache->k_ref[layer] : NULL, build_ref,
             cache->n_kv_heads, cache->head_dim,
-            cache->current_len, seq_len, cache->format, stream);
+            cache->current_len, d_pos, seq_len, cache->format, stream);
         if (s == VV_OK && build_ref) cache->ref_ready[layer] = true;
     }
     if (s != VV_OK) return s;
@@ -192,9 +210,24 @@ vv_status_t vv_kv_cache_get_meta(const vv_kv_cache_t* cache, int layer,
     return VV_OK;
 }
 
-vv_status_t vv_kv_cache_reset(vv_kv_cache_t* cache) {
+vv_status_t vv_kv_cache_publish_len(vv_kv_cache_t* cache, void* stream) {
+    if (!cache) return VV_ERR_NULL_PTR;
+    if (!cache->d_len) return VV_OK;
+    const int len = cache->current_len;
+    const int next = len + 1;
+    vv_status_t s = vv_dev_memcpy_h2d(cache->d_len, &len, sizeof(int), stream);
+    if (s == VV_OK)
+        s = vv_dev_memcpy_h2d(cache->d_len_next, &next, sizeof(int), stream);
+    return s;
+}
+
+vv_status_t vv_kv_cache_reset(vv_kv_cache_t* cache, void* stream) {
     if (!cache) return VV_ERR_NULL_PTR;
     cache->current_len = 0;
+    if (cache->d_len) {
+        vv_dev_memset_async(cache->d_len, 0, sizeof(int), stream);
+        vv_dev_memset_async(cache->d_len_next, 0, sizeof(int), stream);
+    }
     /* The reference key is tied to the keys currently stored; a new session
      * must derive a fresh one from its own first chunk. */
     if (cache->ref_ready)
@@ -223,6 +256,8 @@ vv_status_t vv_kv_cache_free(vv_kv_cache_t* cache) {
     FREE_ARRAY(cache->k_ref);
     #undef FREE_ARRAY
     if (cache->ref_ready) vv_free(cache->ref_ready);
+    if (cache->d_len) vv_dev_free(cache->d_len);
+    if (cache->d_len_next) vv_dev_free(cache->d_len_next);
 
     vv_free(cache);
     return VV_OK;

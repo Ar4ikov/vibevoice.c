@@ -215,13 +215,19 @@ __global__ void flash_decode_split_kernel(
     float* __restrict__ part_m,         /* [n_q_heads, n_parts]              */
     float* __restrict__ part_l,
     int n_q_heads, int n_kv_heads, int head_dim,
-    int cache_len, int n_parts, float scale)
+    int cache_len, const int* __restrict__ d_cache_len,
+    int n_parts, float scale)
 {
     const int q_head  = blockIdx.x;
     const int warp_id = threadIdx.y;
     const int lane    = threadIdx.x;
     const int part    = blockIdx.y * DECODE_WARPS + warp_id;
     if (part >= n_parts) return;
+
+    /* A replayed graph reuses the arguments it recorded, so the exact length
+     * comes from device memory; `n_parts` only sizes the launch and holds
+     * still across the replays a capture is valid for. */
+    if (d_cache_len) cache_len = *d_cache_len;
 
     const int kv_head   = q_head / (n_q_heads / n_kv_heads);
     const int kv_stride = n_kv_heads * head_dim;
@@ -324,11 +330,15 @@ size_t vv_gqa_decode_scratch_bytes(int n_q_heads, int head_dim) {
     return vv_decode_parts_bytes(n_q_heads, head_dim);
 }
 
+int vv_gqa_decode_shape(int cache_len) {
+    return vv_decode_n_parts(cache_len);
+}
+
 vv_status_t vv_gqa_attention_decode_dev(
     const void* q, const void* k_cache, const void* v_cache,
     void* output,
     int n_q_heads, int n_kv_heads, int head_dim,
-    int cache_len, void* scratch, void* stream)
+    int cache_len, const int* d_cache_len, void* scratch, void* stream)
 {
     if (!q || !k_cache || !v_cache || !output || !scratch)
         return VV_ERR_NULL_PTR;
@@ -345,7 +355,8 @@ vv_status_t vv_gqa_attention_decode_dev(
     flash_decode_split_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const half*)q, (const half*)k_cache, (const half*)v_cache,
         part.o, part.m, part.l,
-        n_q_heads, n_kv_heads, head_dim, cache_len, n_parts, scale);
+        n_q_heads, n_kv_heads, head_dim, cache_len, d_cache_len,
+        n_parts, scale);
 
     size_t shbytes = (size_t)n_parts * 2 * sizeof(float);
     int cthreads = head_dim > n_parts ? head_dim : n_parts;

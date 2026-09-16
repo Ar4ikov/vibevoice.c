@@ -36,6 +36,16 @@ typedef struct vv_kv_cache {
     int      bytes_per_vec;   /**< Store bytes for one head's vector         */
     bool     on_cpu;          /**< true = CPU RAM, false = GPU VRAM */
     size_t   bytes_total;     /**< Store + metadata, all layers              */
+    /*
+     * `current_len` again, on the device, plus that value + 1. A decode step
+     * is issued once and replayed for every token, so the kernels that move
+     * with the position -- RoPE, the cache write, how far attention walks --
+     * read it from here rather than from a kernel argument the replay would
+     * reuse. `d_len_next` is what attention covers: the cache as it will be
+     * once this token's K and V are in it.
+     */
+    void*    d_len;           /**< device int, GPU caches only               */
+    void*    d_len_next;      /**< device int = *d_len + 1                   */
 } vv_kv_cache_t;
 
 /**
@@ -54,10 +64,24 @@ size_t vv_kv_cache_bytes(int num_layers, int n_kv_heads, int head_dim,
 
 /**
  * @brief Append new K, V to cache at current position.
+ *
+ * With `use_device_pos` the write lands at the position held in `d_len`
+ * instead of the host's `current_len`, which is what lets a decode step be
+ * captured once and replayed. Only valid for a single position on a GPU
+ * cache; prefill passes false.
  */
 vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
                                 const void* k, const void* v,
-                                int seq_len, void* stream);
+                                int seq_len, bool use_device_pos,
+                                void* stream);
+
+/**
+ * @brief Publish the host's `current_len` to the device copy.
+ *
+ * Prefill advances the length on the host; decode reads it on the device.
+ * This is the handover, called once before the decode loop.
+ */
+vv_status_t vv_kv_cache_publish_len(vv_kv_cache_t* cache, void* stream);
 
 /**
  * @brief Get K, V pointers for a layer (for attention).
@@ -70,9 +94,9 @@ vv_status_t vv_kv_cache_get_meta(const vv_kv_cache_t* cache, int layer,
                                  const void** k_meta, const void** v_meta);
 
 /**
- * @brief Reset cache (for new inference).
+ * @brief Reset cache (for new inference), ordered on `stream`.
  */
-vv_status_t vv_kv_cache_reset(vv_kv_cache_t* cache);
+vv_status_t vv_kv_cache_reset(vv_kv_cache_t* cache, void* stream);
 
 /**
  * @brief Free KV-cache.

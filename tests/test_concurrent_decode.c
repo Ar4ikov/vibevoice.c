@@ -65,7 +65,7 @@ static size_t q_elems(void) { return (size_t)N_Q_HEADS * HEAD_DIM; }
 static vv_status_t decode_once(worker_t* w, uint16_t* dst) {
     vv_status_t s = vv_gqa_attention_decode_dev(
         w->q, w->k, w->v, w->out, N_Q_HEADS, N_KV_HEADS, HEAD_DIM, N_POS,
-        w->scratch, w->stream);
+        NULL, w->scratch, w->stream);
     if (s != VV_OK) return s;
     vv_dev_stream_sync(w->stream);
     vv_dev_memcpy_d2h(dst, w->out, q_elems() * 2, w->stream);
@@ -73,7 +73,7 @@ static vv_status_t decode_once(worker_t* w, uint16_t* dst) {
 
     s = vv_gqa_attention_decode_q_dev(
         w->q, w->ks, w->vs, w->km, w->vm, w->out,
-        N_Q_HEADS, N_KV_HEADS, HEAD_DIM, N_POS, (int)VV_KV_TQ4,
+        N_Q_HEADS, N_KV_HEADS, HEAD_DIM, N_POS, NULL, (int)VV_KV_TQ4,
         w->scratch, w->stream);
     if (s != VV_OK) return s;
     vv_dev_stream_sync(w->stream);
@@ -132,7 +132,7 @@ int main(void) {
     for (size_t i = 0; i < kv_elems; i++) h_kv[i] = vv_float_to_half(frand() * 1.5f);
     vv_dev_memcpy_h2d(d_v, h_kv, kv_elems * 2, NULL);
     if (vv_kv_quant_store_dev(d_k, d_v, d_ks, d_vs, d_km, d_vm, d_kr, true,
-                              N_KV_HEADS, HEAD_DIM, 0, N_POS,
+                              N_KV_HEADS, HEAD_DIM, 0, NULL, N_POS,
                               (int)VV_KV_TQ4, NULL) != VV_OK) {
         printf("FAIL: quantized store failed\n");
         return 1;

@@ -490,6 +490,15 @@ static vv_status_t decoder_layer_impl(
     vv_status_t s;
 
     /*
+     * A decode step is captured once and replayed for every token, so nothing
+     * in it may carry the position as a kernel argument. One row means decode;
+     * prefill keeps the host-side scalars, which is what its chunking needs.
+     */
+    const bool dev_pos = (seq_len == 1) && !kv_cache->on_cpu && kv_cache->d_len;
+    const int* d_pos  = dev_pos ? (const int*)kv_cache->d_len : NULL;
+    const int* d_next = dev_pos ? (const int*)kv_cache->d_len_next : NULL;
+
+    /*
      * Workspace layout:
      * [0]: norm_out    [seq_len * hs] FP16
      * [1]: q           [seq_len * n_heads * head_dim] FP16
@@ -565,10 +574,10 @@ static vv_status_t decoder_layer_impl(
 
     /* 3. RoPE */
     s = vv_rope_dev(q_buf, seq_len, n_heads, head_dim,
-                      position_offset, config->rope_theta, stream);
+                      position_offset, d_pos, config->rope_theta, stream);
     if (s != VV_OK) return s;
     s = vv_rope_dev(k_buf, seq_len, n_kv_heads, head_dim,
-                      position_offset, config->rope_theta, stream);
+                      position_offset, d_pos, config->rope_theta, stream);
     if (s != VV_OK) return s;
 
     if (layer_idx == 0 && seq_len > 1) {
@@ -580,7 +589,7 @@ static vv_status_t decoder_layer_impl(
 
     /* 4. KV-cache append */
     s = vv_kv_cache_append(kv_cache, layer_idx, k_buf, v_buf,
-                            seq_len, stream);
+                            seq_len, dev_pos, stream);
     if (s != VV_OK) return s;
 
     /* 5. GQA attention over the cache (queries of this chunk see all of it) */
@@ -606,7 +615,7 @@ static vv_status_t decoder_layer_impl(
                 s = vv_gqa_attention_decode_dev(
                     q_buf, k_cached, v_cached, attn_out,
                     n_heads, n_kv_heads, head_dim, actual_cache_len,
-                    decode_scratch, stream);
+                    d_next, decode_scratch, stream);
             }
         } else {
             const void *k_meta, *v_meta;
@@ -631,7 +640,7 @@ static vv_status_t decoder_layer_impl(
                 s = vv_gqa_attention_decode_q_dev(
                     q_buf, k_cached, v_cached, k_meta, v_meta, attn_out,
                     n_heads, n_kv_heads, head_dim, actual_cache_len,
-                    (int)fmt, decode_scratch, stream);
+                    d_next, (int)fmt, decode_scratch, stream);
             }
             if (s == VV_OK && vv_kv_rotates(fmt))
                 s = vv_kv_unrotate_dev(attn_out, n_heads, head_dim,
@@ -687,6 +696,13 @@ static vv_status_t decoder_layer_impl(
  * GPU decoder — public API (with layer pool support)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/**
+ * @brief One layer, for inspection. Not the decode entry point.
+ *
+ * vv_decoder_step is: it advances the device-side position the decode kernels
+ * read, and a single layer called on its own would rotate and attend at
+ * whatever position happens to be there.
+ */
 vv_status_t vv_decoder_layer_forward(
     const vv_layer_weights_t* layer,
     const vv_llm_config_t* config,
@@ -718,6 +734,20 @@ vv_status_t vv_decoder_step(
     int position = kv_cache->current_len;
     bool streaming = pool && !pool->all_resident;
 
+    /*
+     * The layers read `d_len` (the position) and `d_len_next` (what attention
+     * covers once this token's K and V are written). Both are advanced here,
+     * on the stream, so the whole step is a function of device state and can be
+     * replayed: `d_len_next` before the layers use it, `d_len` after they do.
+     */
+    const bool dev_pos = !kv_cache->on_cpu && kv_cache->d_len;
+    if (dev_pos) {
+        vv_status_t ps = vv_pos_add_dev((int*)kv_cache->d_len_next,
+                                        (const int*)kv_cache->d_len, 1,
+                                        compute_stream);
+        if (ps != VV_OK) return ps;
+    }
+
     if (streaming) vv_layer_prefetch_begin(pool, model, 0, xfer_stream);
 
     for (int i = 0; i < model->num_layers; i++) {
@@ -738,6 +768,13 @@ vv_status_t vv_decoder_step(
             VV_LOG_E("decoder: layer %d failed: %s", i, vv_status_str(s));
             return s;
         }
+    }
+
+    if (dev_pos) {
+        vv_status_t ps = vv_pos_add_dev((int*)kv_cache->d_len,
+                                        (const int*)kv_cache->d_len, 1,
+                                        compute_stream);
+        if (ps != VV_OK) return ps;
     }
 
     return VV_OK;
@@ -904,7 +941,8 @@ static vv_status_t decoder_layer_cpu(
                     position_offset, config->rope_theta);
     if (s != VV_OK) return s;
 
-    s = vv_kv_cache_append(kv_cache, layer_idx, k_buf, v_buf, seq_len, NULL);
+    s = vv_kv_cache_append(kv_cache, layer_idx, k_buf, v_buf, seq_len,
+                           false, NULL);
     if (s != VV_OK) return s;
 
     {

@@ -46,6 +46,25 @@ vv_status_t vv_dev_memcpy_d2h(void* dst, const void* src, size_t size, void* s) 
 vv_status_t vv_dev_memcpy_d2d(void* dst, const void* src, size_t size, void* s) {
     return vv_dev_memcpy_h2d(dst, src, size, s);
 }
+vv_status_t vv_dev_memset_async(void* p, int v, size_t n, void* s) {
+    (void)s;
+    if (!p) return VV_ERR_NULL_PTR;
+    memset(p, v, n);
+    return VV_OK;
+}
+vv_status_t vv_dev_memcpy_d2d_at(void* dst_base, const void* src, size_t size,
+                                 const int* d_index, void* s) {
+    (void)s;
+    if (!dst_base || !src || !d_index) return VV_ERR_NULL_PTR;
+    memcpy((unsigned char*)dst_base + (size_t)(*d_index) * size, src, size);
+    return VV_OK;
+}
+vv_status_t vv_pos_add_dev(int* dst, const int* src, int delta, void* s) {
+    (void)s;
+    if (!dst || !src) return VV_ERR_NULL_PTR;
+    *dst = *src + delta;
+    return VV_OK;
+}
 vv_status_t vv_dev_memset(void* ptr, int value, size_t size) {
     if (!ptr) return VV_ERR_NULL_PTR;
     memset(ptr, value, size);
@@ -131,8 +150,9 @@ vv_status_t vv_rmsnorm_dev(const void* i, const void* w, void* o,
                            int n, int h, float e, void* s) {
     U(i) U(w) U(o) U(n) U(h) U(e) U(s) return VV_ERR_UNSUPPORTED;
 }
-vv_status_t vv_rope_dev(void* x, int n, int h, int d, int p, float t, void* s) {
-    U(x) U(n) U(h) U(d) U(p) U(t) U(s) return VV_ERR_UNSUPPORTED;
+vv_status_t vv_rope_dev(void* x, int n, int h, int d, int p,
+                        const int* dp, float t, void* s) {
+    U(x) U(n) U(h) U(d) U(p) U(dp) U(t) U(s) return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_swiglu_dev(const void* g, const void* u, void* o, int n, void* s) {
     U(g) U(u) U(o) U(n) U(s) return VV_ERR_UNSUPPORTED;
@@ -147,13 +167,23 @@ vv_status_t vv_bias_add_dev(void* o, const void* b, int M, int N, void* s) {
     U(o) U(b) U(M) U(N) U(s) return VV_ERR_UNSUPPORTED;
 }
 size_t vv_gqa_decode_scratch_bytes(int nq, int d) { U(nq) U(d) return 0; }
+vv_status_t vv_dev_graph_begin(void* s) { U(s) return VV_ERR_UNSUPPORTED; }
+vv_status_t vv_dev_graph_end(void* s, void** g) {
+    U(s) U(g) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_dev_graph_launch(void* g, void* s) {
+    U(g) U(s) return VV_ERR_UNSUPPORTED;
+}
+void vv_dev_graph_destroy(void* g) { U(g) }
+
 vv_status_t vv_gqa_attention_decode_dev(const void* q, const void* k,
                                         const void* v, void* o,
                                         int nq, int nkv, int d, int c,
-                                        void* w, void* s) {
-    U(q) U(k) U(v) U(o) U(nq) U(nkv) U(d) U(c) U(w) U(s)
+                                        const int* dc, void* w, void* s) {
+    U(q) U(k) U(v) U(o) U(nq) U(nkv) U(d) U(c) U(dc) U(w) U(s)
     return VV_ERR_UNSUPPORTED;
 }
+int vv_gqa_decode_shape(int c) { U(c) return 0; }
 vv_status_t vv_gqa_attention_prefill_cached_dev(
     const void* q, const void* k, const void* v, void* o,
     int nq, int nkv, int d, int ql, int qo, int kl, bool c, void* s) {
@@ -169,10 +199,10 @@ vv_status_t vv_gqa_attention_prefill_dev(const void* q, const void* k,
 }
 vv_status_t vv_gqa_attention_decode_q_dev(
     const void* q, const void* ks, const void* vs, const void* km,
-    const void* vm, void* o, int nq, int nkv, int d, int c, int f,
-    void* w, void* s) {
-    U(q) U(ks) U(vs) U(km) U(vm) U(o) U(nq) U(nkv) U(d) U(c) U(f) U(w) U(s)
-    return VV_ERR_UNSUPPORTED;
+    const void* vm, void* o, int nq, int nkv, int d, int c,
+    const int* dc, int f, void* w, void* s) {
+    U(q) U(ks) U(vs) U(km) U(vm) U(o) U(nq) U(nkv) U(d) U(c) U(dc) U(f)
+    U(w) U(s) return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_gqa_attention_prefill_q_dev(
     const void* q, const void* ks, const void* vs, const void* km,
@@ -183,9 +213,10 @@ vv_status_t vv_gqa_attention_prefill_q_dev(
 }
 vv_status_t vv_kv_quant_store_dev(const void* k, const void* v, void* ks,
                                   void* vs, void* km, void* vm, void* kr,
-                                  bool br, int nkv, int d, int p, int n,
-                                  int f, void* s) {
-    U(k) U(v) U(ks) U(vs) U(km) U(vm) U(kr) U(br) U(nkv) U(d) U(p) U(n) U(f) U(s)
+                                  bool br, int nkv, int d, int p,
+                                  const int* dp, int n, int f, void* s) {
+    U(k) U(v) U(ks) U(vs) U(km) U(vm) U(kr) U(br) U(nkv) U(d) U(p) U(dp)
+    U(n) U(f) U(s)
     return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_kv_dequant_dev(const void* st, const void* m, const void* r,

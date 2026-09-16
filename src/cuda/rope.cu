@@ -33,6 +33,7 @@ __global__ void rope_kernel(
     half* __restrict__ x,
     int seq_len, int n_heads, int head_dim,
     int position_offset,
+    const int* __restrict__ d_position,
     float theta)
 {
     int seq_idx = blockIdx.x;
@@ -43,7 +44,9 @@ __global__ void rope_kernel(
     if (d >= half_dim) return;
     if (seq_idx >= seq_len) return;
 
-    int pos = seq_idx + position_offset;
+    /* A captured graph replays the arguments it recorded, so decode reads the
+     * position from device memory; prefill passes it as a scalar. */
+    int pos = seq_idx + (d_position ? *d_position : position_offset);
 
     /* Compute rotation angle — Qwen2 convention:
      * freq = theta^(-2d / head_dim)  = 1 / theta^(2d / head_dim)
@@ -78,13 +81,14 @@ extern "C" {
  * @param seq_len        Sequence length
  * @param n_heads        Number of heads
  * @param head_dim       Dimension per head (128 for Qwen2)
- * @param position_offset Starting position (for KV-cache decode)
+ * @param position_offset Starting position, used when `d_position` is NULL
+ * @param d_position     Device int holding the starting position, or NULL
  * @param theta          RoPE base frequency (1e6 for Qwen2)
  * @param stream         CUDA stream
  */
 vv_status_t vv_rope_dev(
     void* x, int seq_len, int n_heads, int head_dim,
-    int position_offset, float theta, void* stream)
+    int position_offset, const int* d_position, float theta, void* stream)
 {
     if (!x) return VV_ERR_NULL_PTR;
 
@@ -93,7 +97,7 @@ vv_status_t vv_rope_dev(
 
     rope_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (half*)x, seq_len, n_heads, head_dim,
-        position_offset, theta);
+        position_offset, d_position, theta);
 
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA_LAUNCH;

@@ -291,11 +291,15 @@ __global__ void kv_store_kernel(
     uint8_t* __restrict__ store,       /* [max_pos, n_kv_heads, BPV] */
     half* __restrict__ meta,           /* [max_pos, n_kv_heads] or NULL */
     const half* __restrict__ ref,      /* [n_kv_heads, 128] or NULL  */
-    int n_kv_heads, int head_dim, int pos0, int n_pos, int bpv)
+    int n_kv_heads, int head_dim, int pos0,
+    const int* __restrict__ d_pos0, int n_pos, int bpv)
 {
     const int warp_global = blockIdx.x * (blockDim.y) + threadIdx.y;
     const int total = n_pos * n_kv_heads;
     if (warp_global >= total) return;
+
+    /* Device-side when a graph recorded this launch; see rope_kernel. */
+    if (d_pos0) pos0 = *d_pos0;
 
     const int p    = warp_global / n_kv_heads;
     const int h    = warp_global % n_kv_heads;
@@ -444,13 +448,16 @@ __global__ void q_decode_split_kernel(
     float* __restrict__ part_o, float* __restrict__ part_m,
     float* __restrict__ part_l,
     int n_q_heads, int n_kv_heads, int head_dim,
-    int cache_len, int n_parts, int bpv, float scale)
+    int cache_len, const int* __restrict__ d_cache_len,
+    int n_parts, int bpv, float scale)
 {
     const int q_head  = blockIdx.x;
     const int warp_id = threadIdx.y;
     const int lane    = threadIdx.x;
     const int part    = blockIdx.y * QD_WARPS + warp_id;
     if (part >= n_parts) return;
+
+    if (d_cache_len) cache_len = *d_cache_len;
 
     const int kv_head = q_head / (n_q_heads / n_kv_heads);
     const int d0 = lane * 4;
@@ -737,7 +744,7 @@ vv_status_t vv_kv_quant_store_dev(
     const void* k_fp16, const void* v_fp16,
     void* k_store, void* v_store, void* k_meta, void* v_meta,
     void* k_ref, bool build_ref,
-    int n_kv_heads, int head_dim, int pos,
+    int n_kv_heads, int head_dim, int pos, const int* d_pos,
     int n_positions, int kv_format, void* stream)
 {
     if (!k_fp16 || !v_fp16 || !k_store || !v_store) return VV_ERR_NULL_PTR;
@@ -761,10 +768,11 @@ vv_status_t vv_kv_quant_store_dev(
 #define STORE_CALL(F)                                                        \
     kv_store_kernel<F><<<blocks, block, sh, st>>>(                           \
         (const half*)k_fp16, (uint8_t*)k_store, (half*)k_meta,               \
-        (const half*)k_ref, n_kv_heads, head_dim, pos, n_positions, bpv);    \
+        (const half*)k_ref, n_kv_heads, head_dim, pos, d_pos,               \
+        n_positions, bpv);                                                  \
     kv_store_kernel<F><<<blocks, block, sh, st>>>(                           \
         (const half*)v_fp16, (uint8_t*)v_store, (half*)v_meta,               \
-        NULL, n_kv_heads, head_dim, pos, n_positions, bpv);
+        NULL, n_kv_heads, head_dim, pos, d_pos, n_positions, bpv);
 
     DISPATCH_Q(kv_format, STORE_CALL)
 #undef STORE_CALL
@@ -796,7 +804,7 @@ vv_status_t vv_gqa_attention_decode_q_dev(
     const void* q, const void* k_store, const void* v_store,
     const void* k_meta, const void* v_meta, void* output,
     int n_q_heads, int n_kv_heads, int head_dim, int cache_len,
-    int kv_format, void* scratch, void* stream)
+    const int* d_cache_len, int kv_format, void* scratch, void* stream)
 {
     if (!q || !k_store || !v_store || !output || !scratch)
         return VV_ERR_NULL_PTR;
@@ -818,7 +826,8 @@ vv_status_t vv_gqa_attention_decode_q_dev(
         (const half*)q, (const uint8_t*)k_store, (const uint8_t*)v_store,    \
         (const half*)k_meta, (const half*)v_meta,                            \
         part.o, part.m, part.l,                                              \
-        n_q_heads, n_kv_heads, head_dim, cache_len, n_parts, bpv, scale);
+        n_q_heads, n_kv_heads, head_dim, cache_len, d_cache_len,             \
+        n_parts, bpv, scale);
 
     DISPATCH_Q(kv_format, DEC_CALL)
 #undef DEC_CALL

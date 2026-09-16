@@ -28,6 +28,8 @@
 #include "vibevoice/kv_quant.h"
 #include "vibevoice/cpu_kernels.h"
 
+#include "vv_thread.h"
+
 /* Forward declarations — CUDA helpers */
 
 
@@ -745,11 +747,33 @@ fail:
 
 #define VV_ARGMAX_PARTIALS 256
 
+static const char* s_dump_dir = NULL;
+static vv_once_t s_dump_once = VV_ONCE_INIT;
+static void dump_dir_probe(void) { s_dump_dir = getenv("VV_DUMP_DIR"); }
+
 static const char* dump_dir(void) {
-    static const char* d = NULL;
-    static bool probed = false;
-    if (!probed) { d = getenv("VV_DUMP_DIR"); probed = true; }
-    return (d && d[0]) ? d : NULL;
+    vv_once(&s_dump_once, dump_dir_probe);
+    return (s_dump_dir && s_dump_dir[0]) ? s_dump_dir : NULL;
+}
+
+/**
+ * @brief Whether to time the decode phases separately.
+ *
+ * Splitting a token into embed / 28 layers / LM head means draining the stream
+ * between them, which is two extra pipeline stalls per token and costs real
+ * throughput. That is a price worth paying while deciding what to optimise and
+ * not otherwise, so the split is opt-in and the default reports the total.
+ */
+static bool s_profile_decode = false;
+static vv_once_t s_profile_once = VV_ONCE_INIT;
+static void profile_decode_probe(void) {
+    const char* e = getenv("VV_PROFILE_DECODE");
+    s_profile_decode = e && e[0] && e[0] != '0';
+}
+
+static bool profile_decode(void) {
+    vv_once(&s_profile_once, profile_decode_probe);
+    return s_profile_decode;
 }
 
 static void dump_raw(const char* name, const void* data, size_t bytes) {
@@ -950,6 +974,87 @@ static void build_context_info(const vv_inference_params_t* params,
     }
 }
 
+/**
+ * @brief Whether to replay decode steps from a captured graph.
+ *
+ * On by default; VV_CUDA_GRAPH=0 launches every kernel instead, which is how
+ * the two are compared.
+ */
+static bool s_graph_on = true;
+static vv_once_t s_graph_once = VV_ONCE_INIT;
+static void graph_probe(void) {
+    const char* e = getenv("VV_CUDA_GRAPH");
+    s_graph_on = !(e && e[0] == '0');
+}
+
+static bool decode_graph_enabled(void) {
+    vv_once(&s_graph_once, graph_probe);
+    return s_graph_on;
+}
+
+/**
+ * @brief One decode step, replayed from a capture when that is possible.
+ *
+ * The 28 layers are about 450 kernel launches and consecutive kernels on a
+ * stream cannot overlap, so each pays a dispatch gap; submitting the lot as
+ * one graph takes roughly 300 us off an 8 ms token here. That only works
+ * because nothing in the step carries the position as a kernel argument any
+ * more — see the device-side length on vv_kv_cache_t.
+ *
+ * What does change is the decode attention's launch shape, which steps up
+ * every 1024 cached positions. `shape` tracks it and the capture is redone
+ * when it moves: two dozen times over a 24K decode, against thousands of
+ * replays.
+ *
+ * Capture issues no work, so the host-side length the step advances has to be
+ * put back afterwards; every token, captured or not, advances it exactly once.
+ *
+ * @param shape  The launch shape the current capture was made for, or
+ *               VV_GRAPH_GAVE_UP once a capture has failed and this request
+ *               has stopped trying. Start it at -1.
+ */
+#define VV_GRAPH_GAVE_UP (-2)
+
+static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
+                                        bool graph_ok, void** exec, int* shape)
+{
+    #define VV_STEP_DIRECT()                                                 \
+        vv_decoder_step(ctx->model, hidden, ctx->kv_cache, ctx->layer_pool,  \
+                        ctx->workspace, ctx->workspace_size,                 \
+                        ctx->compute_stream, ctx->transfer_stream)
+
+    if (!graph_ok || *shape == VV_GRAPH_GAVE_UP) return VV_STEP_DIRECT();
+
+    const int want = vv_gqa_decode_shape(ctx->kv_cache->current_len + 1);
+    if (want != *shape) {
+        if (*exec) { vv_dev_graph_destroy(*exec); *exec = NULL; }
+
+        const int len = ctx->kv_cache->current_len;
+        vv_status_t cs = vv_dev_graph_begin(ctx->compute_stream);
+        if (cs == VV_OK) {
+            void* got = NULL;
+            cs = VV_STEP_DIRECT();
+            const vv_status_t es = vv_dev_graph_end(ctx->compute_stream, &got);
+            if (cs == VV_OK && es == VV_OK && got) *exec = got;
+            else if (got)                          vv_dev_graph_destroy(got);
+        }
+        ctx->kv_cache->current_len = len;
+
+        if (!*exec) {
+            VV_LOG_W("decode: cannot capture the step, launching each kernel");
+            *shape = VV_GRAPH_GAVE_UP;
+            return VV_STEP_DIRECT();
+        }
+        VV_LOG_D("decode: captured the step at %d cached positions", len);
+        *shape = want;
+    }
+
+    const vv_status_t s = vv_dev_graph_launch(*exec, ctx->compute_stream);
+    if (s == VV_OK) ctx->kv_cache->current_len++;
+    return s;
+    #undef VV_STEP_DIRECT
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Transcribe — GPU path
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -987,7 +1092,7 @@ static vv_status_t transcribe_gpu(
     bool embed_on_cpu = (ctx->embed_table_gpu == NULL);
     bool lm_head_on_cpu = (ctx->lm_head_gpu == NULL);
 
-    vv_kv_cache_reset(ctx->kv_cache);
+    vv_kv_cache_reset(ctx->kv_cache, ctx->compute_stream);
 
     /* ═══ STEP 1: Audio encoding ═══ */
     double t_step = vv_time_ms();
@@ -1171,7 +1276,7 @@ static vv_status_t transcribe_gpu(
 
         /* Text embedding: read token at position 0 (im_start) */
         vv_dev_memcpy_d2h(diag_buf, hidden_states_gpu,
-                            (size_t)sample_dim * 2, NULL);
+                            (size_t)sample_dim * 2, ctx->compute_stream);
         sum_sq = 0.0f;
         for (int d = 0; d < sample_dim; d++) {
             float v = half_to_float_single(diag_buf[d]);
@@ -1184,7 +1289,7 @@ static vv_status_t transcribe_gpu(
             void* audio_pos = (uint8_t*)hidden_states_gpu
                             + (size_t)audio_offset * (size_t)hs * 2;
             vv_dev_memcpy_d2h(diag_buf, audio_pos,
-                                (size_t)sample_dim * 2, NULL);
+                                (size_t)sample_dim * 2, ctx->compute_stream);
             sum_sq = 0.0f;
             for (int d = 0; d < sample_dim; d++) {
                 float v = half_to_float_single(diag_buf[d]);
@@ -1201,7 +1306,8 @@ static vv_status_t transcribe_gpu(
         uint16_t* h = (uint16_t*)vv_alloc(n * 2);
         if (h) {
             vv_dev_stream_sync(ctx->compute_stream);
-            vv_dev_memcpy_d2h(h, hidden_states_gpu, n * 2, NULL);
+            vv_dev_memcpy_d2h(h, hidden_states_gpu, n * 2,
+                              ctx->compute_stream);
             dump_f16_as_f32("c_embeds", h, n);
             vv_free(h);
         }
@@ -1226,7 +1332,8 @@ static vv_status_t transcribe_gpu(
         uint16_t* h = (uint16_t*)vv_alloc(n * 2);
         if (h) {
             vv_dev_stream_sync(ctx->compute_stream);
-            vv_dev_memcpy_d2h(h, hidden_states_gpu, n * 2, NULL);
+            vv_dev_memcpy_d2h(h, hidden_states_gpu, n * 2,
+                              ctx->compute_stream);
             dump_f16_as_f32("c_prefill_hidden", h, n);
             vv_free(h);
         }
@@ -1248,17 +1355,19 @@ static vv_status_t transcribe_gpu(
     void* argmax_v_gpu   = NULL;
     void* argmax_i_gpu   = NULL;
     void* token_out_gpu  = NULL;
-    int32_t* tok_id_gpu  = NULL;
     s = vv_dev_alloc(&normed_gpu, one_hidden);
     if (s != VV_OK) { vv_dev_free(hidden_states_gpu); return s; }
     s = vv_dev_alloc(&hidden_one_gpu, one_hidden);
     if (s != VV_OK) { vv_dev_free(normed_gpu); vv_dev_free(hidden_states_gpu); return s; }
+    /* Holds the current token: the argmax writes it, the embedding reads it. */
+    if (vv_dev_alloc(&token_out_gpu, sizeof(int32_t)) != VV_OK) {
+        s = VV_ERR_CUDA_OOM;
+        goto cleanup_decode;
+    }
     if (!lm_head_on_cpu) {
         if (vv_dev_alloc(&logits_f32_gpu, (size_t)vocab_size * sizeof(float)) != VV_OK ||
             vv_dev_alloc(&argmax_v_gpu, VV_ARGMAX_PARTIALS * sizeof(float)) != VV_OK ||
-            vv_dev_alloc(&argmax_i_gpu, VV_ARGMAX_PARTIALS * sizeof(int32_t)) != VV_OK ||
-            vv_dev_alloc(&token_out_gpu, sizeof(int32_t)) != VV_OK ||
-            vv_dev_alloc((void**)&tok_id_gpu, sizeof(int32_t)) != VV_OK) {
+            vv_dev_alloc(&argmax_i_gpu, VV_ARGMAX_PARTIALS * sizeof(int32_t)) != VV_OK) {
             s = VV_ERR_CUDA_OOM;
             goto cleanup_decode;
         }
@@ -1276,7 +1385,8 @@ static vv_status_t transcribe_gpu(
         uint16_t* normed_cpu = (uint16_t*)vv_alloc(one_hidden);
         if (!normed_cpu) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_decode; }
         vv_dev_stream_sync(ctx->compute_stream);
-        vv_dev_memcpy_d2h(normed_cpu, normed_gpu, one_hidden, NULL);
+        vv_dev_memcpy_d2h(normed_cpu, normed_gpu, one_hidden,
+                          ctx->compute_stream);
         /* FP16 → FP32 */
         float* normed_f32 = (float*)vv_alloc((size_t)hs * sizeof(float));
         float* logits_f32 = (float*)vv_alloc((size_t)vocab_size * sizeof(float));
@@ -1314,12 +1424,14 @@ static vv_status_t transcribe_gpu(
                             ctx->compute_stream);
         if (s != VV_OK) goto cleanup_decode;
         vv_dev_stream_sync(ctx->compute_stream);
-        vv_dev_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t), NULL);
+        vv_dev_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t),
+                          ctx->compute_stream);
         if (dump_dir()) {
             float* lg = (float*)vv_alloc((size_t)vocab_size * sizeof(float));
             if (lg) {
                 vv_dev_memcpy_d2h(lg, logits_f32_gpu,
-                                    (size_t)vocab_size * sizeof(float), NULL);
+                                    (size_t)vocab_size * sizeof(float),
+                                    ctx->compute_stream);
                 dump_f32("c_prefill_logits", lg, (size_t)vocab_size);
                 vv_free(lg);
             }
@@ -1346,6 +1458,26 @@ static vv_status_t transcribe_gpu(
     /* Split the decode cost so the next optimisation targets the real hot
      * spot: 28 transformer layers vs the 152k-row LM head + sampling. */
     double t_layers_ms = 0.0, t_head_ms = 0.0, t_embed_ms = 0.0;
+    const bool prof = profile_decode();
+
+    /*
+     * Prefill advanced the length on the host; from here the kernels read it
+     * on the device, so hand it over.
+     */
+    vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+
+    /*
+     * Replaying the step needs every layer resident (a streaming pool patches
+     * host pointers between layers, which no graph can record) and the
+     * device-side length that makes the step position-invariant. Per-phase
+     * timing wants a drained stream between phases, which a single submission
+     * does not give, so the two are mutually exclusive.
+     */
+    void* step_graph = NULL;
+    int   step_shape = -1;
+    const bool graph_ok = decode_graph_enabled() &&
+                          ctx->layer_pool && ctx->layer_pool->all_resident &&
+                          ctx->kv_cache && ctx->kv_cache->d_len && !prof;
 
     /*
      * Live token echo. Worth watching during a long transcription, pure
@@ -1381,27 +1513,40 @@ static vv_status_t transcribe_gpu(
             vv_dev_memcpy_h2d(hidden_one_gpu, embed_h, one_hidden,
                                 ctx->compute_stream);
         } else {
-            int32_t tok_buf[1]; tok_buf[0] = token_id;
-            vv_dev_memcpy_h2d(tok_id_gpu, tok_buf, sizeof(int32_t), ctx->compute_stream);
-            s = vv_embedding_dev(ctx->embed_table_gpu, tok_id_gpu,
+            /*
+             * The token to embed is the one the previous step's argmax left in
+             * `token_out_gpu`, so it never has to travel. Copying it up from
+             * the host was not just a transfer: a pageable H2D drains the
+             * stream first, which is a stall per token for four bytes that
+             * were already on the card.
+             */
+            if (lm_head_on_cpu) {
+                /* Sampled on the host, so this one does have to travel. */
+                vv_dev_memcpy_h2d(token_out_gpu, &token_id, sizeof(int32_t),
+                                  ctx->compute_stream);
+            }
+            s = vv_embedding_dev(ctx->embed_table_gpu,
+                                   (const int32_t*)token_out_gpu,
                                    hidden_one_gpu, 1, hs, ctx->compute_stream);
             if (s != VV_OK) break;
         }
 
-        vv_dev_stream_sync(ctx->compute_stream);
-        t_embed_ms += vv_time_ms() - t_tok;
-        t_tok = vv_time_ms();
+        if (prof) {
+            vv_dev_stream_sync(ctx->compute_stream);
+            t_embed_ms += vv_time_ms() - t_tok;
+            t_tok = vv_time_ms();
+        }
 
         /* Decoder step */
-        s = vv_decoder_step(ctx->model, hidden_one_gpu, ctx->kv_cache,
-                             ctx->layer_pool, ctx->workspace,
-                             ctx->workspace_size, ctx->compute_stream,
-                             ctx->transfer_stream);
+        s = decoder_step_graphed(ctx, hidden_one_gpu, graph_ok,
+                                 &step_graph, &step_shape);
         if (s != VV_OK) { VV_LOG_E("inference: decode step %d failed", n_generated); break; }
 
-        vv_dev_stream_sync(ctx->compute_stream);
-        t_layers_ms += vv_time_ms() - t_tok;
-        t_tok = vv_time_ms();
+        if (prof) {
+            vv_dev_stream_sync(ctx->compute_stream);
+            t_layers_ms += vv_time_ms() - t_tok;
+            t_tok = vv_time_ms();
+        }
 
         /* RMSNorm + LM head + sample */
         s = vv_rmsnorm_dev(hidden_one_gpu, ctx->final_norm_gpu,
@@ -1412,7 +1557,8 @@ static vv_status_t transcribe_gpu(
         if (lm_head_on_cpu) {
             uint16_t normed_h[4096];
             vv_dev_stream_sync(ctx->compute_stream);
-            vv_dev_memcpy_d2h(normed_h, normed_gpu, one_hidden, NULL);
+            vv_dev_memcpy_d2h(normed_h, normed_gpu, one_hidden,
+                              ctx->compute_stream);
             float normed_f[4096], logits_f[152064]; /* max vocab */
             for (int d = 0; d < hs; d++) normed_f[d] = half_to_float_single(normed_h[d]);
             /* Simplified: use model->lm_head directly (FP16 on CPU) */
@@ -1434,10 +1580,11 @@ static vv_status_t transcribe_gpu(
                                 ctx->compute_stream);
             if (s != VV_OK) break;
             vv_dev_stream_sync(ctx->compute_stream);
-            vv_dev_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t), NULL);
+            vv_dev_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t),
+                              ctx->compute_stream);
         }
 
-        t_head_ms += vv_time_ms() - t_tok;
+        if (prof) t_head_ms += vv_time_ms() - t_tok;
 
         if (vv_is_end_token(ctx->tokenizer, token_id)) break;
 
@@ -1449,12 +1596,17 @@ static vv_status_t transcribe_gpu(
         }
         output_tokens[n_generated++] = token_id;
 
-        /* Stream token text to stderr for live monitoring */
-        {
+        /*
+         * Stream the token text for live monitoring. Only when somebody is
+         * watching: detokenizing here costs an allocation and a second pass
+         * over the merges for text that post-processing decodes again anyway,
+         * and the flush is a write syscall per token.
+         */
+        if (echo_tokens) {
             char* tok_text = NULL;
             vv_tokenizer_decode(ctx->tokenizer, &token_id, 1, &tok_text);
             if (tok_text) {
-                if (echo_tokens) fprintf(stderr, "%s", tok_text);
+                fprintf(stderr, "%s", tok_text);
                 fflush(stderr);
                 vv_free(tok_text);
             }
@@ -1471,6 +1623,9 @@ static vv_status_t transcribe_gpu(
                 n_generated);
     fflush(stderr);
 
+    if (step_graph) vv_dev_graph_destroy(step_graph);
+
+    /* Zero unless VV_PROFILE_DECODE asked for the extra stalls. */
     perf->decode_layers_ms = t_layers_ms;
     perf->decode_head_ms   = t_head_ms;
     perf->decode_embed_ms  = t_embed_ms;
@@ -1524,7 +1679,6 @@ cleanup_decode:
     if (argmax_v_gpu) vv_dev_free(argmax_v_gpu);
     if (argmax_i_gpu) vv_dev_free(argmax_i_gpu);
     if (token_out_gpu) vv_dev_free(token_out_gpu);
-    if (tok_id_gpu) vv_dev_free(tok_id_gpu);
     return s;
 }
 
@@ -1557,7 +1711,7 @@ static vv_status_t transcribe_cpu(
              num_samples, perf->audio_duration_sec);
 
     if (!ctx->tokenizer) { VV_LOG_E("inference: no tokenizer"); return VV_ERR_NULL_PTR; }
-    vv_kv_cache_reset(ctx->kv_cache);
+    vv_kv_cache_reset(ctx->kv_cache, ctx->compute_stream);
 
     /* ═══ STEP 1: Audio encoding (same as GPU path) ═══ */
     double t_step = vv_time_ms();

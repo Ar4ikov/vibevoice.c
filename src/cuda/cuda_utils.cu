@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <stdio.h>
+#include <stdint.h>
 
 extern "C" {
 
@@ -94,6 +95,126 @@ vv_status_t vv_dev_memcpy_d2d(void* dst, const void* src, size_t size,
     } else {
         err = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
     }
+    return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
+}
+
+/* ─── A position that lives on the device ────────────────────────────────── */
+
+__global__ void pos_add_kernel(int* dst, const int* src, int delta) {
+    *dst = *src + delta;
+}
+
+/**
+ * @brief Copy one row into `dst_base + (*d_index) * bytes`.
+ *
+ * A cudaMemcpyAsync would do, except that its destination is computed on the
+ * host and a captured graph would replay the same address for every token.
+ */
+__global__ void copy_at_kernel(uint4* dst_base, const uint4* src,
+                               const int* d_index, int vecs) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < vecs) dst_base[(size_t)(*d_index) * vecs + i] = src[i];
+}
+
+__global__ void copy_at_tail_kernel(unsigned char* dst_base,
+                                    const unsigned char* src,
+                                    const int* d_index, int bytes) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < bytes) dst_base[(size_t)(*d_index) * bytes + i] = src[i];
+}
+
+vv_status_t vv_pos_add_dev(int* dst, const int* src, int delta, void* stream) {
+    if (!dst || !src) return VV_ERR_NULL_PTR;
+    pos_add_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(dst, src, delta);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
+vv_status_t vv_dev_memcpy_d2d_at(void* dst_base, const void* src, size_t bytes,
+                                 const int* d_index, void* stream) {
+    if (!dst_base || !src || !d_index) return VV_ERR_NULL_PTR;
+    if (bytes == 0) return VV_OK;
+    cudaStream_t st = (cudaStream_t)stream;
+
+    /* One row of a KV cache is a multiple of 16 bytes in every format. */
+    if ((bytes % sizeof(uint4)) == 0 &&
+        ((uintptr_t)dst_base % sizeof(uint4)) == 0 &&
+        ((uintptr_t)src % sizeof(uint4)) == 0) {
+        const int vecs = (int)(bytes / sizeof(uint4));
+        const int threads = 128;
+        copy_at_kernel<<<(vecs + threads - 1) / threads, threads, 0, st>>>(
+            (uint4*)dst_base, (const uint4*)src, d_index, vecs);
+    } else {
+        const int threads = 128;
+        copy_at_tail_kernel<<<((int)bytes + threads - 1) / threads, threads,
+                              0, st>>>(
+            (unsigned char*)dst_base, (const unsigned char*)src, d_index,
+            (int)bytes);
+    }
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
+/* ─── Graph capture ──────────────────────────────────────────────────────── */
+
+vv_status_t vv_dev_graph_begin(void* stream) {
+    if (!stream) return VV_ERR_INVALID_ARG;   /* the default stream cannot */
+    cudaError_t err = cudaStreamBeginCapture((cudaStream_t)stream,
+                                             cudaStreamCaptureModeThreadLocal);
+    if (err == cudaSuccess) return VV_OK;
+    cudaGetLastError();
+    return VV_ERR_CUDA;
+}
+
+vv_status_t vv_dev_graph_end(void* stream, void** graph_exec) {
+    if (!stream || !graph_exec) return VV_ERR_NULL_PTR;
+    cudaGraph_t graph = NULL;
+    cudaError_t err = cudaStreamEndCapture((cudaStream_t)stream, &graph);
+    if (err != cudaSuccess || !graph) {
+        /*
+         * A capture can be invalidated from outside: another slot's cudaFree
+         * synchronises the whole device, and a synchronised stream stops being
+         * capturable. Everything issued since begin is then discarded, which
+         * the caller handles by issuing it again for real -- but only if the
+         * error does not linger. Leaving it here made the next launch wrapper
+         * see a failure that had nothing to do with it and abandon the token.
+         */
+        cudaGetLastError();
+        if (graph) cudaGraphDestroy(graph);
+        return VV_ERR_CUDA;
+    }
+
+    cudaGraphExec_t exec = NULL;
+    err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    /* The template is not needed once instantiated. */
+    cudaGraphDestroy(graph);
+    if (err != cudaSuccess) { cudaGetLastError(); return VV_ERR_CUDA; }
+
+    *graph_exec = exec;
+    return VV_OK;
+}
+
+vv_status_t vv_dev_graph_launch(void* graph_exec, void* stream) {
+    if (!graph_exec) return VV_ERR_NULL_PTR;
+    cudaError_t err = cudaGraphLaunch((cudaGraphExec_t)graph_exec,
+                                      (cudaStream_t)stream);
+    return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
+void vv_dev_graph_destroy(void* graph_exec) {
+    if (graph_exec) cudaGraphExecDestroy((cudaGraphExec_t)graph_exec);
+}
+
+/**
+ * @brief Fill device memory, ordered on a stream.
+ *
+ * The unstreamed cudaMemset runs on the legacy default stream, which
+ * synchronises with every other blocking stream in the process. On a server
+ * that means one request resetting its cache stalls all the others and
+ * invalidates any capture in flight.
+ */
+vv_status_t vv_dev_memset_async(void* ptr, int value, size_t size,
+                                void* stream) {
+    if (!ptr) return VV_ERR_NULL_PTR;
+    cudaError_t err = cudaMemsetAsync(ptr, value, size, (cudaStream_t)stream);
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
 }
 

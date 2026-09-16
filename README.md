@@ -56,13 +56,13 @@ RTX 3090, CUDA 12.4, Ryzen 9 5900X. Defaults unless noted.
 | Model load | **9.5 s** |
 | Speech encoding | **243 ms** per 11 s of audio |
 | Prefill | **3056 tok/s** on a 14449-token prompt |
-| Decode | **123 tok/s** at 0.2K context, 100 at 1.5K, 57 at 24K |
-| RTF | **0.065** on a 120 s file, **0.081** on 32 minutes |
+| Decode | **128 tok/s** at 0.2K context, 112 at 1.5K, 76 averaged over a 14K-to-24K window |
+| RTF | **0.065** on a 120 s file, **0.079** on 32 minutes |
 | VRAM | 9.8 GB (3.2 GB weights + 1.8 GB KV at a 32K window) |
 
 `transformers` + `bitsandbytes` on the same GPU and checkpoint: 27.6 tok/s.
 
-A 32-minute recording transcribes in 155 s: 14449 prompt tokens, 9522
+A 32-minute recording transcribes in 152 s: 14449 prompt tokens, 9522
 generated, 168 segments, flat memory throughout.
 
 ### CPU only
@@ -126,9 +126,10 @@ curl http://localhost:8080/v1/audio/transcriptions \
 
 `--slots N` runs N requests concurrently against **one** copy of the weights;
 each slot costs only its own KV cache and workspace. Two 30-second files
-finish in 4.4 s together against 5.9 s back to back. Not 2×, because decode
+finish in 4.2 s together against 5.8 s back to back, returning identical
+transcripts either way. Not 2×, because decode
 is bandwidth-bound on the weights and interleaves — everything either side of
-it overlaps. With `--kv-cache tq4 --max-seq-len 8192` a slot is 116 MB.
+it overlaps. With `--kv-cache tq4 --max-seq-len 8192` a slot is 115 MB.
 
 ### Live microphone
 
@@ -317,7 +318,7 @@ the performance cores. **There is no Metal backend.** See "Not done" below.
 VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
-Eleven suites. The ones that need weights report SKIP without
+Thirteen suites. The ones that need weights report SKIP without
 `VV_TEST_MODEL`. `test_cpu_kernels` checks every CPU kernel against a scalar
 reference, which is what makes the SIMD paths verifiable per architecture —
 it passes natively on AVX2 and under `qemu-aarch64` on NEON, both to 4e-7
@@ -431,6 +432,39 @@ attention suite a second time under: both have to agree with an FP64 reference
 across fourteen shapes, on and off every tile boundary, with and without the
 chunked-prefill offset.
 
+### The decode step is one submission
+
+A token is about 450 kernels through 28 layers, and consecutive kernels on a
+stream cannot overlap, so each pays a dispatch gap whether or not the host can
+keep up — measured here at 304 µs of an 8 ms token, which is what capturing the
+step and replaying it recovers.
+
+Replaying needs the step to be a function of device state, because a replay
+reuses the kernel arguments its capture recorded. The three things that move
+with the position now read a device int instead: the RoPE angle, where the new
+K and V land, and how far attention walks. The one thing that cannot move into
+device memory is the launch grid, and the decode attention's split count steps
+up every 1024 cached positions — so the capture is redone when it does, about
+two dozen times across a 24K decode against thousands of replays.
+
+| | direct launches | replayed |
+|---|---|---|
+| 0.2K context, fp16 KV | 122.9 tok/s | **127.7** |
+| 1.5K context, fp16 KV | 107.4 tok/s | **111.6** |
+| 0.2K context, tq4 KV | 117.5 tok/s | **122.2** |
+| 1.5K context, tq4 KV | 96.7 tok/s | **100.2** |
+
+Transcripts are byte-identical either way. `VV_CUDA_GRAPH=0` turns it off,
+which is also automatic when weights are streamed (a streaming pool patches
+host pointers between layers, and no graph can record that).
+
+Getting this right needed one other thing. Anything issued to CUDA's legacy
+default stream synchronises with every blocking stream in the process, so a
+four-byte read-back in one request used to stall every other slot — and knock
+any capture in flight out of capture mode, which discarded a token's work and
+returned a transcript of one garbage token. Nothing in the pipeline touches the
+default stream any more.
+
 ---
 
 ## Not done
@@ -441,13 +475,12 @@ chunked-prefill offset.
   claim that cannot be stood behind. The seam exists:
   `include/vibevoice/device.h` declares the op set, a build links exactly one
   implementation of it, and `src/device/device_none.c` shows the shape.
-- **CUDA Graphs.** Decode issues ~500 kernel launches per token. Capturing
-  them would take a chunk out of the per-token floor.
 - **A packed CPU micro-kernel.** CPU prefill runs at ~20% of peak FMA.
   Tiling the M and K loops was tried and measured slower; beating it needs a
   proper packed micro-kernel.
 - **`src/trt/`** is stubs. The CUDA encoder does 11 s of audio in 243 ms, so
   TensorRT may never be worth it.
+
 ---
 
 ## Layout

@@ -246,7 +246,7 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
         vv_dev_stream_sync(stream);
         int diag_n = (int)out_elems < CONN_DIAG_N ? (int)out_elems : CONN_DIAG_N;
         uint16_t diag_h[CONN_DIAG_N];
-        vv_dev_memcpy_d2h(diag_h, fc1_gpu, (size_t)diag_n * 2, NULL);
+        vv_dev_memcpy_d2h(diag_h, fc1_gpu, (size_t)diag_n * 2, stream);
         float dmin = 1e30f, dmax = -1e30f, dsum = 0.0f;
         for (int i = 0; i < diag_n; i++) {
             /* inline fp16→fp32 */
@@ -275,7 +275,7 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
         vv_dev_stream_sync(stream);
         int diag_n = (int)out_elems < CONN_DIAG_N ? (int)out_elems : CONN_DIAG_N;
         uint16_t diag_h[CONN_DIAG_N];
-        vv_dev_memcpy_d2h(diag_h, norm_gpu, (size_t)diag_n * 2, NULL);
+        vv_dev_memcpy_d2h(diag_h, norm_gpu, (size_t)diag_n * 2, stream);
         float dmin = 1e30f, dmax = -1e30f, dsum = 0.0f;
         for (int i = 0; i < diag_n; i++) {
             uint16_t h = diag_h[i];
@@ -308,7 +308,7 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
         vv_dev_stream_sync(stream);
         int diag_n = (int)out_elems < CONN_DIAG_N ? (int)out_elems : CONN_DIAG_N;
         uint16_t diag_h[CONN_DIAG_N];
-        vv_dev_memcpy_d2h(diag_h, fc2_gpu, (size_t)diag_n * 2, NULL);
+        vv_dev_memcpy_d2h(diag_h, fc2_gpu, (size_t)diag_n * 2, stream);
         float dmin = 1e30f, dmax = -1e30f, dsum = 0.0f;
         for (int i = 0; i < diag_n; i++) {
             uint16_t h = diag_h[i];
@@ -339,7 +339,7 @@ static vv_status_t vv_connector_forward_gpu(const vv_connector_t* conn,
 
         float* result = (float*)vv_alloc(out_elems * 4);
         if (!result) { vv_dev_free(fp32_gpu); s = VV_ERR_OUT_OF_MEMORY; goto cleanup; }
-        vv_dev_memcpy_d2h(result, fp32_gpu, out_elems * 4, NULL);
+        vv_dev_memcpy_d2h(result, fp32_gpu, out_elems * 4, stream);
         vv_dev_free(fp32_gpu);
         *output_cpu = result;
     }
