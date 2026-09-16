@@ -32,7 +32,7 @@ outputs, as a single file you can drop on a machine and run.
 **No CUDA toolkit on the target.** The CUDA runtime is linked statically and
 cuBLAS is not used at all — both GEMM shapes are hand-written WMMA kernels,
 which measured slightly *faster* than cuBLAS here. The release binary is
-9.6 MB and links against nothing but `libc` and `libm`:
+10.7 MB and links against nothing but `libc` and `libm`:
 
 ```
 $ ldd vv_cli
@@ -420,7 +420,8 @@ self-attention with 28 heads at head_dim 128:
 | 8192 | 288.2 ms (1.7 TFLOP/s) | **8.03 ms (59.9 TFLOP/s)** |
 
 59.9 TFLOP/s is 84% of the card's 71 TFLOP/s ceiling for FP16 multiply with
-FP32 accumulate. End to end on the 32-minute file, prefill goes from 30.7 s to
+FP32 accumulate; an RTX 3070 reaches 31.8 against its own 40.7, and the same
+35x against the scalar kernel. End to end on the 32-minute file, prefill goes from 30.7 s to
 4.7 s (471 → 3056 tok/s) and the whole transcription from 182 s to 155 s.
 
 The text is identical. Four of the 336 timestamps the model emits move by
