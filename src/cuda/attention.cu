@@ -19,6 +19,8 @@
 #include <math.h>
 #include <float.h>
 
+#include "decode_split.h"
+
 /* ─── Tile sizes ─────────────────────────────────────────────────────────── */
 
 #define FA2_BR          8      /* Q rows per block (= warps per block)     */
@@ -33,15 +35,8 @@
  */
 #define FA2_KV_PAD      2
 
-#define DECODE_WARPS    8
+#define DECODE_WARPS    VV_DECODE_WARPS
 #define DECODE_DPT      4      /* head_dim / 32 — dims held per lane       */
-/*
- * Decode attention is latency bound, not bandwidth bound: each warp walks its
- * slice one position at a time and every step depends on a warp reduction, so
- * nothing hides the K/V load latency. The only lever is more warps in flight,
- * hence a short slice (128 positions) and a high cap on the split count.
- */
-#define VV_DECODE_POS_PER_WARP 128
 
 /* ─── Warp-level reduce helpers ──────────────────────────────────────────── */
 
@@ -322,71 +317,38 @@ extern "C" {
 
 #include "vibevoice/device.h"
 
-/*
- * Split-decode scratch: allocated on first use and reused for the session —
- * the decode hot path must never call cudaMalloc.
- */
-#define VV_DECODE_MAX_PARTS 256
-static float* s_part_o = NULL;
-static float* s_part_m = NULL;
-static float* s_part_l = NULL;
-static int    s_part_heads = 0;
-static int    s_part_dim   = 0;
-
-static vv_status_t ensure_decode_scratch(int n_heads, int head_dim) {
-    if (s_part_o && n_heads <= s_part_heads && head_dim <= s_part_dim)
-        return VV_OK;
-    if (s_part_o) { cudaFree(s_part_o); cudaFree(s_part_m); cudaFree(s_part_l); }
-    s_part_heads = n_heads;
-    s_part_dim   = head_dim;
-    size_t no = (size_t)n_heads * VV_DECODE_MAX_PARTS * head_dim * sizeof(float);
-    size_t nm = (size_t)n_heads * VV_DECODE_MAX_PARTS * sizeof(float);
-    if (cudaMalloc((void**)&s_part_o, no) != cudaSuccess) return VV_ERR_CUDA_OOM;
-    if (cudaMalloc((void**)&s_part_m, nm) != cudaSuccess) return VV_ERR_CUDA_OOM;
-    if (cudaMalloc((void**)&s_part_l, nm) != cudaSuccess) return VV_ERR_CUDA_OOM;
-    return VV_OK;
-}
-
-void vv_attention_cleanup(void) {
-    if (s_part_o) { cudaFree(s_part_o); s_part_o = NULL; }
-    if (s_part_m) { cudaFree(s_part_m); s_part_m = NULL; }
-    if (s_part_l) { cudaFree(s_part_l); s_part_l = NULL; }
-    s_part_heads = s_part_dim = 0;
+size_t vv_gqa_decode_scratch_bytes(int n_q_heads, int head_dim) {
+    return vv_decode_parts_bytes(n_q_heads, head_dim);
 }
 
 vv_status_t vv_gqa_attention_decode_dev(
     const void* q, const void* k_cache, const void* v_cache,
     void* output,
     int n_q_heads, int n_kv_heads, int head_dim,
-    int cache_len, void* stream)
+    int cache_len, void* scratch, void* stream)
 {
-    if (!q || !k_cache || !v_cache || !output) return VV_ERR_NULL_PTR;
+    if (!q || !k_cache || !v_cache || !output || !scratch)
+        return VV_ERR_NULL_PTR;
     if (cache_len == 0) return VV_OK;
     if (head_dim != DECODE_DPT * 32) return VV_ERR_UNSUPPORTED;
 
-    vv_status_t st = ensure_decode_scratch(n_q_heads, head_dim);
-    if (st != VV_OK) return st;
-
-    int n_parts = (cache_len + VV_DECODE_POS_PER_WARP - 1)
-                  / VV_DECODE_POS_PER_WARP;
-    if (n_parts < 1) n_parts = 1;
-    if (n_parts > VV_DECODE_MAX_PARTS) n_parts = VV_DECODE_MAX_PARTS;
-    n_parts = ((n_parts + DECODE_WARPS - 1) / DECODE_WARPS) * DECODE_WARPS;
-
+    const vv_decode_parts_t part =
+        vv_decode_parts(scratch, n_q_heads, head_dim);
+    const int n_parts = vv_decode_n_parts(cache_len);
     const float scale = 1.0f / sqrtf((float)head_dim);
 
     dim3 grid(n_q_heads, n_parts / DECODE_WARPS);
     dim3 block(32, DECODE_WARPS);
     flash_decode_split_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const half*)q, (const half*)k_cache, (const half*)v_cache,
-        s_part_o, s_part_m, s_part_l,
+        part.o, part.m, part.l,
         n_q_heads, n_kv_heads, head_dim, cache_len, n_parts, scale);
 
     size_t shbytes = (size_t)n_parts * 2 * sizeof(float);
     int cthreads = head_dim > n_parts ? head_dim : n_parts;
     flash_decode_combine_kernel<<<n_q_heads, cthreads, shbytes,
                                   (cudaStream_t)stream>>>(
-        s_part_o, s_part_m, s_part_l, (half*)output, n_parts, head_dim);
+        part.o, part.m, part.l, (half*)output, n_parts, head_dim);
 
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA_LAUNCH;

@@ -25,6 +25,8 @@
 #include "vibevoice/device.h"
 #include "vibevoice/kv_quant.h"
 
+#include "decode_split.h"
+
 /* ─── Quantizer codebooks ────────────────────────────────────────────────── */
 /*
  * Lloyd-Max levels for a unit Gaussian, computed offline (tools/lloyd_max.py).
@@ -411,9 +413,7 @@ __global__ void kv_rotate_kernel(half* __restrict__ x, int n_heads,
 
 /* ─── Flash decode over a quantized cache ────────────────────────────────── */
 
-#define QD_WARPS   8
-#define QD_POS_PER_WARP 128
-#define QD_MAX_PARTS 256
+#define QD_WARPS   VV_DECODE_WARPS
 
 /** @brief Read lane's 4 dims of one stored vector. */
 template <int FMT>
@@ -698,30 +698,6 @@ __global__ void q_prefill_kernel(
 
 extern "C" {
 
-static float* s_qpart_o = NULL;
-static float* s_qpart_m = NULL;
-static float* s_qpart_l = NULL;
-static int    s_qheads = 0, s_qdim = 0;
-
-static vv_status_t ensure_qscratch(int n_heads, int head_dim) {
-    if (s_qpart_o && n_heads <= s_qheads && head_dim <= s_qdim) return VV_OK;
-    if (s_qpart_o) { cudaFree(s_qpart_o); cudaFree(s_qpart_m); cudaFree(s_qpart_l); }
-    s_qheads = n_heads; s_qdim = head_dim;
-    const size_t no = (size_t)n_heads * QD_MAX_PARTS * head_dim * sizeof(float);
-    const size_t nm = (size_t)n_heads * QD_MAX_PARTS * sizeof(float);
-    if (cudaMalloc((void**)&s_qpart_o, no) != cudaSuccess) return VV_ERR_CUDA_OOM;
-    if (cudaMalloc((void**)&s_qpart_m, nm) != cudaSuccess) return VV_ERR_CUDA_OOM;
-    if (cudaMalloc((void**)&s_qpart_l, nm) != cudaSuccess) return VV_ERR_CUDA_OOM;
-    return VV_OK;
-}
-
-void vv_kv_quant_cleanup(void) {
-    if (s_qpart_o) { cudaFree(s_qpart_o); s_qpart_o = NULL; }
-    if (s_qpart_m) { cudaFree(s_qpart_m); s_qpart_m = NULL; }
-    if (s_qpart_l) { cudaFree(s_qpart_l); s_qpart_l = NULL; }
-    s_qheads = s_qdim = 0;
-}
-
 vv_status_t vv_kv_rotate_dev(void* x, int n_heads, int head_dim,
                              int rows, void* stream)
 {
@@ -820,19 +796,16 @@ vv_status_t vv_gqa_attention_decode_q_dev(
     const void* q, const void* k_store, const void* v_store,
     const void* k_meta, const void* v_meta, void* output,
     int n_q_heads, int n_kv_heads, int head_dim, int cache_len,
-    int kv_format, void* stream)
+    int kv_format, void* scratch, void* stream)
 {
-    if (!q || !k_store || !v_store || !output) return VV_ERR_NULL_PTR;
+    if (!q || !k_store || !v_store || !output || !scratch)
+        return VV_ERR_NULL_PTR;
     if (cache_len == 0) return VV_OK;
     if (head_dim != 128) return VV_ERR_UNSUPPORTED;
 
-    vv_status_t st = ensure_qscratch(n_q_heads, head_dim);
-    if (st != VV_OK) return st;
-
-    int n_parts = (cache_len + QD_POS_PER_WARP - 1) / QD_POS_PER_WARP;
-    if (n_parts < 1) n_parts = 1;
-    if (n_parts > QD_MAX_PARTS) n_parts = QD_MAX_PARTS;
-    n_parts = ((n_parts + QD_WARPS - 1) / QD_WARPS) * QD_WARPS;
+    const vv_decode_parts_t part =
+        vv_decode_parts(scratch, n_q_heads, head_dim);
+    const int n_parts = vv_decode_n_parts(cache_len);
 
     const int bpv = vv_kv_bytes_per_vec((vv_kv_format_t)kv_format, head_dim);
     const float scale = 1.0f / sqrtf((float)head_dim);
@@ -844,7 +817,7 @@ vv_status_t vv_gqa_attention_decode_q_dev(
     q_decode_split_kernel<F><<<grid, block, 0, s>>>(                         \
         (const half*)q, (const uint8_t*)k_store, (const uint8_t*)v_store,    \
         (const half*)k_meta, (const half*)v_meta,                            \
-        s_qpart_o, s_qpart_m, s_qpart_l,                                     \
+        part.o, part.m, part.l,                                              \
         n_q_heads, n_kv_heads, head_dim, cache_len, n_parts, bpv, scale);
 
     DISPATCH_Q(kv_format, DEC_CALL)
@@ -853,7 +826,7 @@ vv_status_t vv_gqa_attention_decode_q_dev(
     const size_t shb = (size_t)n_parts * 2 * sizeof(float);
     const int cthreads = head_dim > n_parts ? head_dim : n_parts;
     q_decode_combine_kernel<<<n_q_heads, cthreads, shb, s>>>(
-        s_qpart_o, s_qpart_m, s_qpart_l, (half*)output, n_parts, head_dim);
+        part.o, part.m, part.l, (half*)output, n_parts, head_dim);
 
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }

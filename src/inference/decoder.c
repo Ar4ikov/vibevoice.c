@@ -451,6 +451,20 @@ static void dump_gpu_fp16(const char* name, const void* gpu, size_t n,
     vv_free(h);
 }
 
+/**
+ * @brief Bytes the split-K decode attention reserves at the workspace front.
+ *
+ * Its partials have to survive between the split kernel and the combine
+ * kernel, and they belong to one context: a shared buffer let two concurrent
+ * requests read each other's slices, which showed up as words drifting in the
+ * second transcript. The workspace is per-context, so carving it from there
+ * gets the lifetime and the ownership right at once.
+ */
+static size_t decode_scratch_bytes(const vv_llm_config_t* cfg) {
+    return vv_gqa_decode_scratch_bytes(cfg->num_attention_heads,
+                                       cfg->head_dim);
+}
+
 static vv_status_t decoder_layer_impl(
     const vv_layer_weights_t* layer,
     const vv_llm_config_t* config,
@@ -486,9 +500,13 @@ static vv_status_t decoder_layer_impl(
      * [6]: up          [seq_len * inter_size] FP16
      * [7]: mlp_out     [seq_len * hs] FP16
      * [8]: temp_weight [max(N*K)] FP16 for NF4 dequant
+     * with the decode-attention scratch ahead of all of it.
      */
     uint8_t* wp = (uint8_t*)temp_workspace;
     size_t offset = 0;
+
+    void* decode_scratch = wp;
+    offset += decode_scratch_bytes(config);
 
     void* norm_out = wp + offset;
     offset += (size_t)seq_len * hs * 2;
@@ -587,7 +605,8 @@ static vv_status_t decoder_layer_impl(
             } else {
                 s = vv_gqa_attention_decode_dev(
                     q_buf, k_cached, v_cached, attn_out,
-                    n_heads, n_kv_heads, head_dim, actual_cache_len, stream);
+                    n_heads, n_kv_heads, head_dim, actual_cache_len,
+                    decode_scratch, stream);
             }
         } else {
             const void *k_meta, *v_meta;
@@ -612,7 +631,7 @@ static vv_status_t decoder_layer_impl(
                 s = vv_gqa_attention_decode_q_dev(
                     q_buf, k_cached, v_cached, k_meta, v_meta, attn_out,
                     n_heads, n_kv_heads, head_dim, actual_cache_len,
-                    (int)fmt, stream);
+                    (int)fmt, decode_scratch, stream);
             }
             if (s == VV_OK && vv_kv_rotates(fmt))
                 s = vv_kv_unrotate_dev(attn_out, n_heads, head_dim,
@@ -757,7 +776,8 @@ vv_status_t vv_decoder_prefill(
                        + cfg->num_attention_heads * cfg->head_dim
                        + 2 * cfg->num_key_value_heads * cfg->head_dim
                        + 2 * cfg->intermediate_size) * 2;
-    size_t weight_scratch = (size_t)cfg->intermediate_size * hs * 2;
+    size_t weight_scratch = (size_t)cfg->intermediate_size * hs * 2
+                          + decode_scratch_bytes(cfg);
     int chunk = seq_len;
     if (workspace_size > weight_scratch + per_token) {
         size_t budget = (workspace_size - weight_scratch) / per_token;

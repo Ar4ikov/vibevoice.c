@@ -24,16 +24,17 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "vv_thread.h"
+
 /* ─── Byte-level alphabet (GPT-2) ───────────────────────────────────────── */
 
 /** Codepoint each raw byte maps to in the byte-level alphabet. */
 static uint32_t g_byte_to_cp[256];
 /** Reverse map, only valid for codepoints produced by g_byte_to_cp. */
 static int      g_cp_to_byte[324];
-static bool     g_bytelevel_ready = false;
+static vv_once_t g_bytelevel_once = VV_ONCE_INIT;
 
-static void bytelevel_init(void) {
-    if (g_bytelevel_ready) return;
+static void bytelevel_build(void) {
     bool printable[256];
     for (int b = 0; b < 256; b++) printable[b] = false;
     for (int b = '!';  b <= '~';  b++) printable[b] = true;
@@ -52,8 +53,10 @@ static void bytelevel_init(void) {
         }
         if (g_byte_to_cp[b] < 324) g_cp_to_byte[g_byte_to_cp[b]] = b;
     }
-    g_bytelevel_ready = true;
 }
+
+/** @brief Build the byte alphabet once, however many threads ask for it. */
+static void bytelevel_init(void) { vv_once(&g_bytelevel_once, bytelevel_build); }
 
 /** @brief Append codepoint @p cp to @p out as UTF-8. Returns bytes written. */
 static int utf8_put(char* out, uint32_t cp) {

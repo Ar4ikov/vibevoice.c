@@ -68,6 +68,15 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
         e->n_slots = i + 1;
     }
 
+    /*
+     * Two slots writing their token streams to the same stderr produce
+     * unreadable interleaved text, so the echo goes quiet as soon as there is
+     * more than one. A single slot still streams, which is what makes a long
+     * transcription watchable.
+     */
+    if (e->n_slots > 1)
+        for (int i = 0; i < e->n_slots; i++) e->slots[i]->quiet = true;
+
     vv_mutex_init(&e->lock);
     vv_cond_init(&e->slot_free);
 

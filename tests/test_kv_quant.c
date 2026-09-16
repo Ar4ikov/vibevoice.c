@@ -80,11 +80,15 @@ int main(void) {
     for (size_t i = 0; i < q_elems; i++) h_q[i] = vv_float_to_half(frand());
 
     void *d_k = NULL, *d_v = NULL, *d_q = NULL, *d_qr = NULL, *d_o = NULL;
+    void* d_scratch = NULL;
     if (vv_dev_alloc(&d_k, kv_elems * 2) != VV_OK ||
         vv_dev_alloc(&d_v, kv_elems * 2) != VV_OK ||
         vv_dev_alloc(&d_q, q_elems * 2)  != VV_OK ||
         vv_dev_alloc(&d_qr, q_elems * 2) != VV_OK ||
-        vv_dev_alloc(&d_o, q_elems * 2)  != VV_OK) {
+        vv_dev_alloc(&d_o, q_elems * 2)  != VV_OK ||
+        vv_dev_alloc(&d_scratch,
+                     vv_gqa_decode_scratch_bytes(N_Q_HEADS, HEAD_DIM))
+            != VV_OK) {
         printf("SKIP: device allocation failed\n");
         return 0;
     }
@@ -93,7 +97,8 @@ int main(void) {
     vv_dev_memcpy_h2d(d_q, h_q, q_elems * 2, NULL);
 
     vv_status_t s = vv_gqa_attention_decode_dev(
-        d_q, d_k, d_v, d_o, N_Q_HEADS, N_KV_HEADS, HEAD_DIM, N_POS, NULL);
+        d_q, d_k, d_v, d_o, N_Q_HEADS, N_KV_HEADS, HEAD_DIM, N_POS,
+        d_scratch, NULL);
     if (s != VV_OK) { printf("FAIL: fp16 decode returned %d\n", s); return 1; }
     vv_dev_stream_sync(NULL);
     vv_dev_memcpy_d2h(h_ref, d_o, q_elems * 2, NULL);
@@ -165,7 +170,7 @@ int main(void) {
 
         s = vv_gqa_attention_decode_q_dev(d_qr, ks, vs, km, vm, d_o,
                                           N_Q_HEADS, N_KV_HEADS, HEAD_DIM,
-                                          N_POS, (int)fmt, NULL);
+                                          N_POS, (int)fmt, d_scratch, NULL);
         if (s != VV_OK) { printf("FAIL: decode %s -> %d\n",
                                  vv_kv_format_name(fmt), s); failures++; continue; }
         if (vv_kv_rotates(fmt))
@@ -205,7 +210,7 @@ int main(void) {
         vv_kv_rotate_dev(d_qr, N_Q_HEADS, HEAD_DIM, 1, NULL);
         vv_gqa_attention_decode_q_dev(d_qr, ks, vs, km, vm, d_o,
                                       N_Q_HEADS, N_KV_HEADS, HEAD_DIM,
-                                      N_POS, (int)fmt, NULL);
+                                      N_POS, (int)fmt, d_scratch, NULL);
         vv_kv_unrotate_dev(d_o, N_Q_HEADS, HEAD_DIM, 1, NULL);
         vv_dev_stream_sync(NULL);
         vv_dev_memcpy_d2h(h_ref, d_o, q_elems * 2, NULL);

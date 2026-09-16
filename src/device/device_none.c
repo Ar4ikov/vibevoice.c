@@ -146,10 +146,13 @@ vv_status_t vv_residual_add_dev(void* x, const void* y, int n, void* s) {
 vv_status_t vv_bias_add_dev(void* o, const void* b, int M, int N, void* s) {
     U(o) U(b) U(M) U(N) U(s) return VV_ERR_UNSUPPORTED;
 }
+size_t vv_gqa_decode_scratch_bytes(int nq, int d) { U(nq) U(d) return 0; }
 vv_status_t vv_gqa_attention_decode_dev(const void* q, const void* k,
                                         const void* v, void* o,
-                                        int nq, int nkv, int d, int c, void* s) {
-    U(q) U(k) U(v) U(o) U(nq) U(nkv) U(d) U(c) U(s) return VV_ERR_UNSUPPORTED;
+                                        int nq, int nkv, int d, int c,
+                                        void* w, void* s) {
+    U(q) U(k) U(v) U(o) U(nq) U(nkv) U(d) U(c) U(w) U(s)
+    return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_gqa_attention_prefill_cached_dev(
     const void* q, const void* k, const void* v, void* o,
@@ -166,8 +169,9 @@ vv_status_t vv_gqa_attention_prefill_dev(const void* q, const void* k,
 }
 vv_status_t vv_gqa_attention_decode_q_dev(
     const void* q, const void* ks, const void* vs, const void* km,
-    const void* vm, void* o, int nq, int nkv, int d, int c, int f, void* s) {
-    U(q) U(ks) U(vs) U(km) U(vm) U(o) U(nq) U(nkv) U(d) U(c) U(f) U(s)
+    const void* vm, void* o, int nq, int nkv, int d, int c, int f,
+    void* w, void* s) {
+    U(q) U(ks) U(vs) U(km) U(vm) U(o) U(nq) U(nkv) U(d) U(c) U(f) U(w) U(s)
     return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_gqa_attention_prefill_q_dev(

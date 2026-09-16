@@ -146,10 +146,26 @@ vv_status_t vv_residual_add_dev(void* x, const void* y, int total, void* stream)
 vv_status_t vv_bias_add_dev(void* output, const void* bias,
                             int M, int N, void* stream);
 
-/** @brief Flash decode: one query row against a KV cache of `cache_len`. */
+/**
+ * @brief Scratch bytes the split-K decode attention needs for one caller.
+ *
+ * Decode splits the cache across warps and merges their online-softmax states
+ * in a second pass, so the partial (o, m, l) triples have to live somewhere
+ * between the two kernels. That buffer belongs to the caller: several
+ * inference contexts decode concurrently on their own streams, and a shared
+ * one would have them reading each other's partials.
+ */
+size_t vv_gqa_decode_scratch_bytes(int n_q_heads, int head_dim);
+
+/**
+ * @brief Flash decode: one query row against a KV cache of `cache_len`.
+ * @param scratch  vv_gqa_decode_scratch_bytes() of device memory, owned by
+ *                 the caller and not touched by any other stream.
+ */
 vv_status_t vv_gqa_attention_decode_dev(
     const void* q, const void* k_cache, const void* v_cache, void* output,
-    int n_q_heads, int n_kv_heads, int head_dim, int cache_len, void* stream);
+    int n_q_heads, int n_kv_heads, int head_dim, int cache_len,
+    void* scratch, void* stream);
 
 /** @brief Flash prefill of `q_len` rows at `q_offset` against a KV cache. */
 vv_status_t vv_gqa_attention_prefill_cached_dev(
@@ -163,12 +179,15 @@ vv_status_t vv_gqa_attention_prefill_dev(
     int n_q_heads, int n_kv_heads, int head_dim,
     int seq_len, bool causal, void* stream);
 
-/** @brief Flash decode against a quantized KV cache (see kv_quant.h). */
+/**
+ * @brief Flash decode against a quantized KV cache (see kv_quant.h).
+ * @param scratch  As for vv_gqa_attention_decode_dev.
+ */
 vv_status_t vv_gqa_attention_decode_q_dev(
     const void* q, const void* k_store, const void* v_store,
     const void* k_meta, const void* v_meta, void* output,
     int n_q_heads, int n_kv_heads, int head_dim, int cache_len,
-    int kv_format, void* stream);
+    int kv_format, void* scratch, void* stream);
 
 /** @brief Flash prefill against a quantized KV cache (see kv_quant.h). */
 vv_status_t vv_gqa_attention_prefill_q_dev(

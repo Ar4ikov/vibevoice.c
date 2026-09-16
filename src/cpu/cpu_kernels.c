@@ -17,6 +17,8 @@
 #include "vibevoice/cpu_kernels.h"
 #include "vibevoice/vibevoice.h"
 
+#include "vv_thread.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,18 +62,19 @@ static const float NF4[16] = {
  */
 static float g_nf4_pair[256][2];
 static float g_i4_pair[256][2];
-static bool  g_tables_ready = false;
+static vv_once_t g_tables_once = VV_ONCE_INIT;
 
-static void build_tables(void) {
-    if (g_tables_ready) return;
+static void fill_tables(void) {
     for (int b = 0; b < 256; b++) {
         g_nf4_pair[b][0] = NF4[b >> 4];
         g_nf4_pair[b][1] = NF4[b & 0xF];
         g_i4_pair[b][0] = (float)(b >> 4);
         g_i4_pair[b][1] = (float)(b & 0xF);
     }
-    g_tables_ready = true;
 }
+
+/** @brief Build the nibble tables once, however many threads ask for them. */
+static void build_tables(void) { vv_once(&g_tables_once, fill_tables); }
 
 /* ─── Runtime SIMD selection ────────────────────────────────────────────── */
 

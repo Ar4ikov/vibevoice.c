@@ -971,20 +971,17 @@ static vv_status_t transcribe_gpu(
     float* combined_fp32 = NULL;
     int n_acoustic_frames = 0, n_semantic_frames = 0;
 
-    /* Temporarily free GPU workspace to give Conv-VAE encoder more VRAM */
-    void* saved_workspace = NULL;
-    size_t saved_workspace_size = 0;
-    if (ctx->use_gpu && ctx->workspace) {
-        saved_workspace = ctx->workspace;
-        saved_workspace_size = ctx->workspace_size;
-        vv_dev_free(ctx->workspace);
-        ctx->workspace = NULL;
-        VV_LOG_D("inference: freed GPU workspace (%zu MB) for audio encoding",
-                 saved_workspace_size / (1024*1024));
-    }
-
     dump_f32("c_audio24k", audio_samples, (size_t)num_samples);
 
+    /*
+     * The workspace stays allocated across the speech encoder. Freeing it
+     * first to make room, as this used to, cost two device-wide synchronising
+     * cudaFree calls per request, did nothing for a second slot whose
+     * workspace was still resident, and left the context with a NULL
+     * workspace for the rest of the process whenever the re-allocation
+     * failed. The encoder already tiles its FFN over time when a segment will
+     * not fit, which is the right answer to a card with no room.
+     */
     if (ctx->acoustic_encoder &&
         ctx->acoustic_encoder->stages != NULL &&
         ctx->acoustic_encoder->input_conv.weight.data != NULL) {
@@ -1000,18 +997,6 @@ static vv_status_t transcribe_gpu(
                                     audio_samples, num_samples,
                                     &semantic_latents, &n_semantic_frames);
         if (s != VV_OK) VV_LOG_W("inference: semantic encoder failed");
-    }
-
-    /* Re-allocate GPU workspace */
-    if (saved_workspace_size > 0 && ctx->use_gpu) {
-        s = vv_dev_alloc(&ctx->workspace, saved_workspace_size);
-        if (s != VV_OK) {
-            VV_LOG_E("inference: failed to re-allocate GPU workspace");
-            return s;
-        }
-        ctx->workspace_size = saved_workspace_size;
-        VV_LOG_D("inference: re-allocated GPU workspace (%zu MB)",
-                 saved_workspace_size / (1024*1024));
     }
 
     int n_audio_frames;
@@ -1337,7 +1322,8 @@ static vv_status_t transcribe_gpu(
      * Live token echo. Worth watching during a long transcription, pure
      * noise inside the chat and mic loops, so it follows the log level.
      */
-    const bool echo_tokens = vv_log_get_level() >= VV_LOG_INFO;
+    const bool echo_tokens = !ctx->quiet &&
+                             vv_log_get_level() >= VV_LOG_INFO;
     if (echo_tokens) fprintf(stderr, "\n--- token stream ---\n");
     if (!vv_is_end_token(ctx->tokenizer, token_id)) {
         output_tokens[n_generated++] = token_id;
@@ -1550,16 +1536,6 @@ static vv_status_t transcribe_cpu(
     float* acoustic_features = NULL, *semantic_features = NULL;
     int n_acoustic_frames = 0, n_semantic_frames = 0;
 
-    /* Temporarily free GPU workspace to give Conv-VAE encoder more VRAM */
-    void* saved_ws2 = NULL;
-    size_t saved_ws2_size = 0;
-    if (ctx->use_gpu && ctx->workspace) {
-        saved_ws2 = ctx->workspace;
-        saved_ws2_size = ctx->workspace_size;
-        vv_dev_free(ctx->workspace);
-        ctx->workspace = NULL;
-    }
-
     if (ctx->acoustic_encoder && ctx->acoustic_encoder->stages &&
         ctx->acoustic_encoder->input_conv.weight.data) {
         vv_conv_vae_encode_cpu(ctx->acoustic_encoder, audio_samples, num_samples,
@@ -1569,11 +1545,6 @@ static vv_status_t transcribe_cpu(
         ctx->semantic_encoder->input_conv.weight.data) {
         vv_conv_vae_encode_cpu(ctx->semantic_encoder, audio_samples, num_samples,
                                 &semantic_latents, &n_semantic_frames);
-    }
-
-    if (saved_ws2_size > 0 && ctx->use_gpu) {
-        vv_dev_alloc(&ctx->workspace, saved_ws2_size);
-        ctx->workspace_size = saved_ws2_size;
     }
 
     int n_audio_frames;
@@ -1764,6 +1735,22 @@ vv_status_t vv_inference_transcribe(
     if (!ctx || !audio_samples || !result) return VV_ERR_NULL_PTR;
 
     memset(&ctx->last_perf, 0, sizeof(ctx->last_perf));
+
+    /*
+     * CUDA's current device is per-thread and this context was created on
+     * another one — the server hands each request to a worker from its
+     * pool. Without this the worker runs on device 0, and every kernel
+     * launched there with a pointer from `gpu_id` fails; it showed up as the
+     * speech encoder silently falling back to the CPU.
+     */
+    if (ctx->use_gpu) {
+        vv_status_t bind = vv_dev_set_device(ctx->gpu_id);
+        if (bind != VV_OK) {
+            VV_LOG_E("inference: cannot bind GPU %d on this thread: %s",
+                     ctx->gpu_id, vv_status_str(bind));
+            return bind;
+        }
+    }
 
     if (ctx->placement == VV_PLACE_CPU_ONLY) {
         return transcribe_cpu(ctx, audio_samples, num_samples, params, result);

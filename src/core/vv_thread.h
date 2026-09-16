@@ -1,9 +1,17 @@
 /**
  * @file vv_thread.h
- * @brief The three threading primitives the runtime needs, on both platforms.
+ * @brief The threading primitives the runtime needs, on both platforms.
  *
- * Internal header: threads, a mutex and a condition variable, mapped onto
- * pthreads or the Win32 equivalents. Not part of the public API.
+ * Internal header: threads, a mutex, a condition variable and a one-time
+ * initialiser, mapped onto pthreads or the Win32 equivalents. Not part of the
+ * public API.
+ *
+ * `vv_once` exists for the lazily built lookup tables — the GPT-2 byte
+ * alphabet, the NF4 nibble pairs. They are pure functions of constants, so
+ * racing threads would write the same bytes, but a reader can still see a
+ * half-built table and several inference contexts do start decoding at once.
+ * One uncontended lock on a path that runs once per token is not worth
+ * arguing about.
  */
 #ifndef VV_THREAD_H
 #define VV_THREAD_H
@@ -47,6 +55,19 @@ static inline void vv_sleep_ms(int ms) { Sleep((DWORD)ms); }
 #define VV_THREAD_RET      unsigned __stdcall
 #define VV_THREAD_RETURN   return 0
 
+typedef INIT_ONCE vv_once_t;
+#define VV_ONCE_INIT INIT_ONCE_STATIC_INIT
+
+static inline BOOL CALLBACK vv_once_thunk(PINIT_ONCE once, PVOID param,
+                                          PVOID* ctx) {
+    (void)once; (void)ctx;
+    (*(void (**)(void))param)();
+    return TRUE;
+}
+static inline void vv_once(vv_once_t* o, void (*fn)(void)) {
+    InitOnceExecuteOnce(o, vv_once_thunk, &fn, NULL);
+}
+
 #else /* POSIX */
 
 #include <pthread.h>
@@ -79,6 +100,13 @@ static inline void vv_sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
 
 #define VV_THREAD_RET      void*
 #define VV_THREAD_RETURN   return NULL
+
+typedef pthread_once_t vv_once_t;
+#define VV_ONCE_INIT PTHREAD_ONCE_INIT
+
+static inline void vv_once(vv_once_t* o, void (*fn)(void)) {
+    pthread_once(o, fn);
+}
 
 #endif
 

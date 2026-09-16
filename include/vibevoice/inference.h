@@ -274,6 +274,13 @@ typedef struct vv_inference_ctx {
      * can run concurrently against one copy of the 3.2 GB of weights.
      */
     bool           is_clone;
+
+    /*
+     * Live token echo is worth watching on a long file and unreadable the
+     * moment two requests share the terminal, so a pool of more than one slot
+     * turns it off.
+     */
+    bool           quiet;
 } vv_inference_ctx_t;
 
 vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
