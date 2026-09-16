@@ -49,6 +49,33 @@ const char* vv_debug_dump_dir(void);
 /** @brief Write a raw blob to $VV_DUMP_DIR/<name>.bin (no-op when unset). */
 void vv_debug_dump(const char* name, const void* data, size_t bytes);
 
+/* ─── Device selection (gpu_select.c) ───────────────────────────────────── */
+
+/** @brief Parse one memory cap: "8G", "18GiB", "8192M", "80%", or bytes. */
+vv_status_t vv_parse_mem_cap(const char* text, vv_mem_cap_t* out);
+
+/** @brief Resolve a cap against a device's total size. 0 = uncapped. */
+size_t vv_mem_cap_bytes(const vv_mem_cap_t* cap, size_t total);
+
+/** @brief Parse `--gpus`: "0,1", "all", or one id. Caps are left untouched. */
+vv_status_t vv_gpu_set_parse(const char* text, vv_gpu_set_t* out);
+
+/** @brief Parse `--gpu-memory`: one cap for every device, or one per device. */
+vv_status_t vv_gpu_set_caps(const char* text, vv_gpu_set_t* set);
+
+/**
+ * @brief Default an empty set to `fallback_id`, check the ids exist, and log
+ *        what each device has and what it is allowed to spend.
+ */
+vv_status_t vv_gpu_set_resolve(vv_gpu_set_t* set, int fallback_id,
+                               bool cpu_only);
+
+/** @brief Bytes the `index`th device may use: free * budget, then the cap. */
+size_t vv_gpu_budget(const vv_gpu_set_t* set, int index, float vram_budget);
+
+/** @brief What that device already holds and the budget cannot place. */
+size_t vv_gpu_reserved(const vv_gpu_set_t* set, int index);
+
 /** @brief Monotonic clock in milliseconds. */
 double vv_time_ms(void);
 

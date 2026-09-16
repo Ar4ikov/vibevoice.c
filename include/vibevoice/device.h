@@ -70,6 +70,18 @@ vv_status_t vv_dev_set_device(int device_id);
 vv_status_t vv_dev_get_device_info(int device_id, size_t* total_mem,
                                    size_t* free_mem, int* sm_count);
 
+/**
+ * @brief Devices this process can use, or 0 when there is no usable driver.
+ *
+ * Counts what CUDA reports, which is already narrowed by
+ * CUDA_VISIBLE_DEVICES, so device 0 here is device 0 everywhere else in the
+ * process and not necessarily the first card in the machine.
+ */
+int vv_dev_device_count(void);
+
+/** @brief The device's name, e.g. "NVIDIA GeForce RTX 3090". */
+vv_status_t vv_dev_get_device_name(int device_id, char* buf, size_t buf_size);
+
 /* Events order the copy stream against the compute stream when weights are
  * streamed layer by layer; host registration makes those copies DMA. */
 vv_status_t vv_dev_event_create(void** ev);

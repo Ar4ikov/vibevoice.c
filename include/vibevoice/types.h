@@ -242,6 +242,32 @@ typedef enum vv_placement {
     VV_PLACE_CPU_ONLY,      /**< Everything on CPU, no CUDA at all            */
 } vv_placement_t;
 
+/* ─── Device selection ──────────────────────────────────────────────────── */
+
+/** @brief Most devices one process will use. */
+#define VV_MAX_GPUS 16
+
+/**
+ * @brief How much of a device this process may take.
+ *
+ * `bytes` when it is non-zero, otherwise `frac` of the device's *total*
+ * memory. Total rather than free, because free moves under you the moment
+ * anything else on the box starts, and "never take more than 8 GB" is the
+ * thing an operator actually wants to say. What is free still caps the
+ * result — a budget cannot spend memory another process is holding.
+ */
+typedef struct vv_mem_cap {
+    size_t bytes;         /**< absolute cap; 0 = use `frac`                 */
+    float  frac;          /**< fraction of the device total; 0 = uncapped   */
+} vv_mem_cap_t;
+
+/** @brief Which devices to use, in the order they should be filled. */
+typedef struct vv_gpu_set {
+    int          id[VV_MAX_GPUS];
+    vv_mem_cap_t cap[VV_MAX_GPUS];
+    int          n;       /**< 0 = nothing asked for; use the default device */
+} vv_gpu_set_t;
+
 /** @brief Parameters for vv_inference_init(). Pass NULL for defaults. */
 typedef struct vv_init_params {
     float  vram_budget;   /**< 0.0-1.0 fraction of free VRAM. Default: 1.0   */
@@ -249,6 +275,7 @@ typedef struct vv_init_params {
     bool   cpu_only;      /**< Force CPU-only mode (vram_budget=0 shortcut)  */
     int    max_seq_len;   /**< KV-cache window in tokens. Default: 32768     */
     int    gpu_layers;    /**< Layers to keep on the GPU. -1 = fit to VRAM   */
+    vv_gpu_set_t gpus;    /**< Devices and their caps. n = 0: use `gpu_id`   */
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -259,6 +286,7 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.cpu_only = false;
     p.max_seq_len = 32768;
     p.gpu_layers = -1;
+    p.gpus.n = 0;
     return p;
 }
 

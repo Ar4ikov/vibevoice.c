@@ -184,6 +184,7 @@ add_library(vibevoice_core STATIC
     src/core/error.c
     src/core/clock.c
     src/core/version.c
+    src/core/gpu_select.c
     src/audio/wav.c
     src/audio/resample.c
     src/audio/normalize.c
@@ -333,6 +334,7 @@ if(VV_BUILD_TESTS)
 
     vv_add_test(test_audio tests/test_audio.c)
     vv_add_test(test_queue tests/test_queue.c)
+    vv_add_test(test_gpu_select tests/test_gpu_select.c)
     vv_add_test(test_safetensors tests/test_safetensors.c)
     vv_add_test(test_nf4 tests/test_nf4.c)
     vv_add_test(test_conv_vae tests/test_conv_vae.c)

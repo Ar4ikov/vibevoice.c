@@ -35,6 +35,9 @@ static void usage(void) {
         "  --model-name <name>   Name reported by /v1/models\n"
         "  --api-key <key>       Require this bearer token\n"
         "  --gpu <id>            GPU device id (default: 0)\n"
+        "  --gpus <list>         Devices to spread slots over: 0,1 | all\n"
+        "  --gpu-memory <size>   Cap per device: 80%% | 18GiB | 8192M | bytes,\n"
+        "                        or one value per device, comma-separated\n"
         "  --max-seq-len <n>     Per-slot KV window (default: 32768)\n"
         "  --kv-cache <fmt>      fp16 | fp8 | fp8-e5m2 | tq4 | tq3 | tq2 | tq1.5\n"
         "  --acoustic-sampling M mode (default) | fix | gaussian; a draw per\n"
@@ -50,6 +53,8 @@ int vv_cmd_serve(int argc, char** argv) {
     vv_engine_params_t ep = vv_engine_params_default();
     vv_server_params_t sp = vv_server_params_default();
     bool verbose = false;
+    const char* gpus_arg = NULL;
+    const char* mem_arg = NULL;
 
     for (int i = 0; i < argc; i++) {
         const char* a = argv[i];
@@ -63,6 +68,8 @@ int vv_cmd_serve(int argc, char** argv) {
         else if (strcmp(a, "--model-name") == 0 && next) { sp.model_name = argv[++i]; }
         else if (strcmp(a, "--api-key") == 0 && next) { sp.api_key = argv[++i]; }
         else if (strcmp(a, "--gpu") == 0 && next) { ep.gpu_id = atoi(argv[++i]); }
+        else if (strcmp(a, "--gpus") == 0 && next) { gpus_arg = argv[++i]; }
+        else if (strcmp(a, "--gpu-memory") == 0 && next) { mem_arg = argv[++i]; }
         else if (strcmp(a, "--max-seq-len") == 0 && next) { ep.max_seq_len = atoi(argv[++i]); }
         else if (strcmp(a, "--gpu-layers") == 0 && next) { ep.gpu_layers = atoi(argv[++i]); }
         else if (strcmp(a, "--vram-budget") == 0 && next) { ep.vram_budget = (float)atof(argv[++i]); }
@@ -108,6 +115,14 @@ int vv_cmd_serve(int argc, char** argv) {
         return 1;
     }
     vv_log_set_level(verbose ? VV_LOG_DEBUG : VV_LOG_INFO);
+
+    if (gpus_arg && vv_gpu_set_parse(gpus_arg, &ep.gpus) != VV_OK) return 1;
+    if (mem_arg && vv_gpu_set_caps(mem_arg, &ep.gpus) != VV_OK) return 1;
+    if (ep.gpus.n > 0) ep.gpu_id = ep.gpus.id[0];
+    if (vv_gpu_set_resolve(&ep.gpus, ep.gpu_id, ep.cpu_only) != VV_OK) return 1;
+    if (ep.gpus.n > ep.n_slots && !ep.cpu_only)
+        VV_LOG_W("serve: %d devices but only %d slot(s); raise --slots to use "
+                 "them all", ep.gpus.n, ep.n_slots);
 
     vv_engine_t* engine = NULL;
     vv_status_t s = vv_engine_create(&ep, &engine);

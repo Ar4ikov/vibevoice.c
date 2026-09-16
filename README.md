@@ -316,8 +316,54 @@ gives 6.1 tok/s instead of 23.5. Use it to make a model fit, not to make it
 fast.
 
 Other knobs for tight memory: `--max-seq-len` bounds the KV window,
-`--vram-budget 0.0-1.0` caps the fraction of free VRAM used, `--cpu` forces
-the CPU path.
+`--gpu-memory` caps what the process may take (below), `--cpu` forces the
+CPU path.
+
+---
+
+## Several cards
+
+`--gpus` picks the devices and `--gpu-memory` says how much of each may be
+spent:
+
+```bash
+vv_cli serve --model ./model_hf --gpus 0,1 --slots 4      # one replica each
+vv_cli serve --model ./model_hf --gpus all --gpu-memory 80%
+vv_cli --model ./model_hf --audio a.wav --gpus 1 --gpu-memory 18GiB
+```
+
+A size is a percentage or an absolute with the usual suffixes — `80%`,
+`18GiB`, `8G`, `8192M`, or a plain byte count — and `GB` means 1024s like
+`GiB` does, because a card sold as 24 GB has 24 GiB and reading it the other
+way would quietly hand back 2% less than asked for. One value caps every
+device; a comma-separated list caps them one by one, in the order `--gpus`
+gave, and a list whose length does not match is refused rather than padded.
+
+The cap is honoured by the placement decision rather than checked afterwards,
+so a device whose budget cannot hold every layer falls back to streaming
+exactly as `--gpu-layers` does. It covers everything the process puts on that
+card: the CUDA context, the 1.3 GB of speech-encoder weights, the encoder's
+scratch, the KV cache and the workspace, not just the transformer. On a 3090,
+`--gpu-memory 6GiB` peaks at 4.5 GB with seven layers resident and a 8192-token
+window; without the flag the same run holds all 28 and a 32768-token window.
+
+`serve` puts one replica on each selected device — its own weights, its own
+slots — and spreads the slot pool over them. Nothing crosses between
+replicas, so this is the shape that actually multiplies throughput. Eight
+30-second clips, four slots, two 3090s:
+
+| | 8 requests |
+|---|---|
+| `--gpus 0 --slots 4` | 13.2 s |
+| `--gpus 0,1 --slots 4` | **7.6 s** |
+
+1.75x rather than 2x because the per-request work that is not on the GPU —
+audio decode, prompt building, JSON — is shared.
+
+Sharding one model across cards is
+[#7](https://github.com/Ar4ikov/vibevoice.c/issues/7) and is not done; a
+single transcription runs on a single device, and `vv_cli --audio` says so if
+it is given more than one.
 
 ---
 

@@ -88,6 +88,14 @@ vv_status_t vv_dev_get_device_info(int id, size_t* total, size_t* freem,
     return VV_ERR_NOT_FOUND;
 }
 
+int vv_dev_device_count(void) { return 0; }
+
+vv_status_t vv_dev_get_device_name(int id, char* buf, size_t n) {
+    (void)id;
+    if (buf && n) buf[0] = '\0';
+    return VV_ERR_NOT_FOUND;
+}
+
 vv_status_t vv_dev_event_create(void** ev) { if (ev) *ev = NULL; return VV_OK; }
 vv_status_t vv_dev_event_destroy(void* ev) { (void)ev; return VV_OK; }
 vv_status_t vv_dev_event_record(void* ev, void* s) { (void)ev; (void)s; return VV_OK; }
