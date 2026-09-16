@@ -164,6 +164,7 @@ add_library(vibevoice_core STATIC
     src/text_tokenizer/vocab.c
     src/text_tokenizer/special_tokens.c
     src/tokenizer_encoder/conv_vae.c
+    src/tokenizer_encoder/latent_sample.c
     src/connector/speech_connector.c
     src/model/safetensors.c
     src/model/config.c

@@ -95,6 +95,10 @@ Audio longer than 60 s is encoded in streaming segments with convolution
 caches, so the result is bit-identical to processing the whole signal at once
 and memory stays flat.
 
+Output is deterministic: the same file gives the same transcript every time.
+`--acoustic-sampling gaussian --seed N` swaps that for the reference's draw of
+the acoustic latent, seeded so it stays repeatable — see below.
+
 ### HTTP server
 
 ```bash
@@ -350,6 +354,28 @@ No mel spectrogram, no FFT. Raw 24 kHz PCM goes straight into two Conv-VAE
 tokenizers, each compressing 3200× (ratios 8·5·5·4·2·2) down to 7.5 Hz. The
 two latent streams are projected to the LLM's 3584 dims and added.
 
+### The acoustic latent is a distribution
+
+The acoustic tokenizer does not return a latent, it returns the mean of a
+Gaussian. Which draw the reference takes is in the checkpoint
+(`std_dist_type`), and for this one it is `gaussian`: a single scale
+`s ~ N(0, fix_std/0.8)` for the whole clip, then `mean + s·N(0,1)` per element.
+`s` is drawn per run, is as often negative as positive, and has RMS 0.625.
+
+The default here is the mode — the mean itself, which is reproducible and is
+the most likely latent rather than one draw from around it. `--acoustic-sampling
+gaussian --seed N` takes the reference's draw instead, and `fix` takes the
+simpler `mean + fix_std·N(0,1)`. The seed pins it: same seed, same latent, same
+transcript. It cannot be bit-identical to PyTorch, because a different
+generator gives different numbers from the same seed; what it answers is
+whether the transcript survives noise of that size.
+
+On a clean 30 s clip, eight draws with scales from −0.47 to +0.85 all gave a
+transcript identical to the mode. On an 11 s clip of slurred, noisy Russian,
+four of eight draws changed a word — `ложи` against `ложе`, the ending of
+`Долбоёб...` — which is where the audio is genuinely ambiguous and the noise
+decides the coin flip. That is the honest reason the mean was never a problem.
+
 The kernels that matter:
 
 - **`gemm.cu`** — both GEMM shapes on tensor cores via WMMA, 128×128×32 block
@@ -394,10 +420,6 @@ attention.
   proper packed micro-kernel.
 - **`src/trt/`** is stubs. The CUDA encoder does 11 s of audio in 243 ms, so
   TensorRT may never be worth it.
-- **Gaussian sampling of the acoustic latent.** The reference draws
-  `mean + std·randn`; this uses the mean, which is deterministic and
-  reproducible. Transcripts match on everything tested.
-
 ---
 
 ## Layout

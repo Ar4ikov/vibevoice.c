@@ -155,11 +155,29 @@ typedef struct vv_quant_tensor {
 
 /* ─── Model configuration (from config.json) ────────────────────────────── */
 
+/**
+ * @brief How the acoustic latent is drawn from the encoder's distribution.
+ *
+ * The encoder returns the mean of a Gaussian of fixed spread, not a latent.
+ * `std_dist_type` in the checkpoint says which draw the reference takes; the
+ * runtime defaults to the mode because that is reproducible.
+ */
+typedef enum vv_acoustic_sampling {
+    VV_ACOUSTIC_MODE = 0,   /**< The mean. Deterministic; the default.      */
+    VV_ACOUSTIC_FIX,        /**< mean + fix_std * N(0,1), elementwise.      */
+    VV_ACOUSTIC_GAUSSIAN,   /**< Per-clip scale N(0, fix_std/0.8) times
+                                 elementwise N(0,1) — this
+                                 checkpoint's own setting.                  */
+    VV_ACOUSTIC_SAMPLING_COUNT
+} vv_acoustic_sampling_t;
+
 typedef struct vv_acoustic_tokenizer_config {
     int   channels;
     bool  causal;
     int   vae_dim;
     float fix_std;
+    /** What the checkpoint asks for; see vv_acoustic_sampling_t. */
+    vv_acoustic_sampling_t std_dist_type;
     int   encoder_n_filters;
     int   encoder_ratios[8];
     int   n_ratios;
@@ -254,6 +272,10 @@ typedef struct vv_inference_params {
     int          num_hotwords;
     bool         enable_timestamps;
     bool         enable_diarize;
+    /** vv_acoustic_sampling_t. 0 = the mode, which is deterministic. */
+    int          acoustic_sampling;
+    /** Seed for that draw. Same seed, same latent, same transcript. */
+    uint64_t     acoustic_seed;
 } vv_inference_params_t;
 
 /* ─── Transcription output ──────────────────────────────────────────────── */

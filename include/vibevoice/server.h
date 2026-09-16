@@ -36,6 +36,12 @@ typedef struct vv_server_params {
     const char* model_name;  /**< Name reported by /v1/models.             */
     const char* api_key;     /**< If set, require this bearer token.       */
     size_t      max_body;    /**< Upload cap in bytes. Default 512 MB.     */
+    /**
+     * vv_acoustic_sampling_t applied to every request. 0 = the mode, which
+     * is deterministic; anything else draws a fresh latent per request, so
+     * the same audio can come back worded differently.
+     */
+    int         acoustic_sampling;
 } vv_server_params_t;
 
 static inline vv_server_params_t vv_server_params_default(void) {
@@ -47,6 +53,7 @@ static inline vv_server_params_t vv_server_params_default(void) {
     p.model_name = NULL;
     p.api_key = NULL;
     p.max_body = (size_t)512 * 1024 * 1024;
+    p.acoustic_sampling = 0;
     return p;
 }
 

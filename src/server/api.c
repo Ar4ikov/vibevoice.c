@@ -6,6 +6,7 @@
 #include "vibevoice/server.h"
 #include "vibevoice/vibevoice.h"
 #include "vibevoice/audio.h"
+#include "vibevoice/tokenizer_encoder.h"
 
 #include "vv_http.h"
 #include "vv_queue.h"
@@ -23,6 +24,7 @@ struct vv_server {
     vv_engine_t* engine;
     char         model_name[128];
     char         api_key[256];
+    int          acoustic_sampling;
     uint64_t     started_at;
     uint64_t     n_requests;
     uint64_t     n_errors;
@@ -295,6 +297,8 @@ static void handle_transcriptions(vv_server_t* sv, const vv_http_req_t* req,
     ip.top_k = 1;
     ip.enable_timestamps = true;
     ip.enable_diarize = true;
+    /* Seed 0 asks the pipeline for a fresh draw, once per request. */
+    ip.acoustic_sampling = sv->acoustic_sampling;
 
     const char* hot[32];
     char hotbuf[1024];
@@ -449,6 +453,7 @@ vv_status_t vv_server_run(vv_engine_t* engine, const vv_server_params_t* params,
                  base[0] ? base : "vibevoice-asr");
     }
     if (p.api_key) snprintf(sv->api_key, sizeof(sv->api_key), "%s", p.api_key);
+    sv->acoustic_sampling = p.acoustic_sampling;
 
     const int conns = p.max_conns > 0 ? p.max_conns
                                       : vv_engine_slots(engine) + p.queue_size + 8;
@@ -457,6 +462,11 @@ vv_status_t vv_server_run(vv_engine_t* engine, const vv_server_params_t* params,
     VV_LOG_I("server: model '%s', %d slot(s)%s",
              sv->model_name, vv_engine_slots(engine),
              sv->api_key[0] ? ", api key required" : "");
+    if (sv->acoustic_sampling)
+        VV_LOG_W("server: acoustic sampling is '%s', so identical audio may "
+                 "come back worded differently",
+                 vv_acoustic_sampling_name(
+                     (vv_acoustic_sampling_t)sv->acoustic_sampling));
 
     vv_status_t s = vv_http_serve(p.host, p.port, conns, p.max_body,
                                   route, sv, &sv->http);

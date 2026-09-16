@@ -4,6 +4,7 @@
  */
 
 #include "vibevoice/model.h"
+#include "vibevoice/tokenizer_encoder.h"
 #include "vibevoice/vibevoice.h"
 #include "cJSON.h"
 
@@ -105,6 +106,17 @@ static void parse_acoustic_tokenizer_config(
     c->causal            = parse_bool(obj, "causal", true);
     c->vae_dim           = parse_int(obj, "vae_dim", 64);
     c->fix_std           = parse_float(obj, "fix_std", 0.5f);
+    {
+        cJSON* d = cJSON_GetObjectItem(obj, "std_dist_type");
+        const char* name = (d && cJSON_IsString(d)) ? d->valuestring : NULL;
+        vv_acoustic_sampling_t m = vv_acoustic_sampling_parse(name);
+        if (m >= VV_ACOUSTIC_SAMPLING_COUNT) {
+            VV_LOG_W("config: unknown std_dist_type '%s', treating as the mode",
+                     name ? name : "");
+            m = VV_ACOUSTIC_MODE;
+        }
+        c->std_dist_type = m;
+    }
     c->encoder_n_filters = parse_int(obj, "encoder_n_filters", 32);
     c->layernorm_eps     = parse_float(obj, "layernorm_eps", 1e-5f);
     c->layer_scale_init_value = parse_float(obj, "layer_scale_init_value",
@@ -180,6 +192,7 @@ vv_status_t vv_config_parse(const char* json_path, vv_model_config_t* config) {
         config->acoustic.causal = true;
         config->acoustic.vae_dim = 64;
         config->acoustic.fix_std = 0.5f;
+        config->acoustic.std_dist_type = VV_ACOUSTIC_GAUSSIAN;
         config->acoustic.encoder_n_filters = 32;
         int default_ratios[] = {8, 5, 5, 4, 2, 2};
         memcpy(config->acoustic.encoder_ratios, default_ratios,

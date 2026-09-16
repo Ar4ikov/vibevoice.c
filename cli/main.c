@@ -10,6 +10,7 @@
  */
 
 #include "vibevoice/vibevoice.h"
+#include "vibevoice/tokenizer_encoder.h"
 #include "vibevoice/kv_quant.h"
 #include "vibevoice/audio.h"
 #include "vibevoice/inference.h"
@@ -50,6 +51,8 @@ typedef struct {
     float       vram_budget;
     bool        verbose;
     const char* hotwords;
+    const char* acoustic_sampling;
+    unsigned long long acoustic_seed;
 } cli_args_t;
 
 
@@ -99,6 +102,9 @@ static void print_usage(const char* prog) {
         "                        fp8-e5m2, tq4, tq3, tq2, tq1.5\n"
         "  --vram-budget <0-1>   VRAM fraction for model (default: 1.0)\n"
         "  --gpu-layers <N>      Layers to keep on the GPU (-1 = fit to VRAM)\n"
+        "  --acoustic-sampling M mode (default, deterministic) | fix |\n"
+        "                        gaussian (what the checkpoint asks for)\n"
+        "  --seed <N>            Seed for that draw (default: from the clock)\n"
         "  --cpu                 CPU-only mode (no GPU)\n"
         "  --verbose             Enable debug logging\n"
         "  --help                Show this message\n\n"
@@ -145,6 +151,10 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             if (args->vram_budget > 1.0f) args->vram_budget = 1.0f;
         } else if (strcmp(argv[i], "--gpu-layers") == 0 && i + 1 < argc) {
             args->gpu_layers = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--acoustic-sampling") == 0 && i + 1 < argc) {
+            args->acoustic_sampling = argv[++i];
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            args->acoustic_seed = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--cpu") == 0) {
             args->cpu_only = true;
         } else if (strcmp(argv[i], "--verbose") == 0) {
@@ -264,6 +274,18 @@ int main(int argc, char** argv) {
     params.top_k = 1;
     params.enable_timestamps = true;
     params.enable_diarize = true;
+    params.acoustic_seed = args.acoustic_seed;
+    if (args.acoustic_sampling) {
+        vv_acoustic_sampling_t m =
+            vv_acoustic_sampling_parse(args.acoustic_sampling);
+        if (m >= VV_ACOUSTIC_SAMPLING_COUNT) {
+            fprintf(stderr, "error: unknown --acoustic-sampling '%s'"
+                            " (mode | fix | gaussian)\n",
+                    args.acoustic_sampling);
+            return 1;
+        }
+        params.acoustic_sampling = (int)m;
+    }
 
     char hotword_buf[512];
     const char* hotword_list[32];

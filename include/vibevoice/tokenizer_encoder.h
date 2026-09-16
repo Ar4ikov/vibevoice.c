@@ -179,6 +179,31 @@ vv_status_t vv_conv_vae_warmup(vv_conv_vae_encoder_t* encoder);
  */
 vv_status_t vv_conv_vae_free(vv_conv_vae_encoder_t* encoder);
 
+/* ─── Acoustic latent sampling ──────────────────────────────────────────── */
+
+/**
+ * @brief Replace the acoustic mean with a draw from its distribution.
+ *
+ * In place over [n_frames, vae_dim], applied once to the whole clip after the
+ * segments are concatenated, which is where the reference samples. A no-op for
+ * VV_ACOUSTIC_MODE or `fix_std` of 0, so the caller need not special-case the
+ * default.
+ *
+ * @param fix_std    The checkpoint's fixed spread (0.5 here).
+ * @param seed       Fixes the draw; the traversal order is fixed too, so the
+ *                   same seed and clip give the same latent every time.
+ * @param out_scale  Optional; the scale actually drawn, for logging.
+ */
+vv_status_t vv_acoustic_sample(float* latents, int n_frames, int vae_dim,
+                               float fix_std, vv_acoustic_sampling_t mode,
+                               uint64_t seed, float* out_scale);
+
+/** @brief "mode", "fix" or "gaussian". */
+const char* vv_acoustic_sampling_name(vv_acoustic_sampling_t mode);
+
+/** @brief Parse one of those names; VV_ACOUSTIC_SAMPLING_COUNT if unknown. */
+vv_acoustic_sampling_t vv_acoustic_sampling_parse(const char* s);
+
 #ifdef __cplusplus
 }
 #endif

@@ -7,6 +7,7 @@
 #include "vibevoice/engine.h"
 #include "vibevoice/server.h"
 #include "vibevoice/kv_quant.h"
+#include "vibevoice/tokenizer_encoder.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +37,8 @@ static void usage(void) {
         "  --gpu <id>            GPU device id (default: 0)\n"
         "  --max-seq-len <n>     Per-slot KV window (default: 32768)\n"
         "  --kv-cache <fmt>      fp16 | fp8 | fp8-e5m2 | tq4 | tq3 | tq2 | tq1.5\n"
+        "  --acoustic-sampling M mode (default) | fix | gaussian; a draw per\n"
+        "                        request, so answers stop being reproducible\n"
         "  --vram-budget <0-1>   Fraction of free VRAM to use\n"
         "  --cpu                 CPU-only\n"
         "  --verbose\n\n"
@@ -70,6 +73,15 @@ int vv_cmd_serve(int argc, char** argv) {
                 return 1;
             }
             ep.kv_format = (int)f;
+        }
+        else if (strcmp(a, "--acoustic-sampling") == 0 && next) {
+            vv_acoustic_sampling_t m = vv_acoustic_sampling_parse(argv[++i]);
+            if (m >= VV_ACOUSTIC_SAMPLING_COUNT) {
+                fprintf(stderr, "error: unknown --acoustic-sampling '%s'"
+                                " (mode | fix | gaussian)\n", argv[i]);
+                return 1;
+            }
+            sp.acoustic_sampling = (int)m;
         }
         else if (strcmp(a, "--cpu") == 0) { ep.cpu_only = true; }
         else if (strcmp(a, "--verbose") == 0) { verbose = true; }

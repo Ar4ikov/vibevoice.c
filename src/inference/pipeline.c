@@ -909,6 +909,33 @@ static vv_status_t build_asr_prompt(
  * comma-joined hotword list there is how the model is steered towards rare
  * names in the upstream demo.
  */
+/**
+ * @brief Draw the acoustic latent, if the caller asked for a draw.
+ *
+ * The reference samples once over the whole clip, after the streaming segments
+ * are concatenated, so this sits between the encoder and the connector rather
+ * than inside the segment loop. A seed of 0 means "pick one and say which",
+ * which keeps an unseeded run reproducible after the fact.
+ */
+static void sample_acoustic(vv_inference_ctx_t* ctx,
+                            const vv_inference_params_t* params,
+                            float* latents, int n_frames) {
+    if (!latents || n_frames <= 0) return;
+
+    vv_acoustic_sampling_t mode = params
+        ? (vv_acoustic_sampling_t)params->acoustic_sampling
+        : VV_ACOUSTIC_MODE;
+    if (mode == VV_ACOUSTIC_MODE) return;
+
+    uint64_t seed = params ? params->acoustic_seed : 0;
+    if (seed == 0) seed = (uint64_t)(vv_time_ms() * 1000.0);
+
+    vv_acoustic_sample(latents, n_frames,
+                       ctx->model->config.acoustic.vae_dim,
+                       ctx->model->config.acoustic.fix_std,
+                       mode, seed, NULL);
+}
+
 static void build_context_info(const vv_inference_params_t* params,
                                char* buf, size_t buf_size) {
     buf[0] = '\0';
@@ -1014,6 +1041,8 @@ static vv_status_t transcribe_gpu(
     if (semantic_latents)
         dump_f32("c_sem_mean", semantic_latents,
                  (size_t)n_audio_frames * (size_t)ctx->semantic_encoder->vae_dim);
+
+    sample_acoustic(ctx, params, acoustic_latents, n_audio_frames);
 
     /* Connectors */
     if (acoustic_latents && ctx->acoustic_connector)
@@ -1554,6 +1583,8 @@ static vv_status_t transcribe_cpu(
     else if (n_semantic_frames > 0) n_audio_frames = n_semantic_frames;
     else { n_audio_frames = num_samples / 3200; if (n_audio_frames < 1) n_audio_frames = 1; }
     perf->audio_frames = n_audio_frames;
+
+    sample_acoustic(ctx, params, acoustic_latents, n_audio_frames);
 
     if (acoustic_latents && ctx->acoustic_connector)
         vv_connector_forward_auto(ctx->acoustic_connector, acoustic_latents, n_audio_frames, &acoustic_features);
