@@ -57,7 +57,16 @@ int main(void) {
     printf("cpu kernels: %s, %d thread(s)\n",
            vv_cpu_simd_name(), vv_cpu_threads());
 
-    enum { M = 3, N = 64, K = 512, GROUP = 128 };
+    /*
+     * The shapes are chosen to land on every seam in the packed GEMM, since
+     * a GEMM that is right on round numbers is right on nothing in
+     * particular. N = 77 leaves a ragged tail past the last 16-column panel;
+     * K = 640 gives an undersized last k-block; and the M list crosses the
+     * threshold below which packing is skipped, the 6-row panel boundary,
+     * and the row count above which the activation block is split.
+     */
+    enum { M = 400, N = 77, K = 640, GROUP = 128 };
+    static const int MS[] = { 1, 3, 4, 7, 13, M };
 
     float* x = malloc(sizeof(float) * M * K);
     float* got = malloc(sizeof(float) * M * N);
@@ -83,55 +92,59 @@ int main(void) {
     for (int i = 0; i < N * K; i++) wf16[i] = vv_float_to_half(frand());
     for (int i = 0; i < N; i++) bias[i] = vv_float_to_half(frand());
 
-    /* ── NF4 GEMM ── */
-    for (int m = 0; m < M; m++)
-        for (int n = 0; n < N; n++) {
-            double acc = 0.0;
-            for (int k = 0; k < K; k++) {
-                const uint8_t byte = packed[(size_t)n * (K / 2) + k / 2];
-                const int code = (k & 1) ? (byte & 0xF) : (byte >> 4);
-                acc += (double)x[m * K + k] * NF4_REF[code] *
-                       vv_half_to_float(scales[(size_t)n * (K / 64) + k / 64]);
+    for (size_t s = 0; s < sizeof(MS) / sizeof(MS[0]); s++) {
+        const int m_rows = MS[s];
+        char what[48];
+
+        /* ── NF4 GEMM ── */
+        for (int m = 0; m < m_rows; m++)
+            for (int n = 0; n < N; n++) {
+                double acc = 0.0;
+                for (int k = 0; k < K; k++) {
+                    const uint8_t byte = packed[(size_t)n * (K / 2) + k / 2];
+                    const int code = (k & 1) ? (byte & 0xF) : (byte >> 4);
+                    acc += (double)x[(size_t)m * K + k] * NF4_REF[code] *
+                           vv_half_to_float(
+                               scales[(size_t)n * (K / 64) + k / 64]);
+                }
+                ref[(size_t)m * N + n] = (float)acc + vv_half_to_float(bias[n]);
             }
-            ref[m * N + n] = (float)acc + vv_half_to_float(bias[n]);
-        }
-    vv_nf4_gemm_cpu(x, packed, scales, bias, got, M, N, K);
-    check("nf4_gemm M=3", got, ref, M * N, 1e-5);
+        vv_nf4_gemm_cpu(x, packed, scales, bias, got, m_rows, N, K);
+        snprintf(what, sizeof(what), "nf4_gemm M=%d", m_rows);
+        check(what, got, ref, m_rows * N, 1e-5);
 
-    vv_nf4_gemm_cpu(x, packed, scales, bias, got, 1, N, K);
-    check("nf4_gemv M=1", got, ref, N, 1e-5);
-
-    /* ── INT4 group-affine GEMM ── */
-    for (int m = 0; m < M; m++)
-        for (int n = 0; n < N; n++) {
-            double acc = 0.0;
-            for (int k = 0; k < K; k++) {
-                const uint8_t byte = packed[(size_t)n * (K / 2) + k / 2];
-                const int q = (k & 1) ? (byte & 0xF) : (byte >> 4);
-                const int g = (size_t)n * (K / GROUP) + k / GROUP;
-                acc += (double)x[m * K + k] *
-                       ((float)q * vv_half_to_float(gscales[g]) +
-                        vv_half_to_float(gmins[g]));
+        /* ── INT4 group-affine GEMM ── */
+        for (int m = 0; m < m_rows; m++)
+            for (int n = 0; n < N; n++) {
+                double acc = 0.0;
+                for (int k = 0; k < K; k++) {
+                    const uint8_t byte = packed[(size_t)n * (K / 2) + k / 2];
+                    const int q = (k & 1) ? (byte & 0xF) : (byte >> 4);
+                    const size_t g = (size_t)n * (K / GROUP) + k / GROUP;
+                    acc += (double)x[(size_t)m * K + k] *
+                           ((float)q * vv_half_to_float(gscales[g]) +
+                            vv_half_to_float(gmins[g]));
+                }
+                ref[(size_t)m * N + n] = (float)acc + vv_half_to_float(bias[n]);
             }
-            ref[m * N + n] = (float)acc + vv_half_to_float(bias[n]);
-        }
-    vv_int4g_gemm_cpu(x, packed, gscales, gmins, bias, got, M, N, K, GROUP);
-    check("int4g_gemm M=3", got, ref, M * N, 1e-5);
+        vv_int4g_gemm_cpu(x, packed, gscales, gmins, bias, got,
+                          m_rows, N, K, GROUP);
+        snprintf(what, sizeof(what), "int4g_gemm M=%d", m_rows);
+        check(what, got, ref, m_rows * N, 1e-5);
 
-    vv_int4g_gemm_cpu(x, packed, gscales, gmins, bias, got, 1, N, K, GROUP);
-    check("int4g_gemv M=1", got, ref, N, 1e-5);
-
-    /* ── Dense FP16 weight ── */
-    for (int m = 0; m < M; m++)
-        for (int n = 0; n < N; n++) {
-            double acc = 0.0;
-            for (int k = 0; k < K; k++)
-                acc += (double)x[m * K + k] *
-                       vv_half_to_float(wf16[(size_t)n * K + k]);
-            ref[m * N + n] = (float)acc + vv_half_to_float(bias[n]);
-        }
-    vv_gemm_f16w_cpu(x, wf16, bias, got, M, N, K);
-    check("gemm_f16w", got, ref, M * N, 1e-5);
+        /* ── Dense FP16 weight ── */
+        for (int m = 0; m < m_rows; m++)
+            for (int n = 0; n < N; n++) {
+                double acc = 0.0;
+                for (int k = 0; k < K; k++)
+                    acc += (double)x[(size_t)m * K + k] *
+                           vv_half_to_float(wf16[(size_t)n * K + k]);
+                ref[(size_t)m * N + n] = (float)acc + vv_half_to_float(bias[n]);
+            }
+        vv_gemm_f16w_cpu(x, wf16, bias, got, m_rows, N, K);
+        snprintf(what, sizeof(what), "gemm_f16w M=%d", m_rows);
+        check(what, got, ref, m_rows * N, 1e-5);
+    }
 
     /* ── RMSNorm ── */
     {

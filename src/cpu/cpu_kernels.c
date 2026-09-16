@@ -2,17 +2,27 @@
  * @file cpu_kernels.c
  * @brief CPU compute path. See cpu_kernels.h for the contract.
  *
- * The shape of every quantized GEMM here is the same: walk one output row's
- * weights, dequantize them into a K-float scratch that stays in L1/L2, and
- * dot it against the M input rows. Materialising the whole matrix instead
- * would move 13 GB of FP32 per forward pass at 7B; this moves the 3.2 GB of
- * packed weights once and nothing else, which is the floor for a decode
- * step and makes the CPU path bandwidth-bound rather than absurd.
+ * There are two quantized GEMMs here and which one runs depends on M.
+ *
+ * A decode step is M = 1 and reads all 3.2 GB of packed weights for one
+ * token, so it is bound by DRAM and nothing else: it walks one output row's
+ * weights, dequantizes them straight into registers and dots them against
+ * the single input row. Materialising the dequantized matrix instead would
+ * move 13 GB of FP32 per forward pass, which is the thing to avoid.
+ *
+ * Prefill is M in the hundreds and has enough arithmetic to be bound by the
+ * FMA units instead, but only if the operands are laid out for them. That is
+ * the packed path further down — see the comment on it.
  *
  * The dequantize step is where the SIMD matters, so it has an AVX2
  * specialisation picked at runtime. Everything else is written so the
  * compiler can vectorise it on its own.
  */
+
+/* sched_getaffinity and CPU_SET are GNU extensions. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 
 #include "vibevoice/cpu_kernels.h"
 #include "vibevoice/vibevoice.h"
@@ -29,6 +39,8 @@
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sched.h>
 #endif
 
 #ifdef _OPENMP
@@ -107,57 +119,165 @@ const char* vv_cpu_simd_name(void) {
     }
 }
 
-/**
- * @brief Physical cores, or 0 when the topology cannot be read.
+/* ─── Core topology and thread placement ───────────────────────────────── */
+
+/*
+ * Two things are needed from the machine: how many physical cores this
+ * process may use, and where to put a worker so it gets one to itself.
  *
- * These kernels are bandwidth bound, and a second thread on the same core
- * adds contention rather than throughput: on a 5900X, decode runs at 7.8
- * tok/s across the 12 cores and 4.3 across the 24 hardware threads.
+ * The count matters because these kernels are bandwidth bound and a second
+ * thread on the same core adds contention rather than throughput: on a
+ * 5900X, decode runs at 7.8 tok/s across the 12 cores and 4.3 across the 24
+ * hardware threads.
+ *
+ * The placement matters for the same reason, and is easy to miss because it
+ * is not wrong on average — it is wrong at random. Nothing stops the OS from
+ * putting two of the twelve workers on the two hyperthreads of one core and
+ * leaving another core idle, and it does: the same prefill measured 650 and
+ * 1120 GFLOP/s on consecutive runs until the threads were pinned. libgomp
+ * ignores a `proc_bind` clause unless OMP_PROC_BIND is set in the
+ * environment, which is not something a library can arrange for itself, so
+ * the pinning is done here.
  */
-static int physical_cores(void) {
+
+#define VV_MAX_CORES 256
+
 #if defined(_WIN32)
-    DWORD len = 0;
-    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
-    if (!len) return 0;
-    char* buf = (char*)malloc(len);
-    if (!buf) return 0;
-    int n = 0;
-    if (GetLogicalProcessorInformationEx(RelationProcessorCore,
-            (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)buf, &len)) {
-        for (DWORD off = 0; off < len;) {
-            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* p =
-                (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf + off);
-            if (p->Relationship == RelationProcessorCore) n++;
-            off += p->Size;
-        }
+/* A CPU index means nothing on its own past 64 processors: it is an index
+   within a group, and a thread is placed by naming both. */
+static GROUP_AFFINITY g_core_cpu[VV_MAX_CORES];
+#else
+static int g_core_cpu[VV_MAX_CORES];  /**< one logical CPU per usable core  */
+#endif
+static int g_n_cores = -1;            /**< -1 = topology not read yet       */
+static vv_once_t g_topo_once = VV_ONCE_INIT;
+
+#if defined(__linux__)
+/** @brief Mark every CPU named in a "0-1,12-13" sibling list. */
+static void mark_siblings(const char* list, cpu_set_t* set) {
+    const char* p = list;
+    while (*p) {
+        char* end;
+        long a = strtol(p, &end, 10);
+        if (end == p) break;
+        long b = a;
+        if (*end == '-') { p = end + 1; b = strtol(p, &end, 10); }
+        for (long c = a; c <= b && c < CPU_SETSIZE; c++) CPU_SET((int)c, set);
+        if (*end != ',') break;
+        p = end + 1;
     }
-    free(buf);
-    return n;
-#elif defined(__APPLE__)
-    int n = 0;
-    size_t sz = sizeof(n);
-    if (sysctlbyname("hw.perflevel0.physicalcpu", &n, &sz, NULL, 0) == 0 && n > 0)
-        return n;                       /* performance cores only */
-    sz = sizeof(n);
-    if (sysctlbyname("hw.physicalcpu", &n, &sz, NULL, 0) == 0) return n;
-    return 0;
-#elif defined(__linux__)
-    /* One entry per core: the CPU that leads its own sibling list. */
-    int n = 0;
-    for (int cpu = 0; cpu < 1024; cpu++) {
-        char path[128];
+}
+#endif
+
+/**
+ * @brief Fill g_core_cpu with one CPU per physical core this process may use.
+ *
+ * "May use" rather than "exists": a cpuset or a taskset is the whole reason
+ * a container gets four cores out of a host's sixty-four, and counting the
+ * host's would oversubscribe every one of them.
+ */
+static void detect_topology(void) {
+    g_n_cores = 0;
+#if defined(__linux__)
+    cpu_set_t allowed, taken;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return;
+    CPU_ZERO(&taken);
+    for (int cpu = 0; cpu < CPU_SETSIZE && g_n_cores < VV_MAX_CORES; cpu++) {
+        if (!CPU_ISSET(cpu, &allowed) || CPU_ISSET(cpu, &taken)) continue;
+        char path[160], list[256];
         snprintf(path, sizeof(path),
                  "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list",
                  cpu);
         FILE* f = fopen(path, "r");
-        if (!f) break;
-        int first = -1;
-        if (fscanf(f, "%d", &first) == 1 && first == cpu) n++;
-        fclose(f);
+        if (f && fgets(list, sizeof(list), f)) mark_siblings(list, &taken);
+        else CPU_SET(cpu, &taken);
+        if (f) fclose(f);
+        g_core_cpu[g_n_cores++] = cpu;
     }
-    return n;
+#elif defined(_WIN32)
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+    if (!len) return;
+    char* buf = (char*)malloc(len);
+    if (!buf) return;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore,
+            (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)buf, &len)) {
+        for (DWORD off = 0; off < len && g_n_cores < VV_MAX_CORES;) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* p =
+                (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf + off);
+            /* The low bit of the core's mask: one hardware thread of it. */
+            if (p->Relationship == RelationProcessorCore &&
+                p->Processor.GroupCount >= 1) {
+                const GROUP_AFFINITY* g = &p->Processor.GroupMask[0];
+                for (int b = 0; b < (int)(sizeof(KAFFINITY) * 8); b++)
+                    if (g->Mask & ((KAFFINITY)1 << b)) {
+                        GROUP_AFFINITY* dst = &g_core_cpu[g_n_cores++];
+                        memset(dst, 0, sizeof(*dst));
+                        dst->Group = g->Group;
+                        dst->Mask = (KAFFINITY)1 << b;
+                        break;
+                    }
+            }
+            off += p->Size;
+        }
+    }
+    free(buf);
+#elif defined(__APPLE__)
+    int n = 0;
+    size_t sz = sizeof(n);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &n, &sz, NULL, 0) != 0 || n <= 0) {
+        sz = sizeof(n);
+        if (sysctlbyname("hw.physicalcpu", &n, &sz, NULL, 0) != 0) n = 0;
+    }
+    if (n > VV_MAX_CORES) n = VV_MAX_CORES;
+    g_n_cores = n;                                   /* placement: see bind */
+#endif
+}
+
+static int physical_cores(void) {
+    vv_once(&g_topo_once, detect_topology);
+    return g_n_cores;
+}
+
+/** @brief True unless the user has said where threads go, or said not to. */
+static bool binding_wanted(void) {
+    const char* off = getenv("VV_CPU_BIND");
+    if (off && off[0] == '0') return false;
+    return !getenv("OMP_PROC_BIND") && !getenv("OMP_PLACES") &&
+           !getenv("GOMP_CPU_AFFINITY") && !getenv("KMP_AFFINITY");
+}
+
+/**
+ * @brief Pin the calling worker to core `slot`, once per thread.
+ *
+ * Darwin has no way to ask for this — thread_policy_set's affinity tags are
+ * a hint the scheduler may ignore, and are unimplemented on Apple silicon —
+ * so there it is a no-op and the P-core count has to be enough.
+ */
+static void bind_worker(int slot) {
+    static VV_TLS int bound = 0;
+    if (bound) return;
+    bound = 1;
+    if (!binding_wanted()) return;
+    const int n = physical_cores();
+    if (n <= 0 || slot < 0 || slot >= n) return;
+#if defined(__linux__)
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(g_core_cpu[slot], &one);
+    sched_setaffinity(0, sizeof(one), &one);
+#elif defined(_WIN32)
+    GROUP_AFFINITY prev;
+    SetThreadGroupAffinity(GetCurrentThread(), &g_core_cpu[slot], &prev);
+#endif
+}
+
+/** @brief Pin every worker of the current team. Call inside a parallel region. */
+static void bind_team(void) {
+#ifdef _OPENMP
+    bind_worker(omp_get_thread_num());
 #else
-    return 0;
+    bind_worker(0);
 #endif
 }
 
@@ -171,6 +291,14 @@ int vv_cpu_threads(void) {
             const int cores = physical_cores();
             if (cores > 0 && cores < omp_get_max_threads())
                 omp_set_num_threads(cores);
+        }
+        /*
+         * libgomp keeps one pool per host thread and reuses it, so pinning
+         * the team here settles every `omp parallel for` below as well.
+         */
+        if (!omp_in_parallel()) {
+#pragma omp parallel
+            { bind_team(); }
         }
     }
     return omp_get_max_threads();
@@ -491,6 +619,488 @@ static float int4g_dot_avx2(const uint8_t* __restrict w,
 }
 #endif /* VV_X86 && __GNUC__ */
 
+/* ─── Packed GEMM ───────────────────────────────────────────────────────── */
+
+/*
+ * C[M,N] = A[M,K] . B[N,K]^T, B arriving 4-bit packed or as FP16.
+ *
+ * Both operands are stored K-contiguous, which is the layout an outer
+ * product does not want. Dotting one dequantized weight row against each of
+ * the M input rows — what this file did before — reads the whole activation
+ * matrix once per output column: 2.0 MB per column and 7.3 GB per
+ * projection at M = 285, K = 3584, none of which fits anywhere useful. The
+ * FMA units then idle at a fifth of their rate waiting on L3.
+ *
+ * So both operands are copied into k-major panels, A as [KC][MR] and B as
+ * [KC][NR], and the MR x NR result stays in registers for a whole k-block.
+ * Each A element now meets NR weights while it sits in a register and each
+ * B element meets MR inputs, so bytes touched per FMA fall by
+ * 2*MR*NR/(MR+NR) — about 11 at 6x16.
+ *
+ * The block sizes come straight off the cache hierarchy. The B panel is
+ * KC*NR*4 bytes, read once per m-panel, so it belongs in L1: 256*16*4 is
+ * 16 KB of a 32 KB L1. The A block is MC*KC*4, read once per n-panel and
+ * therefore N/NR times, so it belongs in L2: 318*256*4 is 318 KB of 512 KB.
+ * MC also sets how many times the weights are streamed from DRAM —
+ * ceil(M/MC) — which is why it is as large as L2 allows.
+ *
+ * Only whole NR-column panels go through here; a ragged tail at the end of N
+ * falls back to the row-at-a-time loop below, which is exact for any width.
+ */
+
+#define VV_KC     256   /* k-block: multiple of 64, so quant groups align   */
+#define VV_L2_A   (320 * 1024)  /* bytes of L2 the A block may claim        */
+
+/** @brief Where one panel of weights comes from, and in what encoding. */
+typedef struct {
+    const uint8_t*  w;        /**< packed 4-bit codes, row-major over K     */
+    const uint16_t* scales;   /**< per-group scale, FP16                    */
+    const uint16_t* mins;     /**< INT4G only: -zero * scale                */
+    const uint16_t* wf16;     /**< FP16 weights, when there are no codes    */
+    int             group;    /**< weights per scale (64 for NF4)           */
+    int             K;
+} bpanel_src_t;
+
+/**
+ * @brief One micro-kernel: MR x NR of C, accumulating over a k-block.
+ * @param mr  Rows of C to write back; the rest of the tile is padding.
+ */
+typedef void (*micro_fn)(const float* ap, const float* bp, float* c,
+                         int ldc, int kc, int mr);
+/** @brief Fill bp[kc][NR] with NR weight rows from n0, starting at column kb. */
+typedef void (*packb_fn)(const bpanel_src_t* src, int n0, int kb, int kc,
+                         float* bp, float* tmp);
+
+typedef struct {
+    int      mr, nr;
+    micro_fn micro;
+    packb_fn packb;
+} ukernel_t;
+
+/* ── Portable micro-kernel ── */
+
+/*
+ * 4x8 rather than 6x16: without a register count to target, the accumulator
+ * tile has to be small enough that any vectorizer keeps it in registers.
+ */
+#define VV_REF_MR 4
+#define VV_REF_NR 8
+
+static void micro_ref(const float* __restrict ap, const float* __restrict bp,
+                      float* __restrict c, int ldc, int kc, int mr) {
+    float t[VV_REF_MR][VV_REF_NR];
+    for (int i = 0; i < VV_REF_MR; i++)
+        for (int j = 0; j < VV_REF_NR; j++)
+            t[i][j] = (i < mr) ? c[(size_t)i * ldc + j] : 0.0f;
+
+    for (int k = 0; k < kc; k++) {
+        const float* __restrict b = bp + (size_t)k * VV_REF_NR;
+        for (int i = 0; i < VV_REF_MR; i++) {
+            const float a = ap[(size_t)k * VV_REF_MR + i];
+            for (int j = 0; j < VV_REF_NR; j++) t[i][j] += a * b[j];
+        }
+    }
+    for (int i = 0; i < mr; i++)
+        for (int j = 0; j < VV_REF_NR; j++) c[(size_t)i * ldc + j] = t[i][j];
+}
+
+/*
+ * The portable packers dequantize a row into `tmp` with the existing row
+ * kernels and then scatter it down the panel. That is two passes over the
+ * panel instead of one, but it is 4 KB of L1 traffic against a k-block's
+ * worth of FMAs, and it keeps one code path for every ISA without one.
+ */
+#define VV_PACKB_REF(DEQUANT_ROW)                                             \
+    for (int r = 0; r < VV_REF_NR; r++) {                                     \
+        DEQUANT_ROW;                                                          \
+        for (int k = 0; k < kc; k++) bp[(size_t)k * VV_REF_NR + r] = tmp[k];  \
+    }
+
+static void packb_nf4_ref(const bpanel_src_t* s, int n0, int kb, int kc,
+                          float* bp, float* tmp) {
+    const size_t wstr = (size_t)s->K >> 1, sstr = (size_t)s->K >> 6;
+#ifdef VV_NEON
+    VV_PACKB_REF(nf4_row_neon(s->w + (size_t)(n0 + r) * wstr + (kb >> 1),
+                              s->scales + (size_t)(n0 + r) * sstr + (kb >> 6),
+                              tmp, kc))
+#else
+    VV_PACKB_REF(nf4_row_scalar(s->w + (size_t)(n0 + r) * wstr + (kb >> 1),
+                                s->scales + (size_t)(n0 + r) * sstr + (kb >> 6),
+                                tmp, kc))
+#endif
+}
+
+static void packb_int4g_ref(const bpanel_src_t* s, int n0, int kb, int kc,
+                            float* bp, float* tmp) {
+    const size_t wstr = (size_t)s->K >> 1;
+    const size_t gstr = (size_t)(s->K / s->group), goff = (size_t)(kb / s->group);
+#ifdef VV_NEON
+    VV_PACKB_REF(int4g_row_neon(s->w + (size_t)(n0 + r) * wstr + (kb >> 1),
+                                s->scales + (size_t)(n0 + r) * gstr + goff,
+                                s->mins + (size_t)(n0 + r) * gstr + goff,
+                                tmp, kc, s->group))
+#else
+    VV_PACKB_REF(int4g_row_scalar(s->w + (size_t)(n0 + r) * wstr + (kb >> 1),
+                                  s->scales + (size_t)(n0 + r) * gstr + goff,
+                                  s->mins + (size_t)(n0 + r) * gstr + goff,
+                                  tmp, kc, s->group))
+#endif
+}
+
+static void packb_f16_ref(const bpanel_src_t* s, int n0, int kb, int kc,
+                          float* bp, float* tmp) {
+    VV_PACKB_REF(f16_row(s->wf16 + (size_t)(n0 + r) * s->K + kb, tmp, kc))
+}
+
+static const ukernel_t UK_REF_NF4   = { VV_REF_MR, VV_REF_NR, micro_ref,
+                                        packb_nf4_ref };
+static const ukernel_t UK_REF_INT4G = { VV_REF_MR, VV_REF_NR, micro_ref,
+                                        packb_int4g_ref };
+static const ukernel_t UK_REF_F16   = { VV_REF_MR, VV_REF_NR, micro_ref,
+                                        packb_f16_ref };
+
+/* ── AVX2 micro-kernel ── */
+
+#if defined(VV_X86) && defined(__GNUC__)
+
+/*
+ * 6 rows by 16 columns: 12 accumulators, two vectors of B and one broadcast
+ * of A leave one of the sixteen ymm registers spare. Each k-step issues 12
+ * FMAs against 8 loads, so at two FMA ports and two load ports the FMAs are
+ * what the loop waits on, which is the point.
+ */
+#define VV_MR 6
+#define VV_NR 16
+
+__attribute__((target("avx2,fma")))
+static void micro_6x16_avx2(const float* __restrict ap,
+                            const float* __restrict bp,
+                            float* __restrict c, int ldc, int kc, int mr) {
+    __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps();
+    __m256 c2 = _mm256_setzero_ps(), c3 = _mm256_setzero_ps();
+    __m256 c4 = _mm256_setzero_ps(), c5 = _mm256_setzero_ps();
+    __m256 c6 = _mm256_setzero_ps(), c7 = _mm256_setzero_ps();
+    __m256 c8 = _mm256_setzero_ps(), c9 = _mm256_setzero_ps();
+    __m256 cA = _mm256_setzero_ps(), cB = _mm256_setzero_ps();
+
+    for (int k = 0; k < kc; k++) {
+        const __m256 b0 = _mm256_loadu_ps(bp);
+        const __m256 b1 = _mm256_loadu_ps(bp + 8);
+        __m256 a;
+        a = _mm256_broadcast_ss(ap + 0);
+        c0 = _mm256_fmadd_ps(a, b0, c0); c1 = _mm256_fmadd_ps(a, b1, c1);
+        a = _mm256_broadcast_ss(ap + 1);
+        c2 = _mm256_fmadd_ps(a, b0, c2); c3 = _mm256_fmadd_ps(a, b1, c3);
+        a = _mm256_broadcast_ss(ap + 2);
+        c4 = _mm256_fmadd_ps(a, b0, c4); c5 = _mm256_fmadd_ps(a, b1, c5);
+        a = _mm256_broadcast_ss(ap + 3);
+        c6 = _mm256_fmadd_ps(a, b0, c6); c7 = _mm256_fmadd_ps(a, b1, c7);
+        a = _mm256_broadcast_ss(ap + 4);
+        c8 = _mm256_fmadd_ps(a, b0, c8); c9 = _mm256_fmadd_ps(a, b1, c9);
+        a = _mm256_broadcast_ss(ap + 5);
+        cA = _mm256_fmadd_ps(a, b0, cA); cB = _mm256_fmadd_ps(a, b1, cB);
+        ap += VV_MR; bp += VV_NR;
+    }
+
+    /* `mr` is 6 for every panel but the last, so these predict away. */
+    #define VV_ST(i, lo, hi) if (mr > (i)) {                                  \
+        float* p = c + (size_t)(i) * ldc;                                     \
+        _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), lo));           \
+        _mm256_storeu_ps(p + 8, _mm256_add_ps(_mm256_loadu_ps(p + 8), hi)); }
+    VV_ST(0, c0, c1) VV_ST(1, c2, c3) VV_ST(2, c4, c5)
+    VV_ST(3, c6, c7) VV_ST(4, c8, c9) VV_ST(5, cA, cB)
+    #undef VV_ST
+}
+
+/** @brief The usual two-stage 8x8 float transpose, in registers. */
+__attribute__((target("avx2"), always_inline))
+static inline void transpose8_avx2(__m256 v[8]) {
+    const __m256 t0 = _mm256_unpacklo_ps(v[0], v[1]);
+    const __m256 t1 = _mm256_unpackhi_ps(v[0], v[1]);
+    const __m256 t2 = _mm256_unpacklo_ps(v[2], v[3]);
+    const __m256 t3 = _mm256_unpackhi_ps(v[2], v[3]);
+    const __m256 t4 = _mm256_unpacklo_ps(v[4], v[5]);
+    const __m256 t5 = _mm256_unpackhi_ps(v[4], v[5]);
+    const __m256 t6 = _mm256_unpacklo_ps(v[6], v[7]);
+    const __m256 t7 = _mm256_unpackhi_ps(v[6], v[7]);
+    const __m256 s0 = _mm256_shuffle_ps(t0, t2, 0x44);
+    const __m256 s1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+    const __m256 s2 = _mm256_shuffle_ps(t1, t3, 0x44);
+    const __m256 s3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    const __m256 s4 = _mm256_shuffle_ps(t4, t6, 0x44);
+    const __m256 s5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+    const __m256 s6 = _mm256_shuffle_ps(t5, t7, 0x44);
+    const __m256 s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+    v[0] = _mm256_permute2f128_ps(s0, s4, 0x20);
+    v[1] = _mm256_permute2f128_ps(s1, s5, 0x20);
+    v[2] = _mm256_permute2f128_ps(s2, s6, 0x20);
+    v[3] = _mm256_permute2f128_ps(s3, s7, 0x20);
+    v[4] = _mm256_permute2f128_ps(s0, s4, 0x31);
+    v[5] = _mm256_permute2f128_ps(s1, s5, 0x31);
+    v[6] = _mm256_permute2f128_ps(s2, s6, 0x31);
+    v[7] = _mm256_permute2f128_ps(s3, s7, 0x31);
+}
+
+/*
+ * Eight rows are dequantized into eight registers and transposed there, so
+ * the panel is written once, contiguously, with no scratch in between. The
+ * eight values one uint32 covers never straddle a quant group: k0 is a
+ * multiple of 8 and every group size is too — which is also why the scales
+ * are converted once per group rather than once per eight values.
+ * vv_half_to_float is branchy software, and at one call per eight values it
+ * cost more than the dequantize it was feeding.
+ */
+#define VV_PACKB_AVX2(GRP, GROUP_SETUP, DEQUANT_8)                            \
+    const int grp = (GRP);                                                    \
+    for (int jb = 0; jb < VV_NR; jb += 8) {                                   \
+        for (int kg = 0; kg < kc; kg += grp) {                                \
+            float gs[8], gm[8];                                               \
+            for (int r = 0; r < 8; r++) {                                     \
+                const int n = n0 + jb + r; (void)n; GROUP_SETUP;              \
+            }                                                                 \
+            for (int k0 = kg; k0 < kg + grp; k0 += 8) {                       \
+                const int kk = kb + k0;                                       \
+                __m256 v[8];                                                  \
+                for (int r = 0; r < 8; r++) {                                 \
+                    const int n = n0 + jb + r; (void)n; v[r] = (DEQUANT_8);   \
+                }                                                             \
+                transpose8_avx2(v);                                           \
+                for (int t = 0; t < 8; t++)                                   \
+                    _mm256_storeu_ps(bp + (size_t)(k0 + t) * VV_NR + jb,      \
+                                     v[t]);                                   \
+            }                                                                 \
+        }                                                                     \
+    }
+
+/** @brief The eight 4-bit codes of row `n` at column `kk`, as float indices. */
+__attribute__((target("avx2"), always_inline))
+static inline __m256 codes_8_avx2(const uint8_t* w, int kk) {
+    const __m256i shifts = _mm256_setr_epi32(4, 0, 12, 8, 20, 16, 28, 24);
+    uint32_t bits;
+    memcpy(&bits, w + (kk >> 1), sizeof(bits));
+    return _mm256_castsi256_ps(_mm256_and_si256(
+        _mm256_srlv_epi32(_mm256_set1_epi32((int)bits), shifts),
+        _mm256_set1_epi32(0xF)));
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+static inline __m256 nf4_8_avx2(const bpanel_src_t* s, int n, int kk,
+                                float scale) {
+    const __m256i idx = _mm256_castps_si256(
+        codes_8_avx2(s->w + (size_t)n * ((size_t)s->K >> 1), kk));
+    const __m256 v = _mm256_blendv_ps(
+        _mm256_permutevar8x32_ps(_mm256_loadu_ps(NF4), idx),
+        _mm256_permutevar8x32_ps(_mm256_loadu_ps(NF4 + 8), idx),
+        _mm256_castsi256_ps(_mm256_slli_epi32(idx, 28)));
+    return _mm256_mul_ps(v, _mm256_set1_ps(scale));
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+static inline __m256 int4g_8_avx2(const bpanel_src_t* s, int n, int kk,
+                                  float scale, float min) {
+    const __m256i idx = _mm256_castps_si256(
+        codes_8_avx2(s->w + (size_t)n * ((size_t)s->K >> 1), kk));
+    return _mm256_fmadd_ps(_mm256_cvtepi32_ps(idx), _mm256_set1_ps(scale),
+                           _mm256_set1_ps(min));
+}
+
+__attribute__((target("avx2,f16c"), always_inline))
+static inline __m256 f16_8_avx2(const bpanel_src_t* s, int n, int kk) {
+    return _mm256_cvtph_ps(_mm_loadu_si128(
+        (const __m128i*)(s->wf16 + (size_t)n * s->K + kk)));
+}
+
+__attribute__((target("avx2,fma,f16c")))
+static void packb_nf4_avx2(const bpanel_src_t* s, int n0, int kb, int kc,
+                           float* bp, float* tmp) {
+    (void)tmp;
+    VV_PACKB_AVX2(64,
+        gs[r] = vv_half_to_float(
+            s->scales[(size_t)n * ((size_t)s->K >> 6) + ((kb + kg) >> 6)]),
+        nf4_8_avx2(s, n, kk, gs[r]))
+}
+
+__attribute__((target("avx2,fma,f16c")))
+static void packb_int4g_avx2(const bpanel_src_t* s, int n0, int kb, int kc,
+                             float* bp, float* tmp) {
+    (void)tmp;
+    const size_t gstr = (size_t)(s->K / s->group);
+    VV_PACKB_AVX2(s->group,
+        do { const size_t g = (size_t)n * gstr + (size_t)(kb + kg) / s->group;
+             gs[r] = vv_half_to_float(s->scales[g]);
+             gm[r] = vv_half_to_float(s->mins[g]); } while (0),
+        int4g_8_avx2(s, n, kk, gs[r], gm[r]))
+}
+
+__attribute__((target("avx2,fma,f16c")))
+static void packb_f16_avx2(const bpanel_src_t* s, int n0, int kb, int kc,
+                           float* bp, float* tmp) {
+    (void)tmp;
+    VV_PACKB_AVX2(kc, gs[r] = gm[r] = 0.0f, f16_8_avx2(s, n, kk))
+}
+
+static const ukernel_t UK_AVX2_NF4   = { VV_MR, VV_NR, micro_6x16_avx2,
+                                         packb_nf4_avx2 };
+static const ukernel_t UK_AVX2_INT4G = { VV_MR, VV_NR, micro_6x16_avx2,
+                                         packb_int4g_avx2 };
+static const ukernel_t UK_AVX2_F16   = { VV_MR, VV_NR, micro_6x16_avx2,
+                                         packb_f16_avx2 };
+#endif /* VV_X86 && __GNUC__ */
+
+/* ── Blocking driver ── */
+
+/** @brief Copy MR rows of A, k-major, zero-padded past the last real row. */
+static void pack_a_panel(const float* A, int M, int K, int row0, int kb,
+                         int kc, int mr_max, float* ap) {
+    for (int r = 0; r < mr_max; r++) {
+        const int row = row0 + r;
+        if (row < M) {
+            const float* src = A + (size_t)row * K + kb;
+            for (int k = 0; k < kc; k++) ap[(size_t)k * mr_max + r] = src[k];
+        } else {
+            for (int k = 0; k < kc; k++) ap[(size_t)k * mr_max + r] = 0.0f;
+        }
+    }
+}
+
+/**
+ * @brief C[M,N] += A . B^T for the first `n_packed` columns of C.
+ *
+ * C must already hold the bias (or zero); every panel accumulates into it.
+ * Returns VV_ERR_OUT_OF_MEMORY if the panels cannot be allocated, in which
+ * case the caller still has its untouched fallback.
+ */
+static vv_status_t gemm_packed(const float* A, const bpanel_src_t* src,
+                               float* C, int M, int N, int K, int n_packed,
+                               const ukernel_t* uk) {
+    const int MR = uk->mr, NR = uk->nr;
+    const int nt = vv_cpu_threads();
+
+    /* A k-block is a whole number of quant groups, so the packers can index
+       a scale per eight values without a boundary case. */
+    int kc_max = ((VV_KC + src->group - 1) / src->group) * src->group;
+    if (kc_max > K) kc_max = K;
+
+    int mc = VV_L2_A / (kc_max * (int)sizeof(float));
+    if (mc < MR) mc = MR;
+    mc = mc / MR * MR;
+    const int m_padded = (M + MR - 1) / MR * MR;
+    if (mc > m_padded) mc = m_padded;
+
+    /* One allocation for the shared A block and every thread's B panel, so
+       a failure is seen before any thread has written to C. */
+    const size_t ap_n = (size_t)mc * kc_max;
+    const size_t per_thread = (size_t)kc_max * NR + (size_t)kc_max;
+    float* ap = (float*)malloc((ap_n + per_thread * (size_t)nt) * sizeof(float));
+    if (!ap) return VV_ERR_OUT_OF_MEMORY;
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nt)
+#endif
+    {
+#ifdef _OPENMP
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        bind_team();
+        float* bp = ap + ap_n + per_thread * (size_t)tid;
+        float* tmp = bp + (size_t)kc_max * NR;
+
+        for (int mb = 0; mb < M; mb += mc) {
+            const int m_left = M - mb;
+            const int m_rows = m_left < mc ? m_left : mc;
+            const int panels = (m_rows + MR - 1) / MR;
+
+            for (int kb = 0; kb < K; kb += kc_max) {
+                const int k_left = K - kb;
+                const int kc = k_left < kc_max ? k_left : kc_max;
+                int i;
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+                for (i = 0; i < panels; i++)
+                    pack_a_panel(A, M, K, mb + i * MR, kb, kc, MR,
+                                 ap + (size_t)i * kc_max * MR);
+                /* Barrier here: every n-panel below reads all of `ap`. */
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+                for (i = 0; i < n_packed / NR; i++) {
+                    const int n0 = i * NR;
+                    uk->packb(src, n0, kb, kc, bp, tmp);
+                    for (int p = 0; p < panels; p++) {
+                        const int mr = m_rows - p * MR;
+                        uk->micro(ap + (size_t)p * kc_max * MR, bp,
+                                  C + (size_t)(mb + p * MR) * N + n0,
+                                  N, kc, mr < MR ? mr : MR);
+                    }
+                }
+            }
+        }
+    }
+    free(ap);
+    return VV_OK;
+}
+
+/** @brief Pick the packed kernel for this encoding, or NULL if there is none. */
+static const ukernel_t* pick_ukernel(int kind) {
+#if defined(VV_X86) && defined(__GNUC__)
+    if (simd_kind() == SIMD_AVX2)
+        return kind == 0 ? &UK_AVX2_NF4
+             : kind == 1 ? &UK_AVX2_INT4G : &UK_AVX2_F16;
+#endif
+    return kind == 0 ? &UK_REF_NF4 : kind == 1 ? &UK_REF_INT4G : &UK_REF_F16;
+}
+
+/**
+ * @brief Seed C with the bias, which every panel then accumulates into.
+ */
+static void fill_bias(float* C, const uint16_t* bias, int M, int N) {
+    if (!bias) {
+        memset(C, 0, (size_t)M * N * sizeof(float));
+        return;
+    }
+    int m;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (m = 0; m < M; m++)
+        for (int n = 0; n < N; n++)
+            C[(size_t)m * N + n] = vv_half_to_float(bias[n]);
+}
+
+/*
+ * Below this many rows the packing does not pay for itself: the weights
+ * still have to be read in full, so the kernel is bandwidth bound either
+ * way, and the row-at-a-time path skips two copies.
+ */
+#define VV_PACK_MIN_M 4
+
+/**
+ * @brief Run the packed path over whole NR-column panels of C.
+ * @return Columns computed — 0 when the packed path declined, in which case
+ *         C is untouched and the caller's row loop must cover all of N.
+ */
+static int gemm_packed_try(const float* input, const bpanel_src_t* src,
+                           const uint16_t* bias, float* output,
+                           int M, int N, int K, int kind) {
+    /* Eight values of a row are dequantized at a time, so K has to divide. */
+    if (M < VV_PACK_MIN_M || (K & 7) != 0) return 0;
+    const ukernel_t* uk = pick_ukernel(kind);
+    const int n_packed = N / uk->nr * uk->nr;
+    if (n_packed == 0) return 0;
+
+    build_tables();
+    fill_bias(output, bias, M, N);
+    if (gemm_packed(input, src, output, M, N, K, n_packed, uk) != VV_OK) {
+        /* The row loop assigns rather than accumulates, so the bias this
+           wrote is harmlessly overwritten. */
+        return 0;
+    }
+    return n_packed;
+}
+
 /* ─── Quantized GEMM ────────────────────────────────────────────────────── */
 
 /*
@@ -512,7 +1122,7 @@ static float int4g_dot_avx2(const uint8_t* __restrict w,
  * DEQUANT_SLICE fills `row[0..kc)` with weight row `n` from column `kp`; the
  * whole row, in this arrangement.
  */
-#define VV_QGEMM_BODY(DEQUANT_SLICE)                                             build_tables();                                                              const uint16_t* bs = (const uint16_t*)bias;                                  const int kp = 0, kc = K;                                                    _Pragma("omp parallel")                                                      {                                                                                float* row = (float*)malloc((size_t)K * sizeof(float));                      if (row) {                                                                       int n;                             _Pragma("omp for schedule(static)")                                          for (n = 0; n < N; n++)      {                                                    DEQUANT_SLICE;                                                               const float b = bs ? vv_half_to_float(bs[n]) : 0.0f;                         for (int m = 0; m < M; m++)                                                      output[(size_t)m * N + n] =                                                      dot_f32(input + (size_t)m * K + kp, row, kc) + b;                }                                                                            free(row);                                                               }                                                                        }
+#define VV_QGEMM_BODY(DEQUANT_SLICE)                                             build_tables();                                                              const uint16_t* bs = (const uint16_t*)bias;                                  const int kp = 0, kc = K;                                                    _Pragma("omp parallel")                                                      {                                                                                float* row = (float*)malloc((size_t)K * sizeof(float));                      if (row) {                                                                       int n;                             _Pragma("omp for schedule(static)")                                          for (n = n_lo; n < N; n++) {                                                    DEQUANT_SLICE;                                                               const float b = bs ? vv_half_to_float(bs[n]) : 0.0f;                         for (int m = 0; m < M; m++)                                                      output[(size_t)m * N + n] =                                                      dot_f32(input + (size_t)m * K + kp, row, kc) + b;                }                                                                            free(row);                                                               }                                                                        }
 
 vv_status_t vv_nf4_gemm_cpu(const float* input, const uint8_t* packed,
                             const void* scales, const void* bias,
@@ -522,6 +1132,11 @@ vv_status_t vv_nf4_gemm_cpu(const float* input, const uint8_t* packed,
 
     const uint16_t* sc = (const uint16_t*)scales;
     const uint16_t* bsv = (const uint16_t*)bias;
+
+    const bpanel_src_t bsrc = { packed, sc, NULL, NULL, 64, K };
+    const int n_lo = gemm_packed_try(input, &bsrc, bsv, output, M, N, K, 0);
+    if (n_lo == N) return VV_OK;
+
 #if defined(VV_X86) && defined(__GNUC__)
     const bool use_avx2 = (simd_kind() == SIMD_AVX2);
     if (use_avx2 && M == 1) {
@@ -567,6 +1182,10 @@ vv_status_t vv_int4g_gemm_cpu(const float* input, const uint8_t* packed,
     const uint16_t* bsv = (const uint16_t*)bias;
     const int ng = K / group;
 
+    const bpanel_src_t bsrc = { packed, sc, mn, NULL, group, K };
+    const int n_lo = gemm_packed_try(input, &bsrc, bsv, output, M, N, K, 1);
+    if (n_lo == N) return VV_OK;
+
 #if defined(VV_X86) && defined(__GNUC__)
     if (simd_kind() == SIMD_AVX2 && M == 1) {
         int n;
@@ -609,6 +1228,10 @@ vv_status_t vv_gemm_f16w_cpu(const float* input, const void* w_fp16,
     const uint16_t* w = (const uint16_t*)w_fp16;
     const uint16_t* bs = (const uint16_t*)bias_fp16;
 
+    const bpanel_src_t bsrc = { NULL, NULL, NULL, w, 8, K };
+    const int n_lo = gemm_packed_try(input, &bsrc, bs, output, M, N, K, 2);
+    if (n_lo == N) return VV_OK;
+
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
@@ -619,7 +1242,7 @@ vv_status_t vv_gemm_f16w_cpu(const float* input, const void* w_fp16,
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
-            for (n = 0; n < N; n++) {
+            for (n = n_lo; n < N; n++) {
                 f16_row(w + (size_t)n * K, row, K);
                 const float b = bs ? vv_half_to_float(bs[n]) : 0.0f;
                 for (int m = 0; m < M; m++)

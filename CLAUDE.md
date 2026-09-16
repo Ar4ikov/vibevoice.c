@@ -21,7 +21,7 @@ Runtime работает end-to-end и **посимвольно совпадае
 | Decode | **128 tok/s** (0.2K ctx), 112 (1.5K), 76 (14K→24K) |
 | RTF | **0.065** (120 c), **0.079** (32 мин) |
 | VRAM | 9.8 GB (3.2 веса + 1.8 KV на 32K) |
-| CPU-only | 7.9 tok/s, RTF 1.24, вывод идентичен GPU |
+| CPU-only | prefill 77 tok/s (991 GFLOP/s), decode 7.9 tok/s, RTF 0.81 |
 
 Для сравнения: `transformers` + `bitsandbytes` на той же карте — 27.6 tok/s.
 
@@ -118,8 +118,6 @@ transcribe it with these keys: ...`.
   разработки. Шов готов — `include/vibevoice/device.h` объявляет набор
   операций, сборка линкует ровно одну реализацию, `src/device/device_none.c`
   показывает форму.
-* **Упакованный CPU micro-kernel** — prefill на CPU идёт на ~20% пика FMA.
-  Тайлинг M и K пробовался и оказался медленнее.
 * `src/trt/` — заглушки.
 * Акустический латент по умолчанию берётся как среднее (детерминированно).
   Выборка эталона есть: `--acoustic-sampling gaussian|fix --seed N`.
