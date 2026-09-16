@@ -107,6 +107,7 @@ static void print_usage(const char* prog) {
         "  --seed <N>            Seed for that draw (default: from the clock)\n"
         "  --cpu                 CPU-only mode (no GPU)\n"
         "  --verbose             Enable debug logging\n"
+        "  --version             Print version and build ref, then exit\n"
         "  --help                Show this message\n\n"
         "Commands:\n"
         "  serve                 Run the OpenAI-compatible HTTP server\n"
@@ -189,6 +190,17 @@ int main(int argc, char** argv) {
 #endif
 
     /*
+     * Answered before anything else is parsed, so that the tag on a
+     * container image can be checked against the binary it holds.
+     */
+    if (argc > 1 && (strcmp(argv[1], "--version") == 0 ||
+                     strcmp(argv[1], "-V") == 0)) {
+        printf("vibevoice.c %s (%s) [%s]\n",
+               vv_version(), vv_build_ref(), vv_build_features());
+        return 0;
+    }
+
+    /*
      * Subcommands. Without one the arguments are read as a single
      * transcription, which is how the CLI has always behaved.
      */
@@ -218,7 +230,7 @@ int main(int argc, char** argv) {
     /* Configure logging */
     vv_log_set_level(args.verbose ? VV_LOG_DEBUG : VV_LOG_INFO);
 
-    VV_LOG_I("vibevoice.c v%s", VV_VERSION_STRING);
+    VV_LOG_I("vibevoice.c %s (%s)", vv_version(), vv_build_ref());
     VV_LOG_I("Model: %s", args.model_dir);
     VV_LOG_I("Audio: %s", args.audio_path);
     VV_LOG_I("GPU: %d", args.gpu_id);

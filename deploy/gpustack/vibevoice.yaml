@@ -19,8 +19,22 @@ common_parameters:
   - --vram-budget
 default_env:
   OMP_NUM_THREADS: '8'
+# One entry per image tag the deployment can be pinned to. GET /health on the
+# running backend reports which build actually answered. A release line only
+# appears here after its first v* tag is published; see docs/RELEASING.md.
 version_configs:
+  # Newest published build, release or master. The default.
   latest:
     image_name: ghcr.io/ar4ikov/vibevoice.c:latest
+    entrypoint: /usr/local/bin/vv_cli
+    custom_framework: cuda
+  # The 0.1 release line: newest v0.1.x, moves when a patch is tagged.
+  '0.1':
+    image_name: ghcr.io/ar4ikov/vibevoice.c:0.1
+    entrypoint: /usr/local/bin/vv_cli
+    custom_framework: cuda
+  # Head of the default branch, republished on every push to master.
+  master:
+    image_name: ghcr.io/ar4ikov/vibevoice.c:master
     entrypoint: /usr/local/bin/vv_cli
     custom_framework: cuda

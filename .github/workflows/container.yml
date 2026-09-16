@@ -8,11 +8,32 @@ on:
 permissions:
   contents: read
   packages: write
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   image:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      # A v* tag has to name the version the source declares, or the image
+      # would be published under a number nothing inside it agrees with.
+      # Prerelease suffixes are compared on the release part alone, so
+      # v0.2.0-rc.1 is checked against 0.2.0.
+      - name: Tag matches the declared version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          declared=$(sed -n 's/^#define VV_VERSION_STRING "\(.*\)"$/\1/p' \
+                     include/vibevoice/vibevoice.h)
+          tagged=${GITHUB_REF_NAME#v}
+          release=${tagged%%-*}
+          echo "header $declared, tag $tagged"
+          if [ "$declared" != "$release" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VV_VERSION_STRING $declared"
+            exit 1
+          fi
+
       - uses: docker/setup-buildx-action@v3
       - name: Image name
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
@@ -22,20 +43,80 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tag scheme, and what each one is for:
+      #   0.2.1        one release, immutable once published
+      #   0.2          newest patch of that minor line, moves
+      #   1            newest major line, offered from 1.0 onward; a bare 0
+      #                is not, because minor bumps below 1.0 may break
+      #   master       head of the default branch
+      #   sha-1a2b3c4  one commit, immutable, what to pin for reproducibility
+      #   latest       newest published build, release or master
+      #   pr-7         built on pull requests, never pushed
       - uses: docker/metadata-action@v5
         id: meta
         with:
           images: ${{ env.IMAGE }}
+          flavor: latest=false
           tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha
-            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            VV_VERSION=${{ steps.meta.outputs.version }}
+            VV_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The point of stamping the tag into the image is that it can be read
+      # back out of it. This starts the published image on a runner with no
+      # GPU -- the binary loads the driver lazily, so --version answers
+      # anywhere -- and checks that it names the tag it was published under.
+      - name: Image reports its own tag
+        if: github.event_name != 'pull_request'
+        env:
+          REF: ${{ steps.meta.outputs.version }}
+        run: |
+          out=$(docker run --rm "$IMAGE:$REF" --version)
+          echo "$out"
+          case "$out" in
+            *"($REF)"*) ;;
+            *) echo "::error::image does not report $REF"; exit 1 ;;
+          esac
+
+      - name: Summary
+        if: always() && steps.build.outcome != 'skipped'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PUSHED: ${{ github.event_name != 'pull_request' }}
+        run: |
+          {
+            if [ "$PUSHED" = "true" ]; then
+              echo "### Published"
+            else
+              echo "### Built, not published (pull request)"
+            fi
+            echo
+            echo '```'
+            echo "$TAGS"
+            if [ -n "$DIGEST" ]; then
+              echo "digest $DIGEST"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

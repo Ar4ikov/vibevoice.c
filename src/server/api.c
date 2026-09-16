@@ -184,11 +184,13 @@ static void handle_health(vv_server_t* sv, vv_http_res_t* res) {
     uint64_t done = 0;
     int busy = 0;
     vv_engine_stats(sv->engine, &done, &busy);
-    char buf[512];
+    char buf[640];
     snprintf(buf, sizeof(buf),
-             "{\"status\":\"ok\",\"model\":\"%s\",\"slots\":%d,"
+             "{\"status\":\"ok\",\"model\":\"%s\",\"version\":\"%s\","
+             "\"build\":\"%s\",\"slots\":%d,"
              "\"busy\":%d,\"completed\":%llu}",
-             sv->model_name, vv_engine_slots(sv->engine), busy,
+             sv->model_name, vv_version(), vv_build_ref(),
+             vv_engine_slots(sv->engine), busy,
              (unsigned long long)done);
     vv_http_respond_json(res, 200, buf);
 }
@@ -230,7 +232,19 @@ static void handle_metrics(vv_server_t* sv, vv_http_res_t* res) {
              sv->queue.waiting, sv->queue.capacity,
              (unsigned long long)sv->queue.rejected);
     vv_mutex_unlock(&sv->queue.lock);
+    /*
+     * A gauge of 1 carrying the version in its labels, which is how a
+     * Prometheus target says which build is answering.
+     */
+    char info_buf[320];
+    snprintf(info_buf, sizeof(info_buf),
+             "# HELP vibevoice_build_info Version of the binary answering\n"
+             "# TYPE vibevoice_build_info gauge\n"
+             "vibevoice_build_info{version=\"%s\",build=\"%s\","
+             "features=\"%s\"} 1\n",
+             vv_version(), vv_build_ref(), vv_build_features());
     strbuf_t b; sb_init(&b); sb_puts(&b, buf); sb_puts(&b, queue_buf);
+    sb_puts(&b, info_buf);
     vv_http_respond(res, 200, "text/plain; version=0.0.4", b.buf, b.len);
     sb_free(&b);
 }

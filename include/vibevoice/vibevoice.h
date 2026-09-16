@@ -20,6 +20,21 @@ extern "C" {
 #define VV_VERSION_PATCH 0
 #define VV_VERSION_STRING "0.1.0"
 
+/** @brief Release version this binary was compiled as, e.g. "0.1.0". */
+const char* vv_version(void);
+
+/**
+ * @brief What the build knew about its source.
+ *
+ * A `git describe` for a working tree, the published tag for a container
+ * image (which passes it as $VV_BUILD_REF), or "unknown". Reported by
+ * `vv_cli --version`, `GET /health` and the `vibevoice_build_info` metric.
+ */
+const char* vv_build_ref(void);
+
+/** @brief Compile-time features, space separated: "cuda openmp". */
+const char* vv_build_features(void);
+
 /* ─── Core ──────────────────────────────────────────────────────────────── */
 
 /** @brief Get human-readable string for a status code. */

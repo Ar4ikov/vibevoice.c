@@ -1,7 +1,40 @@
 cmake_minimum_required(VERSION 3.22)
 
+# ─── Version ─────────────────────────────────────────────────────────────────
+#
+# The release version lives in the public header and nowhere else. CMake reads
+# it from there, so a bump is one edit and the two can never disagree -- which
+# matters because CI refuses to publish a `v*` tag that does not match it.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/vibevoice/vibevoice.h" VV_HEADER)
+string(REGEX MATCH "VV_VERSION_STRING[ \t]+\"([0-9]+[.][0-9]+[.][0-9]+)\""
+       VV_VERSION_MATCH "${VV_HEADER}")
+if(NOT CMAKE_MATCH_1)
+    message(FATAL_ERROR "No VV_VERSION_STRING in include/vibevoice/vibevoice.h")
+endif()
+set(VV_VERSION "${CMAKE_MATCH_1}")
+unset(VV_HEADER)
+
 # ─── Bootstrap project (C/CXX first, CUDA probed afterward) ──────────────────
-project(vibevoice C CXX)
+project(vibevoice VERSION ${VV_VERSION} LANGUAGES C CXX)
+
+# What the binary will report as the source it came from. -DVV_BUILD_REF wins
+# (the container passes the published image tag); a working tree falls back to
+# its git describe; an unpacked tarball to the bare version. Resolved at
+# configure time, so it goes stale until the next `cmake -B`.
+if(NOT VV_BUILD_REF)
+    find_package(Git QUIET)
+    if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            OUTPUT_VARIABLE VV_BUILD_REF
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+    endif()
+endif()
+if(NOT VV_BUILD_REF)
+    set(VV_BUILD_REF "${VV_VERSION}")
+endif()
 
 option(VV_ENABLE_CUDA  "Enable CUDA GPU support"       ON)
 option(VV_ENABLE_BLAS  "Enable OpenBLAS for CPU GEMM"   OFF)
@@ -150,6 +183,7 @@ add_library(vibevoice_core STATIC
     src/core/logger.c
     src/core/error.c
     src/core/clock.c
+    src/core/version.c
     src/audio/wav.c
     src/audio/resample.c
     src/audio/normalize.c
@@ -188,6 +222,9 @@ if(NOT VV_HAS_CUDA AND NOT VV_HAS_METAL)
 endif()
 
 target_link_libraries(vibevoice_core PUBLIC cjson)
+
+# What `vv_cli --version`, /health and vibevoice_build_info report.
+target_compile_definitions(vibevoice_core PUBLIC VV_BUILD_REF="${VV_BUILD_REF}")
 if(OpenMP_C_FOUND)
     target_link_libraries(vibevoice_core PUBLIC OpenMP::OpenMP_C)
 endif()
@@ -337,7 +374,8 @@ install(DIRECTORY include/vibevoice DESTINATION include)
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 message(STATUS "")
-message(STATUS "  vibevoice.c build configuration:")
+message(STATUS "  vibevoice.c ${VV_VERSION} build configuration:")
+message(STATUS "    Build ref: ${VV_BUILD_REF}")
 message(STATUS "    CUDA:      ${VV_HAS_CUDA}")
 message(STATUS "    OpenBLAS:  ${VV_HAS_BLAS}")
 message(STATUS "    TensorRT:  ${VV_HAS_TRT}")

@@ -13,7 +13,8 @@ No weights, Python or Hugging Face credentials are embedded in the image.
    public in GitHub's package settings, or configure authenticated registry pulls
    in GPUStack. A public Git repository does not automatically make its package public.
 2. Import the backend YAML. Create/edit a deployment, choose `vibevoice-custom`,
-   version `latest`, category **Speech-to-Text**, and Hugging Face repository
+   a version (`latest`, a release line such as `0.1`, or `master` -- see
+   [RELEASING](../../docs/RELEASING.md)), category **Speech-to-Text**, and Hugging Face repository
    `Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM`. Use the complete model directory, not
    an individual safetensors shard. Its tokenizer files must be present.
 3. Assign **one NVIDIA GPU per replica**. Start with one replica and one slot.
