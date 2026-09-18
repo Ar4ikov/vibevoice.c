@@ -69,7 +69,7 @@ typedef enum vv_dtype {
     VV_DTYPE_F8_E4M3 = 6,  /* FP8 for double-quantization scales */
     VV_DTYPE_NF4    = 7,   /* logical type: NF4 packed as U8 */
     VV_DTYPE_BOOL   = 8,
-    VV_DTYPE_I8     = 9,
+    VV_DTYPE_I8     = 9,   /* int8: W8A8 weights, int8 activations     */
     VV_DTYPE_I16    = 10,
     VV_DTYPE_U16    = 11,
     VV_DTYPE_U32    = 12,
@@ -77,6 +77,7 @@ typedef enum vv_dtype {
     /** A dtype string the parser does not know. Never guessed at: whoever
      *  needs the tensor refuses it by name instead of reading garbage. */
     VV_DTYPE_UNKNOWN = 14,
+    VV_DTYPE_F64    = 15,
 } vv_dtype_t;
 
 /** @brief Size in bytes for a single element of the given dtype. */
@@ -96,6 +97,7 @@ static inline size_t vv_dtype_size(vv_dtype_t dtype) {
         case VV_DTYPE_U16:     return 2;
         case VV_DTYPE_U32:     return 4;
         case VV_DTYPE_F8_E5M2: return 1;
+        case VV_DTYPE_F64:     return 8;
         default:               return 0;
     }
 }
