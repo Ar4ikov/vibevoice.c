@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/Ar4ikov/vibevoice.c/actions/workflows/container.yml"><img alt="build" src="https://img.shields.io/github/actions/workflow/status/Ar4ikov/vibevoice.c/container.yml?branch=master&label=build&labelColor=0B0D12"></a>
-  <a href="https://github.com/Ar4ikov/vibevoice.c/tags"><img alt="version" src="https://img.shields.io/github/v/tag/Ar4ikov/vibevoice.c?label=version&labelColor=0B0D12&color=0E9E74"></a>
+  <a href="https://github.com/Ar4ikov/vibevoice.c/releases/latest"><img alt="version" src="https://img.shields.io/github/v/release/Ar4ikov/vibevoice.c?sort=semver&display_name=tag&label=version&labelColor=0B0D12&color=0E9E74"></a>
   <a href="https://github.com/Ar4ikov/vibevoice.c/pkgs/container/vibevoice.c"><img alt="image" src="https://img.shields.io/badge/ghcr.io-vibevoice.c-0E9E74?labelColor=0B0D12&logo=docker&logoColor=F7F8FA"></a>
   <img alt="runtime" src="https://img.shields.io/badge/runtime-C11%20%2B%20CUDA%2012-0E9E74?labelColor=0B0D12">
   <img alt="links against" src="https://img.shields.io/badge/links%20against-libc%20%2B%20libm-0E9E74?labelColor=0B0D12">
@@ -404,47 +404,50 @@ shards, because the second replica would only sit idle.
 ## Container images
 
 ```bash
-docker run --rm --gpus all -p 8080:8080 -v /models:/model:ro \
-  ghcr.io/ar4ikov/vibevoice.c:latest serve --model /model --host 0.0.0.0
+docker run --rm --gpus all -p 8080:8080 -v /models:/model:ro   ghcr.io/ar4ikov/vibevoice.c:0.2 serve --model /model --host 0.0.0.0
 ```
 
-Built and tested by the Container workflow, which runs `ctest` inside the
-build stage and then starts the published image to check that it reports the
-tag it was published under.
+Versions follow [SemVer 2.0](https://semver.org), and every published image
+has one version tag that never moves — pin that one:
 
-| tag | published on | moves |
+| tag | published by | moves |
 |---|---|---|
-| `0.2.1` | the `v0.2.1` git tag | never |
-| `0.2` | the same tag | to the newest patch of 0.2 |
-| `latest` | a release, or a push to master | to whichever is newer |
-| `master` | a push to master | with the branch |
+| `0.2.0` | the `v0.2.0` release | never |
+| `0.2.1-dev.5` | a push to master (5 commits past v0.2.0) | never |
 | `sha-1a2b3c4` | any push | never |
-| `pr-7` | a pull request | built and tested, never pushed |
+| `0.2` | the newest `0.2.x` release | to the next patch |
+| `latest` | the newest release | to the next release, never a dev build |
+| `master`, `edge` | a push to master | with the branch |
+| `pr-7` | a pull request | built and checked, never pushed |
 
 ```mermaid
 flowchart TD
   subgraph pinned["safe to pin: never moves"]
+    V["0.2.0"]
+    D["0.2.1-dev.5"]
     S["sha-1a2b3c4"]
-    V["0.2.1"]
   end
   subgraph moving["follows: repointed by a later build"]
     M["0.2"]
-    B["master"]
     L["latest"]
+    B["master / edge"]
   end
   pinned -.-> R["a deployment you have to reproduce"]
   moving -.-> U["a deployment that should pick up fixes"]
 ```
 
-The tag is stamped into the image, so the binary can be asked rather than
+The version is compiled into the binary, so it can be asked rather than
 trusted — `--version`, `GET /health` and the `vibevoice_build_info` metric
-all report it, and the version itself lives in one place,
-`VV_VERSION_STRING`:
+all report it, and CI refuses to announce an image that does not report
+exactly the version it is tagged with:
 
 ```bash
-$ docker run --rm ghcr.io/ar4ikov/vibevoice.c:0.1.0 --version
-vibevoice.c 0.1.0 (0.1.0) [cuda openmp]
+$ docker run --rm ghcr.io/ar4ikov/vibevoice.c:0.2.0 --version
+vibevoice.c 0.2.0 (1a2b3c4) [cuda openmp]
 ```
+
+Each GitHub release also carries the same binary as
+`vibevoice.c-<version>-linux-x86_64.tar.gz`, with its SHA-256.
 
 Tagging, what each tag guarantees, and how to cut a release:
 [docs/RELEASING.md](docs/RELEASING.md). GPUStack deployment:

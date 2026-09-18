@@ -2,53 +2,34 @@
  * @file version.c
  * @brief What this binary says it is.
  *
- * Two different things are worth asking a binary. The release version is
- * compiled in and changes only when someone bumps the header. The build ref
- * is whatever the build knew about its source -- a `git describe` for a
- * working tree, the published image tag for a container -- and it is what
- * makes an image tag checkable from the inside:
+ * Two things are worth asking a binary. Its version is a full SemVer 2.0
+ * string: `0.2.0` for a build of the v0.2.0 tag, `0.2.1-dev.5+g1a2b3c4` for
+ * one five commits past it. Its revision is the commit it was built from.
+ * Both are derived by cmake/Version.cmake and stamped into a generated header
+ * on every build, and the container build passes them in explicitly because
+ * its context has no .git. Either way they are compiled in, so the answer is
+ * the binary's own and cannot be overridden from the environment:
  *
- *     docker run --rm ghcr.io/ar4ikov/vibevoice.c:0.1.0 --version
- *
- * The container stamps its ref through the environment rather than the
- * compile, because a build argument that reaches the `cmake` layer would
- * invalidate the build cache on every commit and rebuild all five CUDA
- * architectures for a string.
+ *     docker run --rm ghcr.io/ar4ikov/vibevoice.c:0.2.0 --version
+ *     vibevoice.c 0.2.0 (1a2b3c4) [cuda openmp]
  */
 #include "vibevoice/vibevoice.h"
 
-#include <stdlib.h>
+#include "vv_build_info.h"
 
-#ifndef VV_BUILD_REF
-#define VV_BUILD_REF "unknown"
+#ifndef VV_VERSION_FULL
+#define VV_VERSION_FULL VV_VERSION_STRING
+#endif
+#ifndef VV_REVISION
+#define VV_REVISION "unknown"
 #endif
 
-/** @brief True for the characters a ref is allowed to contain. */
-static int ref_char_ok(char c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
-           (c >= 'A' && c <= 'Z') || c == '.' || c == '-' || c == '_' ||
-           c == '+';
-}
-
 const char* vv_version(void) {
-    return VV_VERSION_STRING;
+    return VV_VERSION_FULL;
 }
 
 const char* vv_build_ref(void) {
-    /*
-     * An override has to survive being printed into JSON and into a
-     * Prometheus label, so anything outside a tag's alphabet is refused
-     * rather than escaped.
-     */
-    const char* env = getenv("VV_BUILD_REF");
-    if (env && *env) {
-        int n = 0;
-        for (; env[n]; n++) {
-            if (n >= 64 || !ref_char_ok(env[n])) return VV_BUILD_REF;
-        }
-        return env;
-    }
-    return VV_BUILD_REF;
+    return VV_REVISION;
 }
 
 const char* vv_build_features(void) {

@@ -1,0 +1,81 @@
+name: Release
+# Actions -> Release -> Run workflow, or:
+#   gh workflow run release.yml                  # next version from commits
+#   gh workflow run release.yml -f bump=minor
+#   gh workflow run release.yml -f version=1.0.0-rc.1
+#
+# Bumps include/vibevoice/vibevoice.h, turns CHANGELOG.md's Unreleased
+# section into the release's, commits "chore: release X.Y.Z" to master, tags
+# vX.Y.Z, then builds and publishes the image, the GitHub release and its
+# binary. See docs/RELEASING.md.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Kind of release; auto reads the Conventional Commits since the last tag"
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+      version:
+        description: "Exact version instead, e.g. 1.0.0-rc.1 (overrides bump)"
+        type: string
+        required: false
+permissions:
+  contents: write
+  packages: write
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  tag:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.cut.outputs.tag }}
+      version: ${{ steps.cut.outputs.version }}
+    steps:
+      - name: Only from master
+        if: github.ref != 'refs/heads/master'
+        run: |
+          echo "::error::releases are cut from master, not $GITHUB_REF"
+          exit 1
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Cut
+        id: cut
+        env:
+          REQUEST: ${{ inputs.version || inputs.bump }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/release.sh "$REQUEST"
+      # The same rule every build uses has to agree with the tag, before
+      # anything is pushed.
+      - name: Check
+        env:
+          TAG: ${{ steps.cut.outputs.tag }}
+        run: |
+          got="$(cmake -P cmake/Version.cmake | sed -n 's/^version=//p')"
+          echo "tag $TAG, cmake/Version.cmake says $got"
+          [ "v$got" = "$TAG" ]
+      - name: Push
+        env:
+          TAG: ${{ steps.cut.outputs.tag }}
+        run: git push --atomic origin HEAD:master "refs/tags/$TAG"
+      - name: Summary
+        env:
+          TAG: ${{ steps.cut.outputs.tag }}
+        run: |
+          {
+            echo "### $TAG"
+            echo
+            scripts/release.sh --notes "${TAG#v}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: tag
+    uses: ./.github/workflows/container.yml
+    with:
+      ref: ${{ needs.tag.outputs.tag }}
+    secrets: inherit

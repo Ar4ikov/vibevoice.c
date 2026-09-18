@@ -1,8 +1,11 @@
 # Changelog
 
-Newest first. The version is `VV_VERSION_STRING` in
-`include/vibevoice/vibevoice.h`; tagging `v<version>` publishes the matching
-container images — see [docs/RELEASING.md](docs/RELEASING.md).
+Newest first. Versions follow [SemVer 2.0](https://semver.org): below 1.0 a
+minor bump may break, a patch never does. The release number lives in
+`VV_VERSION_STRING` in `include/vibevoice/vibevoice.h`; the Release workflow
+bumps it, turns **Unreleased** into the release's section, tags `v<version>`
+and publishes the image and binary -- see [docs/RELEASING.md](docs/RELEASING.md).
+Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
@@ -32,18 +35,30 @@ container images — see [docs/RELEASING.md](docs/RELEASING.md).
   40% at random. `VV_CPU_BIND=0` or any OpenMP affinity variable opts out.
 - The physical-core count now respects a cpuset or taskset instead of
   counting every core on the host.
-- Container images are versioned: `0.2.1`, `0.2`, `master`, `sha-…` and
-  `pr-…` alongside `latest`, which still points at the newest published
-  build. The workflow refuses a `v*` tag that disagrees with the header, and
-  verifies after publishing that the image reports its own tag.
+- Every build has a SemVer version, compiled in: `0.2.0` for the v0.2.0
+  tag, `0.2.1-dev.5+g1a2b3c4` five commits past it (a prerelease of the next
+  version, so it sorts between the two). One rule in `cmake/Version.cmake`,
+  used by local builds, CI and the image alike.
+- Every published image has an immutable SemVer tag to pin: `0.2.0` for a
+  release, `0.2.1-dev.5` for each push to master, plus `sha-…`. Moving tags:
+  `0.2` and (from 1.0) `1` follow the newest release of their line, `latest`
+  the newest release only -- no longer master, which is `master` and `edge`.
+  Pull requests build as `pr-…`, not pushed, and are checked like the rest.
+- Releases are one click: the Release workflow infers the next version from
+  Conventional Commits (or takes `patch|minor|major|X.Y.Z-rc.N`), bumps the
+  header, moves this section, tags, and publishes the image, a GitHub release
+  and a `linux-x86_64` binary tarball with its checksum.
 - `vv_cli --version`, `GET /health` and a `vibevoice_build_info` metric all
-  report the release version and the build ref.
+  report the version and the commit; CI checks that each image reports
+  exactly the version it is tagged with, before it is announced.
 - OCI labels on the image: title, description, source, licence, version,
   revision.
 - Identity: hand-drawn mark, wordmark and lockup under `assets/brand/`,
   documented in [docs/BRAND.md](docs/BRAND.md).
 
-## 0.1.0
+## 0.1.0 — never tagged
+
+No image or tag was ever published for 0.1.0; 0.2.0 is the first release.
 
 The runtime as first described in the README: transcription with
 diarization and timestamps, an OpenAI-compatible server with slots and a

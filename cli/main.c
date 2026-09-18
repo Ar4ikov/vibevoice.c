@@ -115,7 +115,7 @@ static void print_usage(const char* prog) {
         "  --seed <N>            Seed for that draw (default: from the clock)\n"
         "  --cpu                 CPU-only mode (no GPU)\n"
         "  --verbose             Enable debug logging\n"
-        "  --version             Print version and build ref, then exit\n"
+        "  --version             Print version and revision, then exit\n"
         "  --help                Show this message\n\n"
         "Commands:\n"
         "  serve                 Run the OpenAI-compatible HTTP server\n"
@@ -124,7 +124,7 @@ static void print_usage(const char* prog) {
         "  devices               List the capture devices mic/chat can use\n"
         "  (none)                Transcribe one file and exit\n\n"
         "Run `%s <command> --help` for that command's own options.\n",
-        VV_VERSION_STRING, prog, prog);
+        vv_version(), prog, prog);
 }
 
 static int parse_args(int argc, char** argv, cli_args_t* args) {
