@@ -23,6 +23,7 @@
 #define VV_DEVICE_H
 
 #include "vibevoice/types.h"
+#include "vibevoice/q8.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -280,6 +281,78 @@ vv_status_t vv_w4a16_gemm_dev(
 vv_status_t vv_w4a16_dequant_dev(
     const void* packed, const void* sz, void* out_fp16,
     int N, int K, int group_size, void* stream);
+/* ─── Int8 activations (W8A8, W4A8) ─────────────────────────────────────── */
+
+/*
+ * Activations are quantized per token (row): sx[m] = max|x[m,:]| / 127 and
+ * xq = round-half-even(x * 127 / max|x|), so |xq| <= 127. Every quantizer
+ * below computes exactly that, from the FP16 value the unfused op would have
+ * written, so a quantized row is bit-identical to "op, then vv_act_quant_dev"
+ * and to vv_quant_act_q8_cpu on the same values.
+ *
+ * `xsum` (optional, may be NULL) receives the sum of xq over each run of 32
+ * columns, [M][K/32] int32; the W4A8 GEMV uses it to apply integer zero
+ * points once per 32 weights. K must be a multiple of 32. `layout` is a
+ * vv_q8_layout_t (q8.h).
+ */
+
+/** @brief FP16 [M,K] -> int8 [M,K] + FP32 scale [M] (+ xsum [M,K/32]). */
+vv_status_t vv_act_quant_dev(const void* x, int M, int K, int layout,
+                             int8_t* xq, float* sx, int32_t* xsum,
+                             void* stream);
+
+/** @brief RMSNorm fused with the quantizer (feeds q/k/v and gate/up). */
+vv_status_t vv_rmsnorm_q8_dev(const void* x, const void* weight,
+                              int M, int K, float eps, int layout,
+                              int8_t* xq, float* sx, int32_t* xsum,
+                              void* stream);
+
+/** @brief SwiGLU (silu(gate) * up) fused with the quantizer (feeds down). */
+vv_status_t vv_swiglu_q8_dev(const void* gate, const void* up, int M, int K,
+                             int layout, int8_t* xq, float* sx,
+                             int32_t* xsum, void* stream);
+
+/** @brief Which kernel family runs an int8 linear layer. */
+typedef enum vv_i8_path {
+    VV_I8_PATH_AUTO = 0,  /**< GEMV for M <= 8, tensor cores, else SIMT     */
+    VV_I8_PATH_GEMV = 1,  /**< dp4a, weights read once per 8 rows            */
+    VV_I8_PATH_MMA  = 2,  /**< mma.sync m16n8k32 s8 (sm_80+), cp.async       */
+    VV_I8_PATH_SIMT = 3,  /**< dp4a tiles, any sm_61+; the sm_75 fallback    */
+} vv_i8_path_t;
+
+/**
+ * @brief y[M,N] = sx[m] * sw[n] * (xq[M,K] . w[N,K]) + bias[n] + res[m,n].
+ *
+ * W8A8: `w` int8 [N][K], `sw` FP32 [N] per output channel.
+ * @param bias      FP16 [N] or NULL
+ * @param residual  FP16 [M,N] or NULL; may alias `y` (then y += result)
+ * @param y         FP16 [M,N], or FP32 when `y_f32` (tests: exact sums)
+ */
+vv_status_t vv_w8a8_linear_dev(
+    const int8_t* xq, const float* sx, const int8_t* w, const float* sw,
+    const void* bias, const void* residual, void* y, int y_f32,
+    int M, int N, int K, int path, void* stream);
+
+/**
+ * @brief W4A8: y = sx[m] * sum_g s[n,g] * sum_k (q - z[n,g]) * xq + bias + res.
+ *
+ * @param x_layout vv_q8_layout_t of xq. The GEMV (M <= 8) reads either and is
+ *                 fastest on VV_Q8_NIBBLE; the GEMMs need VV_Q8_NATURAL.
+ *                 vv_w4a8_layout_for(M) says which to quantize into.
+ * @param packed  uint8 [N][K/2], high nibble = even k (the INT4G bytes)
+ * @param scales  FP16 [N][K/G]
+ * @param zeros   uint8 [N][K/G], integer zero points in [0, 15]
+ * @param xsum    int32 [M][K/32] from the quantizer; required by the GEMV
+ */
+static inline int vv_w4a8_layout_for(int M) {
+    return M <= 8 ? VV_Q8_NIBBLE : VV_Q8_NATURAL;
+}
+
+vv_status_t vv_w4a8_linear_dev(
+    const int8_t* xq, int x_layout, const float* sx, const int32_t* xsum,
+    const uint8_t* packed, const void* scales, const uint8_t* zeros,
+    int group_size, const void* bias, const void* residual, void* y,
+    int y_f32, int M, int N, int K, int path, void* stream);
 
 /* ─── Dense linear ───────────────────────────────────────────────────────── */
 

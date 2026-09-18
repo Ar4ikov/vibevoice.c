@@ -161,6 +161,7 @@ add_library(vibevoice_core STATIC
     src/quant/load_quant.c
     src/quant/dequant_cpu.c
     src/cpu/cpu_kernels.c
+    src/cpu/cpu_int8.c
     src/inference/pipeline.c
     src/inference/frontend.c
     src/inference/decoder.c
@@ -234,6 +235,9 @@ if(VV_HAS_CUDA)
         src/cuda/awq_gemv.cu
         src/cuda/int8_gemv.cu
         src/cuda/w4a16.cu
+        src/cuda/act_quant.cu
+        src/cuda/gemv_i8.cu
+        src/cuda/gemm_i8.cu
         src/cuda/lm_head.cu
         src/cuda/conv_vae.cu
         src/cuda/vae_kernels.cu
@@ -345,6 +349,9 @@ if(VV_BUILD_TESTS)
     target_compile_definitions(test_model_load PRIVATE
                                VV_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data")
     vv_add_test(test_prefill_append tests/test_prefill_append.c)
+    # W8A8 / W4A8: quantizers bit-exact, integer sums exact, every GPU path
+    # (dp4a GEMV, tensor-core GEMM, SIMT fallback) forced in turn.
+    vv_add_test(test_int8_linear tests/test_int8_linear.c)
     vv_add_test(test_e2e tests/test_e2e.c)
 endif()
 
