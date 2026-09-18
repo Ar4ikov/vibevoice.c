@@ -24,6 +24,8 @@
 #include <string.h>
 #include <ctype.h>
 
+#include "vv_spawn.h"
+
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
@@ -79,9 +81,14 @@ static bool contains_ci(const char* hay, const char* needle) {
 #if defined(_WIN32)
 
 static int enumerate(vv_mic_device_t* d, int max) {
-    FILE* p = _popen("ffmpeg -hide_banner -list_devices true "
-                     "-f dshow -i dummy 2>&1", "rb");
-    if (!p) return 0;
+    /* ffmpeg prints the list on stderr, so it is merged into the pipe. */
+    static const char* const argv[] = {
+        "ffmpeg", "-hide_banner", "-list_devices", "true",
+        "-f", "dshow", "-i", "dummy", NULL
+    };
+    FILE* p = NULL;
+    vv_child_t* child = vv_spawn_read(argv, VV_SPAWN_STDERR_MERGE, &p);
+    if (!child) return 0;
 
     char line[1024];
     int n = 0;
@@ -122,7 +129,7 @@ static int enumerate(vv_mic_device_t* d, int max) {
             n++;
         }
     }
-    _pclose(p);
+    vv_spawn_wait(child, false);
     return n;
 }
 
@@ -131,9 +138,14 @@ static int enumerate(vv_mic_device_t* d, int max) {
 #elif defined(__APPLE__)
 
 static int enumerate(vv_mic_device_t* d, int max) {
-    FILE* p = popen("ffmpeg -hide_banner -f avfoundation -list_devices true "
-                    "-i \"\" 2>&1", "r");
-    if (!p) return 0;
+    /* ffmpeg prints the list on stderr, so it is merged into the pipe. */
+    static const char* const argv[] = {
+        "ffmpeg", "-hide_banner", "-f", "avfoundation",
+        "-list_devices", "true", "-i", "", NULL
+    };
+    FILE* p = NULL;
+    vv_child_t* child = vv_spawn_read(argv, VV_SPAWN_STDERR_MERGE, &p);
+    if (!child) return 0;
 
     char line[1024];
     int n = 0, section_audio = 0;
@@ -164,7 +176,7 @@ static int enumerate(vv_mic_device_t* d, int max) {
         copy_field(d[n].name, sizeof(d[n].name), name);
         n++;
     }
-    pclose(p);
+    vv_spawn_wait(child, false);
     return n;
 }
 
