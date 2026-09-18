@@ -310,9 +310,21 @@ vv_status_t vv_layer_pool_pin_range(vv_model_t* model, int first, int count) {
  */
 static vv_status_t quant_linear(
     const vv_weight_t* w, const void* x, void* y,
-    void* scratch, int M, int N, int K, void* stream)
+    void* scratch, size_t scratch_bytes, int M, int N, int K, void* stream)
 {
     vv_status_t s;
+
+    if (w->quant_kind == VV_QUANT_INT4G &&
+        w->int4g_layout == VV_INT4G_GPU) {
+        /* W4A16 kernels: bias fused, no dequantized copy of the weight. */
+        if (M == 1)
+            return vv_w4a16_gemv_dev(x, w->tensor.data,
+                                     w->quant.scales.data, w->bias.data,
+                                     y, N, K, w->group_size, stream);
+        return vv_w4a16_gemm_dev(x, w->tensor.data, w->quant.scales.data,
+                                 w->bias.data, y, scratch, scratch_bytes,
+                                 M, N, K, w->group_size, stream);
+    }
 
     if (w->quant_kind == VV_QUANT_INT4G) {
         if (M == 1) {
@@ -467,6 +479,8 @@ static vv_status_t decoder_layer_impl(
     offset += (size_t)seq_len * hs * 2;
 
     void* temp_weight = wp + offset;
+    const size_t temp_bytes = workspace_size > offset
+                            ? workspace_size - offset : 0;
 
     /* 1. Input LayerNorm */
     s = vv_rmsnorm_dev(hidden_states, layer->input_layernorm.data,
@@ -475,15 +489,15 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 2. Q, K, V projections (+ bias if present) */
-    s = quant_linear(&layer->attn.q_proj, norm_out, q_buf, temp_weight,
+    s = quant_linear(&layer->attn.q_proj, norm_out, q_buf, temp_weight, temp_bytes,
                      seq_len, n_heads * head_dim, hs, stream);
     if (s != VV_OK) return s;
 
-    s = quant_linear(&layer->attn.k_proj, norm_out, k_buf, temp_weight,
+    s = quant_linear(&layer->attn.k_proj, norm_out, k_buf, temp_weight, temp_bytes,
                      seq_len, n_kv_heads * head_dim, hs, stream);
     if (s != VV_OK) return s;
 
-    s = quant_linear(&layer->attn.v_proj, norm_out, v_buf, temp_weight,
+    s = quant_linear(&layer->attn.v_proj, norm_out, v_buf, temp_weight, temp_bytes,
                      seq_len, n_kv_heads * head_dim, hs, stream);
     if (s != VV_OK) return s;
 
@@ -578,7 +592,7 @@ static vv_status_t decoder_layer_impl(
         dump_gpu_fp16("c_l0_attn", attn_out, (size_t)seq_len * hs, stream);
 
     /* 6. O projection + bias + residual */
-    s = quant_linear(&layer->attn.o_proj, attn_out, norm_out, temp_weight,
+    s = quant_linear(&layer->attn.o_proj, attn_out, norm_out, temp_weight, temp_bytes,
                      seq_len, hs, hs, stream);
     if (s != VV_OK) return s;
     s = vv_residual_add_dev(hidden_states, norm_out,
@@ -595,11 +609,11 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 8. MLP: gate + up (+ bias if present) */
-    s = quant_linear(&layer->mlp.gate_proj, norm_out, gate_buf, temp_weight,
+    s = quant_linear(&layer->mlp.gate_proj, norm_out, gate_buf, temp_weight, temp_bytes,
                      seq_len, inter_size, hs, stream);
     if (s != VV_OK) return s;
 
-    s = quant_linear(&layer->mlp.up_proj, norm_out, up_buf, temp_weight,
+    s = quant_linear(&layer->mlp.up_proj, norm_out, up_buf, temp_weight, temp_bytes,
                      seq_len, inter_size, hs, stream);
     if (s != VV_OK) return s;
 
@@ -609,7 +623,7 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 10. Down projection + bias + residual */
-    s = quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out, temp_weight,
+    s = quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out, temp_weight, temp_bytes,
                      seq_len, hs, inter_size, stream);
     if (s != VV_OK) return s;
     s = vv_residual_add_dev(hidden_states, mlp_out,

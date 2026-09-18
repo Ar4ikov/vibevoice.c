@@ -737,6 +737,18 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         goto init_common;
     }
 
+    /*
+     * INT4 (AWQ / GPTQ) weights take the W4A16 kernels' layout here, before
+     * anything is uploaded or pinned, so resident and streamed layers carry
+     * the same bytes and the host copy is never kept twice.
+     */
+    s = vv_model_int4g_to_gpu_layout(c->model, NULL);
+    if (s != VV_OK) {
+        VV_LOG_E("inference: INT4 weight layout failed: %s",
+                 vv_status_str(s));
+        vv_model_free(c->model); vv_free(c); return s;
+    }
+
     /* ── GPU path: create streams ── */
     s = vv_dev_stream_create(&c->compute_stream);
     if (s != VV_OK) { vv_model_free(c->model); vv_free(c); return s; }

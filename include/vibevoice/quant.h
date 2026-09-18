@@ -29,8 +29,19 @@ typedef enum vv_quant_kind {
     VV_QUANT_INT8  = 3,
 } vv_quant_kind_t;
 
+/** @brief How an INT4G weight's packed codes and group data are arranged. */
+typedef enum vv_int4g_layout {
+    /** packed [N][K/2] (high nibble = even k), scales and mins FP16
+     *  [N][K/G], zeros uint8 [N][K/G]. What the CPU kernels read. */
+    VV_INT4G_ROWMAJOR = 0,
+    /** packed [N][K/2] with nibbles permuted per 16-byte chunk, scales
+     *  holding half2 {scale, zero} [N][K/G], no mins. What the GPU reads;
+     *  see vv_int4g_to_gpu_layout. */
+    VV_INT4G_GPU      = 1,
+} vv_int4g_layout_t;
+
 /**
- * @brief Repack AutoAWQ / GPTQ tensors into the runtime's INT4G layout.
+ * @brief Repack AutoAWQ tensors into the runtime's INT4G layout.
  *
  * @param qweight    int32 [K][N/8], AWQ column packing
  * @param qzeros     int32 [K/G][N/8]
@@ -39,6 +50,8 @@ typedef enum vv_quant_kind {
  * @param out_packed uint8 [N][K/2], high nibble = even k
  * @param out_scales FP16  [N][K/G]
  * @param out_mins   FP16  [N][K/G], equal to -zero * scale
+ * @param out_zeros  uint8 [N][K/G], the exact integer zero point (with
+ *                   zero_bias applied), or NULL
  *
  * Parallelised over output rows when built with OpenMP.
  */
@@ -46,7 +59,42 @@ vv_status_t vv_awq_repack(const uint32_t* qweight, const uint32_t* qzeros,
                           const uint16_t* scales, int K, int N, int group_size,
                           int zero_bias,
                           uint8_t* out_packed, uint16_t* out_scales,
-                          uint16_t* out_mins);
+                          uint16_t* out_mins, uint8_t* out_zeros);
+
+/**
+ * @brief Repack AutoGPTQ / GPTQModel tensors into the same INT4G layout.
+ *
+ * GPTQ packs along the *input* dimension, in plain order:
+ *   qweight int32 [K/8][N]      bits 4j of word (r, n) hold k = 8r + j
+ *   qzeros  int32 [K/G][N/8]    bits 4j of word (g, c) hold n = 8c + j
+ *   scales  FP16  [K/G][N]
+ *   g_idx   int32 [K]           group of each input channel, or NULL
+ *
+ * The runtime layout needs each group to be a contiguous run of k, so a
+ * g_idx that is anything other than k / G (act-order / desc_act
+ * checkpoints) is refused with VV_ERR_UNSUPPORTED rather than silently
+ * producing wrong weights.
+ *
+ * @param zero_bias 1 for the classic "gptq" format (stored zero - 1),
+ *                  0 for "gptq_v2"
+ */
+vv_status_t vv_gptq_repack(const uint32_t* qweight, const uint32_t* qzeros,
+                           const uint16_t* scales, const int32_t* g_idx,
+                           int K, int N, int group_size, int zero_bias,
+                           uint8_t* out_packed, uint16_t* out_scales,
+                           uint16_t* out_mins, uint8_t* out_zeros);
+
+/**
+ * @brief Convert one row-major INT4G weight to the GPU layout in place.
+ *
+ * `packed` keeps its size; within each 16-byte chunk (32 weights of one
+ * row) word t receives the k-pairs t, t+4, t+8, t+12, nibble slot s holding
+ * element (s >> 2) of pair t + 4*(s & 3). `out_sz` receives half2
+ * {scale, zero} per [N][K/G]. Needs K % 32 == 0 and exact integer zeros.
+ */
+vv_status_t vv_int4g_to_gpu_layout(uint8_t* packed, const uint16_t* scales,
+                                   const uint8_t* zeros, int N, int K,
+                                   int group_size, uint16_t* out_sz);
 
 /**
  * @brief Quantize a dense FP32 weight into the INT4G layout (min/max per

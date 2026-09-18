@@ -34,6 +34,28 @@ Write the entry for a change under Unreleased in the same pull request.
 - Config dimensions are required: a config without, say,
   `intermediate_size` is refused instead of silently becoming the 7B.
   Non-SiLU activations, rope scaling and sliding windows are refused too.
+- **AWQ / GPTQ fast path** ([#19](https://github.com/Ar4ikov/vibevoice.c/issues/19)):
+  INT4 group-affine weights get a GPU layout at load (nibbles permuted per
+  16-byte run, scale and exact integer zero point as one `half2` per group)
+  and two kernels in `src/cuda/w4a16.cu` that share it. The decode GEMV
+  uses 128-bit loads, `LOP3`/`0x6400` conversion and HFMA2, with as many
+  lanes per row as it takes to fill the card: gate/up 727 → 849 GB/s, down
+  669 → 825, q/o 597 → 691, k/v 208 → 294 on a 3090. Every M > 1 runs a
+  Marlin-style tensor-core GEMM that keeps the weights packed until they are
+  in registers, instead of expanding each weight into a 136 MB FP16 scratch:
+  14–25× faster at 9–16 rows, 3–9× at 64, 1.0–1.8× for a 2048-token chunk.
+  End to end on the AWQ checkpoint: decode 133 → 145 tok/s at 0.2K context,
+  116 → 124 at 1.5K, 77 → 81 over 14K → 24K; prefill 1010 → 2370 tok/s on
+  jfk, 2810 → 3460 on test120; the 32-minute file goes from RTF 0.078 to
+  0.074. Dequantization is now the reference's `(q − z)·s` with the
+  checkpoint's integer zero point; transcripts on jfk / test30 / test120 are
+  unchanged, and on the 32-minute file the text and speakers are too while
+  3 of 168 segment boundaries move by 10 ms. The loader reads
+  real AutoGPTQ tensors (`qweight [K/8, N]`, told apart from AWQ by shape),
+  honours GPTQModel's `gptq_v2` zero points, refuses act-order (`desc_act`)
+  checkpoints instead of silently loading them wrong, and fails the load on
+  a tensor it cannot repack. The GPU layout costs ~0.9 s at load for the 7B
+(in place, no second copy). `VV_INT4G_LEGACY=1` restores the old path.
 
 ## [0.2.0](https://github.com/Ar4ikov/vibevoice.c/releases/tag/v0.2.0) — 2026-09-18
 

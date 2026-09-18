@@ -48,6 +48,8 @@ typedef struct {
     char               prefix[128];  /**< "model." / "model.language_model." */
     /* What the projections turned out to be, for the summary line. */
     int                n_nf4, n_int4g, n_int8, n_dense, n_converted;
+    /** 1 when GPTQ zeros are stored minus one (all but "gptq_v2") */
+    int                gptq_bias;
     size_t             proj_bytes;
 } loader_t;
 
@@ -512,11 +514,18 @@ static vv_status_t load_nf4_scales(const loader_t* L, const char* wname,
  * `base` is the projection name without a suffix; qweight, qzeros and
  * scales sit next to it. The repack is what makes the GEMV coalesce — see
  * src/quant/awq_repack.c.
+ *
+ * The two formats pack along different axes and are told apart by shape:
+ *   AWQ   qweight [K, N/8], scales [K/G, N]   (scales width = 8 x qweight)
+ *   GPTQ  qweight [K/8, N], scales [K/G, N]   (scales width = qweight)
+ * A GPTQ g_idx is checked: plain k / G is fine, act-order is refused.
+ * Every size is checked against the header and the config before anything
+ * is indexed: the file is untrusted input.
  */
 static vv_status_t load_awq_weight(const loader_t* L, const char* base,
                                    int N_want, int K_want, vv_weight_t* w) {
     char buf[320];
-    vv_tensor_t qweight = {0}, qzeros = {0}, scales = {0};
+    vv_tensor_t qweight = {0}, qzeros = {0}, scales = {0}, g_idx = {0};
     const st_entry_t* e;
     vv_status_t s;
 
@@ -530,8 +539,8 @@ static vv_status_t load_awq_weight(const loader_t* L, const char* base,
 
     snprintf(buf, sizeof(buf), "%s.qzeros", base);
     e = find(L, buf);
-    if (!e || e->info.dtype != VV_DTYPE_I32) {
-        VV_LOG_E("loader: '%s' is missing or not I32", buf);
+    if (!e || e->info.dtype != VV_DTYPE_I32 || e->info.ndim != 2) {
+        VV_LOG_E("loader: '%s' is missing or not a 2-D I32", buf);
         vv_tensor_free(&qweight);
         return VV_ERR_WEIGHT_MISSING;
     }
@@ -550,57 +559,96 @@ static vv_status_t load_awq_weight(const loader_t* L, const char* base,
         vv_tensor_free(&qweight); vv_tensor_free(&qzeros);
         return s;
     }
-
-    /* qweight is [K, N/8] int32; scales is [K/G, N] fp16. */
-    const int K = (int)qweight.shape[0];
-    const int N = (int)qweight.shape[1] * 8;
-    const int n_groups = (int)scales.shape[0];
-    if (K != K_want || N != N_want || n_groups <= 0 || (K % n_groups) != 0 ||
-        scales.shape[1] != N ||
-        qzeros.size_bytes != (size_t)n_groups * (size_t)(N / 8) * 4) {
-        VV_LOG_E("loader: '%s' AWQ tensors are [%d x %d] with %d groups; "
-                 "the config says [%d x %d]", base, K, N, n_groups,
-                 K_want, N_want);
+    snprintf(buf, sizeof(buf), "%s.g_idx", base);
+    e = find(L, buf);
+    const bool have_gidx = e != NULL;
+    if (e && (s = load_raw(L, e, &g_idx)) != VV_OK) {
         vv_tensor_free(&qweight); vv_tensor_free(&qzeros);
         vv_tensor_free(&scales);
+        return s;
+    }
+
+    #define AWQ_FREE_INPUTS() do { vv_tensor_free(&qweight);           \
+        vv_tensor_free(&qzeros); vv_tensor_free(&scales);             \
+        vv_tensor_free(&g_idx); } while (0)
+
+    const bool gptq_layout = scales.shape[1] == qweight.shape[1] &&
+                             scales.shape[1] != qweight.shape[1] * 8;
+    const int K = gptq_layout ? (int)qweight.shape[0] * 8
+                              : (int)qweight.shape[0];
+    const int N = gptq_layout ? (int)qweight.shape[1]
+                              : (int)qweight.shape[1] * 8;
+    const int n_groups = (int)scales.shape[0];
+    if (K != K_want || N != N_want || n_groups <= 0 || (K % n_groups) != 0 ||
+        (N % 8) != 0 || scales.shape[1] != N) {
+        VV_LOG_E("loader: '%s' %s tensors are [%d x %d] with %d groups; "
+                 "the config says [%d x %d]", base,
+                 gptq_layout ? "GPTQ" : "AWQ", K, N, n_groups,
+                 K_want, N_want);
+        AWQ_FREE_INPUTS();
+        return VV_ERR_SHAPE_MISMATCH;
+    }
+    /* The repack indexes all three by these sizes: hold the data to them. */
+    if (qzeros.shape[0] != n_groups || qzeros.shape[1] != N / 8 ||
+        qzeros.size_bytes != (size_t)n_groups * (size_t)(N / 8) * 4) {
+        VV_LOG_E("loader: '%s.qzeros' is not int32[%d, %d]", base,
+                 n_groups, N / 8);
+        AWQ_FREE_INPUTS();
         return VV_ERR_SHAPE_MISMATCH;
     }
     const int group_size = K / n_groups;
-
-    /*
-     * GPTQ writes zero_point - 1; AWQ writes it directly. The two formats
-     * are otherwise identical here, and a g_idx tensor is the tell.
-     */
-    snprintf(buf, sizeof(buf), "%s.g_idx", base);
-    const int zero_bias = find(L, buf) ? 1 : 0;
+    if (have_gidx && (g_idx.dtype != VV_DTYPE_I32 ||
+                      g_idx.size_bytes != (size_t)K * 4)) {
+        VV_LOG_E("loader: '%s.g_idx' is not int32[%d]", base, K);
+        AWQ_FREE_INPUTS();
+        return VV_ERR_SHAPE_MISMATCH;
+    }
 
     const size_t packed_bytes = (size_t)N * (K / 2);
     const size_t group_bytes  = (size_t)N * n_groups * sizeof(uint16_t);
+    const size_t zero_bytes   = (size_t)N * n_groups;
     uint8_t*  packed = (uint8_t*)vv_alloc(packed_bytes);
     uint16_t* sc     = (uint16_t*)vv_alloc(group_bytes);
     uint16_t* mn     = (uint16_t*)vv_alloc(group_bytes);
-    if (!packed || !sc || !mn) {
-        vv_free(packed); vv_free(sc); vv_free(mn);
-        vv_tensor_free(&qweight); vv_tensor_free(&qzeros);
-        vv_tensor_free(&scales);
+    uint8_t*  zr     = (uint8_t*)vv_alloc(zero_bytes);
+    if (!packed || !sc || !mn || !zr) {
+        vv_free(packed); vv_free(sc); vv_free(mn); vv_free(zr);
+        AWQ_FREE_INPUTS();
         return VV_ERR_OUT_OF_MEMORY;
     }
 
-    s = vv_awq_repack((const uint32_t*)qweight.data,
-                      (const uint32_t*)qzeros.data,
-                      (const uint16_t*)scales.data,
-                      K, N, group_size, zero_bias, packed, sc, mn);
-    vv_tensor_free(&qweight);
-    vv_tensor_free(&qzeros);
-    vv_tensor_free(&scales);
+    /*
+     * GPTQ writes zero_point - 1 (unless it is the v2 format); AWQ writes it
+     * directly. An AWQ-packed tensor with a g_idx next to it is what earlier
+     * versions of this loader called GPTQ, so it keeps that meaning.
+     */
+    int zero_bias;
+    if (gptq_layout) {
+        zero_bias = L->gptq_bias;
+        s = vv_gptq_repack((const uint32_t*)qweight.data,
+                           (const uint32_t*)qzeros.data,
+                           (const uint16_t*)scales.data,
+                           have_gidx ? (const int32_t*)g_idx.data : NULL,
+                           K, N, group_size, zero_bias, packed, sc, mn, zr);
+    } else {
+        zero_bias = have_gidx ? 1 : 0;
+        s = vv_awq_repack((const uint32_t*)qweight.data,
+                          (const uint32_t*)qzeros.data,
+                          (const uint16_t*)scales.data,
+                          K, N, group_size, zero_bias, packed, sc, mn, zr);
+    }
+    AWQ_FREE_INPUTS();
+    #undef AWQ_FREE_INPUTS
     if (s != VV_OK) {
-        vv_free(packed); vv_free(sc); vv_free(mn);
+        VV_LOG_E("loader: cannot repack '%s': %s", base, vv_status_str(s));
+        vv_free(packed); vv_free(sc); vv_free(mn); vv_free(zr);
         return s;
     }
 
     w->quant_kind   = VV_QUANT_INT4G;
     w->is_quantized = true;
     w->group_size   = group_size;
+    w->int4g_layout = VV_INT4G_ROWMAJOR;
 
     const int64_t pshape[2] = { N, K / 2 };
     const int64_t gshape[2] = { N, n_groups };
@@ -608,8 +656,79 @@ static vv_status_t load_awq_weight(const loader_t* L, const char* base,
     set_tensor(&w->quant.scales, sc, VV_DTYPE_F16, group_bytes, 2, gshape);
     set_tensor(&w->mins, mn, VV_DTYPE_F16, group_bytes, 2, gshape);
 
-    VV_LOG_D("loader: AWQ '%s' N=%d K=%d group=%d%s",
-             base, N, K, group_size, zero_bias ? " (gptq zeros)" : "");
+    w->zeros = w->quant.scales;
+    w->zeros.data = zr;
+    w->zeros.size_bytes = zero_bytes;
+    w->zeros.dtype = VV_DTYPE_U8;
+
+    VV_LOG_D("loader: %s '%s' N=%d K=%d group=%d%s",
+             gptq_layout ? "GPTQ" : "AWQ", base, N, K, group_size,
+             zero_bias ? " (zeros stored minus one)" : "");
+    return VV_OK;
+}
+
+vv_status_t vv_model_int4g_to_gpu_layout(vv_model_t* model, int* n_converted)
+{
+    if (n_converted) *n_converted = 0;
+    if (!model) return VV_ERR_NULL_PTR;
+    const char* legacy = getenv("VV_INT4G_LEGACY");
+    if (legacy && legacy[0] && legacy[0] != '0') {
+        VV_LOG_I("loader: VV_INT4G_LEGACY set, INT4 weights keep the "
+                 "row-major layout and the older kernels");
+        return VV_OK;
+    }
+
+    const double t0 = vv_time_ms();
+    int converted = 0, kept = 0;
+    for (int li = 0; li < model->num_layers; li++) {
+        vv_weight_t* ws[7];
+        const int nw = vv_layer_projections(&model->layers[li], ws);
+        for (int wi = 0; wi < nw; wi++) {
+            vv_weight_t* w = ws[wi];
+            if (w->quant_kind != VV_QUANT_INT4G ||
+                w->int4g_layout != VV_INT4G_ROWMAJOR)
+                continue;
+            const int N = (int)w->tensor.shape[0];
+            const int K = (int)w->tensor.shape[1] * 2;
+            const int G = w->group_size;
+            const bool shape_ok = (K % 64) == 0 && (N % 8) == 0 &&
+                                  (G == 32 || G == 64 || G == 128 ||
+                                   G == 256);
+            if (!w->zeros.data || !shape_ok || w->tensor.on_gpu ||
+                w->quant.scales.on_gpu) {
+                kept++;
+                continue;
+            }
+            const int n_groups = K / G;
+            const size_t sz_bytes = (size_t)N * n_groups * 4;
+            uint16_t* sz = (uint16_t*)vv_alloc(sz_bytes);
+            if (!sz) return VV_ERR_OUT_OF_MEMORY;
+            vv_status_t s = vv_int4g_to_gpu_layout(
+                (uint8_t*)w->tensor.data, (const uint16_t*)w->quant.scales.data,
+                (const uint8_t*)w->zeros.data, N, K, G, sz);
+            if (s != VV_OK) { vv_free(sz); return s; }
+
+            vv_tensor_free(&w->quant.scales);
+            vv_tensor_free(&w->mins);
+            vv_tensor_free(&w->zeros);
+            memset(&w->mins, 0, sizeof(w->mins));
+            memset(&w->zeros, 0, sizeof(w->zeros));
+            w->quant.scales.data = sz;
+            w->quant.scales.size_bytes = sz_bytes;
+            w->quant.scales.dtype = VV_DTYPE_F16;
+            w->quant.scales.ndim = 2;
+            w->quant.scales.shape[0] = N;
+            w->quant.scales.shape[1] = n_groups * 2;
+            w->quant.scales.on_gpu = false;
+            w->int4g_layout = VV_INT4G_GPU;
+            converted++;
+        }
+    }
+    if (converted || kept)
+        VV_LOG_I("loader: %d INT4 projections in the W4A16 GPU layout "
+                 "(%d kept row-major) in %.0f ms", converted, kept,
+                 vv_time_ms() - t0);
+    if (n_converted) *n_converted = converted;
     return VV_OK;
 }
 
@@ -837,6 +956,40 @@ static void build_path(char* buf, size_t buf_size,
         snprintf(buf, buf_size, "%s%s", dir, filename);
     else
         snprintf(buf, buf_size, "%s/%s", dir, filename);
+}
+
+/**
+ * @brief Whether a GPTQ checkpoint stores zero points off by one.
+ *
+ * The classic AutoGPTQ format writes zero - 1; GPTQModel's "gptq_v2" writes
+ * the zero itself. The tensors look the same, so only config.json can tell.
+ */
+static int gptq_zero_bias(const char* model_dir) {
+    char path[512];
+    build_path(path, sizeof(path), model_dir, "config.json");
+    FILE* f = fopen(path, "rb");
+    if (!f) return 1;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0) { fclose(f); return 1; }
+    char* json = (char*)vv_alloc((size_t)size + 1);
+    if (!json) { fclose(f); return 1; }
+    const size_t got = fread(json, 1, (size_t)size, f);
+    fclose(f);
+    json[got] = '\0';
+
+    int bias = 1;
+    cJSON* root = cJSON_Parse(json);
+    vv_free(json);
+    if (!root) return 1;
+    const cJSON* qc = cJSON_GetObjectItem(root, "quantization_config");
+    const cJSON* fmt = qc ? cJSON_GetObjectItem(qc, "checkpoint_format") : NULL;
+    if (cJSON_IsString(fmt) && fmt->valuestring &&
+        strcmp(fmt->valuestring, "gptq_v2") == 0)
+        bias = 0;
+    cJSON_Delete(root);
+    return bias;
 }
 
 /**
@@ -1250,6 +1403,7 @@ static vv_status_t model_load_impl(const char* model_dir,
     memset(&L, 0, sizeof(L));
     L.m = model;
     L.quant = (vv_load_quant_t)o.quant;
+    L.gptq_bias = gptq_zero_bias(model_dir);
 
     s = build_index(&L);
     if (s == VV_OK) s = find_prefix(&L);
@@ -1312,6 +1466,12 @@ vv_status_t vv_model_free(vv_model_t* model) {
             vv_tensor_t* t[VV_LAYER_TENSOR_SLOTS];
             const int n = vv_layer_tensors(&model->layers[i], t);
             for (int k = 0; k < n; k++) vv_tensor_free(t[k]);
+            {
+                vv_weight_t* ws[7];
+                const int nw = vv_layer_projections(&model->layers[i], ws);
+                for (int wi = 0; wi < nw; wi++)
+                    vv_tensor_free(&ws[wi]->zeros);
+            }
         }
         vv_free(model->layers);
     }

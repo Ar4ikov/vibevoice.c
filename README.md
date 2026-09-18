@@ -224,7 +224,7 @@ absurd for short clips; this pays it once.
 |---|---|
 | **NF4** (bitsandbytes, double-quantized) | loaded directly |
 | **AWQ** (AutoAWQ) | loaded directly |
-| **GPTQ** | loaded directly (its zero points are off by one; handled) |
+| **GPTQ** (AutoGPTQ / GPTQModel) | loaded directly; `gptq_v2` zero points recognised; act-order (`desc_act`) refused |
 | **BF16 / F16 / F32** (unquantized) | dense FP16, or `--quant nf4\|int4\|int8` at load |
 
 What a projection is gets decided by what the file holds — U8 with an
@@ -259,16 +259,42 @@ Where they differ it is in timestamps (at most 0.06 s, 0.44 s once for
 different voice, dense BF16, `int4` and `int8` call it Speaker 1 while the NF4
 checkpoint calls everything Speaker 0.
 
-AWQ and GPTQ store weights K-major with the eight columns of a word
-interleaved, which is the wrong orientation for a GEMV — walking `k` for one
-output row would stride by `N/8` words. They are repacked once at load into
-the row-major layout the NF4 path uses, with the zero point folded into a
-per-group `min` so dequantization in the kernel is a single FMA. The repack
-is OpenMP-parallel and costs ~1.4 s for the 7B.
+AWQ packs the eight columns of a word along `N` (`qweight [K, N/8]`), GPTQ
+the eight rows along `K` (`qweight [K/8, N]`); the loader tells them apart by
+shape. Either is the wrong orientation for a GEMV, so both are repacked once
+at load into a row-major `[N][K/2]` layout with the exact integer zero point
+kept per group. The CPU kernels read that. The GPU path goes one step
+further before anything is uploaded (so there is only ever one copy): inside
+every 16-byte run of a row the nibbles are permuted so a single `LOP3` with
+the `0x6400` half-precision magic yields four `half2` weights that are at
+once the GEMV's natural `x` pairs and the tensor-core `m16n8k16` B fragment,
+and scale and zero point sit together as one `half2` per group.
+Dequantization is `(q − z)·s` in FP16 — the reference's own formula; the
+older path's `q·s + fp16(−z·s)` differed in the last bit.
 
-On the same audio, AWQ gives an identical transcript and 2% faster decode
-(102.3 vs 100.0 tok/s) for 3% more VRAM — NF4's own scales are
-double-quantized, so it is already at 4.13 bits against AWQ's 4.16.
+- **Decode GEMV**: 128-bit loads, 16–128 lanes per row (more when `N` is
+  small, so the 512-row k/v projections still cover all 82 SMs), two rows
+  per lane group when `K` is long, HFMA2 chains of four flushed to FP32.
+  On a 3090 (graph-replayed, weights cycled past L2): gate/up 849 GB/s,
+  down 825, q/o 691, k/v 294 — against 727 / 669 / 597 / 208 before. The
+  two small shapes are launch-latency bound (6.4 MB and 0.9 MB).
+- **M > 1**: a Marlin-style tensor-core GEMM keeps the weights 4-bit through
+  `cp.async` into shared memory and dequantizes in registers straight into
+  the B fragments, 16/32/64/128-row tiles and split-K when the grid would
+  not cover the card. No 136 MB FP16 copy of each weight any more: 9–16
+  rows are 14–25× faster than before, 64 rows 3–9×, a 2048-token prefill
+  chunk 1.0–1.8× (60 TFLOP/s on gate/up/down). Turing falls back to
+  dequantize + dense GEMM (`VV_W4A16_MMA=0` forces that path).
+- GPTQ act-order checkpoints scatter each group over the input channels;
+  running them would need the activations permuted per projection, so the
+  loader refuses them instead of producing wrong weights as it used to.
+- `VV_INT4G_LEGACY=1` keeps the old layout and kernels, for comparison.
+
+On the same audio AWQ gives an identical transcript, 145 against NF4's
+125 tok/s of decode at short context (124 vs 110 at 1.5K, 81 vs 75 on a
+32-minute file) and 2.3× NF4's prefill rate on an 11 s clip, for 3% more
+VRAM — NF4's own scales are double-quantized, so it is already at 4.13
+bits against AWQ's 4.16.
 
 [`Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM`](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM)
 is a real activation-aware build: `llm-compressor`'s `AWQModifier` over 256
@@ -609,6 +635,9 @@ The kernels that matter:
   The generic path (expand to FP16 scratch, then GEMM) moves 5× the bytes;
   single-token decode is purely bandwidth bound, so the weights stay 4-bit
   all the way into the multiply.
+- **`w4a16.cu`** — AWQ/GPTQ on the GPU: the decode GEMV and a Marlin-style
+  tensor-core GEMM over one shared weight layout, int4 kept packed through
+  shared memory and dequantized in registers with `LOP3`.
 - **`attention.cu`**, **`attention_mma.cuh`** — FlashAttention-2 prefill with
   both matmuls on tensor cores, and a split-KV flash decode where each warp
   owns a slice of the cache and a second kernel merges the partial softmax

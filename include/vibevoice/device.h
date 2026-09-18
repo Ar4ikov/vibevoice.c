@@ -210,6 +210,43 @@ vv_status_t vv_dequant_int8_dev(
     const int8_t* q, const float* scales, void* output_fp16,
     int N, int K, void* stream);
 
+/*
+ * INT4 group-affine weights in the GPU layout (vv_int4g_to_gpu_layout):
+ *   packed [N][K/2] bytes, rows contiguous in k, nibbles permuted inside
+ *          each 16-byte chunk so one LOP3 yields MMA-ready half2 pairs;
+ *   sz     [N][K/G] half2 = { scale, exact integer zero point }.
+ * Dequantization is w = (q - z) * s in FP16, the reference's formula.
+ * K must be a multiple of 32 (64 for the tensor-core path), N of 8, and
+ * G one of 32, 64, 128, 256.
+ */
+
+/**
+ * @brief y[N] = W . x (+ bias) for one token. No allocation, no host-side
+ *        per-token arguments: safe to capture into the decode graph.
+ */
+vv_status_t vv_w4a16_gemv_dev(
+    const void* x, const void* packed, const void* sz, const void* bias,
+    void* y, int N, int K, int group_size, void* stream);
+
+/**
+ * @brief C[M,N] = A[M,K] . W^T (+ bias). Small M runs the GEMV kernel,
+ *        larger M a fused tensor-core GEMM (sm_80+) that keeps the weights
+ *        packed until they are in registers.
+ *
+ * `scratch` holds split-K partials (M*N*4 bytes per slice; the split is
+ * reduced to what fits) and, on devices without the tensor-core path, the
+ * dequantized weight (N*K*2 bytes).
+ */
+vv_status_t vv_w4a16_gemm_dev(
+    const void* A, const void* packed, const void* sz, const void* bias,
+    void* C, void* scratch, size_t scratch_bytes,
+    int M, int N, int K, int group_size, void* stream);
+
+/** @brief GPU-layout INT4 → dense FP16 [N, K]. */
+vv_status_t vv_w4a16_dequant_dev(
+    const void* packed, const void* sz, void* out_fp16,
+    int N, int K, int group_size, void* stream);
+
 /* ─── Dense linear ───────────────────────────────────────────────────────── */
 
 /** @brief C[M,N] = alpha * A[M,K] @ B[N,K]^T + beta * C. */

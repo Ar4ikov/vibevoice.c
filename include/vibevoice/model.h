@@ -33,8 +33,12 @@ typedef struct vv_weight {
     vv_tensor_t     bias;         /**< Optional bias (FP16), NULL if absent  */
     vv_quant_tensor_t quant;      /**< .scales holds per-group scales        */
     vv_tensor_t     mins;         /**< INT4G only: -zero * scale per group   */
+    vv_tensor_t     zeros;        /**< INT4G only, host: exact integer zero
+                                       point per group, uint8 [N][K/G];
+                                       consumed by the GPU layout          */
     int             quant_kind;   /**< vv_quant_kind_t                       */
     int             group_size;   /**< INT4G only: weights per scale         */
+    int             int4g_layout; /**< INT4G only: vv_int4g_layout_t         */
     bool            is_quantized; /**< quant_kind != VV_QUANT_NONE           */
 } vv_weight_t;
 
@@ -180,6 +184,21 @@ vv_status_t vv_model_load(const char* model_dir, vv_model_t** out);
 vv_status_t vv_model_load_ex(const char* model_dir,
                              const vv_model_load_opts_t* opts,
                              vv_model_t** out);
+
+/**
+ * @brief Rearrange every INT4G projection into the GPU layout, in place.
+ *
+ * Called once by the GPU pipeline before any layer is uploaded or pinned,
+ * so resident and streamed layers alike carry the layout the W4A16 kernels
+ * read, and there is only ever one copy of the weights. The CPU-only path
+ * never calls it: its kernels need the row-major form. Weights without
+ * exact integer zero points, or with shapes the kernels do not take, keep
+ * the row-major layout and the older kernels. Idempotent;
+ * VV_INT4G_LEGACY=1 skips it.
+ *
+ * @return number of weights converted, through `n_converted` (may be NULL)
+ */
+vv_status_t vv_model_int4g_to_gpu_layout(vv_model_t* model, int* n_converted);
 
 /**
  * @brief Free all model weights and resources.
