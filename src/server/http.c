@@ -10,6 +10,7 @@
  */
 
 #include "vv_http.h"
+#include "vv_ws.h"
 
 #include "vibevoice/vibevoice.h"
 
@@ -571,4 +572,128 @@ void vv_http_shutdown(vv_http_t* s) {
     shutdown(s->listen_fd, SHUT_RDWR);
     close_socket(s->listen_fd);
     vv_cond_broadcast(&s->conn_done);
+}
+
+/* ─── Streaming responses and WebSocket ──────────────────────────────────── */
+/*
+ * Additive on purpose: nothing above changes, so request parsing can evolve
+ * on its own. A streaming handler runs on its connection's thread, writes as
+ * much as it likes and returns; the connection closes after it, so the body
+ * is delimited by the close and needs neither Content-Length nor chunked
+ * encoding. docs/STREAMING.md describes the endpoints built on this.
+ */
+
+static bool send_all_ok(SOCKET fd, const char* buf, size_t len) {
+#ifdef MSG_NOSIGNAL
+    const int flags = MSG_NOSIGNAL;
+#else
+    const int flags = 0;
+#endif
+    size_t off = 0;
+    while (off < len) {
+        const int n = (int)send(fd, buf + off, (int)(len - off), flags);
+        if (n <= 0) return false;
+        off += (size_t)n;
+    }
+    return true;
+}
+
+bool vv_http_respond_begin(vv_http_res_t* res, int status,
+                           const char* content_type) {
+    if (!res || res->sent) return false;
+    char head[512];
+    const int hn = snprintf(head, sizeof(head),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Cache-Control: no-cache\r\n"
+        "X-Accel-Buffering: no\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        status, status == 200 ? "OK" : "Error", content_type);
+    res->sent = true;
+    return hn > 0 && send_all_ok((SOCKET)(intptr_t)res->fd, head, (size_t)hn);
+}
+
+bool vv_http_write(vv_http_res_t* res, const void* buf, size_t n) {
+    if (!res || !res->sent) return false;
+    return n == 0 || send_all_ok((SOCKET)(intptr_t)res->fd, (const char*)buf, n);
+}
+
+bool vv_http_sse_send(vv_http_res_t* res, const char* event, const char* data) {
+    char small[1024];
+    const size_t need = vv_sse_format(event, data, NULL, 0);
+    char* buf = need < sizeof(small) ? small : (char*)vv_alloc(need + 1);
+    if (!buf) return false;
+    vv_sse_format(event, data, buf, need + 1);
+    const bool ok = vv_http_write(res, buf, need);
+    if (buf != small) vv_free(buf);
+    return ok;
+}
+
+int vv_http_read(vv_http_res_t* res, void* buf, size_t cap, int timeout_ms) {
+    if (!res || !buf || cap == 0) return -1;
+    const SOCKET fd = (SOCKET)(intptr_t)res->fd;
+    if (timeout_ms >= 0) {
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(fd, &rd);
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        const int r = select((int)fd + 1, &rd, NULL, NULL, &tv);
+        if (r == 0) return -2;
+        if (r < 0) return -1;
+    }
+    const size_t want = cap > ((size_t)1 << 30) ? ((size_t)1 << 30) : cap;
+    const int n = (int)recv(fd, (char*)buf, (int)want, 0);
+    return n < 0 ? -1 : n;
+}
+
+static bool header_has_token(const char* value, const char* token) {
+    /* Comma-separated, case-insensitive: "keep-alive, Upgrade". */
+    const size_t tl = strlen(token);
+    for (const char* p = value; p && *p; ) {
+        while (*p == ' ' || *p == ',') p++;
+        const char* e = p;
+        while (*e && *e != ',') e++;
+        const char* t = e;
+        while (t > p && t[-1] == ' ') t--;
+        if ((size_t)(t - p) == tl && ci_equal(p, token, tl)) return true;
+        p = e;
+    }
+    return false;
+}
+
+bool vv_http_ws_accept(const vv_http_req_t* req, vv_http_res_t* res) {
+    if (!req || !res || res->sent) return false;
+    const char* up = vv_http_header(req, "Upgrade");
+    const char* conn = vv_http_header(req, "Connection");
+    const char* ver = vv_http_header(req, "Sec-WebSocket-Version");
+    const char* key = vv_http_header(req, "Sec-WebSocket-Key");
+    char accept[29];
+    if (strcmp(req->method, "GET") != 0 || !up ||
+        !header_has_token(up, "websocket") || !conn ||
+        !header_has_token(conn, "upgrade") || !ver || strcmp(ver, "13") != 0 ||
+        !vv_ws_accept_key(key, accept)) {
+        vv_http_error(res, 400, "invalid_request_error",
+                      "expected a WebSocket upgrade (version 13)");
+        return false;
+    }
+    char head[256];
+    const int hn = snprintf(head, sizeof(head),
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %s\r\n"
+        "\r\n", accept);
+    res->sent = true;
+    return hn > 0 && send_all_ok((SOCKET)(intptr_t)res->fd, head, (size_t)hn);
+}
+
+bool vv_http_ws_send(vv_http_res_t* res, int opcode, const void* data,
+                     size_t n) {
+    uint8_t hdr[10];
+    const size_t hl = vv_ws_frame_header(opcode, true, n, hdr);
+    return vv_http_write(res, hdr, hl) && vv_http_write(res, data, n);
 }

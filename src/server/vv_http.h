@@ -67,4 +67,42 @@ void vv_http_respond_json(vv_http_res_t* res, int status, const char* json);
 void vv_http_error(vv_http_res_t* res, int status, const char* type,
                    const char* message);
 
+/* ─── Streaming responses and WebSocket (end of http.c) ─────────────────── */
+
+/**
+ * @brief Start a streaming response: status and headers, no Content-Length.
+ *
+ * The body ends when the connection closes (every response here is
+ * `Connection: close`). Follow with vv_http_write() / vv_http_sse_send().
+ * @return false when the client is gone
+ */
+bool vv_http_respond_begin(vv_http_res_t* res, int status,
+                           const char* content_type);
+
+/** @brief Write body bytes; false once the client has disconnected. */
+bool vv_http_write(vv_http_res_t* res, const void* buf, size_t n);
+
+/** @brief One Server-Sent Event (see vv_sse_format() in vv_ws.h). */
+bool vv_http_sse_send(vv_http_res_t* res, const char* event, const char* data);
+
+/**
+ * @brief Read from the connection after the request (WebSocket frames).
+ *
+ * Bytes the client sent right after the upgrade request may already be in
+ * `req->body`; feed those first.
+ * @param timeout_ms  < 0 blocks
+ * @return bytes read, 0 on close, -1 on error, -2 on timeout
+ */
+int vv_http_read(vv_http_res_t* res, void* buf, size_t cap, int timeout_ms);
+
+/**
+ * @brief Validate a WebSocket upgrade and answer 101, or 400 if invalid.
+ * @return true when the connection is now a WebSocket
+ */
+bool vv_http_ws_accept(const vv_http_req_t* req, vv_http_res_t* res);
+
+/** @brief Send one unfragmented, unmasked server frame. */
+bool vv_http_ws_send(vv_http_res_t* res, int opcode, const void* data,
+                     size_t n);
+
 #endif /* VV_HTTP_H */
