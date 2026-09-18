@@ -1111,7 +1111,20 @@ static void attach_frontend(vv_inference_ctx_t* c) {
                  vv_model_family_name(c->model->config.family));
 
     if (!c->is_clone) build_frontend_host(c);
-    if (!c->use_gpu) return;
+    if (!c->use_gpu) {
+        /* Repack the CPU encoders' FP16 weights now, not in the first
+           request, whose time it would otherwise be charged to. */
+        const double t_w = vv_time_ms();
+        vv_status_t sa = VV_OK, ss = VV_OK;
+        if (c->acoustic_encoder) sa = vv_conv_vae_prepare_cpu(c->acoustic_encoder);
+        if (c->semantic_encoder) ss = vv_conv_vae_prepare_cpu(c->semantic_encoder);
+        if (sa != VV_OK || ss != VV_OK)
+            VV_LOG_W("inference: CPU speech encoder weights not prepared");
+        else if (c->acoustic_encoder || c->semantic_encoder)
+            VV_LOG_I("inference: CPU speech encoder ready (%.0f ms)",
+                     vv_time_ms() - t_w);
+        return;
+    }
 
     if (!c->is_clone && (c->acoustic_encoder || c->semantic_encoder)) {
         const vv_frontend_params_t fp = vv_frontend_params_default();

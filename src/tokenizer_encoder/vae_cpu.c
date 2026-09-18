@@ -405,6 +405,12 @@ static vv_status_t run_stage(vv_conv_vae_encoder_t* e, cpu_run_t* r, int st,
     return s;
 }
 
+vv_status_t vv_conv_vae_prepare_cpu(vv_conv_vae_encoder_t* e) {
+    if (!e) return VV_ERR_NULL_PTR;
+    if (!vv_conv_vae_complete(e)) return VV_ERR_WEIGHT_MISSING;
+    return cpu_weights_build(e);
+}
+
 vv_status_t vv_conv_vae_encode_cpu(vv_conv_vae_encoder_t* e,
                                     const float* audio, int n_samples,
                                     float** output, int* n_frames) {

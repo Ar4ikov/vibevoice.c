@@ -150,6 +150,13 @@ vv_status_t vv_conv_vae_encode_cpu(vv_conv_vae_encoder_t* encoder,
                                     const float* audio, int n_samples,
                                     float** output, int* n_frames);
 
+/**
+ * @brief Build the CPU path's repacked FP16 weights ahead of the first
+ * encode. Optional (the first encode does it otherwise) and not thread-safe:
+ * call it before the encoder is shared.
+ */
+vv_status_t vv_conv_vae_prepare_cpu(vv_conv_vae_encoder_t* encoder);
+
 /* ─── GPU encoder ───────────────────────────────────────────────────────── */
 
 typedef struct vv_vae_weights vv_vae_weights_t;
