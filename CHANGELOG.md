@@ -51,6 +51,18 @@ Write the entry for a change under Unreleased in the same pull request.
   words are the same as dense BF16 on jfk, test30, test120 and the
   32-minute file. `VV_SAVE_TOKENS` / `VV_TEACHER_TOKENS` measure
   teacher-forced top-1 agreement. Default behaviour is unchanged.
+- Groundwork for VibeVoice-ASR-BitNet (not wired into the pipeline yet): a
+  GGUF reader that validates every offset (`src/model/gguf.c`) and decodes
+  the BitNet fork's I2_S and I8_S types, Q6_K, Q8_0, F16 and BF16; exact
+  ternary x int8 and int8 x int8 kernels on the CPU (AVX2, AVX-VNNI,
+  AVX512-VNNI, NEON with and without `sdot`) and the GPU (dp4a GEMV, int8
+  tensor-core GEMM with the 2-bit codes unpacked in registers), all
+  bit-identical to each other and to VibeASR.cpp's arithmetic. On the
+  5900X a ternary layer at M=1 takes 109 µs and prefill runs 1.3-1.7
+  TOP/s; on the 3090 prefill (M=2048) runs 111-202 TOP/s and the int8 tied head
+  reads at 864 GB/s. `docs/BITNET.md` records the reference runtime's
+  formats and numerics and its RTF on the same box (0.264 at 12 threads on
+  30 s); `tools/bitnet_ref.py` is a numpy fake-quant reference.
 
 ## [0.3.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.2.0...v0.3.0) — 2026-09-19
 
