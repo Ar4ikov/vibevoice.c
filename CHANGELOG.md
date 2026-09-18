@@ -9,6 +9,20 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- Groundwork for `microsoft/VibeVoice-ASR-Streaming-7B` (#20, phase 1).
+  `docs/STREAMING.md` pins down upstream `streaming_generate` exactly:
+  26-frame windows every 22 frames, each encoded on its own and never
+  normalised, `<|text_chunk_end|>` after every chunk, EOS treated as a chunk
+  end, about 815 KV positions per minute. `tools/compare_ref.py dump-stream`
+  records the reference chunk by chunk (ids, text, features, first-token
+  logits) and `cmp-stream` diffs a C dump against it. `include/vibevoice/stream.h`
+  adds the session API over a backend interface, the PCM-to-window
+  scheduler and UTF-8-safe text deltas. From the reference token ids, the
+  deltas rebuild all 159 reference chunk texts. `http.c` gains streaming
+  responses, SSE and WebSocket framing for the streaming endpoints. The
+  model backend is phase 2, so `vv_stream_open()` still returns
+  `VV_ERR_UNSUPPORTED`.
+
 ## [0.3.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.2.0...v0.3.0) — 2026-09-19
 
 - Unquantized checkpoints load: `microsoft/VibeVoice-ASR` in BF16 runs as-is

@@ -927,6 +927,10 @@ speech encoder or the connectors touches the default stream any more.
   claim that cannot be stood behind. The seam exists:
   `include/vibevoice/device.h` declares the op set, a build links exactly one
   implementation of it, and `src/device/device_none.c` shows the shape.
+- **VibeVoice-ASR-Streaming-7B** is half done. The protocol, the reference
+  diffing, the session API and the SSE/WebSocket plumbing are in. Running
+  the model is not: it needs BF16 loading and prefill into a non-empty KV
+  cache. See [docs/STREAMING.md](docs/STREAMING.md).
 
 ---
 
