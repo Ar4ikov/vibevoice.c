@@ -341,6 +341,15 @@ vv_status_t vv_vae_conv_dev(const vv_vae_conv_desc_t* d, const void* x,
     U(d) U(x) U(li) U(w) U(b) U(y) U(lo) U(ic) U(oc) U(k) U(st) U(tr) U(s)
     return VV_ERR_UNSUPPORTED;
 }
+vv_status_t vv_vae_im2col_dev(const vv_vae_conv_desc_t* d, const void* x,
+                              int64_t ld_in, int in_ch, int k, int stride,
+                              int64_t p0, int pc, void* col, int64_t ldcol,
+                              void* stream) {
+    (void)d; (void)x; (void)ld_in; (void)in_ch; (void)k; (void)stride;
+    (void)p0; (void)pc; (void)col; (void)ldcol; (void)stream;
+    return VV_ERR_UNSUPPORTED;
+}
+
 vv_status_t vv_vae_tail_dev(const vv_vae_conv_desc_t* d, const void* x,
                             int64_t li, int ic, void* s) {
     U(d) U(x) U(li) U(ic) U(s) return VV_ERR_UNSUPPORTED;

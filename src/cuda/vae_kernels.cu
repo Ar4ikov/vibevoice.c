@@ -12,12 +12,17 @@
  * input and output start, how many columns of left context sit in its
  * streaming state, and how many to leave there for the next chunk.
  *
- * Numerics are those of the kernels this replaces, operation for operation:
- * the same FP32 accumulation order in every convolution and norm, the same
- * WMMA tiling in the GEMMs, and an FP16 rounding at every point the old
+ * No kernel's arithmetic depends on where an item sits in the packed axis or
+ * on how a stream was cut into chunks: every output sums its products in a
+ * fixed order, and an FP16 rounding happens at every point the old
  * multi-kernel sequence stored an intermediate. So batching, chunking and
  * fusing change no bit of the output, which is what lets the tests demand
- * bit-exact equality rather than a tolerance.
+ * bit-exact equality rather than a tolerance. The one change against the
+ * kernels this replaces is the downsample: a tensor-core GEMM over im2col
+ * tiles instead of a scalar loop, which sums in WMMA order. Against the
+ * PyTorch reference that moves test30's latents from 0.149 / 0.261 % to
+ * 0.147 / 0.265 % relative error (acoustic / semantic); transcripts are
+ * unchanged.
  *
  * All indexing into packed buffers is 64-bit: a packed stage-0 FFN hidden
  * buffer passes INT_MAX elements at about eleven 60 s segments.
@@ -115,6 +120,42 @@ __global__ void vae_tail_kernel(vv_vae_conv_desc_t d, const half* __restrict__ x
         v = xb[(size_t)c * ld_in + (p - it.have)];
     }
     ((half*)it.tail_out)[(size_t)c * d.cap + j] = v;
+}
+
+/**
+ * The downsample convolutions as a GEMM: column q of the tile is packed
+ * output column p0 + q, row ic * k + kk the input it reads through tap kk —
+ * the weight's own [out][in][k] order, so the weight is the GEMM's A as it
+ * lies. Positions are resolved exactly as vae_conv_kernel resolves them:
+ * context from the state (zeros when fresh), then the item's input, then the
+ * zero right padding of a final chunk.
+ */
+__global__ void vae_im2col_kernel(vv_vae_conv_desc_t d, const half* __restrict__ x,
+                                  int64_t ld_in, int k, int stride,
+                                  int64_t p0, int pc, half* __restrict__ col,
+                                  int64_t ldcol)
+{
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= pc) return;
+    const int kr = blockIdx.y;
+    const int ic = kr / k, kk = kr - ic * k;
+    const int64_t p = p0 + q;
+    int i = 0;
+    while (i + 1 < d.n && p >= d.it[i + 1].out_off) i++;
+    const vv_vae_conv_item_t& it = d.it[i];
+    const int t = (int)(p - it.out_off);
+    const int pos = t * stride + kk;
+    half v = __float2half(0.0f);
+    if (t < it.out_len && pos < it.have + it.in_len) {
+        if (pos < it.have) {
+            const half* tl = (const half*)it.tail_in;
+            if (tl) v = tl[(size_t)ic * d.cap + pos];
+        } else {
+            const half* xb = it.in_ptr ? (const half*)it.in_ptr : x + it.in_off;
+            v = xb[(size_t)ic * ld_in + (pos - it.have)];
+        }
+    }
+    col[(size_t)kr * ldcol + q] = v;
 }
 
 /* ─── RMSNorm statistics ───────────────────────────────────────────────── */
@@ -329,7 +370,8 @@ __device__ __forceinline__ void vae_load_n_major(
 /** @brief Epilogue of the FFN GEMMs. */
 enum {
     VAE_EPI_BIAS_GELU  = 0,   /* h = gelu(half(half(acc) + b))              */
-    VAE_EPI_BIAS_RESID = 1    /* x = half(x + half(half(acc) + b) * gamma)  */
+    VAE_EPI_BIAS_RESID = 1,   /* x = half(x + half(half(acc) + b) * gamma)  */
+    VAE_EPI_BIAS       = 2    /* y = half(acc + b), one rounding (convs)    */
 };
 
 __device__ __forceinline__ float vae_gelu(float x) {
@@ -415,6 +457,11 @@ __global__ __launch_bounds__(THREADS) void vae_gemm_nn_kernel(
                 const int c = col0 + (e & 15);
                 if (r < M && c < P) {
                     const size_t off = (size_t)r * ldc + c;
+                    if (EPI == VAE_EPI_BIAS) {
+                        const float b = bias ? __half2float(bias[r]) : 0.0f;
+                        C[off] = __float2half(stg[e] + b);
+                        continue;
+                    }
                     float v = __half2float(__float2half(stg[e]));
                     if (bias)
                         v = __half2float(__float2half(v + __half2float(bias[r])));
@@ -655,8 +702,27 @@ vv_status_t vv_vae_gemm_nn_dev(int epilogue, const void* A, const void* B,
             <<<grid, THREADS, shmem, (cudaStream_t)stream>>>(
             (const half*)A, (const half*)B, ldb, (half*)C, ldc, M, K, P,
             (const half*)bias, (const half*)gamma, rinv, (const half*)norm_w);
+    else if (epilogue == VAE_EPI_BIAS)
+        vae_gemm_nn_kernel<VAE_EPI_BIAS>
+            <<<grid, THREADS, shmem, (cudaStream_t)stream>>>(
+            (const half*)A, (const half*)B, ldb, (half*)C, ldc, M, K, P,
+            (const half*)bias, (const half*)gamma, rinv, (const half*)norm_w);
     else
         return VV_ERR_INVALID_ARG;
+    return launch_status();
+}
+
+vv_status_t vv_vae_im2col_dev(const vv_vae_conv_desc_t* d, const void* x,
+                              int64_t ld_in, int in_ch, int k, int stride,
+                              int64_t p0, int pc, void* col, int64_t ldcol,
+                              void* stream) {
+    if (!d || !col) return VV_ERR_NULL_PTR;
+    if (d->n <= 0 || d->n > VV_VAE_MAX_ITEMS || in_ch * k > 65535)
+        return VV_ERR_INVALID_ARG;
+    if (pc <= 0) return VV_OK;
+    dim3 grid((pc + VAE_THREADS - 1) / VAE_THREADS, in_ch * k);
+    vae_im2col_kernel<<<grid, VAE_THREADS, 0, (cudaStream_t)stream>>>(
+        *d, (const half*)x, ld_in, k, stride, p0, pc, (half*)col, ldcol);
     return launch_status();
 }
 

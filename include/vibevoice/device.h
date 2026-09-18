@@ -598,6 +598,20 @@ vv_status_t vv_vae_mixer_dev(const vv_vae_conv_desc_t* d, const void* xin,
 /** @brief Epilogues of vv_vae_gemm_nn_dev. */
 #define VV_VAE_EPI_BIAS_GELU  0  /**< C = gelu(A @ B + bias)                 */
 #define VV_VAE_EPI_BIAS_RESID 1  /**< C += gamma * (A @ B + bias), in place  */
+#define VV_VAE_EPI_BIAS       2  /**< C = A @ B + bias, rounded once         */
+
+/**
+ * @brief Lay the inputs of a strided conv out as GEMM columns.
+ *
+ * col[ic * k + kk][q] is what tap kk of input channel ic sees for packed
+ * output column p0 + q: context from the item's state, its input, or the
+ * zero padding past a final chunk — the same resolution vv_vae_conv_dev
+ * makes. A GEMM of the [out][in * k] weight against it is the conv.
+ */
+vv_status_t vv_vae_im2col_dev(const vv_vae_conv_desc_t* d, const void* x,
+                              int64_t ld_in, int in_ch, int k, int stride,
+                              int64_t p0, int pc, void* col, int64_t ldcol,
+                              void* stream);
 
 /**
  * @brief C[M, P] (stride ldc) from A[M, K] @ B[K, P] (stride ldb).

@@ -97,6 +97,11 @@ int main(int argc, char** argv) {
     const double sec = (double)n / 24000.0;
 
     vv_init_params_t ip = vv_init_params_default();
+    memset(&ip.gpus, 0, sizeof(ip.gpus));
+    if (vv_gpu_set_resolve(&ip.gpus, 0, false) != VV_OK) {
+        fprintf(stderr, "no usable gpu 0\n");
+        return 1;
+    }
     vv_inference_ctx_t* ctx = NULL;
     if (vv_inference_init(model, 0, &ip, &ctx) != VV_OK || !ctx->frontend) {
         fprintf(stderr, "cannot bring the model up on gpu 0\n");

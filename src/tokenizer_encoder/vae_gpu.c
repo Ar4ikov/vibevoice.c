@@ -325,6 +325,16 @@ static void arena_layout(const vae_plan_t* p, int max_items,
     for (int s = 0; s < p->n_stages; s++)
         if (p->hidden[s] > widest) widest = p->hidden[s];
     if (hid < (size_t)widest * 128) hid = (size_t)widest * 128;
+    /* The downsample GEMMs lay their im2col tiles out in the same buffer. */
+    for (int i = 0; i < p->n_layers; i++) {
+        const vae_layer_t* L = &p->L[i];
+        if (L->kind != VAE_L_DS) continue;
+        const size_t kc = (size_t)L->in_ch * (size_t)L->k;
+        if (hid < kc * 128) hid = kc * 128;
+        const int so = L->stage + 1 < p->n_stages ? L->stage + 1 : L->stage;
+        const size_t full = kc * (size_t)l->ld[so];
+        if (full > hid_full) hid_full = full;
+    }
     if (hid > hid_full) hid = hid_full;
     l->hid_elems = hid;
 
@@ -606,9 +616,29 @@ vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
             if ((size_t)L->out_ch * (size_t)ld2 > a->lay.act_elems)
                 return VV_ERR_OVERFLOW;
             if (T2 > 0) {
-                s = vv_vae_conv_dev(&d, a->act[cur], ld, w->ds_w[st],
-                                    w->ds_b[st], a->act[cur ^ 1], ld2, C,
-                                    L->out_ch, L->k, L->stride, false, stream);
+                /* A tensor-core GEMM over im2col tiles in the FFN's hidden
+                   buffer; the direct kernel spent two thirds of the encoder
+                   here, one scalar load pair per multiply-add. */
+                const int Kc = C * L->k;
+                int64_t tile = (int64_t)(a->lay.hid_elems / (size_t)Kc);
+                tile = tile >= 128 ? tile / 128 * 128 : tile / 8 * 8;
+                if (tile < 8) return VV_ERR_OVERFLOW;
+                for (int64_t p0 = 0; p0 < T2 && s == VV_OK; p0 += tile) {
+                    const int64_t pc = (T2 - p0 < tile) ? T2 - p0 : tile;
+                    const int64_t ldc = round8(pc);
+                    if ((size_t)Kc * (size_t)ldc > used_hid)
+                        used_hid = (size_t)Kc * (size_t)ldc;
+                    s = vv_vae_im2col_dev(&d, a->act[cur], ld, C, L->k,
+                                          L->stride, p0, (int)pc, a->hid, ldc,
+                                          stream);
+                    if (s == VV_OK)
+                        s = vv_vae_gemm_nn_dev(VV_VAE_EPI_BIAS, w->ds_w[st],
+                                               a->hid, ldc,
+                                               (uint16_t*)a->act[cur ^ 1] + p0,
+                                               ld2, L->out_ch, Kc, (int)pc,
+                                               w->ds_b[st], NULL, NULL, NULL,
+                                               stream);
+                }
                 if (s != VV_OK) return s;
             }
             s = vv_vae_tail_dev(&d, a->act[cur], ld, C, stream);
