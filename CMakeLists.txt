@@ -165,6 +165,7 @@ add_library(vibevoice_core STATIC
     src/core/clock.c
     src/core/version.c
     src/core/gpu_select.c
+    src/core/vv_spawn.c
     src/audio/wav.c
     src/audio/resample.c
     src/audio/normalize.c
@@ -348,6 +349,14 @@ if(VV_BUILD_TESTS)
     set_tests_properties(test_attention_scalar PROPERTIES
                          ENVIRONMENT "VV_ATTN_MMA=0")
     vv_add_test(test_cpu_kernels tests/test_cpu_kernels.c)
+
+    # Arguments to helper programs, uploads and HTTP heads stay data (#14).
+    # spawn_child echoes its argv so the test can check it byte for byte.
+    add_executable(spawn_child tests/spawn_child.c)
+    vv_add_test(test_untrusted_input tests/test_untrusted_input.c)
+    add_dependencies(test_untrusted_input spawn_child)
+    target_compile_definitions(test_untrusted_input PRIVATE
+        VV_SPAWN_CHILD="$<TARGET_FILE:spawn_child>")
     vv_add_test(test_e2e tests/test_e2e.c)
 endif()
 

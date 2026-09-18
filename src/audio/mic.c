@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "vv_thread.h"
+#include "vv_spawn.h"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -59,7 +60,8 @@ struct vv_mic {
     /* source-specific */
     void*      alsa_handle;   /* snd_pcm_t*            */
     void*      alsa_lib;
-    FILE*      pipe;
+    FILE*      pipe;          /* the recorder's stdout, owned by `child` */
+    vv_child_t* child;
     float*     file_pcm;      /* whole file, for SRC_FILE */
     int        file_len;
     int        file_pos;
@@ -221,26 +223,46 @@ static vv_status_t mic_alloc(int sample_rate, vv_mic_t** out) {
     return VV_OK;
 }
 
-/** @brief Command line for the fallback recorder, or NULL if none is usable. */
-static const char* recorder_cmd(int rate, const char* device, char* buf,
-                                size_t n) {
+/**
+ * @brief Start the fallback recorder: ffmpeg (avfoundation, dshow) or
+ * arecord, raw mono float32 on stdout at `rate`.
+ *
+ * The device name is one argument of an argument vector -- it never reaches
+ * a shell, so a name with quotes, `;`, `$(...)` or `&` in it is just a name
+ * the recorder will not find.
+ */
+static vv_child_t* start_recorder(int rate, const char* device, FILE** out) {
+    char rate_s[16];
+    snprintf(rate_s, sizeof(rate_s), "%d", rate);
 #ifdef __APPLE__
-    snprintf(buf, n, "ffmpeg -v error -f avfoundation -i \":%s\" "
-                     "-f f32le -ac 1 -ar %d - 2>/dev/null",
-             device && device[0] ? device : "0", rate);
+    char input[300];
+    snprintf(input, sizeof(input), ":%s", device && device[0] ? device : "0");
+    const char* const argv[] = {
+        "ffmpeg", "-v", "error", "-nostdin", "-f", "avfoundation", "-i", input,
+        "-f", "f32le", "-ac", "1", "-ar", rate_s, "pipe:1", NULL
+    };
+    return vv_spawn_read(argv, VV_SPAWN_STDERR_NULL, out);
 #elif defined(_WIN32)
     /*
      * dshow has no device called "default", so an unresolved name is a hard
-     * error rather than a fallback -- vv_mic_open resolves it first.
+     * error rather than a fallback -- vv_mic_open resolves it first. ffmpeg's
+     * complaints stay visible on the console, as they always were here.
      */
-    snprintf(buf, n, "ffmpeg -v error -f dshow -i audio=\"%s\" "
-                     "-f f32le -ac 1 -ar %d -",
-             device && device[0] ? device : "default", rate);
+    char input[400];
+    snprintf(input, sizeof(input), "audio=%s",
+             device && device[0] ? device : "default");
+    const char* const argv[] = {
+        "ffmpeg", "-v", "error", "-nostdin", "-f", "dshow", "-i", input,
+        "-f", "f32le", "-ac", "1", "-ar", rate_s, "pipe:1", NULL
+    };
+    return vv_spawn_read(argv, VV_SPAWN_STDERR_INHERIT, out);
 #else
-    snprintf(buf, n, "arecord -q -f FLOAT_LE -c 1 -r %d -t raw -D %s 2>/dev/null",
-             rate, device && device[0] ? device : "default");
+    const char* const argv[] = {
+        "arecord", "-q", "-f", "FLOAT_LE", "-c", "1", "-r", rate_s,
+        "-t", "raw", "-D", device && device[0] ? device : "default", NULL
+    };
+    return vv_spawn_read(argv, VV_SPAWN_STDERR_NULL, out);
 #endif
-    return buf;
 }
 
 vv_status_t vv_mic_open(int sample_rate, const char* device, vv_mic_t** out) {
@@ -276,7 +298,6 @@ vv_status_t vv_mic_open(int sample_rate, const char* device, vv_mic_t** out) {
 
     /* Fall back to an external recorder. */
     {
-        char cmd[1024];
         char resolved[384];
         if (!vv_mic_resolve_device(device, resolved, sizeof(resolved),
                                    m->device_label,
@@ -288,13 +309,8 @@ vv_status_t vv_mic_open(int sample_rate, const char* device, vv_mic_t** out) {
             vv_free(m);
             return VV_ERR_NOT_FOUND;
         }
-        recorder_cmd(sample_rate, resolved, cmd, sizeof(cmd));
-#ifdef _WIN32
-        m->pipe = _popen(cmd, "rb");
-#else
-        m->pipe = popen(cmd, "r");
-#endif
-        if (m->pipe) {
+        m->child = start_recorder(sample_rate, resolved, &m->pipe);
+        if (m->child) {
             m->kind = SRC_PIPE;
             m->backend_name =
 #ifdef __linux__
@@ -306,6 +322,9 @@ vv_status_t vv_mic_open(int sample_rate, const char* device, vv_mic_t** out) {
                 *out = m;
                 return VV_OK;
             }
+            vv_spawn_wait(m->child, true);
+            m->child = NULL;
+            m->pipe = NULL;
         }
     }
 
@@ -362,15 +381,18 @@ void vv_mic_close(vv_mic_t* m) {
     if (!m) return;
     m->running = 0;
 
-    if (m->pipe) {
-#ifdef _WIN32
-        _pclose(m->pipe);
-#else
-        pclose(m->pipe);
-#endif
+    /*
+     * Stop the recorder, let the capture thread see end-of-file and exit,
+     * and only then close the stream it was reading. Closing first (as
+     * pclose did) freed the FILE under a thread still inside fread().
+     */
+    if (m->child) vv_spawn_terminate(m->child);
+    vv_thread_join(m->thread);
+    if (m->child) {
+        vv_spawn_wait(m->child, false);
+        m->child = NULL;
         m->pipe = NULL;
     }
-    vv_thread_join(m->thread);
 
 #ifndef _WIN32
     if (m->alsa_handle && g_alsa.close) g_alsa.close(m->alsa_handle);

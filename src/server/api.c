@@ -65,18 +65,28 @@ static void sb_reserve(strbuf_t* b, size_t extra) {
 static void sb_puts(strbuf_t* b, const char* s) {
     const size_t n = strlen(s);
     sb_reserve(b, n);
-    if (!b->buf) return;
+    if (!b->buf || b->len + n + 1 > b->cap) return;  /* growth failed */
     memcpy(b->buf + b->len, s, n + 1);
     b->len += n;
 }
 
+/*
+ * Formatted append, measured first so that nothing is cut: segment text in
+ * an SRT or VTT line is as long as the speaker made it, and a fixed 1 KB
+ * buffer used to truncate it silently.
+ */
 static void sb_printf(strbuf_t* b, const char* fmt, ...) {
-    char tmp[1024];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    const int n = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
-    sb_puts(b, tmp);
+    if (n <= 0) return;
+    sb_reserve(b, (size_t)n);
+    if (!b->buf || b->len + (size_t)n + 1 > b->cap) return;
+    va_start(ap, fmt);
+    vsnprintf(b->buf + b->len, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    b->len += (size_t)n;
 }
 
 /** @brief Append `s` escaped as a JSON string body (no surrounding quotes). */
@@ -93,7 +103,10 @@ static void sb_json_escaped(strbuf_t* b, const char* s) {
                 if (*p < 0x20) sb_printf(b, "\\u%04x", *p);
                 else {
                     sb_reserve(b, 1);
-                    if (b->buf) { b->buf[b->len++] = (char)*p; b->buf[b->len] = '\0'; }
+                    if (b->buf && b->len + 2 <= b->cap) {
+                        b->buf[b->len++] = (char)*p;
+                        b->buf[b->len] = '\0';
+                    }
                 }
         }
     }
@@ -184,15 +197,16 @@ static void handle_health(vv_server_t* sv, vv_http_res_t* res) {
     uint64_t done = 0;
     int busy = 0;
     vv_engine_stats(sv->engine, &done, &busy);
-    char buf[640];
-    snprintf(buf, sizeof(buf),
-             "{\"status\":\"ok\",\"model\":\"%s\",\"version\":\"%s\","
-             "\"build\":\"%s\",\"slots\":%d,"
-             "\"busy\":%d,\"completed\":%llu}",
-             sv->model_name, vv_version(), vv_build_ref(),
-             vv_engine_slots(sv->engine), busy,
-             (unsigned long long)done);
-    vv_http_respond_json(res, 200, buf);
+    /* The model name is the operator's free text: escaped like any other. */
+    strbuf_t b; sb_init(&b);
+    sb_puts(&b, "{\"status\":\"ok\",\"model\":\"");
+    sb_json_escaped(&b, sv->model_name);
+    sb_printf(&b, "\",\"version\":\"%s\",\"build\":\"%s\",\"slots\":%d,"
+                  "\"busy\":%d,\"completed\":%llu}",
+              vv_version(), vv_build_ref(), vv_engine_slots(sv->engine), busy,
+              (unsigned long long)done);
+    vv_http_respond_json(res, 200, b.buf ? b.buf : "{}");
+    sb_free(&b);
 }
 
 static void handle_metrics(vv_server_t* sv, vv_http_res_t* res) {
@@ -383,12 +397,28 @@ static void handle_transcriptions(vv_server_t* sv, const vv_http_req_t* req,
     vv_transcription_free(tr);
 }
 
+/*
+ * Compare in time that depends only on the lengths, not on how many leading
+ * bytes of a guess are right: strcmp() returns at the first difference,
+ * which lets a key be recovered one byte at a time from response latency.
+ */
+static bool key_equal(const char* given, const char* key) {
+    const size_t n = strlen(key);
+    const size_t m = strlen(given);
+    unsigned char diff = (unsigned char)(m != n);
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char g = i < m ? (unsigned char)given[i] : 0;
+        diff |= (unsigned char)(g ^ (unsigned char)key[i]);
+    }
+    return diff == 0;
+}
+
 static bool authorized(const vv_server_t* sv, const vv_http_req_t* req) {
     if (!sv->api_key[0]) return true;
     const char* h = vv_http_header(req, "Authorization");
     if (!h) return false;
     if (strncmp(h, "Bearer ", 7) == 0) h += 7;
-    return strcmp(h, sv->api_key) == 0;
+    return key_equal(h, sv->api_key);
 }
 
 static void route(const vv_http_req_t* req, vv_http_res_t* res, void* user) {

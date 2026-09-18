@@ -1513,6 +1513,14 @@ static vv_status_t step_slice(vv_model_t* model, void* hidden,
         vv_decoder_step(model, hidden, kv, pool, ws, ws_size,                \
                         compute, xfer, first_layer, n_layers)
 
+    /*
+     * The capacity check lives in vv_kv_cache_append, and a replayed step
+     * never runs it: past the window a replay would write K and V past the
+     * end of the cache and attend over memory that is not the cache. Every
+     * path, direct or replayed, on every shard, stops here instead.
+     */
+    if (kv->current_len >= kv->max_seq_len) return VV_ERR_OVERFLOW;
+
     if (!graph_ok || g->shape == VV_GRAPH_GAVE_UP) return VV_STEP_DIRECT();
 
     const int want = vv_gqa_decode_shape(kv->current_len + 1);
@@ -2079,6 +2087,12 @@ static vv_status_t transcribe_gpu(
 
         /* Decoder step */
         s = decoder_step_graphed(ctx, hidden_one_gpu, graph_ok, graphs);
+        if (s == VV_ERR_OVERFLOW) {
+            VV_LOG_W("inference: the KV window is full (%d positions); the "
+                     "transcript stops here -- raise --max-seq-len",
+                     ctx->kv_cache->max_seq_len);
+            break;
+        }
         if (s != VV_OK) { VV_LOG_E("inference: decode step %d failed", n_generated); break; }
 
         if (prof) {

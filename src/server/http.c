@@ -214,13 +214,37 @@ void vv_http_respond_json(vv_http_res_t* res, int status, const char* json) {
     vv_http_respond(res, status, "application/json", json, strlen(json));
 }
 
+/*
+ * Copy `s` into `out` as the body of a JSON string. Messages can carry text
+ * that came from outside (a status string, a file name); a quote or a
+ * control character in one must not end the string it sits in.
+ */
+static void json_escape_into(char* out, size_t cap, const char* s) {
+    size_t o = 0;
+    for (const unsigned char* p = (const unsigned char*)(s ? s : ""); *p; p++) {
+        char tmp[8];
+        const char* piece = tmp;
+        if (*p == '"')       piece = "\\\"";
+        else if (*p == '\\') piece = "\\\\";
+        else if (*p < 0x20)  snprintf(tmp, sizeof(tmp), "\\u%04x", *p);
+        else { tmp[0] = (char)*p; tmp[1] = '\0'; }
+        const size_t n = strlen(piece);
+        if (o + n + 1 > cap) break;
+        memcpy(out + o, piece, n);
+        o += n;
+    }
+    out[o] = '\0';
+}
+
 void vv_http_error(vv_http_res_t* res, int status, const char* type,
                    const char* message) {
-    char buf[1024];
+    char msg[512], typ[64], buf[1024];
+    json_escape_into(msg, sizeof(msg), message);
+    json_escape_into(typ, sizeof(typ), type);
     /* OpenAI's error envelope, which clients and GPUStack both understand. */
     snprintf(buf, sizeof(buf),
              "{\"error\":{\"message\":\"%s\",\"type\":\"%s\",\"code\":%d}}",
-             message, type, status);
+             msg, typ, status);
     vv_http_respond_json(res, status, buf);
 }
 
@@ -231,18 +255,84 @@ typedef struct {
     SOCKET     fd;
 } conn_arg_t;
 
+/*
+ * Content-Length of a request head, found as a header line of its own (not as
+ * text inside some other header's value), in any capitalisation. Returns -1
+ * for a head that must be refused: a malformed or repeated-and-different
+ * length, or a Transfer-Encoding, which this server does not implement (a
+ * chunked body read as raw bytes would be parsed as garbage).
+ */
+static int head_content_length(const char* head, size_t head_len,
+                               size_t* want) {
+    *want = 0;
+    int seen = 0;
+    const char* end = head + head_len;
+    const char* line = memchr(head, '\n', head_len);
+    while (line && ++line < end) {
+        const char* eol = memchr(line, '\n', (size_t)(end - line));
+        if (!eol) eol = end;
+        const size_t n = (size_t)(eol - line);
+        if (n >= 17 && ci_equal(line, "transfer-encoding", 17)) return -1;
+        if (n >= 15 && ci_equal(line, "content-length:", 15)) {
+            const char* v = line + 15;
+            while (v < eol && (*v == ' ' || *v == '\t')) v++;
+            size_t value = 0;
+            const char* d = v;
+            for (; d < eol && *d >= '0' && *d <= '9'; d++) {
+                if (value > ((size_t)-1 - 9) / 10) return -1;   /* overflow */
+                value = value * 10 + (size_t)(*d - '0');
+            }
+            if (d == v) return -1;
+            while (d < eol && (*d == ' ' || *d == '\t' || *d == '\r')) d++;
+            if (d != eol) return -1;
+            if (seen && value != *want) return -1;
+            *want = value;
+            seen = 1;
+        }
+        line = eol < end ? eol : NULL;
+    }
+    return seen;
+}
+
+/* How long a client may take to send its request head, and to go quiet. */
+#define VV_HTTP_HEAD_TIMEOUT_MS  30000
+#define VV_HTTP_IO_TIMEOUT_MS    60000
+
+static void set_io_timeouts(SOCKET fd, int ms) {
+#ifdef _WIN32
+    const DWORD tv = (DWORD)ms;
+#else
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+#endif
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+}
+
 static bool read_request(SOCKET fd, size_t max_body, vv_http_req_t* req,
                          char** out_buf) {
+    /*
+     * One spare byte past `cap` keeps the buffer NUL-terminated after every
+     * recv(), so no string function can run past what was received.
+     */
     size_t cap = 64 * 1024, len = 0;
-    char* buf = (char*)vv_alloc(cap);
+    char* buf = (char*)vv_alloc(cap + 1);
     if (!buf) return false;
+    buf[0] = '\0';
 
-    size_t head_end = 0;
+    /*
+     * Every recv() is bounded by the socket timeout, and the head as a whole
+     * by a deadline, so a client that trickles one byte at a time cannot
+     * keep a connection thread forever.
+     */
+    const double head_deadline = vv_time_ms() + VV_HTTP_HEAD_TIMEOUT_MS;
+    size_t head_end = 0, want = 0;
     for (;;) {
         if (len == cap) {
             if (cap >= max_body + (1 << 20)) { vv_free(buf); return false; }
             size_t ncap = cap * 2;
-            char* nb = (char*)vv_alloc(ncap);
+            char* nb = (char*)vv_alloc(ncap + 1);
             if (!nb) { vv_free(buf); return false; }
             memcpy(nb, buf, len);
             vv_free(buf);
@@ -251,24 +341,34 @@ static bool read_request(SOCKET fd, size_t max_body, vv_http_req_t* req,
         const int n = (int)recv(fd, buf + len, (int)(cap - len), 0);
         if (n <= 0) break;
         len += (size_t)n;
+        buf[len] = '\0';
 
         if (!head_end) {
             const char* e = mem_find(buf, len, "\r\n\r\n", 4);
-            if (e) head_end = (size_t)(e - buf) + 4;
+            if (e) {
+                head_end = (size_t)(e - buf) + 4;
+                if (head_content_length(buf, head_end, &want) < 0 ||
+                    want > max_body) {
+                    vv_free(buf);
+                    return false;
+                }
+            } else if (vv_time_ms() > head_deadline || len > (64u << 10)) {
+                vv_free(buf);          /* head too slow, or too large */
+                return false;
+            }
         }
-        if (head_end) {
-            /* Stop once Content-Length worth of body has arrived. */
-            size_t want = 0;
-            const char* cl = mem_find(buf, head_end, "Content-Length:", 15);
-            if (!cl) cl = mem_find(buf, head_end, "content-length:", 15);
-            if (cl) want = (size_t)strtoull(cl + 15, NULL, 10);
-            if (want > max_body) { vv_free(buf); return false; }
-            if (len >= head_end + want) break;
-        }
+        /* Stop once Content-Length worth of body has arrived. */
+        if (head_end && len >= head_end + want) break;
     }
     if (!head_end) { vv_free(buf); return false; }
 
     memset(req, 0, sizeof(*req));
+
+    /*
+     * Parse only the head. The blank line that ends it becomes a NUL, so
+     * every search below stops there and never reaches into the body.
+     */
+    buf[head_end - 2] = '\0';
 
     /* Request line */
     char* p = buf;
@@ -286,25 +386,28 @@ static bool read_request(SOCKET fd, size_t max_body, vv_http_req_t* req,
     if (q) { *q = '\0'; snprintf(req->query, sizeof(req->query), "%s", q + 1); }
 
     /* Headers */
-    char* line = memchr(sp2 + 1, '\n', head_end - (size_t)(sp2 + 1 - buf));
+    char* line = strchr(sp2 + 1, '\n');
     while (line && req->n_headers < VV_HTTP_MAX_HEADERS) {
         line++;
-        if (line[0] == '\r' || line[0] == '\n') break;
+        if (line[0] == '\0' || line[0] == '\r' || line[0] == '\n') break;
+        char* eol = strchr(line, '\n');
         char* colon = strchr(line, ':');
-        char* eol = strchr(line, '\r');
-        if (!colon || !eol || colon > eol) break;
+        if (!colon || (eol && colon > eol)) break;
+        if (eol) *eol = '\0';
         *colon = '\0';
-        *eol = '\0';
         char* val = colon + 1;
-        while (*val == ' ') val++;
+        while (*val == ' ' || *val == '\t') val++;
+        size_t vlen = strlen(val);
+        while (vlen && (val[vlen - 1] == '\r' || val[vlen - 1] == ' ' ||
+                        val[vlen - 1] == '\t'))
+            val[--vlen] = '\0';
         snprintf(req->headers[req->n_headers].name,
                  sizeof(req->headers[0].name), "%s", line);
         snprintf(req->headers[req->n_headers].value,
                  sizeof(req->headers[0].value), "%s", val);
         req->n_headers++;
-        *eol = '\r';
-        line = strchr(eol + 1, '\n');
-        if (line && (size_t)(line - buf) >= head_end) break;
+        if (!eol) break;
+        line = eol;
     }
 
     req->body = buf + head_end;
@@ -410,6 +513,7 @@ vv_status_t vv_http_serve(const char* host, int port, int max_conns,
 
         int nod = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&nod, sizeof(nod));
+        set_io_timeouts(fd, VV_HTTP_IO_TIMEOUT_MS);
 
         vv_mutex_lock(&s->lock);
         if (s->n_conns >= s->max_conns || !s->running) {
