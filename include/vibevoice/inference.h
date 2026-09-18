@@ -7,6 +7,7 @@
 
 #include "vibevoice/types.h"
 #include "vibevoice/model.h"
+#include "vibevoice/family.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -134,7 +135,8 @@ vv_status_t vv_kv_cache_free(vv_kv_cache_t* cache);
  * of layer i+1 while layer i is computing.
  */
 #define VV_LAYER_POOL_SLOTS 2
-#define VV_LAYER_TENSORS_PER_LAYER 27   /* 2 norms + 7*(packed+scales+mins) + 4 attn bias */
+/* Every slot vv_layer_tensors() lists (model.h), biases of all 7 included. */
+#define VV_LAYER_TENSORS_PER_LAYER VV_LAYER_TENSOR_SLOTS
 
 typedef struct vv_layer_pool {
     void*  gpu_buf[VV_LAYER_POOL_SLOTS]; /**< Pre-allocated GPU staging  */
@@ -224,6 +226,11 @@ vv_status_t vv_decoder_layer_forward(
  * for one chunk of positions: causality lives inside a layer, and the cache
  * a layer reads is the one it just wrote.
  *
+ * The sequence is appended at `kv_cache->current_len`: on an empty cache
+ * that is a prompt, after decode steps it is the next chunk of a streaming
+ * session. The device-side length the decode step reads is not touched;
+ * call vv_kv_cache_publish_len() before decoding again.
+ *
  * @param pool  Optional layer pool for streaming (NULL = weights on GPU).
  * @param xfer  Transfer stream for async upload (NULL = use compute).
  */
@@ -259,6 +266,13 @@ vv_status_t vv_decoder_step(
 
 /* ─── CPU-mode decoder (Phase 3) ───────────────────────────────────────── */
 
+/**
+ * @brief Prefill on the CPU, appended to what the cache already holds.
+ *
+ * Like the GPU prefill, positions start at `kv_cache->current_len`, and the
+ * sequence runs in chunks sized to the workspace, so the prompt length is
+ * bounded by the KV window rather than by 512 MB of activations.
+ */
 vv_status_t vv_decoder_prefill_cpu(
     vv_model_t* model,
     float* hidden_states,      /**< [seq_len, hidden_size] FP32, in/out */
@@ -364,6 +378,14 @@ typedef struct vv_inference_ctx {
 
     /* Text tokenizer (cached for decode loop) */
     struct vv_tokenizer* tokenizer;
+
+    /*
+     * Prompt, stop tokens and generation mode for this model, resolved
+     * against the tokenizer once. `family_ok` is false when the tokenizer
+     * could not supply what the family needs; transcription then refuses.
+     */
+    vv_family_t    family;
+    bool           family_ok;
 
     /* Audio encoding components */
     struct vv_conv_vae_encoder* acoustic_encoder;

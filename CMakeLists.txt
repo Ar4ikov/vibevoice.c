@@ -188,6 +188,7 @@ add_library(vibevoice_core STATIC
     src/quant/nf4_table.c
     src/quant/kv_format.c
     src/quant/awq_repack.c
+    src/quant/load_quant.c
     src/quant/dequant_cpu.c
     src/cpu/cpu_kernels.c
     src/inference/pipeline.c
@@ -195,6 +196,7 @@ add_library(vibevoice_core STATIC
     src/inference/kv_cache.c
     src/inference/sampling.c
     src/inference/postprocess.c
+    src/inference/family.c
 )
 # With no accelerator backend the device op set still has to link. The stub
 # implements memory and streams on the host and refuses every compute op,

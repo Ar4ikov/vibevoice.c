@@ -50,6 +50,7 @@ typedef struct {
     int         max_seq_len;
     int         gpu_layers;
     const char* kv_cache;
+    const char* quant;
     bool        cpu_only;
     float       vram_budget;
     bool        verbose;
@@ -108,6 +109,9 @@ static void print_usage(const char* prog) {
         "  --trt-semantic <plan> TensorRT engine for semantic encoder\n"
         "  --kv-cache FMT        KV-cache storage: fp16 (default), fp8,\n"
         "                        fp8-e5m2, tq4, tq3, tq2, tq1.5\n"
+        "  --quant <fmt>         Weights: auto (default: as the checkpoint\n"
+        "                        stores them) | none | nf4 | int4 — the last\n"
+        "                        three quantize a dense checkpoint at load\n"
         "  --vram-budget <0-1>   VRAM fraction for model (default: 1.0)\n"
         "  --gpu-layers <N>      Layers to keep on the GPU (-1 = fit to VRAM)\n"
         "  --acoustic-sampling M mode (default, deterministic) | fix |\n"
@@ -160,6 +164,8 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->trt_semantic = argv[++i];
         } else if (strcmp(argv[i], "--kv-cache") == 0 && i + 1 < argc) {
             args->kv_cache = argv[++i];
+        } else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
+            args->quant = argv[++i];
         } else if (strcmp(argv[i], "--vram-budget") == 0 && i + 1 < argc) {
             args->vram_budget = (float)atof(argv[++i]);
             if (args->vram_budget < 0.0f) args->vram_budget = 0.0f;
@@ -284,19 +290,36 @@ int main(int argc, char** argv) {
     float* audio = NULL;
     int n_samples = 0;
 
-    vv_status_t s = vv_audio_preprocess(args.audio_path, &audio, &n_samples);
+    /*
+     * Decoded now, prepared once the model is up: whether it is loudness
+     * normalized is the model's call (the streaming checkpoint says no).
+     */
+    float* raw_audio = NULL;
+    int raw_len = 0, raw_sr = 0;
+    vv_status_t s = vv_audio_load_any(args.audio_path, &raw_audio, &raw_len,
+                                      &raw_sr);
     if (s != VV_OK) {
         VV_LOG_E("Failed to load audio: %s", vv_status_str(s));
         return 1;
     }
     double t1 = get_time_ms();
-    VV_LOG_I("Audio loaded: %d samples (%.2f sec) in %.1f ms",
-             n_samples, (float)n_samples / 24000.0f, t1 - t0);
+    VV_LOG_I("Audio loaded: %d samples at %d Hz in %.1f ms",
+             raw_len, raw_sr, t1 - t0);
 
     /* Step 2: Initialize inference */
     t0 = get_time_ms();
     vv_inference_ctx_t* ctx = NULL;
     vv_init_params_t init_params = vv_init_params_default();
+    if (args.quant) {
+        const vv_load_quant_t q = vv_load_quant_parse(args.quant);
+        if (q >= VV_LOAD_QUANT_COUNT) {
+            fprintf(stderr, "error: --quant is auto, none, nf4 or int4, "
+                            "not '%s'\n", args.quant);
+            vv_free(raw_audio);
+            return 1;
+        }
+        init_params.weight_quant = (int)q;
+    }
     if (args.kv_cache) {
         vv_kv_format_t f = vv_kv_format_parse(args.kv_cache);
         if (f >= VV_KV_FORMAT_COUNT) {
@@ -315,11 +338,25 @@ int main(int argc, char** argv) {
     s = vv_inference_init(args.model_dir, args.gpu_id, &init_params, &ctx);
     if (s != VV_OK) {
         VV_LOG_E("Failed to initialize inference: %s", vv_status_str(s));
-        vv_free(audio);
+        vv_free(raw_audio);
         return 1;
     }
     t1 = get_time_ms();
     VV_LOG_I("Model loaded in %.1f ms", t1 - t0);
+
+    /* Resample to 24 kHz; normalize to -25 dBFS unless the model says not. */
+    s = vv_audio_prepare_ex(raw_audio, raw_len, raw_sr,
+                            ctx->family_ok ? ctx->family.normalize_audio
+                                           : true,
+                            &audio, &n_samples);
+    vv_free(raw_audio);
+    if (s != VV_OK) {
+        VV_LOG_E("Failed to prepare audio: %s", vv_status_str(s));
+        vv_inference_free(ctx);
+        return 1;
+    }
+    VV_LOG_I("Audio prepared: %d samples (%.2f sec) at 24 kHz",
+             n_samples, (float)n_samples / 24000.0f);
 
     /* Step 3: Transcribe */
     t0 = get_time_ms();

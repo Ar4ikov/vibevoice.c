@@ -61,6 +61,14 @@ typedef enum vv_dtype {
     VV_DTYPE_F8_E4M3 = 6,  /* FP8 for double-quantization scales */
     VV_DTYPE_NF4    = 7,   /* logical type: NF4 packed as U8 */
     VV_DTYPE_BOOL   = 8,
+    VV_DTYPE_I8     = 9,
+    VV_DTYPE_I16    = 10,
+    VV_DTYPE_U16    = 11,
+    VV_DTYPE_U32    = 12,
+    VV_DTYPE_F8_E5M2 = 13,
+    /** A dtype string the parser does not know. Never guessed at: whoever
+     *  needs the tensor refuses it by name instead of reading garbage. */
+    VV_DTYPE_UNKNOWN = 14,
 } vv_dtype_t;
 
 /** @brief Size in bytes for a single element of the given dtype. */
@@ -75,6 +83,11 @@ static inline size_t vv_dtype_size(vv_dtype_t dtype) {
         case VV_DTYPE_F8_E4M3: return 1;
         case VV_DTYPE_NF4:     return 1; /* packed: 2 values per byte */
         case VV_DTYPE_BOOL:    return 1;
+        case VV_DTYPE_I8:      return 1;
+        case VV_DTYPE_I16:     return 2;
+        case VV_DTYPE_U16:     return 2;
+        case VV_DTYPE_U32:     return 4;
+        case VV_DTYPE_F8_E5M2: return 1;
         default:               return 0;
     }
 }
@@ -128,6 +141,16 @@ static inline uint16_t vv_float_to_half(float f) {
     if (man & 0x400u) { man = 0; exp++; }
     if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
     return (uint16_t)(sign | ((uint32_t)exp << 10) | man);
+}
+
+/**
+ * @brief bfloat16 → float. Exact: bfloat16 is the top half of a float, so
+ *        every value, subnormals included, widens without rounding.
+ */
+static inline float vv_bf16_to_float(uint16_t b) {
+    union { uint32_t u; float f; } c;
+    c.u = (uint32_t)b << 16;
+    return c.f;
 }
 
 /* ─── Tensor descriptor ─────────────────────────────────────────────────── */
@@ -211,7 +234,45 @@ typedef struct vv_llm_config {
     int   max_position_embeddings;
     float rope_theta;
     float rms_norm_eps;
+    /**
+     * The LM head is the embedding table. Read at the root of config.json
+     * or inside `decoder_config` (BitNet puts it there); the loader then
+     * keeps one buffer for both and never reads a separate `lm_head.weight`.
+     */
+    bool  tie_word_embeddings;
+    /** q/k/v carry a bias. Qwen2 always has one, so this defaults on. */
+    bool  attention_bias;
 } vv_llm_config_t;
+
+/**
+ * @brief Which published model a checkpoint is.
+ *
+ * All three share the speech front end and the Qwen2 layer; what differs is
+ * the size, the prompt, the stop tokens and whether text comes out once per
+ * clip or once per chunk. See family.h for what each one means at run time.
+ */
+typedef enum vv_model_family {
+    VV_FAMILY_ASR_7B = 0,         /**< microsoft/VibeVoice-ASR and its 4-bit
+                                       and AWQ derivatives                    */
+    VV_FAMILY_ASR_BITNET,         /**< microsoft/VibeVoice-ASR-BitNet (1.5B)  */
+    VV_FAMILY_ASR_STREAMING_7B,   /**< microsoft/VibeVoice-ASR-Streaming-7B   */
+    VV_FAMILY_COUNT
+} vv_model_family_t;
+
+/* ─── Audio configuration ───────────────────────────────────────────────── */
+
+/** @brief preprocessor_config.json, with the reference processor's defaults. */
+typedef struct vv_audio_config {
+    int   target_sample_rate;  /**< 24000 */
+    bool  normalize_audio;     /**< true; false for the streaming model   */
+    float target_db_fs;        /**< -25.0 */
+    float eps;                 /**< 1e-6 */
+    int   compress_ratio;      /**< 3200 */
+    /** Streaming only: frames of text per chunk, 0 for one-shot models.  */
+    int   chunk_frames;
+    /** Streaming only: frames of audio past the chunk the model may see. */
+    int   lookahead_frames;
+} vv_audio_config_t;
 
 typedef struct vv_model_config {
     vv_acoustic_tokenizer_config_t acoustic;
@@ -219,17 +280,10 @@ typedef struct vv_model_config {
     vv_llm_config_t                llm;
     int   acoustic_vae_dim;
     int   semantic_vae_dim;
+    vv_audio_config_t              audio;    /**< preprocessor_config.json */
+    vv_model_family_t              family;   /**< see vv_config_load()     */
+    char  architecture[64];                  /**< architectures[0], or ""  */
 } vv_model_config_t;
-
-/* ─── Audio configuration ───────────────────────────────────────────────── */
-
-typedef struct vv_audio_config {
-    int   target_sample_rate;  /**< 24000 */
-    bool  normalize_audio;     /**< true */
-    float target_db_fs;        /**< -25.0 */
-    float eps;                 /**< 1e-6 */
-    int   compress_ratio;      /**< 3200 */
-} vv_audio_config_t;
 
 /* ─── Inference initialization parameters ───────────────────────────────── */
 
@@ -299,6 +353,8 @@ typedef struct vv_init_params {
     int    gpu_layers;    /**< Layers to keep on the GPU. -1 = fit to VRAM   */
     vv_gpu_set_t gpus;    /**< Devices and their caps. n = 0: use `gpu_id`   */
     int    split_mode;    /**< vv_split_mode_t across those devices          */
+    int    weight_quant;  /**< vv_load_quant_t (quant.h). 0 = auto: keep the
+                               checkpoint's own format                      */
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -311,6 +367,7 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.gpu_layers = -1;
     p.gpus.n = 0;
     p.split_mode = VV_SPLIT_AUTO;
+    p.weight_quant = 0;
     return p;
 }
 

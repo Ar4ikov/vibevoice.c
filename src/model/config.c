@@ -144,23 +144,130 @@ static void parse_semantic_tokenizer_config(
 
 /* ─── LLM config parsing ───────────────────────────────────────────────── */
 
-static void parse_decoder_config(cJSON* obj, vv_llm_config_t* c) {
-    c->hidden_size             = parse_int(obj, "hidden_size", 3584);
-    c->num_hidden_layers       = parse_int(obj, "num_hidden_layers", 28);
-    c->num_attention_heads     = parse_int(obj, "num_attention_heads", 28);
-    c->num_key_value_heads     = parse_int(obj, "num_key_value_heads", 4);
-    c->intermediate_size       = parse_int(obj, "intermediate_size", 18944);
-    c->vocab_size              = parse_int(obj, "vocab_size", 152064);
+/**
+ * @brief A dimension the model cannot run without.
+ *
+ * Missing used to mean "the 7B value", which let a 1.5B config load as a 7B
+ * one and fail much later on a shape nobody could explain. Now it is an
+ * error with the key's name in it.
+ */
+static vv_status_t require_int(cJSON* obj, const char* key, int* out) {
+    cJSON* v = cJSON_GetObjectItem(obj, key);
+    if (!v || !cJSON_IsNumber(v) || v->valuedouble < 1.0) {
+        VV_LOG_E("config: '%s' is missing or not a positive number", key);
+        return VV_ERR_MODEL_FORMAT;
+    }
+    *out = (int)v->valuedouble;
+    return VV_OK;
+}
+
+static vv_status_t parse_decoder_config(cJSON* obj, cJSON* root,
+                                        vv_llm_config_t* c) {
+    vv_status_t s;
+    if ((s = require_int(obj, "hidden_size", &c->hidden_size)) != VV_OK ||
+        (s = require_int(obj, "num_hidden_layers",
+                         &c->num_hidden_layers)) != VV_OK ||
+        (s = require_int(obj, "num_attention_heads",
+                         &c->num_attention_heads)) != VV_OK ||
+        (s = require_int(obj, "intermediate_size",
+                         &c->intermediate_size)) != VV_OK ||
+        (s = require_int(obj, "vocab_size", &c->vocab_size)) != VV_OK)
+        return s;
+
+    /* The rest have Qwen2Config's own defaults, which are not the 7B's. */
+    c->num_key_value_heads     = parse_int(obj, "num_key_value_heads",
+                                           c->num_attention_heads);
     c->max_position_embeddings = parse_int(obj, "max_position_embeddings",
-                                            131072);
-    c->rope_theta              = parse_float(obj, "rope_theta", 1000000.0f);
+                                           32768);
+    c->rope_theta              = parse_float(obj, "rope_theta", 10000.0f);
     c->rms_norm_eps            = parse_float(obj, "rms_norm_eps", 1e-6f);
+    c->attention_bias          = parse_bool(obj, "attention_bias", true);
+
+    /* Tied embeddings: inside decoder_config (BitNet) or at the root. */
+    {
+        cJSON* t = cJSON_GetObjectItem(obj, "tie_word_embeddings");
+        if (!t && root) t = cJSON_GetObjectItem(root, "tie_word_embeddings");
+        c->tie_word_embeddings = (t && cJSON_IsBool(t)) ? cJSON_IsTrue(t)
+                                                         : false;
+    }
 
     /* head_dim derived or explicit */
     c->head_dim = parse_int(obj, "head_dim", 0);
-    if (c->head_dim == 0 && c->num_attention_heads > 0) {
+    if (c->head_dim == 0) {
+        if (c->hidden_size % c->num_attention_heads != 0) {
+            VV_LOG_E("config: hidden_size %d is not a multiple of %d heads "
+                     "and there is no head_dim", c->hidden_size,
+                     c->num_attention_heads);
+            return VV_ERR_MODEL_FORMAT;
+        }
         c->head_dim = c->hidden_size / c->num_attention_heads;
     }
+    if (c->num_key_value_heads <= 0 ||
+        c->num_attention_heads % c->num_key_value_heads != 0) {
+        VV_LOG_E("config: %d attention heads cannot share %d KV heads",
+                 c->num_attention_heads, c->num_key_value_heads);
+        return VV_ERR_MODEL_FORMAT;
+    }
+
+    /*
+     * What the layer does is fixed in the kernels: SwiGLU with SiLU, plain
+     * RoPE, full attention everywhere. A config asking for anything else
+     * would run and produce nonsense, so it is refused here instead.
+     */
+    {
+        cJSON* a = cJSON_GetObjectItem(obj, "hidden_act");
+        if (a && (!cJSON_IsString(a) || strcmp(a->valuestring, "silu") != 0)) {
+            VV_LOG_E("config: hidden_act '%s' is not supported (only silu)",
+                     cJSON_IsString(a) ? a->valuestring : "?");
+            return VV_ERR_UNSUPPORTED;
+        }
+        cJSON* rs = cJSON_GetObjectItem(obj, "rope_scaling");
+        if (rs && !cJSON_IsNull(rs)) {
+            VV_LOG_E("config: rope_scaling is not supported");
+            return VV_ERR_UNSUPPORTED;
+        }
+        if (parse_bool(obj, "use_sliding_window", false)) {
+            VV_LOG_E("config: sliding-window attention is not supported");
+            return VV_ERR_UNSUPPORTED;
+        }
+    }
+    return VV_OK;
+}
+
+/**
+ * @brief The family config.json alone points to.
+ *
+ * The streaming model names itself; the batch 7B and BitNet share an
+ * architecture string (`VibeVoiceForASRTraining`) and differ in size, so
+ * the 1536-wide LM is what marks BitNet. Chunk geometry in
+ * preprocessor_config.json promotes a model to streaming as well.
+ */
+static vv_model_family_t family_of(const vv_model_config_t* c) {
+    if (strstr(c->architecture, "Streaming") || c->audio.chunk_frames > 0)
+        return VV_FAMILY_ASR_STREAMING_7B;
+    if (strstr(c->architecture, "BitNet") || c->llm.hidden_size == 1536)
+        return VV_FAMILY_ASR_BITNET;
+    return VV_FAMILY_ASR_7B;
+}
+
+const char* vv_model_family_name(vv_model_family_t f) {
+    switch (f) {
+        case VV_FAMILY_ASR_7B:           return "asr-7b";
+        case VV_FAMILY_ASR_BITNET:       return "asr-bitnet";
+        case VV_FAMILY_ASR_STREAMING_7B: return "asr-streaming-7b";
+        default:                         return "?";
+    }
+}
+
+/** @brief What VibeVoiceASRProcessor assumes without a preprocessor file. */
+static void audio_defaults(vv_audio_config_t* a) {
+    a->target_sample_rate = 24000;
+    a->normalize_audio    = true;
+    a->target_db_fs       = -25.0f;
+    a->eps                = 1e-6f;
+    a->compress_ratio     = 3200;
+    a->chunk_frames       = 0;
+    a->lookahead_frames   = 0;
 }
 
 /* ─── Public API ────────────────────────────────────────────────────────── */
@@ -225,23 +332,122 @@ vv_status_t vv_config_parse(const char* json_path, vv_model_config_t* config) {
 
     /* Decoder config (Qwen2) - may be nested or at root level */
     cJSON* dec_cfg = cJSON_GetObjectItem(root, "decoder_config");
-    if (dec_cfg) {
-        parse_decoder_config(dec_cfg, &config->llm);
-    } else {
-        /* Try root level (some configs have flat layout) */
-        parse_decoder_config(root, &config->llm);
+    vv_status_t s = parse_decoder_config(dec_cfg ? dec_cfg : root, root,
+                                         &config->llm);
+    if (s != VV_OK) {
+        VV_LOG_E("config: '%s' does not describe a usable decoder",
+                 json_path);
+        cJSON_Delete(root);
+        return s;
+    }
+
+    {
+        cJSON* arch = cJSON_GetObjectItem(root, "architectures");
+        cJSON* a0 = (arch && cJSON_IsArray(arch))
+                    ? cJSON_GetArrayItem(arch, 0) : NULL;
+        if (a0 && cJSON_IsString(a0)) {
+            strncpy(config->architecture, a0->valuestring,
+                    sizeof(config->architecture) - 1);
+            config->architecture[sizeof(config->architecture) - 1] = '\0';
+        }
     }
 
     config->acoustic_vae_dim = config->acoustic.vae_dim;
     config->semantic_vae_dim = config->semantic.vae_dim;
+    audio_defaults(&config->audio);
+    /* The streaming checkpoint repeats these two in config.json. */
+    config->audio.target_sample_rate =
+        parse_int(root, "target_sample_rate", config->audio.target_sample_rate);
+    config->audio.compress_ratio =
+        parse_int(root, "speech_tok_compress_ratio", config->audio.compress_ratio);
+    config->family = family_of(config);
 
     cJSON_Delete(root);
 
     VV_LOG_I("config: loaded — LLM hidden=%d layers=%d heads=%d kv_heads=%d "
-             "max_pos=%d, acoustic_vae=%d, semantic_vae=%d",
+             "max_pos=%d, acoustic_vae=%d, semantic_vae=%d, tied=%d, "
+             "family=%s",
              config->llm.hidden_size, config->llm.num_hidden_layers,
              config->llm.num_attention_heads, config->llm.num_key_value_heads,
              config->llm.max_position_embeddings,
-             config->acoustic_vae_dim, config->semantic_vae_dim);
+             config->acoustic_vae_dim, config->semantic_vae_dim,
+             (int)config->llm.tie_word_embeddings,
+             vv_model_family_name(config->family));
+    return VV_OK;
+}
+
+vv_status_t vv_config_parse_preprocessor(const char* json_path,
+                                         vv_model_config_t* config) {
+    if (!json_path || !config) return VV_ERR_NULL_PTR;
+
+    char* json_str = read_file_to_string(json_path);
+    if (!json_str) {
+        /* The BF16 and BitNet repositories ship none: defaults apply. */
+        config->family = family_of(config);
+        return VV_OK;
+    }
+    cJSON* root = cJSON_Parse(json_str);
+    vv_free(json_str);
+    if (!root) {
+        VV_LOG_E("config: JSON parse failed for '%s'", json_path);
+        return VV_ERR_PARSE;
+    }
+
+    vv_audio_config_t* a = &config->audio;
+    a->target_sample_rate = parse_int(root, "target_sample_rate",
+                                      a->target_sample_rate);
+    a->compress_ratio     = parse_int(root, "speech_tok_compress_ratio",
+                                      a->compress_ratio);
+    a->normalize_audio    = parse_bool(root, "normalize_audio",
+                                       a->normalize_audio);
+    a->target_db_fs       = parse_float(root, "target_dB_FS", a->target_db_fs);
+    a->eps                = parse_float(root, "eps", a->eps);
+    a->chunk_frames       = parse_int(root, "chunk_frames", 0);
+    a->lookahead_frames   = parse_int(root, "lookahead_frames", 0);
+    cJSON_Delete(root);
+
+    if (a->target_sample_rate != 24000 || a->compress_ratio != 3200) {
+        VV_LOG_E("config: %d Hz at %d samples per frame is not supported "
+                 "(the speech encoder is built for 24000 / 3200)",
+                 a->target_sample_rate, a->compress_ratio);
+        return VV_ERR_UNSUPPORTED;
+    }
+    if (a->chunk_frames < 0 || a->lookahead_frames < 0) {
+        VV_LOG_E("config: negative chunk geometry in '%s'", json_path);
+        return VV_ERR_MODEL_FORMAT;
+    }
+
+    config->family = family_of(config);
+    return VV_OK;
+}
+
+vv_status_t vv_config_load(const char* model_dir, vv_model_config_t* config) {
+    if (!model_dir || !config) return VV_ERR_NULL_PTR;
+
+    char path[1024];
+    const size_t n = strlen(model_dir);
+    const char* sep = (n > 0 && (model_dir[n - 1] == '/' ||
+                                 model_dir[n - 1] == '\\')) ? "" : "/";
+    snprintf(path, sizeof(path), "%s%sconfig.json", model_dir, sep);
+    vv_status_t s = vv_config_parse(path, config);
+    if (s != VV_OK) return s;
+
+    snprintf(path, sizeof(path), "%s%spreprocessor_config.json",
+             model_dir, sep);
+    s = vv_config_parse_preprocessor(path, config);
+    if (s != VV_OK) return s;
+
+    if (config->family == VV_FAMILY_ASR_STREAMING_7B &&
+        config->audio.chunk_frames <= 0) {
+        /* Upstream refuses a streaming checkpoint without its geometry. */
+        VV_LOG_E("config: streaming model without chunk_frames in "
+                 "preprocessor_config.json");
+        return VV_ERR_MODEL_FORMAT;
+    }
+    VV_LOG_I("config: family %s (%s), normalize=%d, chunk %d + %d frames",
+             vv_model_family_name(config->family),
+             config->architecture[0] ? config->architecture : "no architecture",
+             (int)config->audio.normalize_audio, config->audio.chunk_frames,
+             config->audio.lookahead_frames);
     return VV_OK;
 }

@@ -45,6 +45,54 @@ vv_status_t vv_int4g_quantize(const float* w, int N, int K, int group_size,
                               uint8_t* out_packed, uint16_t* out_scales,
                               uint16_t* out_mins);
 
+/**
+ * @brief What the loader should do with the checkpoint's projections.
+ *
+ * AUTO keeps whatever the checkpoint has: packed NF4 and AWQ stay as they
+ * are, and a dense BF16/F16/F32 checkpoint stays dense (FP16) unless asked.
+ * The other values quantize dense projections while they are read from the
+ * file, before placement, so every byte count downstream is the final one.
+ * A checkpoint that is already quantized is only accepted in its own format.
+ *
+ * New formats go before VV_LOAD_QUANT_COUNT, with a name in
+ * vv_load_quant_name(); the parser picks them up from there.
+ */
+typedef enum vv_load_quant {
+    VV_LOAD_QUANT_AUTO = 0,  /**< keep the checkpoint's format            */
+    VV_LOAD_QUANT_NONE,      /**< dense FP16                               */
+    VV_LOAD_QUANT_NF4,       /**< NF4, blockwise absmax 64, FP16 scales    */
+    VV_LOAD_QUANT_INT4,      /**< INT4G asymmetric, group 128              */
+    VV_LOAD_QUANT_COUNT
+} vv_load_quant_t;
+
+/** @brief "auto" | "none" | "nf4" | "int4" → value; COUNT when unknown. */
+vv_load_quant_t vv_load_quant_parse(const char* name);
+
+/** @brief Name for logs and --help; "?" when out of range. */
+const char* vv_load_quant_name(vv_load_quant_t q);
+
+/** @brief Block size of the NF4 layout the runtime reads (bitsandbytes). */
+#define VV_NF4_BLOCK 64
+/** @brief Group size load-time INT4G quantization uses. */
+#define VV_INT4G_LOAD_GROUP 128
+
+/**
+ * @brief Quantize dense FP32 rows to NF4 in the bitsandbytes layout.
+ *
+ * Blocks of 64 consecutive elements of the row-major [N,K] matrix share one
+ * absmax scale, stored as FP16 (no double quantization — the loader would
+ * only undo it again). Each element takes the NF4 code nearest to
+ * w / scale, where `scale` is the FP16 value the kernels will multiply by,
+ * so what is rounded is exactly what is reconstructed.
+ *
+ * @param out_packed [N][K/2], high nibble = even k
+ * @param out_scales [N*K/64] FP16
+ *
+ * Rows are independent: the result does not depend on the thread count.
+ */
+vv_status_t vv_nf4_quantize(const float* w, int N, int K,
+                            uint8_t* out_packed, uint16_t* out_scales);
+
 #ifdef __cplusplus
 }
 #endif

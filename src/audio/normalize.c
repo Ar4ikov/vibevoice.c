@@ -87,6 +87,13 @@ vv_status_t vv_audio_preprocess(const char* wav_path, float** samples,
 
 vv_status_t vv_audio_prepare(const float* pcm, int n_samples, int sample_rate,
                              float** out, int* out_len) {
+    return vv_audio_prepare_ex(pcm, n_samples, sample_rate, true,
+                               out, out_len);
+}
+
+vv_status_t vv_audio_prepare_ex(const float* pcm, int n_samples,
+                                int sample_rate, bool normalize,
+                                float** out, int* out_len) {
     if (!pcm || !out || !out_len) return VV_ERR_NULL_PTR;
     if (n_samples <= 0 || sample_rate <= 0) return VV_ERR_INVALID_ARG;
 
@@ -104,8 +111,10 @@ vv_status_t vv_audio_prepare(const float* pcm, int n_samples, int sample_rate,
         len = n_samples;
     }
 
-    vv_status_t s = vv_audio_normalize(buf, len, -25.0f, 1e-6f);
-    if (s != VV_OK) { vv_free(buf); return s; }
+    if (normalize) {
+        vv_status_t s = vv_audio_normalize(buf, len, -25.0f, 1e-6f);
+        if (s != VV_OK) { vv_free(buf); return s; }
+    }
 
     *out = buf;
     *out_len = len;
