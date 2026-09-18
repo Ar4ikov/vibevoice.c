@@ -113,6 +113,7 @@ vv_status_t vv_dev_event_create(void** ev) { if (ev) *ev = NULL; return VV_OK; }
 vv_status_t vv_dev_event_destroy(void* ev) { (void)ev; return VV_OK; }
 vv_status_t vv_dev_event_record(void* ev, void* s) { (void)ev; (void)s; return VV_OK; }
 vv_status_t vv_dev_stream_wait_event(void* s, void* ev) { (void)s; (void)ev; return VV_OK; }
+vv_status_t vv_dev_event_sync(void* ev) { (void)ev; return VV_OK; }
 vv_status_t vv_dev_host_register(void* p, size_t n) { (void)p; (void)n; return VV_OK; }
 vv_status_t vv_dev_host_unregister(void* p) { (void)p; return VV_OK; }
 
@@ -327,49 +328,52 @@ vv_status_t vv_argmax_dev(const void* l, int V, void* sv, void* si,
                           void* ot, void* ov, void* s) {
     U(l) U(V) U(sv) U(si) U(ot) U(ov) U(s) return VV_ERR_UNSUPPORTED;
 }
-vv_status_t vv_conv1d_dev(const void* i, const void* w, const void* b, void* o,
-                          int ic, int il, int oc, int k, int st, int g,
-                          bool c, int* ol, void* s) {
-    U(i) U(w) U(b) U(o) U(ic) U(il) U(oc) U(k) U(st) U(g) U(c) U(ol) U(s)
-    return VV_ERR_UNSUPPORTED;
-}
-vv_status_t vv_conv1d_raw_dev(const void* i, const void* w, const void* b,
-                              void* o, int ic, int il, int oc, int k, int st,
-                              int g, int pl, int ol, void* s) {
-    U(i) U(w) U(b) U(o) U(ic) U(il) U(oc) U(k) U(st) U(g) U(pl) U(ol) U(s)
-    return VV_ERR_UNSUPPORTED;
-}
-vv_status_t vv_rmsnorm_channel_first_dev(const void* i, const void* w, void* o,
-                                         int c, int l, float e, void* s) {
-    U(i) U(w) U(o) U(c) U(l) U(e) U(s) return VV_ERR_UNSUPPORTED;
-}
-vv_status_t vv_residual_add_scaled_dev(void* x, const void* y, const void* sc,
-                                       int c, int l, void* s) {
-    U(x) U(y) U(sc) U(c) U(l) U(s) return VV_ERR_UNSUPPORTED;
-}
-vv_status_t vv_channel_bias_add_dev(void* o, const void* b, int c, int l,
-                                    void* s) {
-    U(o) U(b) U(c) U(l) U(s) return VV_ERR_UNSUPPORTED;
-}
-vv_status_t vv_silu_dev(void* d, int n, void* s) {
-    U(d) U(n) U(s) return VV_ERR_UNSUPPORTED;
-}
-vv_status_t vv_gelu_dev(void* d, int n, void* s) {
-    U(d) U(n) U(s) return VV_ERR_UNSUPPORTED;
-}
 vv_status_t vv_fp32_to_fp16_dev(const void* i, void* o, int n, void* s) {
     U(i) U(o) U(n) U(s) return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_fp16_to_fp32_dev(const void* i, void* o, int n, void* s) {
     U(i) U(o) U(n) U(s) return VV_ERR_UNSUPPORTED;
 }
-vv_status_t vv_gather_tile_dev(const void* src, void* dst, int c, int fl,
-                               int to, int tl, void* s) {
-    U(src) U(dst) U(c) U(fl) U(to) U(tl) U(s) return VV_ERR_UNSUPPORTED;
+vv_status_t vv_vae_conv_dev(const vv_vae_conv_desc_t* d, const void* x,
+                            int64_t li, const void* w, const void* b, void* y,
+                            int64_t lo, int ic, int oc, int k, int st,
+                            bool tr, void* s) {
+    U(d) U(x) U(li) U(w) U(b) U(y) U(lo) U(ic) U(oc) U(k) U(st) U(tr) U(s)
+    return VV_ERR_UNSUPPORTED;
 }
-vv_status_t vv_scatter_tile_dev(const void* src, void* dst, int c, int fl,
-                                int to, int tl, void* s) {
-    U(src) U(dst) U(c) U(fl) U(to) U(tl) U(s) return VV_ERR_UNSUPPORTED;
+vv_status_t vv_vae_tail_dev(const vv_vae_conv_desc_t* d, const void* x,
+                            int64_t li, int ic, void* s) {
+    U(d) U(x) U(li) U(ic) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_vae_rms_dev(const void* x, int64_t ld, int64_t T, int C,
+                           float e, float* r, const vv_vae_conv_desc_t* d,
+                           void* s) {
+    U(x) U(ld) U(T) U(C) U(e) U(r) U(d) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_vae_mixer_dev(const vv_vae_conv_desc_t* d, const void* xi,
+                             void* xo, int64_t ld, const float* r, int64_t T,
+                             const void* nw, const void* cw, const void* cb,
+                             const void* g, int C, int k, void* s) {
+    U(d) U(xi) U(xo) U(ld) U(r) U(T) U(nw) U(cw) U(cb) U(g) U(C) U(k) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_vae_gemm_nn_dev(int ep, const void* A, const void* B,
+                               int64_t ldb, void* C, int64_t ldc, int M,
+                               int K, int P, const void* b, const void* g,
+                               const float* r, const void* nw, void* s) {
+    U(ep) U(A) U(B) U(ldb) U(C) U(ldc) U(M) U(K) U(P) U(b) U(g) U(r) U(nw)
+    U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_vae_gemm_tn_dev(const void* A, int64_t lda, const void* B,
+                               void* C, int64_t ldc, int M, int N, int K,
+                               const void* b, const vv_vae_rows_t* r,
+                               void* s) {
+    U(A) U(lda) U(B) U(C) U(ldc) U(M) U(N) U(K) U(b) U(r) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_vae_f32_to_f16_dev(const float* i, void* o, int64_t n,
+                                  void* s) {
+    U(i) U(o) U(n) U(s) return VV_ERR_UNSUPPORTED;
 }
 
 #undef U

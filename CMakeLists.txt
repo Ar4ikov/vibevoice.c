@@ -147,6 +147,8 @@ add_library(vibevoice_core STATIC
     src/text_tokenizer/vocab.c
     src/text_tokenizer/special_tokens.c
     src/tokenizer_encoder/conv_vae.c
+    src/tokenizer_encoder/vae_gpu.c
+    src/tokenizer_encoder/vae_cpu.c
     src/tokenizer_encoder/latent_sample.c
     src/connector/speech_connector.c
     src/model/safetensors.c
@@ -159,6 +161,7 @@ add_library(vibevoice_core STATIC
     src/quant/dequant_cpu.c
     src/cpu/cpu_kernels.c
     src/inference/pipeline.c
+    src/inference/frontend.c
     src/inference/decoder.c
     src/inference/kv_cache.c
     src/inference/sampling.c
@@ -229,8 +232,8 @@ if(VV_HAS_CUDA)
         src/cuda/int8_gemv.cu
         src/cuda/w4a16.cu
         src/cuda/lm_head.cu
-        src/cuda/conv1d.cu
         src/cuda/conv_vae.cu
+        src/cuda/vae_kernels.cu
         src/cuda/rmsnorm.cu
         src/cuda/rope.cu
         src/cuda/attention.cu
@@ -285,6 +288,7 @@ if(VV_BUILD_TESTS)
     vv_add_test(test_safetensors tests/test_safetensors.c)
     vv_add_test(test_nf4 tests/test_nf4.c)
     vv_add_test(test_conv_vae tests/test_conv_vae.c)
+    vv_add_test(test_vae_stream tests/test_vae_stream.c)
     vv_add_test(test_tokenizer tests/test_tokenizer.c)
     vv_add_test(test_kv_quant tests/test_kv_quant.c)
     vv_add_test(test_kv_shard tests/test_kv_shard.c)
@@ -344,6 +348,12 @@ if(VV_BUILD_BENCH)
     target_link_libraries(vv_bench PRIVATE vibevoice_core)
     if(VV_HAS_CUDA)
         target_link_libraries(vv_bench PRIVATE vibevoice_cuda)
+    endif()
+    # Speech front end throughput, alone and under concurrency.
+    add_executable(vv_bench_encoder bench/bench_encoder.c)
+    target_link_libraries(vv_bench_encoder PRIVATE vibevoice_core)
+    if(VV_HAS_CUDA)
+        target_link_libraries(vv_bench_encoder PRIVATE vibevoice_cuda)
     endif()
 endif()
 

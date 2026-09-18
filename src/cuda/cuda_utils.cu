@@ -364,6 +364,12 @@ vv_status_t vv_dev_event_record(void* ev, void* stream) {
            ? VV_OK : VV_ERR_CUDA;
 }
 
+vv_status_t vv_dev_event_sync(void* ev) {
+    if (!ev) return VV_ERR_NULL_PTR;
+    return cudaEventSynchronize((cudaEvent_t)ev) == cudaSuccess
+           ? VV_OK : VV_ERR_CUDA;
+}
+
 vv_status_t vv_dev_stream_wait_event(void* stream, void* ev) {
     if (!ev) return VV_ERR_NULL_PTR;
     return cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)ev, 0)
