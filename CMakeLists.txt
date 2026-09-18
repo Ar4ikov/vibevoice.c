@@ -2,39 +2,19 @@ cmake_minimum_required(VERSION 3.22)
 
 # ─── Version ─────────────────────────────────────────────────────────────────
 #
-# The release version lives in the public header and nowhere else. CMake reads
-# it from there, so a bump is one edit and the two can never disagree -- which
-# matters because CI refuses to publish a `v*` tag that does not match it.
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/vibevoice/vibevoice.h" VV_HEADER)
-string(REGEX MATCH "VV_VERSION_STRING[ \t]+\"([0-9]+[.][0-9]+[.][0-9]+)\""
-       VV_VERSION_MATCH "${VV_HEADER}")
-if(NOT CMAKE_MATCH_1)
-    message(FATAL_ERROR "No VV_VERSION_STRING in include/vibevoice/vibevoice.h")
-endif()
-set(VV_VERSION "${CMAKE_MATCH_1}")
-unset(VV_HEADER)
+# The release number lives in the public header and nowhere else; the full
+# SemVer of *this* build (0.2.0 on a release tag, 0.2.1-dev.5+g1a2b3c4 five
+# commits later) is derived from it and from git by cmake/Version.cmake -- the
+# same file CI runs to name the image, so the two cannot disagree. Pin it with
+# -DVV_VERSION_FULL=... -DVV_REVISION=... where there is no .git to ask.
+set(VV_VERSION_FULL "" CACHE STRING "Override the derived SemVer of this build")
+set(VV_REVISION     "" CACHE STRING "Override the derived source revision")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Version.cmake")
+vv_header_version("${CMAKE_CURRENT_SOURCE_DIR}" VV_VERSION)
 
 # ─── Bootstrap project (C/CXX first, CUDA probed afterward) ──────────────────
 project(vibevoice VERSION ${VV_VERSION} LANGUAGES C CXX)
-
-# What the binary will report as the source it came from. -DVV_BUILD_REF wins
-# (the container passes the published image tag); a working tree falls back to
-# its git describe; an unpacked tarball to the bare version. Resolved at
-# configure time, so it goes stale until the next `cmake -B`.
-if(NOT VV_BUILD_REF)
-    find_package(Git QUIET)
-    if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
-            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-            OUTPUT_VARIABLE VV_BUILD_REF
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET)
-    endif()
-endif()
-if(NOT VV_BUILD_REF)
-    set(VV_BUILD_REF "${VV_VERSION}")
-endif()
+vv_compute_version("${CMAKE_CURRENT_SOURCE_DIR}")
 
 option(VV_ENABLE_CUDA  "Enable CUDA GPU support"       ON)
 option(VV_ENABLE_BLAS  "Enable OpenBLAS for CPU GEMM"   OFF)
@@ -224,8 +204,25 @@ endif()
 
 target_link_libraries(vibevoice_core PUBLIC cjson)
 
-# What `vv_cli --version`, /health and vibevoice_build_info report.
-target_compile_definitions(vibevoice_core PUBLIC VV_BUILD_REF="${VV_BUILD_REF}")
+# What `vv_cli --version`, /health and vibevoice_build_info report. Stamped
+# on every build rather than at configure time, so a commit is reflected
+# without re-running cmake; the header is only rewritten when the text
+# changes, so an unchanged version recompiles nothing, and only version.c
+# includes it, so a changed one recompiles one file.
+set(VV_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+add_custom_target(vv_build_info
+    COMMAND "${CMAKE_COMMAND}"
+            "-DVV_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            "-DVV_OUT=${VV_GENERATED_DIR}/vv_build_info.h"
+            "-DVV_VERSION_FULL=$CACHE{VV_VERSION_FULL}"
+            "-DVV_REVISION=$CACHE{VV_REVISION}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Version.cmake"
+    BYPRODUCTS "${VV_GENERATED_DIR}/vv_build_info.h"
+    COMMENT "Stamping the build version"
+    VERBATIM)
+add_dependencies(vibevoice_core vv_build_info)
+set_source_files_properties(src/core/version.c PROPERTIES
+    INCLUDE_DIRECTORIES "${VV_GENERATED_DIR}")
 if(OpenMP_C_FOUND)
     target_link_libraries(vibevoice_core PUBLIC OpenMP::OpenMP_C)
 endif()
@@ -377,8 +374,8 @@ install(DIRECTORY include/vibevoice DESTINATION include)
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 message(STATUS "")
-message(STATUS "  vibevoice.c ${VV_VERSION} build configuration:")
-message(STATUS "    Build ref: ${VV_BUILD_REF}")
+message(STATUS "  vibevoice.c ${VV_VERSION_FULL} build configuration:")
+message(STATUS "    Revision:  ${VV_REVISION}")
 message(STATUS "    CUDA:      ${VV_HAS_CUDA}")
 message(STATUS "    OpenBLAS:  ${VV_HAS_BLAS}")
 message(STATUS "    TensorRT:  ${VV_HAS_TRT}")

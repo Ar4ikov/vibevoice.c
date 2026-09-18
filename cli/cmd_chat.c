@@ -555,7 +555,7 @@ int vv_cmd_chat(int argc, char** argv) {
     printf("vibevoice.c %s — model ready, %d slot(s).\n"
            "Type a file path, `rec <seconds>`, `devices`, `device <sel>`, "
            "`hotwords a,b`, `stats`, or `quit`.\n",
-           VV_VERSION_STRING, vv_engine_slots(engine));
+           vv_version(), vv_engine_slots(engine));
 
     char line[1024];
     char device_sel[256];

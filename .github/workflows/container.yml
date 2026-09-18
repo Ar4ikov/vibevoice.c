@@ -5,116 +5,208 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+  # The Release workflow calls this with the tag it just pushed: a push made
+  # with GITHUB_TOKEN does not start workflows on its own.
+  workflow_call:
+    inputs:
+      ref:
+        description: Release tag to build and publish, e.g. v0.2.0
+        type: string
+        required: true
 permissions:
-  contents: read
+  contents: write   # attach the binary to a GitHub release
   packages: write
 concurrency:
-  group: container-${{ github.ref }}
+  group: container-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   image:
     runs-on: ubuntu-22.04
+    env:
+      REF: ${{ inputs.ref || github.ref }}
+      PUSH: ${{ github.event_name != 'pull_request' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # Tags and history: the version is derived from the last tag and
+          # the number of commits since it.
+          fetch-depth: 0
 
-      # A v* tag has to name the version the source declares, or the image
-      # would be published under a number nothing inside it agrees with.
-      # Prerelease suffixes are compared on the release part alone, so
-      # v0.2.0-rc.1 is checked against 0.2.0.
-      - name: Tag matches the declared version
-        if: startsWith(github.ref, 'refs/tags/v')
+      # One rule for the version, shared with every local build:
+      # cmake/Version.cmake. 0.2.0 on a release tag, 0.2.1-dev.5+g1a2b3c4
+      # five commits later.
+      - name: Version
+        id: version
+        run: cmake -P cmake/Version.cmake | tee -a "$GITHUB_OUTPUT"
+
+      # What this build publishes. Every pushed build gets one tag that is a
+      # SemVer version and never moves -- that is the one to pin -- plus the
+      # moving tags that apply to it:
+      #
+      #   0.2.0          v0.2.0                immutable
+      #   0.2.1-dev.5    push to master        immutable, a prerelease of the
+      #                                        next version
+      #   sha-1a2b3c4    any push              immutable
+      #   0.2            newest 0.2.x release  moves
+      #   1              newest 1.x release    moves; not offered below 1.0,
+      #                                        where minor bumps may break
+      #   latest         newest release        moves; never a dev build
+      #   master, edge   head of master        moves
+      #   pr-7           pull request          built and checked, not pushed
+      - name: Tags
+        id: tags
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE: ${{ steps.version.outputs.release }}
+          IMAGE_VERSION: ${{ steps.version.outputs.image }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
-          declared=$(sed -n 's/^#define VV_VERSION_STRING "\(.*\)"$/\1/p' \
-                     include/vibevoice/vibevoice.h)
-          tagged=${GITHUB_REF_NAME#v}
-          release=${tagged%%-*}
-          echo "header $declared, tag $tagged"
-          if [ "$declared" != "$release" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match VV_VERSION_STRING $declared"
-            exit 1
-          fi
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha="sha-$(git rev-parse --short=7 HEAD)"
+          tags=()
+          case "$REF" in
+            refs/tags/v*|v*)
+              tag="${REF#refs/tags/}"
+              # A tag has to name the version the source declares, or the
+              # image would carry a number nothing inside it agrees with.
+              if [ "v$VERSION" != "$tag" ] || [ "${VERSION%%-*}" != "$RELEASE" ]; then
+                echo "::error::$tag builds as $VERSION with VV_VERSION_STRING $RELEASE; a release tag must sit on a clean commit whose header names the same X.Y.Z"
+                exit 1
+              fi
+              kind=release
+              tags+=("$IMAGE_VERSION" "$sha")
+              if [ "$PRERELEASE" = false ]; then
+                # Moving tags only for the newest release in their range,
+                # so that patching an old line never drags them backwards.
+                IFS=. read -r major minor _ <<<"$VERSION"
+                newest() { git tag -l "$1" | grep -Ev -- '-' | sed 's/^v//' | sort -V | tail -1; }
+                [ "$(newest "v$major.$minor.*")" = "$VERSION" ] && tags+=("$major.$minor")
+                if [ "$major" != 0 ] && [ "$(newest "v$major.*")" = "$VERSION" ]; then
+                  tags+=("$major")
+                fi
+                [ "$(newest 'v*')" = "$VERSION" ] && tags+=(latest)
+              fi
+              ;;
+            refs/heads/master)
+              kind=dev
+              tags+=("$IMAGE_VERSION" "$sha" master edge)
+              ;;
+            refs/pull/*)
+              kind=pr
+              tags+=("pr-$PR")
+              ;;
+            refs/heads/*)
+              kind=branch
+              branch="${REF#refs/heads/}"
+              tags+=("$IMAGE_VERSION" "$sha" "branch-${branch//[^A-Za-z0-9_.-]/-}")
+              ;;
+            *)
+              echo "::error::do not know how to tag $REF"; exit 1 ;;
+          esac
+          {
+            echo "kind=$kind"
+            echo "image=$image"
+            echo "list<<EOF"
+            for t in "${tags[@]}"; do echo "$image:$t"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          printf 'tag: %s\n' "${tags[@]}"
 
       - uses: docker/setup-buildx-action@v3
-      - name: Image name
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: env.PUSH == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Tag scheme, and what each one is for:
-      #   0.2.1        one release, immutable once published
-      #   0.2          newest patch of that minor line, moves
-      #   1            newest major line, offered from 1.0 onward; a bare 0
-      #                is not, because minor bumps below 1.0 may break
-      #   master       head of the default branch
-      #   sha-1a2b3c4  one commit, immutable, what to pin for reproducibility
-      #   latest       newest published build, release or master
-      #   pr-7         built on pull requests, never pushed
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{ env.IMAGE }}
-          flavor: latest=false
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
-            type=ref,event=branch
-            type=ref,event=pr
-            type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
 
       - uses: docker/build-push-action@v6
         id: build
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          annotations: ${{ steps.meta.outputs.annotations }}
+          push: ${{ env.PUSH == 'true' }}
+          # A pull request loads the image instead, so the check below runs
+          # on it too and a broken stamp fails before it is merged.
+          load: ${{ env.PUSH != 'true' }}
+          tags: ${{ steps.tags.outputs.list }}
           build-args: |
-            VV_VERSION=${{ steps.meta.outputs.version }}
-            VV_REVISION=${{ github.sha }}
+            VV_VERSION=${{ steps.version.outputs.version }}
+            VV_REVISION=${{ steps.version.outputs.revision }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The point of stamping the tag into the image is that it can be read
-      # back out of it. This starts the published image on a runner with no
-      # GPU -- the binary loads the driver lazily, so --version answers
-      # anywhere -- and checks that it names the tag it was published under.
-      - name: Image reports its own tag
-        if: github.event_name != 'pull_request'
+      # The version is compiled into the binary, so it can be asked rather
+      # than trusted. Starts the image on a runner with no GPU -- the binary
+      # loads the driver lazily, so --version answers anywhere -- and checks
+      # that it names exactly the version its tag says.
+      - name: Image reports its own version
         env:
-          REF: ${{ steps.meta.outputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
+          LIST: ${{ steps.tags.outputs.list }}
         run: |
-          out=$(docker run --rm "$IMAGE:$REF" --version)
-          echo "$out"
+          ref="$(head -1 <<<"$LIST")"
+          out="$(docker run --rm "$ref" --version)"
+          echo "$ref: $out"
           case "$out" in
-            *"($REF)"*) ;;
-            *) echo "::error::image does not report $REF"; exit 1 ;;
+            "vibevoice.c $VERSION "*) ;;
+            *) echo "::error::$ref reports '$out', expected version $VERSION"; exit 1 ;;
           esac
+          label="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$ref")"
+          [ "$label" = "$VERSION" ] || { echo "::error::label says $label"; exit 1; }
+
+      # A release is only announced once its image exists. The binary from
+      # the image goes up with it: static CUDA runtime, needs only libc,
+      # libm and libgomp, starts without a driver and falls back to the CPU.
+      - name: GitHub release
+        if: steps.tags.outputs.kind == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          IMAGE: ${{ steps.tags.outputs.image }}
+        run: |
+          tag="v$VERSION"
+          dir="vibevoice.c-$VERSION-linux-x86_64"
+          mkdir -p "$dir"
+          cid="$(docker create "$IMAGE:$VERSION")"
+          docker cp "$cid:/usr/local/bin/vv_cli" "$dir/vv_cli"
+          docker rm "$cid" >/dev/null
+          cp -r LICENSES README.md "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+          sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+
+          notes="$(scripts/release.sh --notes "$VERSION" || true)"
+          [ -n "$notes" ] || notes="$(git tag -l --format='%(contents:body)' "$tag")"
+          printf '%s\n\n---\n\n```bash\ndocker pull %s:%s\n```\n' \
+            "$notes" "$IMAGE" "$VERSION" > notes.md
+
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            flags=()
+            [ "$PRERELEASE" = true ] && flags+=(--prerelease)
+            gh release create "$tag" --verify-tag --title "vibevoice.c $VERSION" \
+              --notes-file notes.md "${flags[@]}"
+          fi
+          gh release upload "$tag" "$dir.tar.gz" "$dir.tar.gz.sha256" --clobber
 
       - name: Summary
         if: always() && steps.build.outcome != 'skipped'
         env:
-          TAGS: ${{ steps.meta.outputs.tags }}
+          LIST: ${{ steps.tags.outputs.list }}
+          VERSION: ${{ steps.version.outputs.version }}
           DIGEST: ${{ steps.build.outputs.digest }}
-          PUSHED: ${{ github.event_name != 'pull_request' }}
         run: |
           {
-            if [ "$PUSHED" = "true" ]; then
-              echo "### Published"
+            if [ "$PUSH" = "true" ]; then
+              echo "### Published $VERSION"
             else
-              echo "### Built, not published (pull request)"
+              echo "### Built $VERSION, not published (pull request)"
             fi
             echo
             echo '```'
-            echo "$TAGS"
+            echo "$LIST"
             if [ -n "$DIGEST" ]; then
               echo "digest $DIGEST"
             fi

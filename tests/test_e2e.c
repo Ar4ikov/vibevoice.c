@@ -10,6 +10,7 @@
 #include "vibevoice/audio.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -26,12 +27,90 @@ static int tests_passed = 0;
     } \
 } while(0)
 
+/*
+ * One SemVer 2.0 numeric identifier: digits, no leading zero. Returns the
+ * number of characters consumed and its value, or 0 when there is none.
+ */
+static int semver_num(const char* s, long* value) {
+    int n = 0;
+    while (s[n] >= '0' && s[n] <= '9') n++;
+    if (n == 0 || (n > 1 && s[0] == '0')) return 0;
+    if (value) *value = strtol(s, NULL, 10);
+    return n;
+}
+
+/* Dot-separated identifiers from [0-9A-Za-z-], none empty. */
+static int semver_idents(const char* s, int len) {
+    if (len == 0) return 0;
+    int run = 0;
+    for (int i = 0; i < len; i++) {
+        const char c = s[i];
+        if (c == '.') {
+            if (run == 0) return 0;
+            run = 0;
+        } else if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                   (c >= 'A' && c <= 'Z') || c == '-') {
+            run++;
+        } else {
+            return 0;
+        }
+    }
+    return run > 0;
+}
+
+/* Whole-string SemVer 2.0 check; fills in major.minor.patch. */
+static int is_semver(const char* v, long xyz[3]) {
+    const char* p = v;
+    for (int i = 0; i < 3; i++) {
+        const int n = semver_num(p, &xyz[i]);
+        if (n == 0) return 0;
+        p += n;
+        if (i < 2) {
+            if (*p != '.') return 0;
+            p++;
+        }
+    }
+    if (*p == '-') {
+        const char* end = strchr(p, '+');
+        const int len = end ? (int)(end - p - 1) : (int)strlen(p + 1);
+        if (!semver_idents(p + 1, len)) return 0;
+        p += 1 + len;
+    }
+    if (*p == '+') {
+        if (!semver_idents(p + 1, (int)strlen(p + 1))) return 0;
+        p += strlen(p);
+    }
+    return *p == '\0';
+}
+
 static void test_version(void) {
     printf("test_version:\n");
-    TEST_ASSERT(VV_VERSION_MAJOR == 0, "version major == 0");
-    TEST_ASSERT(VV_VERSION_MINOR == 1, "version minor == 1");
-    TEST_ASSERT(strcmp(VV_VERSION_STRING, "0.1.0") == 0,
-                "version string == '0.1.0'");
+
+    char parts[32];
+    snprintf(parts, sizeof(parts), "%d.%d.%d",
+             VV_VERSION_MAJOR, VV_VERSION_MINOR, VV_VERSION_PATCH);
+    TEST_ASSERT(strcmp(parts, VV_VERSION_STRING) == 0,
+                "header MAJOR.MINOR.PATCH matches VV_VERSION_STRING");
+
+    long xyz[3] = {0, 0, 0};
+    const char* v = vv_version();
+    printf("  vv_version() = %s, vv_build_ref() = %s\n", v, vv_build_ref());
+    TEST_ASSERT(is_semver(v, xyz), "vv_version() is SemVer 2.0");
+
+    /* A build is of the header's release line or of the one after it. */
+    const long have = xyz[0] * 1000000L + xyz[1] * 1000L + xyz[2];
+    const long want = VV_VERSION_MAJOR * 1000000L + VV_VERSION_MINOR * 1000L +
+                      VV_VERSION_PATCH;
+    TEST_ASSERT(have >= want, "vv_version() is not older than the header");
+
+    TEST_ASSERT(vv_build_ref() && vv_build_ref()[0],
+                "vv_build_ref() is not empty");
+
+    long tmp[3];
+    TEST_ASSERT(is_semver("1.0.0-rc.1.dev.3+g1a2b3c4.dirty", tmp) &&
+                !is_semver("1.0", tmp) && !is_semver("01.0.0", tmp) &&
+                !is_semver("1.0.0-", tmp) && !is_semver("1.0.0+a..b", tmp),
+                "the SemVer check itself accepts and rejects correctly");
 }
 
 static void test_audio_pipeline_synthetic(void) {

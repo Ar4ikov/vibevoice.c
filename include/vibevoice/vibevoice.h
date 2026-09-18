@@ -15,20 +15,29 @@ extern "C" {
 
 /* ─── Version ───────────────────────────────────────────────────────────── */
 
+/*
+ * The release line this source belongs to, and the only place the number is
+ * written down. The Release workflow bumps all four together; CMake refuses
+ * to configure if they disagree. See docs/RELEASING.md.
+ */
 #define VV_VERSION_MAJOR 0
-#define VV_VERSION_MINOR 1
+#define VV_VERSION_MINOR 2
 #define VV_VERSION_PATCH 0
-#define VV_VERSION_STRING "0.1.0"
+#define VV_VERSION_STRING "0.2.0"
 
-/** @brief Release version this binary was compiled as, e.g. "0.1.0". */
+/**
+ * @brief Full SemVer 2.0 version of this build.
+ *
+ * `0.2.0` for a build of the v0.2.0 tag; `0.2.1-dev.5+g1a2b3c4` for a build
+ * five commits past it, a prerelease of the next version so that it sorts
+ * between the two; `+...dirty` when the tree had uncommitted changes.
+ */
 const char* vv_version(void);
 
 /**
- * @brief What the build knew about its source.
- *
- * A `git describe` for a working tree, the published tag for a container
- * image (which passes it as $VV_BUILD_REF), or "unknown". Reported by
- * `vv_cli --version`, `GET /health` and the `vibevoice_build_info` metric.
+ * @brief Commit this binary was built from: short hash, "-dirty" when the
+ * tree had changes, or "unknown" without git. Reported by `vv_cli --version`,
+ * `GET /health` and the `vibevoice_build_info` metric next to the version.
  */
 const char* vv_build_ref(void);
 
