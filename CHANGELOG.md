@@ -9,6 +9,24 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- **Security** ([#14](https://github.com/Ar4ikov/vibevoice.c/issues/14)):
+  ffmpeg and the recorder are started from an argument vector
+  (`posix_spawnp`, `CreateProcessW` with only the pipe and `NUL`
+  inherited) instead of through `popen()` and a shell, so a quote, `$(...)`,
+  backtick, `;`, `&` or `%VAR%` in a path or device name is passed, not run
+  (CodeQL `cpp/command-line-injection`); ffmpeg gets its input as
+  `file:<path>`. Upload temp files are created exclusively (`mkstemp`,
+  `GetTempFileName`) -- two concurrent uploads could share a name and each
+  other's audio through an unsynchronised counter. The HTTP reader parses
+  only within the request head, honours `Content-Length` in any
+  capitalisation and only as a header of its own, refuses
+  `Transfer-Encoding`, and times out slow clients; the API key is compared
+  in constant time; error and `/health` JSON is escaped. A decode step that
+  would pass the end of the KV window now stops the transcript with a
+  warning -- a replayed CUDA graph used to write past the cache. SRT/VTT
+  segments longer than 1 KB are no longer truncated. `tools/requirements.txt`
+  moves past `torch.load` RCE (CVE-2025-32434) and CVE-2024-34062. Closing
+  `mic` no longer frees the recorder's stream under the capture thread.
 - One model can be split across devices: layers 0..k on the first, the rest
   on the next, each owning the KV cache for its own layers and only the
   hidden state crossing between them. `--split-mode auto|replica|layer`
