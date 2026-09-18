@@ -1,0 +1,54 @@
+name: Task
+description: A piece of work, argued as why, what and how.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One issue is one branch and one pull request. Write it so that
+        someone who was not in the room can pick it up: numbers over
+        adjectives, file paths over "the loader", and a way to tell when it
+        is done.
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: >-
+        What is wrong or missing today, and what it costs. Measured if it
+        can be measured: a timing, a size, a transcript that differs, an
+        alert number.
+      placeholder: >-
+        On a 30 s file the encoder takes 180 ms of a 1.9 s request, and it
+        runs segment after segment while the GPU is a third busy...
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: >-
+        The change as its user sees it: flags, formats, endpoints,
+        behaviour. Include what is explicitly out of scope, and what must
+        not regress.
+      placeholder: |
+        - `--foo auto|bar|baz`, `auto` by default
+        - output stays character-identical to the PyTorch reference
+        - not in scope: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: how
+    attributes:
+      label: How
+      description: >-
+        The approach, where it lands in the code, and how it will be
+        verified: which tests, which benchmark, which reference.
+      placeholder: |
+        1. ...
+        2. ...
+
+        Done when: `ctest` passes on gpubox and on MSVC, ...
+    validations:
+      required: true
