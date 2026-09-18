@@ -167,6 +167,7 @@ add_library(vibevoice_core STATIC
     src/inference/sampling.c
     src/inference/postprocess.c
     src/inference/family.c
+    src/inference/stream.c
 )
 # With no accelerator backend the device op set still has to link. The stub
 # implements memory and streams on the host and refuses every compute op,
@@ -296,6 +297,7 @@ if(VV_BUILD_TESTS)
     vv_add_test(test_kv_pool tests/test_kv_pool.c)
     vv_add_test(test_attention tests/test_attention.c)
     vv_add_test(test_decode_position tests/test_decode_position.c)
+    vv_add_test(test_stream tests/test_stream.c)
     # The same suite again with the tensor-core prefill kernel switched off:
     # the scalar fallback has to agree with the reference too, and the two
     # timings side by side are what the speedup is measured from.
