@@ -9,6 +9,8 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+## [0.2.0](https://github.com/Ar4ikov/vibevoice.c/releases/tag/v0.2.0) — 2026-09-18
+
 - **Security** ([#14](https://github.com/Ar4ikov/vibevoice.c/issues/14)):
   ffmpeg and the recorder are started from an argument vector
   (`posix_spawnp`, `CreateProcessW` with only the pipe and `NUL`
