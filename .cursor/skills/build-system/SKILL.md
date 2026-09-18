@@ -1,14 +1,13 @@
-# Skill: Build System (CMake + MSVC + CUDA + TRT)
+# Skill: Build System (CMake + MSVC + CUDA)
 
 ## Target
 - Windows 11 x64, MSVC 2022 (v143), C11 + CUDA C++17
-- CMake 3.28+, CUDA 12.2+, TensorRT 10.x
+- CMake 3.28+, CUDA 12.2+
 
 ## CMake Targets
 - `vibevoice_core` — static lib (C): core, audio, tokenizer, model, quant
 - `vibevoice_cuda` — static lib (CUDA): all .cu kernels
-- `vibevoice_trt` — static lib (C/C++): TRT engine wrapper
-- `vibevoice` — shared lib (.dll): links all above + CUDA + TRT
+- `vibevoice` — shared lib (.dll): links all above + CUDA
 - `vv_cli` — executable: CLI tool
 - `vv_tests` — executable: CTest tests
 - `vv_bench` — executable: benchmarks
@@ -19,4 +18,4 @@
 - sm_89 (RTX 4090)
 
 ## Environment Variables
-- CUDA_PATH, TENSORRT_PATH
+- CUDA_PATH

@@ -1,6 +1,6 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 #  vibevoice.c — Cursor Rules
-#  Pure C runtime for VibeVoice-ASR (4-bit quantized) with CUDA/TensorRT
+#  Pure C runtime for VibeVoice-ASR (4-bit quantized) with CUDA
 #  VERIFIED against actual model source code (2026-02-12)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -10,11 +10,10 @@
 # ─── 1. ЯЗЫКОВОЙ СТЕК ─────────────────────────────────────────────────────────
 # • Весь runtime-код пишется на ЧИСТОМ C (C11, ISO/IEC 9899:2011).
 # • GPU-ядра пишутся как CUDA C (.cu) с extern "C" обёрткой для линковки.
-# • TensorRT интеграция — исключительно через C API (nvinfer_c.h / NvInferRuntime).
-# • C++ допускается ТОЛЬКО внутри .cu файлов и ТОЛЬКО для CUDA/TRT API calls.
+# • C++ допускается ТОЛЬКО внутри .cu файлов и ТОЛЬКО для CUDA API calls.
 #   Любой публичный интерфейс — строго extern "C".
 # • Python допускается ТОЛЬКО в каталоге tools/ для одноразовой конвертации
-#   весов/экспорта ONNX. Python НИКОГДА не является runtime-зависимостью.
+#   весов. Python НИКОГДА не является runtime-зависимостью.
 # • Запрещено: PyTorch, TensorFlow, ONNX Runtime, Transformers, любые тяжёлые
 #   ML-фреймворки в runtime.
 
@@ -24,7 +23,6 @@
 # • Компилятор: MSVC (Visual Studio 2022 17.x), nvcc (CUDA Toolkit 12.x).
 # • Сборка: CMake 3.28+, только Release x64 для production.
 # • CUDA Toolkit: 12.2+ (для Ampere Tensor Cores, FP16/INT8 поддержка).
-# • TensorRT: 10.x+ (C API, builder, runtime, plugin registry).
 # • cuBLAS/cuDNN: через CUDA Toolkit, линковка как внешние .dll/.lib.
 
 # ─── 3. АРХИТЕКТУРА ПРОЕКТА ───────────────────────────────────────────────────
@@ -43,7 +41,6 @@
 # │   ├── model/                  — safetensors парсер, config.json, loader
 # │   ├── quant/                  — NF4 lookup table, CPU dequant reference
 # │   ├── cuda/                   — CUDA ядра: dequant, conv1d, attention, etc.
-# │   ├── trt/                    — TensorRT engine builder/runtime (Conv-VAE)
 # │   └── inference/              — pipeline, decoder, KV-cache, sampling
 # ├── cli/                        — CLI executable (vv_cli.exe)
 # ├── tools/                      — Python утилиты (НЕ runtime)
@@ -131,6 +128,6 @@
 # ─── 10. БЕЗОПАСНОСТЬ И ЛИЦЕНЗИИ ─────────────────────────────────────────────
 # • Модель: MIT лицензия (Microsoft VibeVoice).
 # • Квантизация: MIT (scerz/VibeVoice-ASR-4bit).
-# • CUDA/TensorRT: проприетарная лицензия NVIDIA — не включать бинарники.
+# • CUDA: проприетарная лицензия NVIDIA — не включать бинарники.
 # • third_party/: каждая библиотека с указанием лицензии в LICENSES/.
 # • Запрещено: хранить API-ключи, токены HuggingFace в коде/репо.

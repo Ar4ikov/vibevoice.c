@@ -535,8 +535,7 @@ Tagging, what each tag guarantees, and how to cut a release:
 
 ```bash
 export PATH=/usr/local/cuda-12.4/bin:$PATH
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DVV_ENABLE_TRT=OFF \
-      -DCMAKE_CUDA_ARCHITECTURES=86
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build -j
 ```
 
@@ -876,8 +875,6 @@ speech encoder or the connectors touches the default stream any more.
   claim that cannot be stood behind. The seam exists:
   `include/vibevoice/device.h` declares the op set, a build links exactly one
   implementation of it, and `src/device/device_none.c` shows the shape.
-- **`src/trt/`** is stubs. The CUDA encoder does 11 s of audio in 243 ms, so
-  TensorRT may never be worth it.
 
 ---
 
@@ -898,10 +895,10 @@ src/inference/       pipeline, decoder, KV cache, sampling, post-processing
 src/engine/          slot pool over one set of weights
 src/server/          HTTP and the OpenAI-compatible API
 cli/                 transcribe, serve, chat, mic
-tools/               reference diffing, AWQ conversion, ONNX/TRT export
+tools/               reference diffing, AWQ conversion
 ```
 
 ## Licence
 
-MIT, matching the model. Third-party: cJSON (MIT). CUDA and TensorRT are
-covered by the NVIDIA EULA.
+MIT, matching the model. Third-party: cJSON (MIT). CUDA is covered by the
+NVIDIA EULA.

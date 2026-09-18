@@ -3,12 +3,11 @@ setlocal enabledelayedexpansion
 REM ============================================================================
 REM  vibevoice.c — Environment Setup Script
 REM
-REM  Run this once per terminal session to configure MSVC + CUDA + TensorRT.
+REM  Run this once per terminal session to configure MSVC + CUDA.
 REM  After running, you can use cmake/build.bat/ninja directly.
 REM
 REM  Usage:
 REM    scripts\setup_env.bat
-REM    scripts\setup_env.bat --trt "C:\TensorRT-10.4.0"
 REM ============================================================================
 
 echo.
@@ -16,16 +15,8 @@ echo  vibevoice.c Environment Setup
 echo  ══════════════════════════════
 echo.
 
-REM ─── Parse arguments ────────────────────────────────────────────────────────
-:parse_args
-if "%~1"=="--trt" (
-    set "TENSORRT_PATH=%~2"
-    shift & shift
-    goto :parse_args
-)
-
 REM ─── Step 1: MSVC ──────────────────────────────────────────────────────────
-echo [1/4] Looking for MSVC...
+echo [1/3] Looking for MSVC...
 
 where cl >nul 2>&1
 if %errorlevel% equ 0 (
@@ -64,7 +55,7 @@ echo       MSVC: OK
 
 :check_cuda
 REM ─── Step 2: CUDA ──────────────────────────────────────────────────────────
-echo [2/4] Looking for CUDA Toolkit...
+echo [2/3] Looking for CUDA Toolkit...
 
 if defined CUDA_PATH (
     if exist "%CUDA_PATH%\bin\nvcc.exe" (
@@ -95,44 +86,9 @@ for /f "tokens=*" %%V in ('nvcc --version 2^>^&1 ^| findstr "release"') do (
     echo       nvcc: %%V
 )
 
-REM ─── Step 3: TensorRT ─────────────────────────────────────────────────────
-echo [3/4] Looking for TensorRT...
-
-if defined TENSORRT_PATH (
-    if exist "%TENSORRT_PATH%\include\NvInfer.h" (
-        echo       TENSORRT_PATH: %TENSORRT_PATH%
-        set "PATH=%TENSORRT_PATH%\lib;%PATH%"
-        goto :check_cmake
-    ) else (
-        echo       TENSORRT_PATH set but NvInfer.h not found
-        echo       Checked: %TENSORRT_PATH%\include\NvInfer.h
-    )
-)
-
-REM Try common locations
-for %%T in (
-    "C:\TensorRT"
-    "C:\TensorRT-10*"
-    "%LOCALAPPDATA%\TensorRT*"
-    "%CUDA_PATH%\..\TensorRT*"
-) do (
-    for /d %%D in (%%T) do (
-        if exist "%%D\include\NvInfer.h" (
-            set "TENSORRT_PATH=%%D"
-            echo       Auto-detected: !TENSORRT_PATH!
-            set "PATH=!TENSORRT_PATH!\lib;!PATH!"
-            goto :check_cmake
-        )
-    )
-)
-
-echo       TensorRT not found (optional — build will skip TRT support)
-echo       Download from: https://developer.nvidia.com/tensorrt
-echo       Then set: TENSORRT_PATH=C:\path\to\TensorRT
-
 :check_cmake
-REM ─── Step 4: CMake + Ninja ─────────────────────────────────────────────────
-echo [4/4] Checking build tools...
+REM ─── Step 3: CMake + Ninja ─────────────────────────────────────────────────
+echo [3/3] Checking build tools...
 
 where cmake >nul 2>&1
 if %errorlevel% neq 0 (

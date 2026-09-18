@@ -21,7 +21,6 @@ option(VV_ENABLE_BLAS  "Enable OpenBLAS for CPU GEMM"   OFF)
 option(VV_BUILD_TESTS  "Build test executables"          ON)
 option(VV_BUILD_BENCH  "Build benchmark executable"      ON)
 option(VV_BUILD_CLI    "Build CLI executable"            ON)
-option(VV_ENABLE_TRT   "Enable TensorRT support"         ON)
 option(VV_ENABLE_NVTX  "Enable NVTX profiling markers"   OFF)
 
 # ─── Probe for CUDA after C/CXX toolchain is ready ───────────────────────────
@@ -81,39 +80,6 @@ if(VV_ENABLE_BLAS)
         else()
             message(WARNING "OpenBLAS not found — using naive CPU GEMM")
         endif()
-    endif()
-endif()
-
-# ─── Find TensorRT (optional) ────────────────────────────────────────────────
-set(VV_HAS_TRT OFF)
-if(VV_HAS_CUDA AND VV_ENABLE_TRT)
-    if(DEFINED ENV{TENSORRT_PATH})
-        set(TENSORRT_ROOT "$ENV{TENSORRT_PATH}")
-    elseif(DEFINED TENSORRT_PATH)
-        set(TENSORRT_ROOT "${TENSORRT_PATH}")
-    endif()
-
-    if(TENSORRT_ROOT)
-        find_library(NVINFER_LIB nvinfer
-            PATHS "${TENSORRT_ROOT}/lib" NO_DEFAULT_PATH)
-        find_library(NVINFER_PLUGIN_LIB nvinfer_plugin
-            PATHS "${TENSORRT_ROOT}/lib" NO_DEFAULT_PATH)
-        find_library(NVONNXPARSER_LIB nvonnxparser
-            PATHS "${TENSORRT_ROOT}/lib" NO_DEFAULT_PATH)
-        find_path(TENSORRT_INCLUDE_DIR NvInfer.h
-            PATHS "${TENSORRT_ROOT}/include" NO_DEFAULT_PATH)
-    else()
-        find_library(NVINFER_LIB nvinfer)
-        find_library(NVINFER_PLUGIN_LIB nvinfer_plugin)
-        find_library(NVONNXPARSER_LIB nvonnxparser)
-        find_path(TENSORRT_INCLUDE_DIR NvInfer.h)
-    endif()
-
-    if(NVINFER_LIB AND TENSORRT_INCLUDE_DIR)
-        set(VV_HAS_TRT ON)
-        message(STATUS "TensorRT found: ${NVINFER_LIB}")
-    else()
-        message(WARNING "TensorRT not found, TRT support disabled")
     endif()
 endif()
 
@@ -282,24 +248,6 @@ if(VV_HAS_CUDA)
     endif()
 endif()
 
-# ─── vibevoice_trt (TensorRT wrapper, optional) ──────────────────────────────
-if(VV_HAS_TRT)
-    add_library(vibevoice_trt STATIC
-        src/trt/engine_builder.c
-        src/trt/engine_runtime.c
-        src/trt/trt_utils.c
-    )
-    target_include_directories(vibevoice_trt PRIVATE ${TENSORRT_INCLUDE_DIR})
-    target_link_libraries(vibevoice_trt PUBLIC
-        ${NVINFER_LIB}
-        ${NVINFER_PLUGIN_LIB}
-    )
-    if(NVONNXPARSER_LIB)
-        target_link_libraries(vibevoice_trt PUBLIC ${NVONNXPARSER_LIB})
-    endif()
-    target_compile_definitions(vibevoice_trt PUBLIC VV_HAS_TRT=1)
-endif()
-
 # ─── vibevoice shared library ─────────────────────────────────────────────────
 add_library(vibevoice SHARED
     src/core/alloc.c  # re-add for DLL export; in production use object libs
@@ -308,9 +256,6 @@ target_link_libraries(vibevoice PUBLIC vibevoice_core)
 if(VV_HAS_CUDA)
     target_link_libraries(vibevoice PUBLIC vibevoice_cuda)
 endif()
-if(VV_HAS_TRT)
-    target_link_libraries(vibevoice PUBLIC vibevoice_trt)
-endif()
 
 # ─── CLI executable ───────────────────────────────────────────────────────────
 if(VV_BUILD_CLI)
@@ -318,9 +263,6 @@ if(VV_BUILD_CLI)
     target_link_libraries(vv_cli PRIVATE vibevoice_core)
     if(VV_HAS_CUDA)
         target_link_libraries(vv_cli PRIVATE vibevoice_cuda)
-    endif()
-    if(VV_HAS_TRT)
-        target_link_libraries(vv_cli PRIVATE vibevoice_trt)
     endif()
 endif()
 
@@ -423,7 +365,6 @@ message(STATUS "  vibevoice.c ${VV_VERSION_FULL} build configuration:")
 message(STATUS "    Revision:  ${VV_REVISION}")
 message(STATUS "    CUDA:      ${VV_HAS_CUDA}")
 message(STATUS "    OpenBLAS:  ${VV_HAS_BLAS}")
-message(STATUS "    TensorRT:  ${VV_HAS_TRT}")
 message(STATUS "    CLI:       ${VV_BUILD_CLI}")
 message(STATUS "    Tests:     ${VV_BUILD_TESTS}")
 message(STATUS "")
