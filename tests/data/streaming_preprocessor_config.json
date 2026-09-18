@@ -1,0 +1,8 @@
+{
+  "speech_tok_compress_ratio": 3200,
+  "target_sample_rate": 24000,
+  "normalize_audio": false,
+  "chunk_frames": 22,
+  "lookahead_frames": 4,
+  "processor_class": "VibeVoiceASRProcessor"
+}

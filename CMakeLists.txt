@@ -359,6 +359,10 @@ if(VV_BUILD_TESTS)
     add_dependencies(test_untrusted_input spawn_child)
     target_compile_definitions(test_untrusted_input PRIVATE
         VV_SPAWN_CHILD="$<TARGET_FILE:spawn_child>")
+    vv_add_test(test_model_load tests/test_model_load.c)
+    target_compile_definitions(test_model_load PRIVATE
+                               VV_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data")
+    vv_add_test(test_prefill_append tests/test_prefill_append.c)
     vv_add_test(test_e2e tests/test_e2e.c)
 endif()
 
