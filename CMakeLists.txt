@@ -155,6 +155,7 @@ add_library(vibevoice_core STATIC
     src/model/safetensors.c
     src/model/config.c
     src/model/loader.c
+    src/model/gguf.c
     src/quant/nf4_table.c
     src/quant/kv_format.c
     src/quant/awq_repack.c
@@ -163,6 +164,7 @@ add_library(vibevoice_core STATIC
     src/quant/dequant_cpu.c
     src/cpu/cpu_kernels.c
     src/cpu/cpu_int8.c
+    src/cpu/bitnet_cpu.c
     src/inference/pipeline.c
     src/inference/calib.c
     src/inference/frontend.c
@@ -252,6 +254,7 @@ if(VV_HAS_CUDA)
         src/cuda/gemm.cu
         src/cuda/embedding.cu
         src/cuda/cuda_utils.cu
+        src/cuda/bitnet.cu
     )
     target_link_libraries(vibevoice_cuda PUBLIC CUDA::cudart_static)
     if(VV_ENABLE_NVTX)
@@ -355,6 +358,13 @@ if(VV_BUILD_TESTS)
     # (dp4a GEMV, tensor-core GEMM, SIMT fallback) forced in turn.
     vv_add_test(test_int8_linear tests/test_int8_linear.c)
     vv_add_test(test_e2e tests/test_e2e.c)
+    vv_add_test(test_gguf tests/test_gguf.c)
+    vv_add_test(test_bitnet tests/test_bitnet.c)
+    # Again with the tensor-core GEMM off: the dp4a fallback that pre-Ampere
+    # GPUs take has to agree with the CPU bit for bit as well.
+    add_test(NAME test_bitnet_dp4a COMMAND test_bitnet)
+    set_tests_properties(test_bitnet_dp4a PROPERTIES
+                         ENVIRONMENT "VV_BITNET_MMA=0")
 endif()
 
 # ─── Benchmark ────────────────────────────────────────────────────────────────
@@ -369,6 +379,11 @@ if(VV_BUILD_BENCH)
     target_link_libraries(vv_bench_encoder PRIVATE vibevoice_core)
     if(VV_HAS_CUDA)
         target_link_libraries(vv_bench_encoder PRIVATE vibevoice_cuda)
+    endif()
+    add_executable(vv_bench_bitnet bench/bench_bitnet.c)
+    target_link_libraries(vv_bench_bitnet PRIVATE vibevoice_core)
+    if(VV_HAS_CUDA)
+        target_link_libraries(vv_bench_bitnet PRIVATE vibevoice_cuda)
     endif()
 endif()
 

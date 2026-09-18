@@ -439,5 +439,36 @@ vv_status_t vv_vae_f32_to_f16_dev(const float* i, void* o, int64_t n,
     U(i) U(o) U(n) U(s) return VV_ERR_UNSUPPORTED;
 }
 
+/* BitNet integer ops */
+vv_status_t vv_act_quant_i8_dev(const void* x, int f16, int M, int K,
+                                int8_t* q, float* sc, int32_t* sum, void* s) {
+    U(x) U(f16) U(M) U(K) U(q) U(sc) U(sum) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_ternary_gemm_dev(const int8_t* q, const int32_t* xs,
+                                const float* xsc, const uint8_t* c, float ws,
+                                const float* b, int32_t* acc, void* y,
+                                int f16, int M, int N, int K, void* s) {
+    U(q) U(xs) U(xsc) U(c) U(ws) U(b) U(acc) U(y) U(f16) U(M) U(N) U(K) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_i8_gemm_dev(const int8_t* a, const float* as, const int8_t* w,
+                           float ws, const float* b, int32_t* acc, float* y,
+                           float* am, int M, int N, int K, void* s) {
+    U(a) U(as) U(w) U(ws) U(b) U(acc) U(y) U(am) U(M) U(N) U(K) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_i8s_requant_dev(const float* y, int64_t n, const float* am,
+                               int relu, int8_t* q, float* os, void* s) {
+    U(y) U(n) U(am) U(relu) U(q) U(os) U(s) return VV_ERR_UNSUPPORTED;
+}
+size_t vv_i8_head_argmax_scratch_bytes(int V) { U(V) return 0; }
+vv_status_t vv_i8_head_argmax_dev(const int8_t* q, const float* sc,
+                                  const int8_t* w, const float* ws, int V,
+                                  int K, int32_t* tok, float* val, void* scr,
+                                  void* s) {
+    U(q) U(sc) U(w) U(ws) U(V) U(K) U(tok) U(val) U(scr) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+
 #undef U
 #undef VV_STUB

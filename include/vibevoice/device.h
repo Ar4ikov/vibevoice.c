@@ -804,6 +804,79 @@ vv_status_t vv_vae_f32_to_f16_dev(const float* in, void* out, int64_t n,
 /** @brief Block the calling host thread until `ev` has completed. */
 vv_status_t vv_dev_event_sync(void* ev);
 
+/* ─── BitNet integer ops (bitnet.cu) ─────────────────────────────────────── */
+/*
+ * Layouts and numerics are those of include/vibevoice/bitnet.h: ternary
+ * weights in the I2_S byte layout with one FP32 scale per tensor, per-token
+ * int8 activations, int8 weights with one scale per tensor (VAE) or per row
+ * (LM head). Every per-token value (activation scale, row sum) is read from
+ * device memory, so the decode launches can be captured into a graph.
+ */
+
+/**
+ * @brief Per-token int8 quantization: q = rne(x * s), s = 127 / max|x|.
+ * @param x_f16  nonzero if @p x is FP16, else FP32
+ * @param sum    [M] int32 row sums of q, needed by the ternary GEMM
+ */
+vv_status_t vv_act_quant_i8_dev(const void* x, int x_f16, int M, int K,
+                                int8_t* q, float* scale, int32_t* sum,
+                                void* stream);
+
+/**
+ * @brief Ternary x int8: acc = sum_k (c - 1) * q, and optionally
+ *        y = (float)acc / x_scale[m] * w_scale + bias[n].
+ *
+ * dp4a GEMV for M <= 8; above that an int8 tensor-core GEMM
+ * (mma.m16n8k32, sm_80+) that unpacks the 2-bit codes in registers, with
+ * the GEMV looped over row blocks on older GPUs. K % 128 == 0.
+ *
+ * @param xsum     [M] row sums of q (from vv_act_quant_i8_dev)
+ * @param x_scale  [M], or NULL when only @p acc is wanted
+ * @param bias     FP32 [N] or NULL
+ * @param acc      int32 [M, N] or NULL
+ * @param y        [M, N] FP16 (y_f16) or FP32, or NULL
+ */
+vv_status_t vv_ternary_gemm_dev(const int8_t* q, const int32_t* xsum,
+                                const float* x_scale, const uint8_t* codes,
+                                float w_scale, const float* bias,
+                                int32_t* acc, void* y, int y_f16,
+                                int M, int N, int K, void* stream);
+
+/**
+ * @brief Int8 x int8 (W8A8): acc = sum_k w * a, and optionally
+ *        y = (float)acc * (w_scale / a_scale) + bias with max|y| folded
+ *        into @p absmax (device float, must start at 0) for requantization.
+ * @param a_scale  device float, the activation multiplier (127 / amax)
+ */
+vv_status_t vv_i8_gemm_dev(const int8_t* a, const float* a_scale,
+                           const int8_t* w, float w_scale, const float* bias,
+                           int32_t* acc, float* y, float* absmax,
+                           int M, int N, int K, void* stream);
+
+/**
+ * @brief Requantize a tensor with one scale read from @p absmax (device):
+ *        q = rne(clamp(y * 127/absmax, relu ? 0 : -127, 127)).
+ * @param out_scale device float receiving 127 / absmax
+ */
+vv_status_t vv_i8s_requant_dev(const float* y, int64_t n, const float* absmax,
+                               int relu, int8_t* q, float* out_scale,
+                               void* stream);
+
+/** @brief Scratch bytes vv_i8_head_argmax_dev needs for a vocabulary of V. */
+size_t vv_i8_head_argmax_scratch_bytes(int V);
+
+/**
+ * @brief Int8 tied-head argmax: logit_n = (float)(w_n . q) * w_scale[n] / s.
+ * @param scale    device float, the activation multiplier
+ * @param token    device int32
+ * @param value    device float or NULL
+ * @param scratch  vv_i8_head_argmax_scratch_bytes(V), owned by the caller
+ */
+vv_status_t vv_i8_head_argmax_dev(const int8_t* q, const float* scale,
+                                  const int8_t* w, const float* w_scale,
+                                  int V, int K, int32_t* token, float* value,
+                                  void* scratch, void* stream);
+
 #ifdef __cplusplus
 }
 #endif
