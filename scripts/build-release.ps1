@@ -51,7 +51,6 @@ Write-Host "architectures: $archs"
 
 cmake -B $BuildDir -G "Visual Studio 17 2022" -A x64 `
     -DCMAKE_BUILD_TYPE=Release `
-    -DVV_ENABLE_TRT=OFF `
     -DVV_BUILD_TESTS=OFF `
     -DVV_BUILD_BENCH=OFF `
     -DCMAKE_CUDA_ARCHITECTURES="$archs"

@@ -35,7 +35,6 @@ fi
 cmake -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DVV_ENABLE_CUDA=OFF \
-    -DVV_ENABLE_TRT=OFF \
     "${EXTRA[@]}"
 
 cmake --build "$BUILD_DIR" -j "$(sysctl -n hw.ncpu)"
