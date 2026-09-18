@@ -692,6 +692,101 @@ static void test_frontend(vv_conv_vae_encoder_t* ea, vv_conv_vae_encoder_t* es) 
     tiny_free(&tc.conn_w);
 }
 
+/* ─── Split-K GEMM ─────────────────────────────────────────────────────── */
+
+/**
+ * The deep stage-5/6 GEMMs split K into slices. The split must follow K
+ * alone: the same columns computed in one call or in two narrower calls
+ * (another batch) have to agree bit for bit, and all of it has to match an
+ * FP64 reference with every epilogue.
+ */
+static void test_gemm_splitk(void* stream) {
+    const int M = 96, K = 2048, P = 45, P1 = 19;
+    TEST_ASSERT(vv_vae_gemm_splitk(K) == 2 && vv_vae_gemm_splitk(1024) == 1,
+                "split-K depends on K alone");
+    uint64_t rng = 99;
+    uint16_t* A = (uint16_t*)vv_alloc((size_t)M * K * 2);
+    uint16_t* B = (uint16_t*)vv_alloc((size_t)K * P * 2);
+    uint16_t* X = (uint16_t*)vv_alloc((size_t)M * P * 2);
+    uint16_t bias[96], gam[96];
+    for (size_t i = 0; i < (size_t)M * K; i++) A[i] = vv_float_to_half(frand(&rng) * 0.05f);
+    for (size_t i = 0; i < (size_t)K * P; i++) B[i] = vv_float_to_half(frand(&rng));
+    for (size_t i = 0; i < (size_t)M * P; i++) X[i] = vv_float_to_half(frand(&rng));
+    for (int i = 0; i < M; i++) {
+        bias[i] = vv_float_to_half(frand(&rng) * 0.1f);
+        gam[i] = vv_float_to_half(0.5f + frand(&rng) * 0.1f);
+    }
+    void *dA, *dB, *dC, *dC2, *db, *dg;
+    float* ws = NULL;
+    const size_t ws_elems = (size_t)2 * M * P;
+    vv_dev_alloc(&dA, (size_t)M * K * 2);
+    vv_dev_alloc(&dB, (size_t)K * P * 2);
+    vv_dev_alloc(&dC, (size_t)M * P * 2);
+    vv_dev_alloc(&dC2, (size_t)M * P * 2);
+    vv_dev_alloc(&db, (size_t)M * 2);
+    vv_dev_alloc(&dg, (size_t)M * 2);
+    vv_dev_alloc((void**)&ws, ws_elems * 4);
+    vv_dev_memcpy_h2d(dA, A, (size_t)M * K * 2, stream);
+    vv_dev_memcpy_h2d(dB, B, (size_t)K * P * 2, stream);
+    vv_dev_memcpy_h2d(db, bias, (size_t)M * 2, stream);
+    vv_dev_memcpy_h2d(dg, gam, (size_t)M * 2, stream);
+
+    const int epis[3] = { VV_VAE_EPI_BIAS, VV_VAE_EPI_BIAS_GELU,
+                          VV_VAE_EPI_BIAS_RESID };
+    for (int e = 0; e < 3; e++) {
+        vv_dev_memcpy_h2d(dC, X, (size_t)M * P * 2, stream);
+        vv_dev_memcpy_h2d(dC2, X, (size_t)M * P * 2, stream);
+        vv_status_t st = vv_vae_gemm_nn_dev(epis[e], dA, dB, P, dC, P, M, K, P,
+                                            db, dg, NULL, NULL, ws, ws_elems,
+                                            stream);
+        /* The same columns as two calls of 19 and 26. */
+        if (st == VV_OK)
+            st = vv_vae_gemm_nn_dev(epis[e], dA, dB, P, dC2, P, M, K, P1, db,
+                                    dg, NULL, NULL, ws, ws_elems, stream);
+        if (st == VV_OK)
+            st = vv_vae_gemm_nn_dev(epis[e], dA, (uint16_t*)dB + P1, P,
+                                    (uint16_t*)dC2 + P1, P, M, K, P - P1, db,
+                                    dg, NULL, NULL, ws, ws_elems, stream);
+        TEST_ASSERT(st == VV_OK, "split-K GEMM runs");
+        uint16_t* c1 = download(dC, (size_t)M * P, stream);
+        uint16_t* c2 = download(dC2, (size_t)M * P, stream);
+        TEST_ASSERT(memcmp(c1, c2, (size_t)M * P * 2) == 0,
+                    "split-K: one call == two narrower calls, bit for bit");
+        double num = 0.0, den = 0.0;
+        for (int r = 0; r < M; r++)
+            for (int c = 0; c < P; c++) {
+                double acc = 0.0;
+                for (int k = 0; k < K; k++)
+                    acc += (double)vv_half_to_float(A[(size_t)r * K + k]) *
+                           (double)vv_half_to_float(B[(size_t)k * P + c]);
+                acc += vv_half_to_float(bias[r]);
+                double want;
+                if (epis[e] == VV_VAE_EPI_BIAS) want = acc;
+                else if (epis[e] == VV_VAE_EPI_BIAS_GELU)
+                    want = 0.5 * acc * (1.0 + erf(acc / sqrt(2.0)));
+                else
+                    want = vv_half_to_float(X[(size_t)r * P + c]) +
+                           acc * vv_half_to_float(gam[r]);
+                const double got = vv_half_to_float(c1[(size_t)r * P + c]);
+                num += (got - want) * (got - want);
+                den += want * want;
+            }
+        const double rel = sqrt(num / (den > 0 ? den : 1));
+        printf("    epilogue %d rel=%.2e\n", epis[e], rel);
+        TEST_ASSERT(rel < 2e-3, "split-K GEMM matches the FP64 reference");
+        vv_free(c1);
+        vv_free(c2);
+    }
+    /* Too little scratch is an error, never a quiet fallback to one slice. */
+    TEST_ASSERT(vv_vae_gemm_nn_dev(VV_VAE_EPI_BIAS, dA, dB, P, dC, P, M, K, P,
+                                   db, NULL, NULL, NULL, ws, 10, stream)
+                == VV_ERR_OVERFLOW, "split-K refuses short scratch");
+    vv_dev_stream_sync(stream);
+    vv_dev_free(dA); vv_dev_free(dB); vv_dev_free(dC); vv_dev_free(dC2);
+    vv_dev_free(db); vv_dev_free(dg); vv_dev_free(ws);
+    vv_free(A); vv_free(B); vv_free(X);
+}
+
 int main(void) {
     printf("=== VibeVoice Conv-VAE Streaming Tests ===\n\n");
     vv_log_set_level(VV_LOG_WARN);
@@ -717,6 +812,7 @@ int main(void) {
         if (s == VV_OK) s = vv_vae_arena_create(ea, 8, 100000, &g.a);
         TEST_ASSERT(s == VV_OK, "GPU weights and arena");
         if (s == VV_OK) {
+            test_gemm_splitk(g.stream);
             test_gpu_vs_reference(&g);
             test_gpu_chunking(&g);
             test_gpu_batching(&g);

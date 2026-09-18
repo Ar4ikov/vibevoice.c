@@ -614,15 +614,31 @@ vv_status_t vv_vae_im2col_dev(const vv_vae_conv_desc_t* d, const void* x,
                               void* stream);
 
 /**
+ * @brief K slices a Conv-VAE GEMM of depth K is split into.
+ *
+ * A function of K alone, never of the column count: the stage-5/6 GEMMs
+ * have a few hundred columns and would otherwise run on 32 blocks, but a
+ * split that depended on how many items share a launch would make an
+ * item's result depend on its neighbours.
+ */
+static inline int vv_vae_gemm_splitk(int K) {
+    return (K >= 2048 && K % 1024 == 0) ? K / 1024 : 1;
+}
+
+/**
  * @brief C[M, P] (stride ldc) from A[M, K] @ B[K, P] (stride ldb).
  * @param rinv, norm_w  Both or neither: B is RMS-normalised while it is
  *                      staged, B[k][p] * rinv[p] * norm_w[k].
+ * @param ws, ws_elems  FP32 scratch for the split-K partials, at least
+ *                      vv_vae_gemm_splitk(K) * M * P elements when that is
+ *                      more than one; the slices are summed in order.
  */
 vv_status_t vv_vae_gemm_nn_dev(int epilogue, const void* A, const void* B,
                                int64_t ldb, void* C, int64_t ldc,
                                int M, int K, int P, const void* bias,
                                const void* gamma, const float* rinv,
-                               const void* norm_w, void* stream);
+                               const void* norm_w, float* ws,
+                               size_t ws_elems, void* stream);
 
 /** @brief Where the rows of a TN GEMM go (speech connectors). */
 #define VV_VAE_ROWS_PLAIN        0  /**< C[r][c], stride ldc                  */

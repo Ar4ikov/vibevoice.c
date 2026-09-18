@@ -298,10 +298,18 @@ typedef struct {
     size_t  act_elems;              /**< each of the two activation buffers */
     size_t  rinv_elems;
     size_t  hid_elems;
-    size_t  off_act1, off_rinv, off_hid, bytes;
+    size_t  part_elems;             /**< FP32 split-K partials             */
+    size_t  off_act1, off_rinv, off_hid, off_part, bytes;
 } vae_arena_layout_t;
 
 static int64_t round8(int64_t v) { return (v + 7) / 8 * 8; }
+
+static size_t max_sz(size_t a, size_t b) { return a > b ? a : b; }
+
+/** FP32 partials a GEMM split into `S` slices needs; none when unsplit. */
+static size_t split_need(int S, int M, size_t cols) {
+    return S > 1 ? (size_t)S * (size_t)M * cols : 0;
+}
 
 static void arena_layout(const vae_plan_t* p, int max_items,
                          int64_t max_samples, vae_arena_layout_t* l) {
@@ -338,10 +346,29 @@ static void arena_layout(const vae_plan_t* p, int max_items,
     if (hid > hid_full) hid = hid_full;
     l->hid_elems = hid;
 
+    /* Split-K partials: slices x rows x columns of the widest GEMM that is
+       split at all (only the deep stage-4..6 ones, whose columns are few). */
+    size_t part = 0;
+    for (int s = 0; s < p->n_stages; s++) {
+        const int C = p->C[s], H = p->hidden[s];
+        const size_t cols = (size_t)l->ld[s];
+        part = max_sz(part, split_need(vv_vae_gemm_splitk(C), H, cols));
+        part = max_sz(part, split_need(vv_vae_gemm_splitk(H), C, cols));
+    }
+    for (int i = 0; i < p->n_layers; i++) {
+        const vae_layer_t* L = &p->L[i];
+        if (L->kind != VAE_L_DS) continue;
+        const int so = L->stage + 1 < p->n_stages ? L->stage + 1 : L->stage;
+        part = max_sz(part, split_need(vv_vae_gemm_splitk(L->in_ch * L->k),
+                                       L->out_ch, (size_t)l->ld[so]));
+    }
+    l->part_elems = part;
+
     l->off_act1 = align_up(act * 2, VAE_ALIGN);
     l->off_rinv = l->off_act1 + align_up(act * 2, VAE_ALIGN);
     l->off_hid  = l->off_rinv + align_up(l->rinv_elems * 4, VAE_ALIGN);
-    l->bytes    = l->off_hid + align_up(l->hid_elems * 2, VAE_ALIGN);
+    l->off_part = l->off_hid + align_up(l->hid_elems * 2, VAE_ALIGN);
+    l->bytes    = l->off_part + align_up(l->part_elems * 4, VAE_ALIGN);
 }
 
 struct vv_vae_arena {
@@ -353,6 +380,7 @@ struct vv_vae_arena {
     void*              act[2];
     float*             rinv;
     void*              hid;
+    float*             part;
     size_t             high_water;
     bool               stats;
     /* Host scratch: per item per layer, the context left after this call. */
@@ -396,6 +424,7 @@ vv_status_t vv_vae_arena_create(const vv_conv_vae_encoder_t* e, int max_items,
     a->act[1] = (char*)a->blob + a->lay.off_act1;
     a->rinv   = (float*)((char*)a->blob + a->lay.off_rinv);
     a->hid    = (char*)a->blob + a->lay.off_hid;
+    a->part   = (float*)((char*)a->blob + a->lay.off_part);
 
     const char* ev = getenv("VV_ENC_STATS");
     a->stats = ev && ev[0] && ev[0] != '0';
@@ -597,12 +626,14 @@ vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
                     s = vv_vae_gemm_nn_dev(VV_VAE_EPI_BIAS_GELU, bw->l1_w, x, ld,
                                            a->hid, ldh, bw->hidden, C, (int)pc,
                                            bw->l1_b, NULL, a->rinv + p0,
-                                           bw->ffn_norm_w, stream);
+                                           bw->ffn_norm_w, a->part,
+                                           a->lay.part_elems, stream);
                     if (s == VV_OK)
                         s = vv_vae_gemm_nn_dev(VV_VAE_EPI_BIAS_RESID, bw->l2_w,
                                                a->hid, ldh, x, ld, C,
                                                bw->hidden, (int)pc, bw->l2_b,
                                                bw->ffn_gamma, NULL, NULL,
+                                               a->part, a->lay.part_elems,
                                                stream);
                     if (s != VV_OK) return s;
                 }
@@ -637,6 +668,7 @@ vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
                                                (uint16_t*)a->act[cur ^ 1] + p0,
                                                ld2, L->out_ch, Kc, (int)pc,
                                                w->ds_b[st], NULL, NULL, NULL,
+                                               a->part, a->lay.part_elems,
                                                stream);
                 }
                 if (s != VV_OK) return s;

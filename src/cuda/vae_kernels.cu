@@ -378,12 +378,42 @@ __device__ __forceinline__ float vae_gelu(float x) {
     return 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));
 }
 
+/** Bias, GELU or gamma-residual on one accumulated value. */
+template <int EPI>
+__device__ __forceinline__ void vae_epilogue(float acc, half* __restrict__ C,
+                                             size_t off, int r,
+                                             const half* __restrict__ bias,
+                                             const half* __restrict__ gamma)
+{
+    if (EPI == VAE_EPI_BIAS) {
+        const float b = bias ? __half2float(bias[r]) : 0.0f;
+        C[off] = __float2half(acc + b);
+        return;
+    }
+    float v = __half2float(__float2half(acc));
+    if (bias)
+        v = __half2float(__float2half(v + __half2float(bias[r])));
+    if (EPI == VAE_EPI_BIAS_GELU) {
+        C[off] = __float2half(vae_gelu(v));
+    } else {
+        const float xv = __half2float(C[off]);
+        C[off] = gamma ? __float2half(xv + v * __half2float(gamma[r]))
+                       : __float2half(xv + v);
+    }
+}
+
+/*
+ * With `part` set, block z sums only K slice [z * kslice, (z+1) * kslice)
+ * and stores its raw FP32 accumulators to part[z][M][P]; vae_splitk_kernel
+ * then adds the slices in order and applies the epilogue.
+ */
 template <int EPI>
 __global__ __launch_bounds__(THREADS) void vae_gemm_nn_kernel(
     const half* __restrict__ A, const half* __restrict__ B, int64_t ldb,
     half* __restrict__ C, int64_t ldc, int M, int K, int P,
     const half* __restrict__ bias, const half* __restrict__ gamma,
-    const float* __restrict__ rinv, const half* __restrict__ nw)
+    const float* __restrict__ rinv, const half* __restrict__ nw,
+    float* __restrict__ part, int kslice)
 {
     extern __shared__ char smem_raw[];
     half* As = (half*)smem_raw;
@@ -396,6 +426,8 @@ __global__ __launch_bounds__(THREADS) void vae_gemm_nn_kernel(
     const int col_base = blockIdx.x * BN;
     const bool k_aligned = (K & 7) == 0;
     const bool p_aligned = (ldb & 7) == 0 && (((uintptr_t)B) & 15) == 0;
+    const int kbeg = blockIdx.z * kslice;
+    const int kend = kbeg + kslice < K ? kbeg + kslice : K;
 
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[FRAG_M][FRAG_N];
     #pragma unroll
@@ -404,12 +436,12 @@ __global__ __launch_bounds__(THREADS) void vae_gemm_nn_kernel(
         for (int j = 0; j < FRAG_N; ++j)
             wmma::fill_fragment(acc[i][j], 0.f);
 
-    vae_load_k_major<BM>(A, K, row_base, M, K, 0, k_aligned, As);
-    vae_load_n_major(B, ldb, 0, K, col_base, P, p_aligned, rinv, nw, Bs);
+    vae_load_k_major<BM>(A, K, row_base, M, kend, kbeg, k_aligned, As);
+    vae_load_n_major(B, ldb, kbeg, kend, col_base, P, p_aligned, rinv, nw, Bs);
     __syncthreads();
 
     int stage = 0;
-    for (int k0 = 0; k0 < K; k0 += BK) {
+    for (int k0 = kbeg; k0 < kend; k0 += BK) {
         const half* Ac = As + stage * BM * LDK;
         const half* Bc = Bs + stage * BK * LDN;
         #pragma unroll
@@ -430,11 +462,11 @@ __global__ __launch_bounds__(THREADS) void vae_gemm_nn_kernel(
                 for (int j = 0; j < FRAG_N; ++j)
                     wmma::mma_sync(acc[i][j], af[i], bf[j], acc[i][j]);
         }
-        if (k0 + BK < K) {
+        if (k0 + BK < kend) {
             const int nx = stage ^ 1;
-            vae_load_k_major<BM>(A, K, row_base, M, K, k0 + BK, k_aligned,
+            vae_load_k_major<BM>(A, K, row_base, M, kend, k0 + BK, k_aligned,
                                  As + nx * BM * LDK);
-            vae_load_n_major(B, ldb, k0 + BK, K, col_base, P, p_aligned,
+            vae_load_n_major(B, ldb, k0 + BK, kend, col_base, P, p_aligned,
                              rinv, nw, Bs + nx * BK * LDN);
             __syncthreads();
             stage = nx;
@@ -456,28 +488,30 @@ __global__ __launch_bounds__(THREADS) void vae_gemm_nn_kernel(
                 const int r = row0 + (e >> 4);
                 const int c = col0 + (e & 15);
                 if (r < M && c < P) {
-                    const size_t off = (size_t)r * ldc + c;
-                    if (EPI == VAE_EPI_BIAS) {
-                        const float b = bias ? __half2float(bias[r]) : 0.0f;
-                        C[off] = __float2half(stg[e] + b);
-                        continue;
-                    }
-                    float v = __half2float(__float2half(stg[e]));
-                    if (bias)
-                        v = __half2float(__float2half(v + __half2float(bias[r])));
-                    if (EPI == VAE_EPI_BIAS_GELU) {
-                        C[off] = __float2half(vae_gelu(v));
-                    } else {
-                        const float xv = __half2float(C[off]);
-                        C[off] = gamma
-                            ? __float2half(xv + v * __half2float(gamma[r]))
-                            : __float2half(xv + v);
-                    }
+                    if (part)
+                        part[((size_t)blockIdx.z * M + r) * (size_t)P + c] = stg[e];
+                    else
+                        vae_epilogue<EPI>(stg[e], C, (size_t)r * ldc + c, r,
+                                          bias, gamma);
                 }
             }
             __syncwarp();
         }
     }
+}
+
+template <int EPI>
+__global__ void vae_splitk_kernel(const float* __restrict__ part, int S,
+                                  int M, int P, half* __restrict__ C,
+                                  int64_t ldc, const half* __restrict__ bias,
+                                  const half* __restrict__ gamma)
+{
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)M * P) return;
+    const int r = (int)(i / P), c = (int)(i - (int64_t)r * P);
+    float acc = 0.0f;
+    for (int z = 0; z < S; z++) acc += part[(size_t)z * M * P + i];
+    vae_epilogue<EPI>(acc, C, (size_t)r * ldc + c, r, bias, gamma);
 }
 
 /* ─── TN GEMM for the speech connectors ─────────────────────────────────── */
@@ -682,31 +716,59 @@ vv_status_t vv_vae_mixer_dev(const vv_vae_conv_desc_t* d, const void* xin,
     return launch_status();
 }
 
+} /* extern "C" */
+
+template <int EPI>
+static void gemm_nn_launch(const half* A, const half* B, int64_t ldb, half* C,
+                           int64_t ldc, int M, int K, int P, const half* bias,
+                           const half* gamma, const float* rinv, const half* nw,
+                           float* part, int S, cudaStream_t st) {
+    const size_t shmem = (size_t)2 * (BM * LDK + BK * LDN) * sizeof(half);
+    const int kslice = (K + S - 1) / S;
+    dim3 grid((P + BN - 1) / BN, (M + BM - 1) / BM, S);
+    vae_gemm_nn_kernel<EPI><<<grid, THREADS, shmem, st>>>(
+        A, B, ldb, C, ldc, M, K, P, bias, gamma, rinv, nw,
+        S > 1 ? part : NULL, kslice);
+    if (S > 1) {
+        const int64_t n = (int64_t)M * P;
+        vae_splitk_kernel<EPI><<<(unsigned)((n + VAE_THREADS - 1) / VAE_THREADS),
+                                 VAE_THREADS, 0, st>>>(part, S, M, P, C, ldc,
+                                                       bias, gamma);
+    }
+}
+
+extern "C" {
+
 vv_status_t vv_vae_gemm_nn_dev(int epilogue, const void* A, const void* B,
                                int64_t ldb, void* C, int64_t ldc,
                                int M, int K, int P, const void* bias,
                                const void* gamma, const float* rinv,
-                               const void* norm_w, void* stream) {
+                               const void* norm_w, float* ws,
+                               size_t ws_elems, void* stream) {
     if (!A || !B || !C) return VV_ERR_NULL_PTR;
     if (M <= 0 || K <= 0 || P <= 0) return VV_ERR_INVALID_ARG;
     if ((norm_w != NULL) != (rinv != NULL)) return VV_ERR_INVALID_ARG;
-    const size_t shmem = (size_t)2 * (BM * LDK + BK * LDN) * sizeof(half);
-    dim3 grid((P + BN - 1) / BN, (M + BM - 1) / BM);
+    const int S = vv_vae_gemm_splitk(K);
+    /* The slices are BK-aligned so every slice sees whole K steps. */
+    if (S > 1 && (((K / S) % BK) != 0 || !ws ||
+                  (size_t)S * (size_t)M * (size_t)P > ws_elems))
+        return VV_ERR_OVERFLOW;
+    const cudaStream_t st = (cudaStream_t)stream;
+    const half* a = (const half*)A;
+    const half* b = (const half*)B;
+    half* c = (half*)C;
+    const half* bs = (const half*)bias;
+    const half* g = (const half*)gamma;
+    const half* nw = (const half*)norm_w;
     if (epilogue == VAE_EPI_BIAS_GELU)
-        vae_gemm_nn_kernel<VAE_EPI_BIAS_GELU>
-            <<<grid, THREADS, shmem, (cudaStream_t)stream>>>(
-            (const half*)A, (const half*)B, ldb, (half*)C, ldc, M, K, P,
-            (const half*)bias, (const half*)gamma, rinv, (const half*)norm_w);
+        gemm_nn_launch<VAE_EPI_BIAS_GELU>(a, b, ldb, c, ldc, M, K, P, bs, g,
+                                          rinv, nw, ws, S, st);
     else if (epilogue == VAE_EPI_BIAS_RESID)
-        vae_gemm_nn_kernel<VAE_EPI_BIAS_RESID>
-            <<<grid, THREADS, shmem, (cudaStream_t)stream>>>(
-            (const half*)A, (const half*)B, ldb, (half*)C, ldc, M, K, P,
-            (const half*)bias, (const half*)gamma, rinv, (const half*)norm_w);
+        gemm_nn_launch<VAE_EPI_BIAS_RESID>(a, b, ldb, c, ldc, M, K, P, bs, g,
+                                           rinv, nw, ws, S, st);
     else if (epilogue == VAE_EPI_BIAS)
-        vae_gemm_nn_kernel<VAE_EPI_BIAS>
-            <<<grid, THREADS, shmem, (cudaStream_t)stream>>>(
-            (const half*)A, (const half*)B, ldb, (half*)C, ldc, M, K, P,
-            (const half*)bias, (const half*)gamma, rinv, (const half*)norm_w);
+        gemm_nn_launch<VAE_EPI_BIAS>(a, b, ldb, c, ldc, M, K, P, bs, g,
+                                     rinv, nw, ws, S, st);
     else
         return VV_ERR_INVALID_ARG;
     return launch_status();

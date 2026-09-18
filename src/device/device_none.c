@@ -367,11 +367,15 @@ vv_status_t vv_vae_mixer_dev(const vv_vae_conv_desc_t* d, const void* xi,
     return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_vae_gemm_nn_dev(int ep, const void* A, const void* B,
-                               int64_t ldb, void* C, int64_t ldc, int M,
-                               int K, int P, const void* b, const void* g,
-                               const float* r, const void* nw, void* s) {
-    U(ep) U(A) U(B) U(ldb) U(C) U(ldc) U(M) U(K) U(P) U(b) U(g) U(r) U(nw)
-    U(s) return VV_ERR_UNSUPPORTED;
+                               int64_t ldb, void* C, int64_t ldc,
+                               int M, int K, int P, const void* bias,
+                               const void* gamma, const float* rinv,
+                               const void* norm_w, float* ws,
+                               size_t ws_elems, void* stream) {
+    (void)ep; (void)A; (void)B; (void)ldb; (void)C; (void)ldc; (void)M;
+    (void)K; (void)P; (void)bias; (void)gamma; (void)rinv; (void)norm_w;
+    (void)ws; (void)ws_elems; (void)stream;
+    return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_vae_gemm_tn_dev(const void* A, int64_t lda, const void* B,
                                void* C, int64_t ldc, int M, int N, int K,
