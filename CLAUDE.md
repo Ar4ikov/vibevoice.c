@@ -158,7 +158,6 @@ transcribe it with these keys: ...`.
   разработки. Шов готов — `include/vibevoice/device.h` объявляет набор
   операций, сборка линкует ровно одну реализацию, `src/device/device_none.c`
   показывает форму.
-* `src/trt/` — заглушки.
 * Акустический латент по умолчанию берётся как среднее (детерминированно).
   Выборка эталона есть: `--acoustic-sampling gaussian|fix --seed N`.
 
@@ -342,7 +341,6 @@ eps:                     1e-6
 | Компилятор | MSVC 2022 (v143), nvcc (CUDA 12.2+) |
 | Сборка | CMake 3.28+ |
 | CUDA | 12.2+ (Tensor Cores FP16/INT8 на Ampere) |
-| TensorRT | 10.x+ (C API) |
 | cuBLAS | Через CUDA Toolkit |
 | cuDNN | 9.x (опционально, для Conv-VAE оптимизации) |
 
@@ -367,8 +365,8 @@ vibevoice.c/
 │   ├── connector.h                 # Speech connector MLP API
 │   ├── model.h                     # Model loading API
 │   ├── inference.h                 # Inference pipeline API
-│   ├── profiler.h                  # Profiling utilities API
-│   └── trt.h                       # TensorRT engine API
+│   ├── frontend.h                  # Speech front end устройства: энкодеры + коннекторы + батчинг
+│   └── profiler.h                  # Profiling utilities API
 │
 ├── src/
 │   ├── core/                       # Ядро: аллокаторы, логгер, ошибки
@@ -387,10 +385,13 @@ vibevoice.c/
 │   │   └── special_tokens.c        # Специальные токены VibeVoice
 │   │
 │   ├── tokenizer_encoder/          # Conv-VAE speech tokenizer encoders
-│   │   └── conv_vae.c              # CPU reference для Conv-VAE
+│   │   ├── conv_vae.c              # описание архитектуры, init, число кадров
+│   │   ├── vae_plan.h              # план слоёв: контекст, шаг, хвост стриминга
+│   │   ├── vae_gpu.c               # веса/состояние/арена, батчевый encode
+│   │   └── vae_cpu.c               # CPU-энкодер: тайлы по времени, OpenMP, packed GEMM
 │   │
 │   ├── connector/                  # Speech connectors (MLP)
-│   │   └── speech_connector.c      # fc1 → RMSNorm → fc2 (no activation)
+│   │   └── speech_connector.c      # fc1 → RMSNorm → fc2 (no activation), CPU и GPU
 │   │
 │   ├── model/                      # Загрузка модели
 │   │   ├── safetensors.c           # Парсер формата safetensors
@@ -403,8 +404,7 @@ vibevoice.c/
 │   │
 │   ├── cuda/                       # CUDA ядра (.cu файлы)
 │   │   ├── dequant_nf4.cu          # NF4 dequantization kernel
-│   │   ├── conv1d.cu               # 1D causal convolution kernels
-│   │   ├── conv_vae.cu             # Conv-VAE tokenizer encoder (GPU)
+│   │   ├── vae_kernels.cu          # Conv-VAE: свёртки по таблице дескрипторов, fused mixer, GEMM с эпилогами
 │   │   ├── rmsnorm.cu              # RMSNorm kernel
 │   │   ├── rope.cu                 # Rotary Position Embeddings
 │   │   ├── attention.cu            # GQA Flash Attention (28Q/4KV)
@@ -413,16 +413,12 @@ vibevoice.c/
 │   │   ├── embedding.cu            # Embedding lookup
 │   │   └── cuda_utils.cu           # Memory management, stream helpers
 │   │
-│   ├── trt/                        # TensorRT интеграция
-│   │   ├── engine_builder.c        # Engine build from ONNX (C API)
-│   │   ├── engine_runtime.c        # Engine load & execute
-│   │   └── trt_utils.c             # Error handling, logging for TRT
-│   │
 │   ├── device/                     # device_none.c — заглушка без ускорителя
 │   ├── engine/                     # пул слотов над одной копией весов
 │   ├── server/                     # HTTP + OpenAI-совместимый API
 │   └── inference/                  # Inference pipeline
 │       ├── pipeline.c              # Полный pipeline: audio → transcript
+│       ├── frontend.c              # Speech front end на устройство, сервис батчинга
 │       ├── decoder.c               # Autoregressive decoder loop
 │       ├── kv_cache.c              # KV-cache management (paged)
 │       ├── sampling.c              # Token sampling (greedy, top-k)
@@ -435,8 +431,6 @@ vibevoice.c/
 │
 ├── tools/                          # Python утилиты (НЕ runtime)
 │   ├── convert_weights.py          # HF safetensors → .vvmodel
-│   ├── export_onnx.py              # PyTorch → ONNX (Conv-VAE encoders)
-│   ├── build_trt_engine.py         # ONNX → TensorRT .plan
 │   ├── validate_weights.py         # Сравнение C vs Python output
 │   └── requirements.txt            # Python зависимости
 │
@@ -445,6 +439,7 @@ vibevoice.c/
 │   ├── test_safetensors.c          # parser correctness
 │   ├── test_nf4.c                  # dequant vs CPU reference
 │   ├── test_conv_vae.c             # tokenizer encoder vs Python
+│   ├── test_vae_stream.c           # батч, стриминг, окна, GPU vs CPU (крошечная модель)
 │   └── test_e2e.c                  # end-to-end: audio → transcript
 │
 ├── bench/                          # Бенчмарки
@@ -455,8 +450,7 @@ vibevoice.c/
 │
 └── LICENSES/                       # Лицензии зависимостей
     ├── MIT_VibeVoice.txt
-    ├── MIT_cJSON.txt
-    └── NVIDIA_TensorRT.txt
+    └── MIT_cJSON.txt
 ```
 
 ---
@@ -490,18 +484,22 @@ vibevoice.c/
 - `--use_fast_math` для Release builds.
 - NVTX маркеры в каждом kernel-launch wrapper.
 
-### TensorRT
-- Только C API (`nvinfer_c.h` / extern "C" обёртки).
-- Engine сериализуется под конкретный GPU. Rebuild при смене GPU/драйвера.
-- Dynamic shapes обязательны (batch, seq_len).
-- TRT для Conv-VAE encoders (FP16, стандартные ops), НЕ для LLM decoder (NF4).
+### Speech-энкодер
+- Веса FP16 на устройстве — одна копия на устройство (`vv_vae_weights_t`),
+  общая для всех слотов; состояние стрима (`vv_vae_state_t`) — хвосты свёрток;
+  scratch — арена, размер которой считается из (max items, max samples) и
+  входит в бюджет placement.
+- Внутри encode — только запуски ядер на переданный stream: ни аллокаций,
+  ни `cudaFree`, ни синхронизаций (кроме `VV_ENC_STATS=1`).
+- Батч, стриминг чанками любой длины и stateless-окна дают тот же результат
+  бит в бит, что и одиночный проход; `tests/test_vae_stream.c` это проверяет.
 
 ---
 
 ## 7. Стратегия ускорения
 
 ### Приоритеты (от высшего к низшему)
-1. **TensorRT engine** для Conv-VAE Tokenizer Encoders (FP16, стандартные conv ops).
+1. **Батчевый и fused CUDA Conv-VAE** (упакованная ось времени, эпилоги GEMM, общая арена).
 2. **Custom CUDA kernels** для LLM decoder (4-bit dequant + GEMM).
 3. **cuBLAS** для FP16 GEMM (после dequant, и для connectors).
 4. **Flash Attention** (custom kernel) для long-context (128K).
@@ -509,11 +507,11 @@ vibevoice.c/
 6. **FP8 KV-cache** для экономии памяти.
 7. **Kernel fusion** (RMSNorm + QKV projection, dequant + GEMM).
 
-### Почему не TensorRT для всей модели
-- TensorRT не поддерживает NF4 нативно.
-- Conv-VAE encoders отлично ложатся на TRT (стандартные conv1d ops, FP16).
-- LLM decoder: NF4 → custom CUDA kernels + cuBLAS — полный контроль.
-- Гибрид: TRT encoders + CUDA decoder = оптимальный баланс.
+### Почему не TensorRT
+Заглушки `src/trt/` удалены: энкодер упирался не в арифметику, а в
+запуски, аллокации и синхронизации, которые TensorRT не убирает, а
+`libnvinfer` ломал обещание «только libc и libm». `--trt-acoustic` и
+`--trt-semantic` ещё один релиз разбираются и игнорируются с предупреждением.
 
 ### Memory Budget (RTX 3080, 10 GB usable)
 ```
@@ -644,7 +642,7 @@ the base model microsoft/VibeVoice-ASR or Qwen2.5-7B.
 ```bash
 export PATH=/usr/local/cuda-12.4/bin:$PATH
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
-      -DVV_ENABLE_TRT=OFF -DCMAKE_CUDA_ARCHITECTURES=86
+      -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build -j 16
 VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
@@ -668,7 +666,6 @@ scripts/build-macos.sh            # macOS, CPU-путь
 
 ```powershell
 $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2"
-$env:TENSORRT_PATH = "C:\TensorRT-10.4.0"
 
 cmake -B build -G "Visual Studio 17 2022" -A x64 `
     -DCMAKE_BUILD_TYPE=Release `
@@ -703,10 +700,6 @@ vv_cli --model ./model_hf --audio long.wav --kv-cache tq4 --gpu-layers 20
 
 # С hotwords
 vv_cli.exe --model ./model_hf --audio meeting.wav --hotwords "VibeVoice,Azure"
-
-# С TensorRT engines для tokenizer encoders
-vv_cli.exe --model ./model_hf --trt-acoustic encoder_ac.plan \
-    --trt-semantic encoder_sem.plan --audio recording.wav
 
 # С ограничением по VRAM (для 12GB карт)
 vv_cli.exe --model ./model_hf --audio recording.wav --max-seq-len 8192
@@ -827,7 +820,6 @@ Stage filter progression (encoder_n_filters=32):
 | Зависимость | Версия | Лицензия | Назначение |
 |-------------|--------|----------|------------|
 | CUDA Toolkit | 12.2+ | NVIDIA EULA | GPU runtime, nvcc, cuBLAS |
-| TensorRT | 10.x+ | NVIDIA EULA | Conv-VAE encoder engine |
 | cJSON | 1.7.x | MIT | JSON парсинг (config, output) |
 
 Все остальное — собственная реализация на C.
