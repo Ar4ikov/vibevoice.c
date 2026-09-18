@@ -37,6 +37,17 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
   цикл с горячей моделью; `mic` — живая транскрипция с VAD.
 * Веса: NF4 (bitsandbytes), AWQ, GPTQ. AWQ/GPTQ перепаковываются при
   загрузке в row-major INT4G (иначе GEMV не коалесится).
+* Неквантованные чекпоинты (BF16/F16/F32, `microsoft/VibeVoice-ASR`):
+  плотный FP16 или `--quant nf4|int4` прямо при загрузке из mmap, до
+  placement. Формат проекции определяется по dtype в файле, а не по имени
+  (U8+`.absmax` → NF4, I32 `qweight` → INT4G, float → dense); каждый тензор
+  сверяется с формой из config, отсутствующий/кривой — ошибка с именем.
+  `tie_word_embeddings` — head и embedding один буфер. BF16 dense на 3090:
+  56 tok/s, 18.7 GB; `--quant int4` — 133 tok/s, те же слова, что NF4.
+* Семейства моделей (`include/vibevoice/family.h`): `asr-7b`, `asr-bitnet`,
+  `asr-streaming-7b` — промпт, стоп-токены, нормализация, геометрия чанков.
+  Один проход по слоям — `vv_layer_tensors()`; prefill дописывает с
+  `kv->current_len` (GPU и CPU), CPU prefill идёт чанками.
 * KV-кэш: `--kv-cache fp16|fp8|fp8-e5m2|tq4|tq3|tq2|tq1.5`. На 32K позиций
   1792 → 896 / 462 / 350 / 238 / 182 MB. fp8, fp8-e5m2 и tq4 дают
   идентичный транскрипт.
@@ -619,7 +630,7 @@ VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
 `ctest` без `VV_TEST_MODEL` тоже проходит — тесты, которым нужны веса,
-рапортуют SKIP. Всего 8 наборов.
+рапортуют SKIP. Всего 17 наборов.
 
 Релизная сборка (все архитектуры, статические рантаймы, без тестов):
 

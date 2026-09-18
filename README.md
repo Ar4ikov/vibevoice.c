@@ -225,6 +225,32 @@ absurd for short clips; this pays it once.
 | **NF4** (bitsandbytes, double-quantized) | loaded directly |
 | **AWQ** (AutoAWQ) | loaded directly |
 | **GPTQ** | loaded directly (its zero points are off by one; handled) |
+| **BF16 / F16 / F32** (unquantized) | dense FP16, or `--quant nf4\|int4` at load |
+
+What a projection is gets decided by what the file holds — U8 with an
+`.absmax` next to it is NF4, an I32 `qweight` is AWQ/GPTQ, anything float is
+dense — and every tensor is checked against the config's shape; a missing or
+misshaped one fails the load with its name. `--quant auto` (the default)
+keeps the checkpoint as it is; `none`, `nf4` and `int4` apply to dense
+checkpoints and quantize each projection as it is read from the mapping,
+before placement, so the VRAM budget sees the final sizes and peak host
+memory is the quantized model plus a 32 MB slab. NF4 here is bitsandbytes'
+layout (blocks of 64, FP16 scales, no double quantization); INT4 is the
+asymmetric group-128 layout the AWQ path uses. Both are deterministic
+whatever the thread count.
+
+`microsoft/VibeVoice-ASR` (BF16, 17.3 GB) on a 3090:
+
+| `--quant` | load (warm) | VRAM | decode | RTF 11 s / 30 s / 120 s | transcript vs the NF4 checkpoint |
+|---|---|---|---|---|---|
+| `none` (FP16) | 5.3–6.9 s | 18.7 GB | 56 tok/s | 0.108 / 0.110 / 0.109 | same words on all three |
+| `nf4` | 15–24 s | 9.8 GB | 126 tok/s | 0.067 / 0.060 / 0.059 | same words; jfk and test30 byte-identical |
+| `int4` | 10–15 s | 9.7 GB | 133 tok/s | 0.064 / 0.059 / 0.058 | same words |
+
+Where they differ it is in timestamps (at most 0.06 s, 0.44 s once for
+`int4`) and in one speaker label: on test30, whose middle clip is a
+different voice, dense BF16 and `int4` call it Speaker 1 while the NF4
+checkpoint calls everything Speaker 0.
 
 AWQ and GPTQ store weights K-major with the eight columns of a word
 interleaved, which is the wrong orientation for a GEMV — walking `k` for one
@@ -498,7 +524,7 @@ the performance cores. **There is no Metal backend.** See "Not done" below.
 VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
-Thirteen suites. The ones that need weights report SKIP without
+Seventeen suites. The ones that need weights report SKIP without
 `VV_TEST_MODEL`. `test_cpu_kernels` checks every CPU kernel against a scalar
 reference, which is what makes the SIMD paths verifiable per architecture —
 it passes natively on AVX2 and under `qemu-aarch64` on NEON, both to 4e-7
@@ -510,13 +536,20 @@ relative.
 
 | what | where |
 |---|---|
+| BF16 original (dense, or `--quant nf4\|int4`) | [`microsoft/VibeVoice-ASR`](https://huggingface.co/microsoft/VibeVoice-ASR) |
 | NF4 weights (bitsandbytes) | [`scerz/VibeVoice-ASR-4bit`](https://huggingface.co/scerz/VibeVoice-ASR-4bit) |
 | AWQ weights (W4A16, asymmetric) | [`Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM`](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM) |
 | `tokenizer.json` | [`microsoft/VibeVoice-ASR`](https://huggingface.co/microsoft/VibeVoice-ASR) or Qwen2.5-7B |
 
-Either checkpoint works; point `--model` at the directory. The NF4 repo does
-not ship tokenizer files, so drop `tokenizer.json` next to the safetensors.
-The AWQ repo already carries its own.
+Any of them works; point `--model` at the directory. The NF4 and BF16 repos
+do not ship tokenizer files, so drop `tokenizer.json` next to the
+safetensors. The AWQ repo already carries its own.
+
+The loader also recognises `microsoft/VibeVoice-ASR-BitNet` (1.5B, tied head)
+and `microsoft/VibeVoice-ASR-Streaming-7B` by their configs. The streaming
+model generates chunk by chunk on a persistent KV cache, which a one-shot
+`vv_cli` run refuses for now; its prompt, stop tokens and chunk geometry are
+in place in `src/inference/family.c`.
 
 ---
 
