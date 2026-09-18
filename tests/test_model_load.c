@@ -26,9 +26,12 @@
 #ifdef _WIN32
 #include <direct.h>
 #define MKDIR(p) _mkdir(p)
+#define RMDIR(p) _rmdir(p)
 #else
 #include <sys/stat.h>
+#include <unistd.h>
 #define MKDIR(p) mkdir(p, 0755)
+#define RMDIR(p) rmdir(p)
 #endif
 
 #ifndef VV_TEST_DATA_DIR
@@ -521,6 +524,10 @@ int main(void) {
     test_family_logic();
     test_dense_load();
     test_load_quant();
+    /* Leave nothing behind in the directory ctest runs from. */
+    remove("test_model_load_dense/config.json");
+    remove("test_model_load_dense/model.safetensors");
+    RMDIR("test_model_load_dense");
     for (int i = 0; i < g_n; i++) free(g_t[i].data);
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures,
            failures == 1 ? "" : "s");
