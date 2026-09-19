@@ -395,6 +395,9 @@ GEMVs for decode, `maddubs`/VNNI/`sdot` on the CPU. The epilogue is
 - `--quant w8a8` / `--quant w4a8` quantize a dense checkpoint at load
   (per-channel int8; asymmetric group-128 int4 on the W4A16 layout).
   `--quant w4a8` on an AWQ checkpoint runs its codes and scales unchanged.
+  The NF4 checkpoint is not accepted as W4A8: its codes index a
+  non-uniform table, and re-rounding them onto an int4 grid (tried) made
+  the 32-minute file run on to the KV limit. It keeps its W4A16 path.
 - **compressed-tensors** checkpoints from llm-compressor
   (`int-quantized` / `pack-quantized`, `input_activations.dynamic`) load as
   they are; `tests/test_model_load.c` checks the loader integer for integer.

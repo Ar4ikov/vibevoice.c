@@ -41,7 +41,8 @@ Write the entry for a change under Unreleased in the same pull request.
 - W8A8 and W4A8: activations quantized to int8 per token, int8 × int8 on
   the s8 tensor cores for prefill and `dp4a` GEMVs for decode, with no FP16
   weight copy anywhere. `--quant w8a8|w4a8` quantizes a BF16 checkpoint at
-  load; `--quant w4a8` also runs an AWQ checkpoint exactly;
+  load; `--quant w4a8` also runs an AWQ checkpoint exactly (not the NF4
+  one: its codes are not integers);
   compressed-tensors checkpoints (llm-compressor `int-quantized` /
   `pack-quantized`, dynamic int8 activations) load directly. SmoothQuant
   folds in at load from a built-in calibration pass (`--calib <audio>`,
