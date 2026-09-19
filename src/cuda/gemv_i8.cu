@@ -12,11 +12,12 @@
  * by sx * sw at the end.
  *
  * W4A8: each lane reads 32 weights (16 bytes) per step, all inside one group
- * because G is a multiple of 32. The nibbles are used as unsigned bytes
- * (0..15) straight from the packed word: `w & 0x0F0F0F0F` gives the odd
- * columns and `(w >> 4) & 0x0F0F0F0F` the even ones, and the activation word
- * pair is split the same way with two byte permutes. The zero point is
- * applied once per 32 weights through the quantizer's xsum:
+ * because G is a multiple of 32. The weights are the W4A16 GPU layout, and
+ * the activations come in the matching VV_Q8_W4_GEMV order, so the nibbles
+ * are used as unsigned bytes (0..15) straight from the packed word:
+ * `w & 0x0F0F0F0F` and `(w >> 4) & 0x0F0F0F0F` each meet one activation word
+ * with no shuffle. The zero point is applied once per 32 weights through the
+ * quantizer's xsum:
  *
  *   sum (q - z) x = sum q x - z * sum x
  *
@@ -76,7 +77,7 @@ w8a8_gemv_kernel(const vv_i8_args p)
     }
 }
 
-template <int MR, bool NIB>
+template <int MR>
 __global__ void __launch_bounds__(32 * I8_GEMV_WARPS)
 w4a8_gemv_kernel(const vv_i8_args p)
 {
@@ -86,8 +87,7 @@ w4a8_gemv_kernel(const vv_i8_args p)
     const int chunks = p.K >> 5;               /* 32 weights = 16 bytes */
     const int ng = p.K / p.G;
     const uint4* wr = (const uint4*)((const uint8_t*)p.w + (size_t)n * (p.K >> 1));
-    const half* srow = p.scales + (size_t)n * ng;
-    const uint8_t* zrow = p.zeros + (size_t)n * ng;
+    const half2* szrow = p.sz + (size_t)n * ng;
 
     float acc[MR];
 #pragma unroll
@@ -97,36 +97,32 @@ w4a8_gemv_kernel(const vv_i8_args p)
     for (int c = lane; c < chunks; c += 32) {
         const uint4 wv = __ldg(wr + c);
         const int g = (c << 5) / p.G;
-        const float s = __half2float(srow[g]);
-        const int z = (int)zrow[g];
+        const float2 sz = __half22float2(__ldg(szrow + g));
+        const int z = (int)sz.y;
         const uint32_t wa[4] = { wv.x, wv.y, wv.z, wv.w };
-        uint32_t hi[4], lo[4];
+        uint32_t ev[4], od[4];
 #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            hi[i] = (wa[i] >> 4) & 0x0F0F0F0Fu;   /* k = 8i + 0, 2, 4, 6 */
-            lo[i] = wa[i] & 0x0F0F0F0Fu;          /* k = 8i + 1, 3, 5, 7 */
+        for (int t = 0; t < 4; t++) {
+            ev[t] = wa[t] & 0x0F0F0F0Fu;          /* slots 0, 2, 4, 6 */
+            od[t] = (wa[t] >> 4) & 0x0F0F0F0Fu;   /* slots 1, 3, 5, 7 */
         }
 #pragma unroll
         for (int m = 0; m < MR; m++) {
+            /* VV_Q8_W4_GEMV: bytes 8t..8t+3 are word t's even slots,
+             * 8t+4..8t+7 its odd ones. */
             const int4* xp = (const int4*)(p.xq + (size_t)m * p.K + (c << 5));
             const int4 xa = __ldg(xp), xb = __ldg(xp + 1);
-            const uint32_t xw[8] = { (uint32_t)xa.x, (uint32_t)xa.y,
-                                     (uint32_t)xa.z, (uint32_t)xa.w,
-                                     (uint32_t)xb.x, (uint32_t)xb.y,
-                                     (uint32_t)xb.z, (uint32_t)xb.w };
             int dot = 0;
-#pragma unroll
-            for (int i = 0; i < 4; i++) {
-                /* nibble layout: evens are words 0-3, odds words 4-7 */
-                const uint32_t ev = NIB ? xw[i]
-                    : __byte_perm(xw[2 * i], xw[2 * i + 1], 0x6420);
-                const uint32_t od = NIB ? xw[4 + i]
-                    : __byte_perm(xw[2 * i], xw[2 * i + 1], 0x7531);
-                dot = i8_dp4a((int)hi[i], (int)ev, dot);
-                dot = i8_dp4a((int)lo[i], (int)od, dot);
-            }
+            dot = i8_dp4a((int)ev[0], xa.x, dot);
+            dot = i8_dp4a((int)od[0], xa.y, dot);
+            dot = i8_dp4a((int)ev[1], xa.z, dot);
+            dot = i8_dp4a((int)od[1], xa.w, dot);
+            dot = i8_dp4a((int)ev[2], xb.x, dot);
+            dot = i8_dp4a((int)od[2], xb.y, dot);
+            dot = i8_dp4a((int)ev[3], xb.z, dot);
+            dot = i8_dp4a((int)od[3], xb.w, dot);
             const int xs = __ldg(p.xsum + (size_t)m * chunks + c);
-            acc[m] = fmaf(s, (float)(dot - z * xs), acc[m]);
+            acc[m] = fmaf(sz.x, (float)(dot - z * xs), acc[m]);
         }
     }
 
@@ -140,9 +136,7 @@ w4a8_gemv_kernel(const vv_i8_args p)
 #define I8_GEMV_CASE(KERN, MR)                                               \
     case MR: KERN<MR><<<grid, block, 0, st>>>(p); break;
 #define I8_W4_CASE(MR)                                                       \
-    case MR: if (p.x_nibble) w4a8_gemv_kernel<MR, true><<<grid, block, 0, st>>>(p); \
-             else w4a8_gemv_kernel<MR, false><<<grid, block, 0, st>>>(p);   \
-             break;
+    case MR: w4a8_gemv_kernel<MR><<<grid, block, 0, st>>>(p); break;
 
 /** @brief Launch the M <= 8 kernels; `w4` picks the weight format. */
 extern "C" vv_status_t vv_i8_gemv_launch(const vv_i8_args* ap, int w4,
@@ -152,9 +146,9 @@ extern "C" vv_status_t vv_i8_gemv_launch(const vv_i8_args* ap, int w4,
     if (p.M < 1 || p.M > 8) return VV_ERR_UNSUPPORTED;
     if (w4) {
         if ((p.K & 31) != 0 || !p.xsum || p.G <= 0 || (p.G & 31) != 0 ||
-            (p.K % p.G) != 0)
+            (p.K % p.G) != 0 || p.x_layout != VV_Q8_W4_GEMV)
             return VV_ERR_UNSUPPORTED;
-    } else if ((p.K & 15) != 0) {
+    } else if ((p.K & 15) != 0 || p.x_layout != VV_Q8_NATURAL) {
         return VV_ERR_UNSUPPORTED;
     }
     const dim3 block(32, I8_GEMV_WARPS);

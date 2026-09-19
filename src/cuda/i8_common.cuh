@@ -18,15 +18,14 @@ struct vv_i8_args {
     const int8_t*  xq;       /* [M][K] int8 activations                     */
     const float*   sx;       /* [M] per-token scale                         */
     const int32_t* xsum;     /* [M][K/32] sums of xq (W4A8 GEMV)            */
-    const void*    w;        /* W8: int8 [N][K]; W4: uint8 [N][K/2]         */
+    const void*    w;        /* W8: int8 [N][K]; W4: GPU-layout [N][K/2]    */
     const float*   sw;       /* W8: FP32 [N]                                */
-    const half*    scales;   /* W4: FP16 [N][K/G]                           */
-    const uint8_t* zeros;    /* W4: uint8 [N][K/G]                          */
+    const half2*   sz;       /* W4: {scale, zero} [N][K/G]                  */
     const half*    bias;     /* [N] or NULL                                 */
     const half*    res;      /* [M][N] or NULL; may alias y                 */
     void*          y;        /* [M][N] FP16, or FP32 when y_f32             */
     int y_f32;
-    int x_nibble;            /* xq in VV_Q8_NIBBLE order (W4A8 GEMV only)   */
+    int x_layout;            /* vv_q8_layout_t of xq                        */
     int M, N, K, G;
 };
 
@@ -51,16 +50,16 @@ __device__ __forceinline__ int i8_dp4a(int a, int b, int c) {
 }
 
 /**
- * @brief Four nibbles -> four signed bytes (q - z), in k order.
+ * @brief Four nibbles of a W4A16 GPU-layout word -> four signed bytes q - z.
  *
- * `w2` holds two packed bytes (k0<<4|k1, k2<<4|k3) in its low 16 bits.
- * `zrep` is the zero point replicated into all four bytes. The difference is
- * in [-15, 15], so it is exact as s8 and the MMA needs no correction term.
+ * `h` holds nibble slots 0..3 (or 4..7, shifted down) in its low 16 bits;
+ * byte i of the result is slot i. `zrep` is the zero point replicated into
+ * all four bytes. The difference is in [-15, 15], exact as s8, so the MMA
+ * needs no correction term.
  */
-__device__ __forceinline__ uint32_t i8_unpack4_sub(uint32_t w2, uint32_t zrep) {
-    const uint32_t hi = (w2 >> 4) & 0x0F0Fu;   /* k0, k2 */
-    const uint32_t lo = w2 & 0x0F0Fu;          /* k1, k3 */
-    const uint32_t v = __byte_perm(hi, lo, 0x5140);
+__device__ __forceinline__ uint32_t i8_unpack4_sub(uint32_t h, uint32_t zrep) {
+    const uint32_t a = __byte_perm(h, 0u, 0x4140);   /* b0, 0, b1, 0 */
+    const uint32_t v = (a & 0x000F000Fu) | ((a << 4) & 0x0F000F00u);
     return __vsub4(v, zrep);
 }
 

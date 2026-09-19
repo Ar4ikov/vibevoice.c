@@ -24,6 +24,7 @@
 #include "vibevoice/vibevoice.h"
 #include "vibevoice/device.h"
 #include "vibevoice/cpu_kernels.h"
+#include "vibevoice/quant.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -55,7 +56,7 @@ static double now_ms(void) {
 
 /* ─── Reference quantizer ───────────────────────────────────────────────── */
 
-static void ref_quant(const float* x, int K, int nibble, int8_t* q, float* sx,
+static void ref_quant(const float* x, int K, int layout, int8_t* q, float* sx,
                       int32_t* xs) {
     float amax = 0.0f;
     for (int k = 0; k < K; k++) if (fabsf(x[k]) > amax) amax = fabsf(x[k]);
@@ -69,8 +70,7 @@ static void ref_quant(const float* x, int K, int nibble, int8_t* q, float* sx,
             if (v > 127) v = 127;
             if (v < -127) v = -127;
             s += (int)v;
-            const int d = nibble ? ((j & 1) ? 16 + j / 2 : j / 2) : j;
-            q[c * 32 + d] = (int8_t)v;
+            q[c * 32 + vv_q8_pos(layout, j)] = (int8_t)v;
         }
         xs[c] = s;
     }
@@ -92,7 +92,7 @@ static void test_cpu_quantizer(void) {
         int32_t* xs = (int32_t*)malloc((size_t)M * K / 32 * 4);
         int32_t* rs = (int32_t*)malloc((size_t)M * K / 32 * 4);
         float sx[5], rx[5];
-        for (int nib = 0; nib < 2; nib++) {
+        for (int nib = 0; nib < VV_Q8_LAYOUT_COUNT; nib++) {
             vv_quant_act_q8_cpu(x, M, K, nib, q, sx, xs);
             int bad = 0;
             for (int m = 0; m < M; m++) {
@@ -120,6 +120,9 @@ typedef struct {
     float* sone;         /* all 1.0       */
     uint8_t* z4;         /* [N][K/G]      */
     uint16_t* bias;      /* [N] FP16      */
+    uint8_t* w4g;        /* w4 in the W4A16 GPU layout          */
+    uint16_t* sz;        /* half2 {s4, z4} [N][K/G]             */
+    uint16_t* szone;     /* half2 {1, z4}                       */
 } problem_t;
 
 static problem_t make_problem(int N, int K, int G) {
@@ -150,12 +153,26 @@ static problem_t make_problem(int N, int K, int G) {
         p.s4one[i] = vv_float_to_half(1.0f);
         p.z4[i] = (uint8_t)(rnd() % 16);
     }
+    /* What the GPU reads: the same codes, rearranged by the conversion the
+       loader uses, and the group data as half2 {scale, zero}. */
+    p.w4g = (uint8_t*)malloc((size_t)N * K / 2);
+    p.sz = (uint16_t*)malloc((size_t)N * ng * 4);
+    p.szone = (uint16_t*)malloc((size_t)N * ng * 4);
+    memcpy(p.w4g, p.w4, (size_t)N * K / 2);
+    vv_int4g_to_gpu_layout(p.w4g, p.s4, p.z4, N, K, G, p.sz);
+    {
+        uint8_t* tmp = (uint8_t*)malloc((size_t)N * K / 2);
+        memcpy(tmp, p.w4, (size_t)N * K / 2);
+        vv_int4g_to_gpu_layout(tmp, p.s4one, p.z4, N, K, G, p.szone);
+        free(tmp);
+    }
     return p;
 }
 
 static void free_problem(problem_t* p) {
     free(p->w8); free(p->w4); free(p->sw); free(p->sone); free(p->s4);
-    free(p->s4one); free(p->z4); free(p->bias);
+    free(p->s4one); free(p->z4); free(p->bias); free(p->w4g); free(p->sz);
+    free(p->szone);
 }
 
 /* Exact integer parts for one (m, n). W4: per group (sum (q - z) x). */
@@ -302,7 +319,7 @@ static void test_gpu_quantizers(void* st) {
         int32_t* rxs = (int32_t*)malloc((size_t)M * (K / 32) * 4);
         uint16_t* hy = (uint16_t*)malloc(n * 2);
 
-        for (int wl = 0; wl < 6; wl++) {
+        for (int wl = 0; wl < 3 * VV_Q8_LAYOUT_COUNT; wl++) {
             const int which = wl % 3, lay = wl / 3;
             vv_status_t s;
             if (which == 0) {
@@ -337,7 +354,7 @@ static void test_gpu_quantizers(void* st) {
 }
 
 typedef struct {
-    void *w8, *sw, *sone, *w4, *s4, *s4one, *z4, *bias;
+    void *w8, *sw, *sone, *w4, *sz, *szone, *bias;
 } dev_problem_t;
 
 static dev_problem_t upload(const problem_t* p) {
@@ -346,18 +363,17 @@ static dev_problem_t upload(const problem_t* p) {
     d.w8 = dup_dev(p->w8, (size_t)p->N * p->K);
     d.sw = dup_dev(p->sw, (size_t)p->N * 4);
     d.sone = dup_dev(p->sone, (size_t)p->N * 4);
-    d.w4 = dup_dev(p->w4, (size_t)p->N * p->K / 2);
-    d.s4 = dup_dev(p->s4, ng * 2);
-    d.s4one = dup_dev(p->s4one, ng * 2);
-    d.z4 = dup_dev(p->z4, ng);
+    d.w4 = dup_dev(p->w4g, (size_t)p->N * p->K / 2);
+    d.sz = dup_dev(p->sz, ng * 4);
+    d.szone = dup_dev(p->szone, ng * 4);
     d.bias = dup_dev(p->bias, (size_t)p->N * 2);
     return d;
 }
 
 static void free_dev(dev_problem_t* d) {
     vv_dev_free(d->w8); vv_dev_free(d->sw); vv_dev_free(d->sone);
-    vv_dev_free(d->w4); vv_dev_free(d->s4); vv_dev_free(d->s4one);
-    vv_dev_free(d->z4); vv_dev_free(d->bias);
+    vv_dev_free(d->w4); vv_dev_free(d->sz); vv_dev_free(d->szone);
+    vv_dev_free(d->bias);
 }
 
 static void test_gpu_linear(const problem_t* p, const dev_problem_t* d, int M,
@@ -371,14 +387,18 @@ static void test_gpu_linear(const problem_t* p, const dev_problem_t* d, int M,
     float* one = (float*)malloc((size_t)M * 4);
     int32_t* xs = (int32_t*)malloc((size_t)M * (K / 32) * 4);
     vv_quant_act_q8_cpu(x, M, K, VV_Q8_NATURAL, xq, sx, xs);
+    /* The W4 kernels read the GPU-layout orders: GEMV and MMA/SIMT. */
     int8_t* xqn = (int8_t*)malloc(mk);
-    vv_quant_act_q8_cpu(x, M, K, VV_Q8_NIBBLE, xqn, sx, xs);
+    int8_t* xqm = (int8_t*)malloc(mk);
+    vv_quant_act_q8_cpu(x, M, K, VV_Q8_W4_GEMV, xqn, sx, xs);
+    vv_quant_act_q8_cpu(x, M, K, VV_Q8_W4_MMA, xqm, sx, xs);
     for (int m = 0; m < M; m++) one[m] = 1.0f;
     uint16_t* res = (uint16_t*)malloc(mn * 2);
     for (size_t i = 0; i < mn; i++) res[i] = vv_float_to_half(frand());
 
     int8_t* dxq = (int8_t*)dup_dev(xq, mk);
     int8_t* dxqn = (int8_t*)dup_dev(xqn, mk);
+    int8_t* dxqm = (int8_t*)dup_dev(xqm, mk);
     float* dsx = (float*)dup_dev(sx, (size_t)M * 4);
     float* done = (float*)dup_dev(one, (size_t)M * 4);
     int32_t* dxs = (int32_t*)dup_dev(xs, (size_t)M * (K / 32) * 4);
@@ -396,15 +416,15 @@ static void test_gpu_linear(const problem_t* p, const dev_problem_t* d, int M,
     for (int pi = 0; pi < 3; pi++) {
         const int path = paths[pi];
         if (path == VV_I8_PATH_GEMV && M > 8) continue;
-        for (int w4l = 0; w4l < 3; w4l++) {
-            /* 0: W8A8, 1: W4A8 natural, 2: W4A8 nibble (GEMV only) */
-            const int w4 = w4l > 0, lay = w4l == 2;
-            if (lay && path != VV_I8_PATH_GEMV) continue;
-            const int8_t* ax = lay ? dxqn : dxq;
+        for (int w4 = 0; w4 < 2; w4++) {
+            /* W8A8 reads natural order; W4A8 the GEMV or the MMA order. */
+            const int lay = !w4 ? VV_Q8_NATURAL
+                          : path == VV_I8_PATH_GEMV ? VV_Q8_W4_GEMV : VV_Q8_W4_MMA;
+            const int8_t* ax = lay == VV_Q8_W4_GEMV ? dxqn
+                             : lay == VV_Q8_W4_MMA ? dxqm : dxq;
             /* exact integer part */
             vv_status_t s = w4
-                ? vv_w4a8_linear_dev(ax, lay, done, dxs, (const uint8_t*)d->w4,
-                                     d->s4one, (const uint8_t*)d->z4, p->G,
+                ? vv_w4a8_linear_dev(ax, lay, done, dxs, d->w4, d->szone, p->G,
                                      NULL, NULL, dy, 1, M, N, K, path, st)
                 : vv_w8a8_linear_dev(dxq, done, (const int8_t*)d->w8,
                                      (const float*)d->sone, NULL, NULL, dy, 1,
@@ -424,14 +444,13 @@ static void test_gpu_linear(const problem_t* p, const dev_problem_t* d, int M,
                 }
             }
             CHECK(s == VV_OK && bad == 0, "gpu %s %s exact M=%d N=%d K=%d: "
-                  "%d/%d (status %d)", lay ? "w4a8/nib" : w4 ? "w4a8" : "w8a8",
+                  "%d/%d (status %d)", w4 ? "w4a8" : "w8a8",
                   pn[path], M, N, K, bad, cnt, (int)s);
 
             /* real scales, bias and a residual, FP16 out (y = res + ...) */
             vv_dev_memcpy_h2d(dy, res, mn * 2, NULL);
             s = w4
-                ? vv_w4a8_linear_dev(ax, lay, dsx, dxs, (const uint8_t*)d->w4,
-                                     d->s4, (const uint8_t*)d->z4, p->G,
+                ? vv_w4a8_linear_dev(ax, lay, dsx, dxs, d->w4, d->sz, p->G,
                                      d->bias, dy, dy, 0, M, N, K, path, st)
                 : vv_w8a8_linear_dev(dxq, dsx, (const int8_t*)d->w8,
                                      (const float*)d->sw, d->bias, dy, dy, 0,
@@ -453,13 +472,14 @@ static void test_gpu_linear(const problem_t* p, const dev_problem_t* d, int M,
                 if (err > tol) bad++;
             }
             CHECK(s == VV_OK && bad == 0, "gpu %s %s fp16 M=%d N=%d K=%d: %d/%d "
-                  "worst %.2f tol", lay ? "w4a8/nib" : w4 ? "w4a8" : "w8a8",
+                  "worst %.2f tol", w4 ? "w4a8" : "w8a8",
                   pn[path], M, N, K, bad, cnt, worst);
         }
     }
-    vv_dev_free(dxq); vv_dev_free(dxqn); vv_dev_free(dsx); vv_dev_free(done);
+    vv_dev_free(dxq); vv_dev_free(dxqn); vv_dev_free(dxqm); vv_dev_free(dsx);
+    vv_dev_free(done);
     vv_dev_free(dxs); vv_dev_free(dres); vv_dev_free(dy);
-    free(xqn); free(x); free(xq); free(sx); free(one); free(xs); free(res); free(yf);
+    free(xqn); free(xqm); free(x); free(xq); free(sx); free(one); free(xs); free(res); free(yf);
     free(yh);
 }
 
@@ -497,8 +517,8 @@ static void bench(void* st) {
                     vv_dev_stream_sync(st);
                     const double t0 = now_ms();
                     for (int r = 0; r < 20; r++) {
-                        if (w4) vv_w4a8_linear_dev(dxq, vv_w4a8_layout_for(M), dsx, dxs, (const uint8_t*)d.w4,
-                                                   d.s4, (const uint8_t*)d.z4, 128,
+                        if (w4) vv_w4a8_linear_dev(dxq, vv_w4a8_layout_for(M),
+                                                   dsx, dxs, d.w4, d.sz, 128,
                                                    NULL, NULL, dy, 0, M, N, K,
                                                    VV_I8_PATH_AUTO, st);
                         else    vv_w8a8_linear_dev(dxq, dsx, (const int8_t*)d.w8,
@@ -516,8 +536,7 @@ static void bench(void* st) {
                 printf("  %-13s %s  M=%-5d %8.3f ms  %7.1f TOPS  %7.1f GB/s\n",
                        sh[si].nm, w4 ? "W4A8 " : "W8A8 ", M, best, tops, gbs);
             }
-            /* The path these replace: INT4G W4A16 (fused M <= 8, else
-             * dequantize into a scratch and run the FP16 WMMA GEMM). */
+            /* The same weights on FP16 activations: the W4A16 kernels. */
             {
                 void* dx = dup_dev(NULL, (size_t)M * K * 2);
                 vv_dev_memset(dx, 0, (size_t)M * K * 2);
@@ -528,13 +547,12 @@ static void bench(void* st) {
                     const double t0 = now_ms();
                     for (int r = 0; r < 20; r++) {
                         if (M == 1)
-                            vv_awq_gemv_dev(dx, (const uint32_t*)d.w4,
-                                            (const uint32_t*)d.s4, d.s4, NULL,
-                                            dy, N, K, 128, st);
+                            vv_w4a16_gemv_dev(dx, d.w4, d.sz, NULL, dy, N, K,
+                                              128, st);
                         else
-                            vv_awq_gemm_dev(dx, (const uint32_t*)d.w4,
-                                            (const uint32_t*)d.s4, d.s4, dy,
-                                            scratch, M, N, K, 128, st);
+                            vv_w4a16_gemm_dev(dx, d.w4, d.sz, NULL, dy,
+                                              scratch, (size_t)N * K * 2,
+                                              M, N, K, 128, st);
                     }
                     vv_dev_stream_sync(st);
                     const double t = (now_ms() - t0) / 20.0;

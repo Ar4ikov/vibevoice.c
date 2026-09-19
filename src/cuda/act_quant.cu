@@ -50,14 +50,28 @@ __device__ __forceinline__ float aq_block_max(float v, float* red) {
     return red[0];
 }
 
+/** Where column j of a 32-column run goes: vv_q8_pos(), on the device. */
+__device__ __forceinline__ int aq_pos(int layout, int j) {
+    const int e = j & 1, t = (j >> 1) & 3, s = (j >> 3) + 4 * e;
+    switch (layout) {
+    case VV_Q8_NIBBLE:  return e ? 16 + (j >> 1) : (j >> 1);
+    case VV_Q8_W4_GEMV: return 8 * t + 4 * (s & 1) + (s >> 1);
+    case VV_Q8_W4_MMA:  return 16 * e + 4 * t + (s & 3);
+    default:            return j;
+    }
+}
+
 /**
  * @brief Quantize the FP16 row held in shared memory.
  *
  * Thread t owns 8-element chunks t, t + 256, ...; four consecutive threads
- * cover one 32-column run, which is what the xsum needs.
+ * cover one 32-column run, which is what the xsum needs. The natural and
+ * nibble layouts store whole words; the two W4 GPU layouts scatter the
+ * chunk's bytes across the run (vv_q8_pos), which costs nothing next to the
+ * GEMM that reads them.
  */
 __device__ __forceinline__ void aq_quantize_row(
-    const half* row, int K, int nibble, int8_t* xq, float* sx,
+    const half* row, int K, int layout, int8_t* xq, float* sx,
     int32_t* xsum, float* red)
 {
     const int tid = threadIdx.x;
@@ -86,8 +100,16 @@ __device__ __forceinline__ void aq_quantize_row(
                 if (j < 4) lo |= b << (8 * j);
                 else       hi |= b << (8 * (j - 4));
             }
-            if (!nibble) {
+            if (layout == VV_Q8_NATURAL) {
                 *(uint2*)(xq + (c << 3)) = make_uint2(lo, hi);
+            } else if (layout != VV_Q8_NIBBLE) {
+                int8_t* run = xq + ((c >> 2) << 5);
+                const int j0 = (c & 3) << 3;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const uint32_t w = j < 4 ? lo : hi;
+                    run[aq_pos(layout, j0 + j)] = (int8_t)(w >> (8 * (j & 3)));
+                }
             } else {
                 /* chunk c is columns 8i..8i+7 of its 32-run, i = c & 3:
                  * its evens land at 4i.., its odds at 16 + 4i.. */
@@ -107,7 +129,7 @@ __device__ __forceinline__ void aq_quantize_row(
 }
 
 __global__ void act_quant_kernel(const half* __restrict__ x, int K,
-                                 int nibble, int8_t* __restrict__ xq,
+                                 int layout, int8_t* __restrict__ xq,
                                  float* __restrict__ sx,
                                  int32_t* __restrict__ xsum)
 {
@@ -119,7 +141,7 @@ __global__ void act_quant_kernel(const half* __restrict__ x, int K,
     for (int c = threadIdx.x; c < (K >> 3); c += AQ_THREADS)
         ((uint4*)row)[c] = ((const uint4*)xr)[c];
     __syncthreads();
-    aq_quantize_row(row, K, nibble, xq + r * K, sx + r,
+    aq_quantize_row(row, K, layout, xq + r * K, sx + r,
                     xsum ? xsum + r * (K >> 5) : NULL, red);
 }
 
@@ -130,7 +152,7 @@ __global__ void act_quant_kernel(const half* __restrict__ x, int K,
  */
 __global__ void rmsnorm_q8_kernel(const half* __restrict__ x,
                                   const half* __restrict__ weight, int K,
-                                  float eps, int nibble,
+                                  float eps, int layout,
                                   int8_t* __restrict__ xq,
                                   float* __restrict__ sx,
                                   int32_t* __restrict__ xsum)
@@ -162,14 +184,14 @@ __global__ void rmsnorm_q8_kernel(const half* __restrict__ x,
         row[i] = __float2half(v * rms * w);
     }
     __syncthreads();
-    aq_quantize_row(row, K, nibble, xq + r * K, sx + r,
+    aq_quantize_row(row, K, layout, xq + r * K, sx + r,
                     xsum ? xsum + r * (K >> 5) : NULL, red);
 }
 
 /* The FP16 value is swiglu_vec2_kernel's (swiglu.cu): same expression. */
 __global__ void swiglu_q8_kernel(const half* __restrict__ gate,
                                  const half* __restrict__ up, int K,
-                                 int nibble, int8_t* __restrict__ xq,
+                                 int layout, int8_t* __restrict__ xq,
                                  float* __restrict__ sx,
                                  int32_t* __restrict__ xsum)
 {
@@ -191,7 +213,7 @@ __global__ void swiglu_q8_kernel(const half* __restrict__ gate,
         row2[i] = __floats2half2_rn(s0, s1);
     }
     __syncthreads();
-    aq_quantize_row((const half*)row2, K, nibble, xq + r * K, sx + r,
+    aq_quantize_row((const half*)row2, K, layout, xq + r * K, sx + r,
                     xsum ? xsum + r * (K >> 5) : NULL, red);
 }
 
@@ -205,14 +227,19 @@ static vv_status_t aq_check(int M, int K, const void* a, const int8_t* xq,
     return VV_OK;
 }
 
+static bool aq_layout_ok(int layout) {
+    return layout >= 0 && layout < VV_Q8_LAYOUT_COUNT;
+}
+
 vv_status_t vv_act_quant_dev(const void* x, int M, int K, int layout,
                              int8_t* xq, float* sx, int32_t* xsum,
                              void* stream)
 {
     vv_status_t s = aq_check(M, K, x, xq, sx);
     if (s != VV_OK) return s;
+    if (!aq_layout_ok(layout)) return VV_ERR_INVALID_ARG;
     act_quant_kernel<<<M, AQ_THREADS, (size_t)K * 2, (cudaStream_t)stream>>>(
-        (const half*)x, K, layout == VV_Q8_NIBBLE, xq, sx, xsum);
+        (const half*)x, K, layout, xq, sx, xsum);
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
@@ -224,10 +251,11 @@ vv_status_t vv_rmsnorm_q8_dev(const void* x, const void* weight,
     vv_status_t s = aq_check(M, K, x, xq, sx);
     if (s != VV_OK) return s;
     if (!weight) return VV_ERR_NULL_PTR;
+    if (!aq_layout_ok(layout)) return VV_ERR_INVALID_ARG;
     /* vv_rmsnorm_dev narrows its block below 256 columns; match it or bail. */
     if (K < AQ_THREADS) return VV_ERR_UNSUPPORTED;
     rmsnorm_q8_kernel<<<M, AQ_THREADS, (size_t)K * 2, (cudaStream_t)stream>>>(
-        (const half*)x, (const half*)weight, K, eps, layout == VV_Q8_NIBBLE,
+        (const half*)x, (const half*)weight, K, eps, layout,
         xq, sx, xsum);
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
@@ -239,8 +267,9 @@ vv_status_t vv_swiglu_q8_dev(const void* gate, const void* up, int M, int K,
     vv_status_t s = aq_check(M, K, gate, xq, sx);
     if (s != VV_OK) return s;
     if (!up) return VV_ERR_NULL_PTR;
+    if (!aq_layout_ok(layout)) return VV_ERR_INVALID_ARG;
     swiglu_q8_kernel<<<M, AQ_THREADS, (size_t)K * 2, (cudaStream_t)stream>>>(
-        (const half*)gate, (const half*)up, K, layout == VV_Q8_NIBBLE,
+        (const half*)gate, (const half*)up, K, layout,
         xq, sx, xsum);
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }

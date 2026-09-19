@@ -14,11 +14,12 @@
  *     chunk index XORed by (row >> 1) & 3, which makes every ldmatrix phase
  *     hit eight distinct bank groups;
  *   - W8A8 loads B with ldmatrix.x4 (two n8 fragments per instruction);
- *   - W4A8 keeps B packed in shared memory (rows padded to 48 bytes, which is
- *     conflict-free for the 16-bit reads below) and expands each fragment in
- *     registers: two nibble masks and a byte permute give four k-ordered
- *     codes, and one __vsub4 subtracts the replicated zero point. The result
- *     is in [-15, 15], so the MMA accumulates the exact integer
+ *   - W4A8 reads the W4A16 GPU layout as it is and keeps B packed in shared
+ *     memory (rows padded to 48 bytes, conflict-free for the word reads
+ *     below). The activations come in the matching VV_Q8_W4_MMA order, so a
+ *     lane's two B registers are the two halves of one packed word: a byte
+ *     permute, two masks and one __vsub4 of the replicated zero point each.
+ *     The result is in [-15, 15], so the MMA accumulates the exact integer
  *     sum (q - z) x of the group; at every group boundary it is scaled by
  *     s[n, g] into an FP32 accumulator.
  *   - epilogue: acc * sx[m] (* sw[n]) + bias[n] (+ residual), FP16 out.
@@ -196,7 +197,8 @@ i8_mma_kernel(const vv_i8_args p)
 #pragma unroll
         for (int j = 0; j < (W4 ? NI : 1); j++) {
             const int gn = n0 + wn0 + j * 8 + (lane >> 2);
-            znext[j] = (gn < N) ? (uint32_t)__ldg(p.zeros + (size_t)gn * ng) : 0u;
+            znext[j] = (gn < N)
+                ? (uint32_t)__high2float(__ldg(p.sz + (size_t)gn * ng)) : 0u;
         }
     }
 
@@ -229,10 +231,11 @@ i8_mma_kernel(const vv_i8_args p)
                     zrep[j] = znext[j] * 0x01010101u;
                     const int gn = n0 + wn0 + j * 8 + (lane >> 2);
                     znext[j] = (gn < N && g + 1 < ng)
-                        ? (uint32_t)__ldg(p.zeros + (size_t)gn * ng + g + 1) : 0u;
+                        ? (uint32_t)__high2float(__ldg(p.sz + (size_t)gn * ng + g + 1))
+                        : 0u;
                     const int cn = n0 + wn0 + j * 8 + (lane & 3) * 2;
-                    sc[j][0] = (cn < N) ? __half2float(__ldg(p.scales + (size_t)cn * ng + g)) : 0.0f;
-                    sc[j][1] = (cn + 1 < N) ? __half2float(__ldg(p.scales + (size_t)(cn + 1) * ng + g)) : 0.0f;
+                    sc[j][0] = (cn < N) ? __low2float(__ldg(p.sz + (size_t)cn * ng + g)) : 0.0f;
+                    sc[j][1] = (cn + 1 < N) ? __low2float(__ldg(p.sz + (size_t)(cn + 1) * ng + g)) : 0.0f;
                 }
             }
 
@@ -249,12 +252,12 @@ i8_mma_kernel(const vv_i8_args p)
 #pragma unroll
                 for (int j = 0; j < NI; j++) {
                     const int r = wn0 + j * 8 + (lane >> 2);
-                    const unsigned char* rowp = sB + r * I8_W4_LDB + kk * 16 +
-                                                (lane & 3) * 2;
-                    const uint32_t w0 = *(const uint16_t*)rowp;
-                    const uint32_t w1 = *(const uint16_t*)(rowp + 8);
-                    bf[j][0] = i8_unpack4_sub(w0, zrep[W4 ? j : 0]);
-                    bf[j][1] = i8_unpack4_sub(w1, zrep[W4 ? j : 0]);
+                    /* Word t of the k32 chunk: its low half is this lane's
+                     * k = 4t..4t+3, its high half 16+4t.. (VV_Q8_W4_MMA). */
+                    const uint32_t w = *(const uint32_t*)(sB + r * I8_W4_LDB +
+                                                          kk * 16 + (lane & 3) * 4);
+                    bf[j][0] = i8_unpack4_sub(w, zrep[W4 ? j : 0]);
+                    bf[j][1] = i8_unpack4_sub(w >> 16, zrep[W4 ? j : 0]);
                 }
             } else {
 #pragma unroll
@@ -371,13 +374,15 @@ i8_simt_kernel(const vv_i8_args p)
             uint32_t zr = 0;
             if (gn < N) {
                 v = *(const uint4*)((const uint8_t*)p.w + (size_t)gn * (K >> 1) + (k0 >> 1));
-                zr = (uint32_t)p.zeros[(size_t)gn * ng + kt / tiles_per_group] * 0x01010101u;
+                zr = (uint32_t)__high2float(p.sz[(size_t)gn * ng + kt / tiles_per_group])
+                   * 0x01010101u;
             }
             const uint32_t words[4] = { v.x, v.y, v.z, v.w };
 #pragma unroll
             for (int q = 0; q < 4; q++) {
-                sB[r][2 * q + 0] = (gn < N) ? i8_unpack4_sub(words[q] & 0xFFFFu, zr) : 0u;
-                sB[r][2 * q + 1] = (gn < N) ? i8_unpack4_sub(words[q] >> 16, zr) : 0u;
+                /* VV_Q8_W4_MMA: word q's halves are x words q and 4 + q */
+                sB[r][q]     = (gn < N) ? i8_unpack4_sub(words[q], zr) : 0u;
+                sB[r][4 + q] = (gn < N) ? i8_unpack4_sub(words[q] >> 16, zr) : 0u;
             }
         }
         __syncthreads();
@@ -400,7 +405,7 @@ i8_simt_kernel(const vv_i8_args p)
 #pragma unroll
             for (int j = 0; j < 4; j++) {
                 const int gn = n0 + tx + 16 * j;
-                const float s = (gn < N) ? __half2float(p.scales[(size_t)gn * ng + g]) : 0.0f;
+                const float s = (gn < N) ? __low2float(p.sz[(size_t)gn * ng + g]) : 0.0f;
 #pragma unroll
                 for (int i = 0; i < 4; i++) {
                     facc[i][j] = fmaf((float)acc[i][j], s, facc[i][j]);
@@ -536,9 +541,11 @@ static vv_status_t i8_dispatch(const vv_i8_args& p, bool w4, int path,
     if (w4 && (p.G <= 0 || (p.G & 31) != 0 || (p.K % p.G) != 0))
         return VV_ERR_UNSUPPORTED;
 
+    /* The GEMMs read natural (W8) or VV_Q8_W4_MMA (W4) activations. */
+    const int gemm_layout = w4 ? VV_Q8_W4_MMA : VV_Q8_NATURAL;
     if (path == VV_I8_PATH_AUTO) {
-        if (p.M <= 8 && (!w4 || p.xsum)) path = VV_I8_PATH_GEMV;
-        else if (p.x_nibble) return VV_ERR_UNSUPPORTED;   /* GEMMs: natural */
+        const bool gemv = w4 ? p.x_layout == VV_Q8_W4_GEMV : p.M <= 8;
+        if (gemv) path = VV_I8_PATH_GEMV;
         else if (i8_mma_usable(NULL) && (p.K % I8_BK) == 0) path = VV_I8_PATH_MMA;
         else path = VV_I8_PATH_SIMT;
     }
@@ -546,7 +553,7 @@ static vv_status_t i8_dispatch(const vv_i8_args& p, bool w4, int path,
     case VV_I8_PATH_GEMV:
         return vv_i8_gemv_launch(&p, w4 ? 1 : 0, stream);
     case VV_I8_PATH_MMA: {
-        if (p.x_nibble) return VV_ERR_UNSUPPORTED;
+        if (p.x_layout != gemm_layout) return VV_ERR_UNSUPPORTED;
         int sms = 0;
         if (!i8_mma_usable(&sms) || (p.K % I8_BK) != 0) return VV_ERR_UNSUPPORTED;
         switch (i8_pick_tile(p.M, p.N, sms, w4)) {
@@ -565,7 +572,7 @@ static vv_status_t i8_dispatch(const vv_i8_args& p, bool w4, int path,
         }
     }
     case VV_I8_PATH_SIMT:
-        if (p.x_nibble) return VV_ERR_UNSUPPORTED;
+        if (p.x_layout != gemm_layout) return VV_ERR_UNSUPPORTED;
         return i8_simt_launch(p, w4, st);
     default:
         return VV_ERR_INVALID_ARG;
@@ -582,27 +589,28 @@ vv_status_t vv_w8a8_linear_dev(
     if (!xq || !sx || !w || !sw || !y) return VV_ERR_NULL_PTR;
     vv_i8_args p;
     p.xq = xq; p.sx = sx; p.xsum = NULL; p.w = w; p.sw = sw;
-    p.scales = NULL; p.zeros = NULL;
+    p.sz = NULL;
     p.bias = (const half*)bias; p.res = (const half*)residual;
     p.y = y; p.y_f32 = y_f32; p.M = M; p.N = N; p.K = K; p.G = K;
-    p.x_nibble = 0;
+    p.x_layout = VV_Q8_NATURAL;
     return i8_dispatch(p, false, path, stream);
 }
 
 vv_status_t vv_w4a8_linear_dev(
     const int8_t* xq, int x_layout, const float* sx, const int32_t* xsum,
-    const uint8_t* packed, const void* scales, const uint8_t* zeros,
-    int group_size, const void* bias, const void* residual, void* y,
+    const void* packed, const void* sz, int group_size,
+    const void* bias, const void* residual, void* y,
     int y_f32, int M, int N, int K, int path, void* stream)
 {
-    if (!xq || !sx || !packed || !scales || !zeros || !y)
-        return VV_ERR_NULL_PTR;
+    if (!xq || !sx || !packed || !sz || !y) return VV_ERR_NULL_PTR;
+    if (x_layout != VV_Q8_W4_GEMV && x_layout != VV_Q8_W4_MMA)
+        return VV_ERR_INVALID_ARG;
     vv_i8_args p;
     p.xq = xq; p.sx = sx; p.xsum = xsum; p.w = packed; p.sw = NULL;
-    p.scales = (const half*)scales; p.zeros = zeros;
+    p.sz = (const half2*)sz;
     p.bias = (const half*)bias; p.res = (const half*)residual;
     p.y = y; p.y_f32 = y_f32; p.M = M; p.N = N; p.K = K; p.G = group_size;
-    p.x_nibble = (x_layout == VV_Q8_NIBBLE);
+    p.x_layout = x_layout;
     return i8_dispatch(p, true, path, stream);
 }
 

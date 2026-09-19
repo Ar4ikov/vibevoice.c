@@ -163,6 +163,8 @@ static void quant_row(const float* x, int K, int layout, int8_t* q,
     }
     const float inv = (amax > 0.0f) ? 127.0f / amax : 0.0f;
     *sx = amax / 127.0f;
+    int pos[32];
+    for (int j = 0; j < 32; j++) pos[j] = vv_q8_pos(layout, j);
     for (int c = 0; c < K / 32; c++) {
         int s = 0;
         for (int j = 0; j < 32; j++) {
@@ -170,10 +172,7 @@ static void quant_row(const float* x, int K, int layout, int8_t* q,
             v = v > 127.0f ? 127.0f : (v < -127.0f ? -127.0f : v);
             const int qi = (int)v;
             s += qi;
-            /* Nibble layout: even columns first, then odd ones. */
-            const int dst = (layout == VV_Q8_NIBBLE)
-                ? ((j & 1) ? 16 + (j >> 1) : (j >> 1)) : j;
-            q[c * 32 + dst] = (int8_t)qi;
+            q[c * 32 + pos[j]] = (int8_t)qi;
         }
         if (xsum) xsum[c] = s;
     }
@@ -183,6 +182,7 @@ vv_status_t vv_quant_act_q8_cpu(const float* x, int M, int K, int layout,
                                 int8_t* xq, float* sx, int32_t* xsum) {
     if (!x || !xq || !sx) return VV_ERR_NULL_PTR;
     if (M <= 0 || K <= 0 || (K % 32) != 0) return VV_ERR_INVALID_ARG;
+    if (layout < 0 || layout >= VV_Q8_LAYOUT_COUNT) return VV_ERR_INVALID_ARG;
     int m;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (M > 4)

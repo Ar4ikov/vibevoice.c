@@ -336,22 +336,24 @@ vv_status_t vv_w8a8_linear_dev(
 /**
  * @brief W4A8: y = sx[m] * sum_g s[n,g] * sum_k (q - z[n,g]) * xq + bias + res.
  *
- * @param x_layout vv_q8_layout_t of xq. The GEMV (M <= 8) reads either and is
- *                 fastest on VV_Q8_NIBBLE; the GEMMs need VV_Q8_NATURAL.
- *                 vv_w4a8_layout_for(M) says which to quantize into.
- * @param packed  uint8 [N][K/2], high nibble = even k (the INT4G bytes)
- * @param scales  FP16 [N][K/G]
- * @param zeros   uint8 [N][K/G], integer zero points in [0, 15]
+ * The weights are the W4A16 GPU layout, byte for byte (vv_int4g_to_gpu_layout):
+ * one copy of an INT4 projection serves both activation widths.
+ *
+ * @param x_layout VV_Q8_W4_GEMV for the GEMV (M <= 8), VV_Q8_W4_MMA for the
+ *                 GEMMs; vv_w4a8_layout_for(M) is the one the AUTO path
+ *                 takes. A layout the chosen path does not read is refused.
+ * @param packed  [N][K/2], nibbles permuted per 16-byte chunk (GPU layout)
+ * @param sz      half2 [N][K/G] = { scale, integer zero point in 0..15 }
  * @param xsum    int32 [M][K/32] from the quantizer; required by the GEMV
  */
 static inline int vv_w4a8_layout_for(int M) {
-    return M <= 8 ? VV_Q8_NIBBLE : VV_Q8_NATURAL;
+    return M <= 8 ? VV_Q8_W4_GEMV : VV_Q8_W4_MMA;
 }
 
 vv_status_t vv_w4a8_linear_dev(
     const int8_t* xq, int x_layout, const float* sx, const int32_t* xsum,
-    const uint8_t* packed, const void* scales, const uint8_t* zeros,
-    int group_size, const void* bias, const void* residual, void* y,
+    const void* packed, const void* sz, int group_size,
+    const void* bias, const void* residual, void* y,
     int y_f32, int M, int N, int K, int path, void* stream);
 
 /* ─── Dense linear ───────────────────────────────────────────────────────── */
