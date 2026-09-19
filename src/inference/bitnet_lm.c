@@ -20,7 +20,9 @@
  *   softmax   scale, causal -inf mask, ggml_v_expf (a polynomial, not expf)
  *             in chunks of 8 whose sums are added in double
  *   KQV       llamafile's tinyBLAS: F16 V against F32 probabilities, 8 FMA
- *             lanes over the positions, then its horizontal sum
+ *             lanes over the positions, then its horizontal sum; with one
+ *             query (decode) sgemm declines and ggml_vec_dot_f16 runs on
+ *             F16 probabilities instead (32 lanes)
  *   ffn       ggml_v_silu(gate) * up
  *
  * and where the reference's GCC build (-march=native, contraction on) fuses
@@ -366,6 +368,33 @@ BL_TGT static void kqv_avx2(const float* V, size_t ldv, const float* p, int nc,
         _mm256_storeu_ps(out + d, _mm256_add_ps(x0, x1));
     }
 }
+
+/* kqv_vec's accumulation and ggml_vec_dot_f16's reduction, 8 outputs at a time */
+BL_TGT static void kqv_vec_avx2(const float* V, size_t ldv, const float* p,
+                                int kvl, int hd, float* acc, float* out) {
+    for (int j = 0; j < kvl; j++) {
+        if (p[j] == 0.0f) continue;
+        const __m256 vp = _mm256_set1_ps(p[j]);
+        const float* vr = V + (size_t)j * ldv;
+        float* a = acc + (size_t)(j & 31) * hd;
+        for (int d = 0; d < hd; d += 8)
+            _mm256_storeu_ps(a + d, _mm256_fmadd_ps(_mm256_loadu_ps(vr + d), vp,
+                                                    _mm256_loadu_ps(a + d)));
+    }
+    for (int d = 0; d < hd; d += 8) {
+        __m256 x0[8];
+        for (int l = 0; l < 8; l++) {
+            const __m256 s02 = _mm256_add_ps(_mm256_loadu_ps(acc + (size_t)l * hd + d),
+                                             _mm256_loadu_ps(acc + (size_t)(16 + l) * hd + d));
+            const __m256 s13 = _mm256_add_ps(_mm256_loadu_ps(acc + (size_t)(8 + l) * hd + d),
+                                             _mm256_loadu_ps(acc + (size_t)(24 + l) * hd + d));
+            x0[l] = _mm256_add_ps(s02, s13);
+        }
+        const __m256 t0 = _mm256_add_ps(x0[0], x0[4]), t1 = _mm256_add_ps(x0[1], x0[5]);
+        const __m256 t2 = _mm256_add_ps(x0[2], x0[6]), t3 = _mm256_add_ps(x0[3], x0[7]);
+        _mm256_storeu_ps(out + d, _mm256_add_ps(_mm256_add_ps(t0, t1), _mm256_add_ps(t2, t3)));
+    }
+}
 #endif
 
 static void softmax_s(float* wp, int nc, float max) {
@@ -398,26 +427,44 @@ static void kqv_s(const float* V, size_t ldv, const float* p, int nc, int hd,
 
 /* Scratch floats one attention worker needs for a cache of kv positions. */
 static size_t attn_scratch(int kv, int hd) {
-    return 2 * (size_t)((kv + 31) / 32 * 32) + (size_t)hd * 9 + 16;
+    return (size_t)((kv + 31) / 32 * 32) + (size_t)hd * 33 + 16;
 }
 
 /*
  * KQV for a single query, as ggml computes it when the batch has one token:
  * llamafile's sgemm only takes n >= 2, so the product falls back to
  * ggml_vec_dot_f16 over the transposed F16 V rows with the probabilities
- * converted to F16. p is already F16-valued and zero past the cache;
- * nc % 32 == 0. col is nc floats of scratch.
+ * converted to F16 (p is already F16-valued here). That dot keeps 32 FMA
+ * lanes -- position j lands in lane j % 32 -- and reduces them at the end,
+ * so the same sums come out of walking the contiguous V rows once with 32
+ * accumulator rows, instead of gathering a column per output. acc is
+ * 32 * hd floats of scratch.
  */
-static void kqv_vec(const float* V, size_t ldv, const float* p, int nc, int hd,
-                    float* col, float* out, int simd) {
-    (void)simd;
-    for (int d = 0; d < hd; d++) {
-        for (int j = 0; j < nc; j++) col[j] = p[j] != 0.0f ? V[(size_t)j * ldv + d] : 0.0f;
+static void kqv_vec(const float* V, size_t ldv, const float* p, int kvl, int hd,
+                    float* acc, float* out, int simd) {
+    memset(acc, 0, sizeof(float) * 32 * (size_t)hd);
 #ifdef VV_BL_X86
-        out[d] = simd ? dot_ggml_avx2(col, p, nc) : dot_ggml_s(col, p, nc);
-#else
-        out[d] = dot_ggml_s(col, p, nc);
+    if (simd) {
+        kqv_vec_avx2(V, ldv, p, kvl, hd, acc, out);
+        return;
+    }
 #endif
+    (void)simd;
+    for (int j = 0; j < kvl; j++) {
+        if (p[j] == 0.0f) continue;        /* fma(v, 0, a) == a */
+        const float* vr = V + (size_t)j * ldv;
+        float* a = acc + (size_t)(j & 31) * hd;
+        for (int d = 0; d < hd; d++) a[d] = fmaf(vr[d], p[j], a[d]);
+    }
+    for (int d = 0; d < hd; d++) {
+        float x0[8], t0[4];
+        for (int l = 0; l < 8; l++) {
+            const float s02 = acc[(size_t)l * hd + d] + acc[(size_t)(16 + l) * hd + d];
+            const float s13 = acc[(size_t)(8 + l) * hd + d] + acc[(size_t)(24 + l) * hd + d];
+            x0[l] = s02 + s13;
+        }
+        for (int l = 0; l < 4; l++) t0[l] = x0[l] + x0[l + 4];
+        out[d] = (t0[0] + t0[1]) + (t0[2] + t0[3]);
     }
 }
 
@@ -447,7 +494,7 @@ static void attention(const float* q, const float* K, const float* V,
         const int nc = T == 1 ? (kvl + 31) / 32 * 32 : (kvl + 7) / 8 * 8;
         float* wp = sc;
         float* qh = sc + nc;               /* hd */
-        float* acc = qh + hd;              /* 8 * hd, or nc for kqv_vec */
+        float* acc = qh + hd;              /* 8 * hd, 32 * hd for kqv_vec */
         const float* qr = q + ((size_t)t * n_heads + h) * hd;
         for (int d = 0; d < hd; d++) qh[d] = f16r(qr[d]);
         float max = -INFINITY;
@@ -470,7 +517,7 @@ static void attention(const float* q, const float* K, const float* V,
 #endif
             softmax_s(wp, nc, max);
             for (int j = 0; j < nc; j++) wp[j] = f16r(wp[j]);
-            kqv_vec(V + (size_t)hk * hd, ldkv, wp, nc, hd, acc, o, simd);
+            kqv_vec(V + (size_t)hk * hd, ldkv, wp, kvl, hd, acc, o, simd);
             continue;
         }
 #ifdef VV_BL_X86
