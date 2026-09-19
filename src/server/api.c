@@ -354,6 +354,14 @@ static void handle_transcriptions(vv_server_t* sv, const vv_http_req_t* req,
 
     if (s != VV_OK || !tr) {
         vv_mutex_lock(&sv->stats_lock); sv->n_errors++; vv_mutex_unlock(&sv->stats_lock);
+        if (s == VV_ERR_KV_POOL_EXHAUSTED) {
+            /* The slots of a device ran their shared KV pool dry at once.
+             * Nothing is wrong with the request; it fits once they finish. */
+            vv_http_error(res, 503, "server_overloaded",
+                          "KV cache pool exhausted by concurrent requests; "
+                          "retry later");
+            return;
+        }
         char msg[256];
         snprintf(msg, sizeof(msg), "transcription failed: %s",
                  vv_status_str(s));

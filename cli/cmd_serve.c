@@ -45,6 +45,10 @@ static void usage(void) {
         "  --quant <fmt>         auto (default) | none | nf4 | int4 | int8 —\n"
         "                        weights of a dense checkpoint, quantized at\n"
         "                        load\n"
+        "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
+        "                        attention kernels; VV_ATTN= does the same\n"
+        "  --kv-paged <mode>     auto (default: on with several slots) | on |\n"
+        "                        off — slots share one pool of KV pages\n"
         "  --acoustic-sampling M mode (default) | fix | gaussian; a draw per\n"
         "                        request, so answers stop being reproducible\n"
         "  --vram-budget <0-1>   Fraction of free VRAM to use\n"
@@ -87,6 +91,24 @@ int vv_cmd_serve(int argc, char** argv) {
         else if (strcmp(a, "--max-seq-len") == 0 && next) { ep.max_seq_len = atoi(argv[++i]); }
         else if (strcmp(a, "--gpu-layers") == 0 && next) { ep.gpu_layers = atoi(argv[++i]); }
         else if (strcmp(a, "--vram-budget") == 0 && next) { ep.vram_budget = (float)atof(argv[++i]); }
+        else if (strcmp(a, "--attn") == 0 && next) {
+            const vv_attn_backend_t b = vv_attn_backend_parse(argv[++i]);
+            if (b >= VV_ATTN_BACKEND_COUNT) {
+                fprintf(stderr, "serve: --attn is auto, fa1, fa2 or "
+                                "flashinfer, not '%s'\n", argv[i]);
+                return 1;
+            }
+            ep.attn_backend = (int)b;
+        }
+        else if (strcmp(a, "--kv-paged") == 0 && next) {
+            const int m = vv_kv_paging_parse(argv[++i]);
+            if (m < 0) {
+                fprintf(stderr, "serve: --kv-paged is auto, on or off, not "
+                                "'%s'\n", argv[i]);
+                return 1;
+            }
+            ep.kv_paging = m;
+        }
         else if (strcmp(a, "--kv-cache") == 0 && next) {
             vv_kv_format_t f = vv_kv_format_parse(argv[++i]);
             if (f >= VV_KV_FORMAT_COUNT) {

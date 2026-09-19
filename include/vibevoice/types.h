@@ -28,6 +28,9 @@ typedef enum vv_status {
     VV_ERR_UNSUPPORTED    = -7,
     VV_ERR_OVERFLOW       = -8,
     VV_ERR_SHAPE_MISMATCH = -9,
+    /** A shared KV page pool had no pages left for a request that still fit
+     *  its own window. Retryable: the pages come back as other requests end. */
+    VV_ERR_KV_POOL_EXHAUSTED = -10,
 
     /* CUDA errors */
     VV_ERR_CUDA           = -100,
@@ -386,6 +389,59 @@ const char* vv_split_mode_name(vv_split_mode_t mode);
 
 #define VV_SPLIT_MODE_COUNT 3
 
+/**
+ * @brief Which attention kernels a context runs.
+ *
+ * All of them compute the same thing to within FP16 rounding; they differ in
+ * how they use the card. `auto` picks per device and KV format (see
+ * vv_attn_resolve in device.h) and is what every caller should leave it at
+ * unless it is comparing kernels.
+ */
+typedef enum vv_attn_backend {
+    VV_ATTN_AUTO = 0,     /**< fa2 where it runs (sm_75+), else fa1          */
+    VV_ATTN_FA1,          /**< tiled scalar kernels, one query head at a
+                               time, no tensor cores; the reference          */
+    VV_ATTN_FA2,          /**< FlashAttention-2 prefill on tensor cores and a
+                               GQA-grouped split-KV decode, bit-identical to
+                               the kernels before the backends; pages on
+                               FP16; sm_75+                                  */
+    VV_ATTN_FLASHINFER,   /**< tensor-core prefill and decode, split KV for
+                               few rows, any KV format, paged; fastest, and
+                               within FP16 rounding of fa2; sm_75+           */
+} vv_attn_backend_t;
+
+#define VV_ATTN_BACKEND_COUNT 4
+
+/** @brief Parse "auto" | "fa1" | "fa2" | "flashinfer" ("fi"); count on failure. */
+vv_attn_backend_t vv_attn_backend_parse(const char* name);
+
+/** @brief Name for logging. */
+const char* vv_attn_backend_name(vv_attn_backend_t b);
+
+/**
+ * @brief Apply the environment to a requested backend.
+ *
+ * An explicit request wins. `auto` defers to VV_ATTN=fa1|fa2|flashinfer, and
+ * VV_ATTN_MMA=0 (the older switch) still means fa1.
+ */
+vv_attn_backend_t vv_attn_backend_from_env(vv_attn_backend_t requested);
+
+/**
+ * @brief Whether the KV cache is one slab per context or pages from a pool.
+ *
+ * Paged caches take 64-position pages from one pool per device, so the slots
+ * of a server share memory instead of each reserving a full window.
+ */
+typedef enum vv_kv_paging {
+    VV_KV_PAGED_AUTO = 0, /**< paged when several slots share a device and
+                               their kernels read pages as resolved          */
+    VV_KV_PAGED_OFF,      /**< one contiguous slab per context               */
+    VV_KV_PAGED_ON,       /**< pages from a pool shared by the slots          */
+} vv_kv_paging_t;
+
+/** @brief Parse "auto" | "on" | "off"; -1 on failure. */
+int vv_kv_paging_parse(const char* name);
+
 /** @brief Parameters for vv_inference_init(). Pass NULL for defaults. */
 typedef struct vv_init_params {
     float  vram_budget;   /**< 0.0-1.0 fraction of free VRAM. Default: 1.0   */
@@ -397,6 +453,13 @@ typedef struct vv_init_params {
     int    split_mode;    /**< vv_split_mode_t across those devices          */
     int    weight_quant;  /**< vv_load_quant_t (quant.h). 0 = auto: keep the
                                checkpoint's own format                      */
+    int    attn_backend;  /**< vv_attn_backend_t. Default: auto              */
+    int    kv_paging;     /**< vv_kv_paging_t. Default: auto                 */
+    /**
+     * Contexts that will share this device's KV pool (the context itself
+     * plus the clones made from it). Sizes a paged pool; 1 otherwise.
+     */
+    int    n_slots;
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -410,6 +473,9 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.gpus.n = 0;
     p.split_mode = VV_SPLIT_AUTO;
     p.weight_quant = 0;
+    p.attn_backend = VV_ATTN_AUTO;
+    p.kv_paging = VV_KV_PAGED_AUTO;
+    p.n_slots = 1;
     return p;
 }
 
@@ -491,6 +557,7 @@ typedef struct vv_perf_metrics {
     int    hidden_size;          /**< Hidden dimension                      */
     int    kv_format;            /**< vv_kv_format_t of the KV cache        */
     size_t workspace_mb;         /**< Allocated workspace in MB             */
+    int    attn_backend;         /**< vv_attn_backend_t the context ran     */
 } vv_perf_metrics_t;
 
 /* ─── Log levels ────────────────────────────────────────────────────────── */

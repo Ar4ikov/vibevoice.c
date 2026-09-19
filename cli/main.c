@@ -51,6 +51,8 @@ typedef struct {
     int         gpu_layers;
     const char* kv_cache;
     const char* quant;
+    const char* attn;
+    const char* kv_paged;
     bool        cpu_only;
     float       vram_budget;
     bool        verbose;
@@ -113,6 +115,10 @@ static void print_usage(const char* prog) {
         "                        stores them) | none | nf4 | int4 | int8 — the\n"
         "                        last three quantize a dense checkpoint at\n"
         "                        load\n"
+        "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
+        "                        attention kernels; VV_ATTN= does the same\n"
+        "  --kv-paged <mode>     auto (default) | on | off — take KV from a\n"
+        "                        pool of 64-position pages\n"
         "  --vram-budget <0-1>   VRAM fraction for model (default: 1.0)\n"
         "  --gpu-layers <N>      Layers to keep on the GPU (-1 = fit to VRAM)\n"
         "  --acoustic-sampling M mode (default, deterministic) | fix |\n"
@@ -163,6 +169,10 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->trt_acoustic = argv[++i];
         } else if (strcmp(argv[i], "--trt-semantic") == 0 && i + 1 < argc) {
             args->trt_semantic = argv[++i];
+        } else if (strcmp(argv[i], "--attn") == 0 && i + 1 < argc) {
+            args->attn = argv[++i];
+        } else if (strcmp(argv[i], "--kv-paged") == 0 && i + 1 < argc) {
+            args->kv_paged = argv[++i];
         } else if (strcmp(argv[i], "--kv-cache") == 0 && i + 1 < argc) {
             args->kv_cache = argv[++i];
         } else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
@@ -329,6 +339,24 @@ int main(int argc, char** argv) {
             return 1;
         }
         init_params.kv_format = (int)f;
+    }
+    if (args.attn) {
+        const vv_attn_backend_t b = vv_attn_backend_parse(args.attn);
+        if (b >= VV_ATTN_BACKEND_COUNT) {
+            fprintf(stderr, "error: --attn is auto, fa1, fa2 or flashinfer, "
+                            "not '%s'\n", args.attn);
+            return 1;
+        }
+        init_params.attn_backend = (int)b;
+    }
+    if (args.kv_paged) {
+        const int m = vv_kv_paging_parse(args.kv_paged);
+        if (m < 0) {
+            fprintf(stderr, "error: --kv-paged is auto, on or off, not '%s'\n",
+                    args.kv_paged);
+            return 1;
+        }
+        init_params.kv_paging = m;
     }
     init_params.vram_budget = args.vram_budget;
     init_params.cpu_only = args.cpu_only;
@@ -504,6 +532,8 @@ int main(int argc, char** argv) {
                perf->kv_cache_pct);
         printf("    Format               %8s\n",
                vv_kv_format_name((vv_kv_format_t)perf->kv_format));
+        printf("    Attention            %8s\n",
+               vv_attn_backend_name((vv_attn_backend_t)perf->attn_backend));
 
         /* GPU memory */
         if (perf->vram_total_bytes > 0) {

@@ -8,12 +8,23 @@
 #include "vibevoice/types.h"
 #include "vibevoice/model.h"
 #include "vibevoice/family.h"
+#include "vibevoice/device.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* ─── KV-Cache ──────────────────────────────────────────────────────────── */
+
+/**
+ * @brief A device's worth of KV pages, shared by the caches of its slots.
+ *
+ * Each layer holds [n_pages][VV_KV_PAGE_SIZE][n_kv_heads][bytes_per_vec]
+ * (plus FP16 scales for TurboQuant). A cache maps logical pages onto pool
+ * pages through its own table, so N slots need memory for the positions they
+ * actually hold rather than N full windows. Opaque; thread-safe.
+ */
+typedef struct vv_kv_pool vv_kv_pool_t;
 
 /**
  * @brief KV-cache for Qwen2 transformer.
@@ -55,6 +66,20 @@ typedef struct vv_kv_cache {
      */
     void*    d_len;           /**< device int, GPU caches only               */
     void*    d_len_next;      /**< device int = *d_len + 1                   */
+
+    /** vv_attn_backend_t this cache is read with, already resolved. */
+    int      attn_backend;
+    /*
+     * Paging. With a pool, the per-layer pointers above are the pool's and
+     * position t lives at page_table[t / 64] * 64 + t % 64. The table is on
+     * the device (the kernels read it, so a captured graph follows it) and
+     * `pages` is its host mirror.
+     */
+    vv_kv_pool_t* pool;       /**< NULL for a contiguous slab                */
+    int*     page_table;      /**< device [max_pages]                        */
+    int*     pages;           /**< host [max_pages]                          */
+    int      n_pages;         /**< pages mapped so far                       */
+    int      max_pages;
 } vv_kv_cache_t;
 
 /**
@@ -123,6 +148,73 @@ vv_status_t vv_kv_cache_reset(vv_kv_cache_t* cache, void* stream);
  * @brief Free KV-cache.
  */
 vv_status_t vv_kv_cache_free(vv_kv_cache_t* cache);
+
+/**
+ * @brief Allocate a page pool for layers [first, first + count).
+ * @param n_pages  Pages of VV_KV_PAGE_SIZE positions, shared by all users.
+ */
+vv_status_t vv_kv_pool_create(vv_kv_pool_t** pool, int num_layers,
+                              int first, int count, int n_kv_heads,
+                              int head_dim, int n_pages, int format);
+
+/** @brief Drop one reference; the last one frees the device memory. */
+void vv_kv_pool_release(vv_kv_pool_t* pool);
+
+/** @brief Pages in the pool, and how many are free right now. */
+int vv_kv_pool_pages(const vv_kv_pool_t* pool, int* n_free);
+
+/** @brief Device bytes the pool holds. */
+size_t vv_kv_pool_bytes(const vv_kv_pool_t* pool);
+
+/**
+ * @brief A cache that takes its pages from `pool` (and holds a reference).
+ *
+ * Nothing is mapped until vv_kv_cache_reserve; `max_seq_len` only bounds
+ * the table.
+ */
+vv_status_t vv_kv_cache_create_paged(vv_kv_cache_t** cache,
+                                     vv_kv_pool_t* pool, int max_seq_len);
+
+/**
+ * @brief Make sure positions [0, n_positions) have pages.
+ *
+ * Takes pages from the pool and writes their ids into the device table on
+ * `stream`. A no-op for a slab or when they are already mapped. Must not be
+ * called inside a graph capture unless it is known to be a no-op.
+ * @return VV_ERR_OVERFLOW past max_seq_len (the window is full),
+ *         VV_ERR_KV_POOL_EXHAUSTED when the pool has too few free pages.
+ */
+vv_status_t vv_kv_cache_reserve(vv_kv_cache_t* cache, int n_positions,
+                                void* stream);
+
+/**
+ * @brief vv_kv_cache_reserve that waits for pages instead of failing.
+ *
+ * A pool shared by several slots can run short while another slot still
+ * holds pages it will return. This blocks until they come back, and returns
+ * VV_ERR_KV_POOL_EXHAUSTED only when that cannot happen: the pool is smaller
+ * than the request, or every other cache holding pages is itself waiting
+ * (then exactly one of the waiters fails, and its pages free the others).
+ * Never call it inside a graph capture.
+ */
+vv_status_t vv_kv_cache_reserve_wait(vv_kv_cache_t* cache, int n_positions,
+                                     void* stream);
+
+/** @brief Free pages, caches holding pages, and how many of those are
+ *         blocked in vv_kv_cache_reserve_wait. Any pointer may be NULL. */
+void vv_kv_pool_stats(const vv_kv_pool_t* pool, int* n_free, int* n_holders,
+                      int* n_stalled);
+
+/**
+ * @brief Give every page back to the pool. The caller guarantees no kernel
+ *        still reads them (the stream is idle). Also done by reset.
+ */
+void vv_kv_cache_release(vv_kv_cache_t* cache);
+
+/**
+ * @brief The view attention kernels take for one layer of `cache`.
+ */
+vv_kv_view_t vv_kv_cache_view(const vv_kv_cache_t* cache, int layer);
 
 /* ─── Layer weight streaming pool ───────────────────────────────────────── */
 

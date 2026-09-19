@@ -85,6 +85,9 @@ static void usage(const char* which) {
         "  --max-seq-len <n>     KV window\n"
         "  --kv-cache <fmt>      fp16 | fp8 | tq4 | ...\n"
         "  --quant <fmt>         auto (default) | none | nf4 | int4 | int8\n"
+        "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
+        "                        attention kernels; VV_ATTN= does the same\n"
+        "  --kv-paged <mode>     auto | on | off\n"
         "  --hotwords a,b,c      Hotwords\n"
         "  --cpu                 CPU-only\n"
         "  --verbose\n");
@@ -129,6 +132,24 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
         else if (strcmp(s, "--max-seq-len") == 0 && next) a->ep.max_seq_len = atoi(argv[++i]);
         else if (strcmp(s, "--gpu-layers") == 0 && next) a->ep.gpu_layers = atoi(argv[++i]);
         else if (strcmp(s, "--vram-budget") == 0 && next) a->ep.vram_budget = (float)atof(argv[++i]);
+        else if (strcmp(s, "--attn") == 0 && next) {
+            const vv_attn_backend_t b = vv_attn_backend_parse(argv[++i]);
+            if (b >= VV_ATTN_BACKEND_COUNT) {
+                fprintf(stderr, "error: --attn is auto, fa1, fa2 or "
+                                "flashinfer, not '%s'\n", argv[i]);
+                return -1;
+            }
+            a->ep.attn_backend = (int)b;
+        }
+        else if (strcmp(s, "--kv-paged") == 0 && next) {
+            const int m = vv_kv_paging_parse(argv[++i]);
+            if (m < 0) {
+                fprintf(stderr, "error: --kv-paged is auto, on or off, not "
+                                "'%s'\n", argv[i]);
+                return -1;
+            }
+            a->ep.kv_paging = m;
+        }
         else if (strcmp(s, "--kv-cache") == 0 && next) {
             vv_kv_format_t f = vv_kv_format_parse(argv[++i]);
             if (f >= VV_KV_FORMAT_COUNT) {

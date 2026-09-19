@@ -275,6 +275,40 @@ vv_status_t vv_kv_quant_store_dev(const void* k, const void* v, void* ks,
     U(n) U(f) U(s)
     return VV_ERR_UNSUPPORTED;
 }
+vv_status_t vv_kv_store_dev(const void* k, const void* v, void* ks,
+                            void* vs, void* km, void* vm, void* kr,
+                            bool br, int nkv, int d, int p,
+                            const int* dp, int n, int f, const int* pt,
+                            void* s) {
+    U(k) U(v) U(ks) U(vs) U(km) U(vm) U(kr) U(br) U(nkv) U(d) U(p) U(dp)
+    U(n) U(f) U(pt) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_kv_page_map_dev(int* t, int first, int n, const int* p,
+                               void* s) {
+    U(t) U(first) U(n) U(p) U(s) return VV_ERR_UNSUPPORTED;
+}
+int vv_attn_resolve(int r, int f, bool pg, int nq, int nkv, int d) {
+    U(r) U(f) U(pg) U(nq) U(nkv) U(d) return VV_ATTN_FA1;
+}
+size_t vv_attn_scratch_bytes(int nq, int nkv, int d) {
+    U(nq) U(nkv) U(d) return 0;
+}
+int vv_attn_decode_shape(int b, int nq, int nkv, int c) {
+    U(b) U(nq) U(nkv) U(c) return 0;
+}
+vv_status_t vv_attn_prefill(int b, const void* q, const vv_kv_view_t* kv,
+                            void* o, int nq, int ql, int qo, int kl, bool c,
+                            void* w, void* s) {
+    U(b) U(q) U(kv) U(o) U(nq) U(ql) U(qo) U(kl) U(c) U(w) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_attn_decode(int b, const void* q, const vv_kv_view_t* kv,
+                           void* o, int nq, int c, const int* dc, void* w,
+                           void* s) {
+    U(b) U(q) U(kv) U(o) U(nq) U(c) U(dc) U(w) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
 vv_status_t vv_kv_dequant_dev(const void* st, const void* m, const void* r,
                               void* o, int nkv, int d, int n, int f, void* s) {
     U(st) U(m) U(r) U(o) U(nkv) U(d) U(n) U(f) U(s) return VV_ERR_UNSUPPORTED;

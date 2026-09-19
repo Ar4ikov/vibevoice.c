@@ -65,6 +65,30 @@ Write the entry for a change under Unreleased in the same pull request.
   kernels: `microsoft/VibeVoice-ASR` with `--quant int4` decodes at 149
   instead of 133 tok/s, RTF 0.053 / 0.052 / 0.052 on 11 s / 30 s / 120 s
   instead of 0.064 / 0.060 / 0.057, same words.
+- **Attention backends** ([#17](https://github.com/Ar4ikov/vibevoice.c/issues/17)):
+  `--attn auto|fa1|fa2|flashinfer` (and `VV_ATTN=`; `VV_ATTN_MMA=0` still
+  means the scalar kernels) on `vv_cli`, `serve`, `chat` and `mic`, behind
+  one dispatch point. `auto` runs **fa2**: the FA2 prefill with the 7 heads
+  of a GQA group packed into one block and a decode that runs a group
+  together — bit-identical to the kernels before, so no transcript moves,
+  and 32-minute decode goes from 75.0 to 93.5 tok/s (RTF 0.080 -> 0.067).
+  **flashinfer** puts decode on tensor cores too, splits the cache for
+  few-row prefill, and runs fp8/tq caches through the same kernels
+  (107.5 tok/s, RTF 0.060; one-hundredth-second timestamp moves, no word
+  changes on the parity set). A `tq4` cache on the 32-minute file: 33.4 ->
+  73.7 tok/s with fa2, 111.2 with flashinfer. Turing gets the tensor-core paths through
+  `mma.m16n8k8`.
+- **Paged KV cache**: the slots of a device share one pool of 64-position
+  pages instead of a full window each (`--kv-paged auto|on|off`, on by
+  default with several slots whose kernels read pages). The pool honours
+  the VRAM budget, which clones' slabs never did. A request reserves its
+  expected pages before it starts and waits while others hold them; a step
+  that finds the pool dry waits for pages too, and only when no other
+  holder could ever free any does one request fail, with the new
+  `VV_ERR_KV_POOL_EXHAUSTED` (503 from `serve`). A pool never truncates a
+  transcript and reports success.
+- A decode step that fails now fails the request; before, the tokens so far
+  were post-processed and returned as a complete transcript.
 
 ## [0.2.0](https://github.com/Ar4ikov/vibevoice.c/releases/tag/v0.2.0) — 2026-09-18
 
