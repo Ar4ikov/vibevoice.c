@@ -569,6 +569,13 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         }
     }
 
+    /* The attention kernels this context runs, resolved for the device. */
+    const vv_attn_backend_t attn_want =
+        vv_attn_backend_from_env((vv_attn_backend_t)p.attn_backend);
+    const int attn_slab = vv_attn_resolve(
+        (int)attn_want, p.kv_format, false, llm->num_attention_heads,
+        llm->num_key_value_heads, llm->head_dim);
+
     /* ── Decide placement strategy ── */
     if (cpu_only) {
         c->placement = VV_PLACE_CPU_ONLY;
@@ -768,6 +775,11 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         VV_LOG_E("inference: failed to create KV-cache");
         goto fail_gpu;
     }
+    c->kv_cache->attn_backend = attn_slab;
+    VV_LOG_I("inference: attention %s (asked %s), KV %s",
+             vv_attn_backend_name((vv_attn_backend_t)c->kv_cache->attn_backend),
+             vv_attn_backend_name(attn_want),
+             vv_kv_format_name((vv_kv_format_t)p.kv_format));
 
     /* ── Layer weights ── */
     if (c->n_resident_layers > 0) {
@@ -849,6 +861,8 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
             }
 
             s = shard_init(sh, c->model, llm, max_seq, p.kv_format, ws);
+            if (s == VV_OK)
+                sh->kv_cache->attn_backend = attn_slab;
             if (s != VV_OK) {
                 VV_LOG_E("shard: gpu %d unusable (%s)", sh->gpu_id,
                          vv_status_str(s));
@@ -1095,6 +1109,7 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
                                  llm->num_key_value_heads, llm->head_dim,
                                  max_seq, p.kv_format, false);
     if (s != VV_OK) goto fail;
+    c->kv_cache->attn_backend = parent->kv_cache->attn_backend;
 
     c->workspace_size = parent->workspace_size;
     s = vv_dev_alloc(&c->workspace, c->workspace_size);
@@ -1138,6 +1153,7 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
                                              llm->head_dim, max_seq,
                                              p.kv_format, false);
             if (s == VV_OK) {
+                sh->kv_cache->attn_backend = ps->kv_cache->attn_backend;
                 sh->workspace_size = ps->workspace_size;
                 s = vv_dev_alloc(&sh->workspace, sh->workspace_size);
             }
@@ -1365,7 +1381,11 @@ static vv_status_t step_slice(vv_model_t* model, void* hidden,
 
     if (!graph_ok || g->shape == VV_GRAPH_GAVE_UP) return VV_STEP_DIRECT();
 
-    const int want = vv_gqa_decode_shape(kv->current_len + 1);
+    const vv_llm_config_t* llm = &model->config.llm;
+    const int want = vv_attn_decode_shape(kv->attn_backend,
+                                          llm->num_attention_heads,
+                                          llm->num_key_value_heads,
+                                          kv->current_len + 1);
     if (want != g->shape) {
         if (g->exec) { vv_dev_graph_destroy(g->exec); g->exec = NULL; }
 
@@ -1491,6 +1511,8 @@ static vv_status_t transcribe_gpu(
     perf->num_layers = ctx->model->num_layers;
     perf->hidden_size = hs;
     perf->kv_format = ctx->kv_cache ? ctx->kv_cache->format : VV_KV_FP16;
+    perf->attn_backend = ctx->kv_cache ? ctx->kv_cache->attn_backend
+                                       : VV_ATTN_FA1;
     perf->workspace_mb = ctx->workspace_size / (1024 * 1024);
 
     VV_LOG_I("inference: GPU transcribe %d samples (%.2f sec)",

@@ -434,6 +434,7 @@ typedef struct vv_init_params {
     int    split_mode;    /**< vv_split_mode_t across those devices          */
     int    weight_quant;  /**< vv_load_quant_t (quant.h). 0 = auto: keep the
                                checkpoint's own format                      */
+    int    attn_backend;  /**< vv_attn_backend_t. Default: auto              */
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -447,6 +448,7 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.gpus.n = 0;
     p.split_mode = VV_SPLIT_AUTO;
     p.weight_quant = 0;
+    p.attn_backend = VV_ATTN_AUTO;
     return p;
 }
 
@@ -528,6 +530,7 @@ typedef struct vv_perf_metrics {
     int    hidden_size;          /**< Hidden dimension                      */
     int    kv_format;            /**< vv_kv_format_t of the KV cache        */
     size_t workspace_mb;         /**< Allocated workspace in MB             */
+    int    attn_backend;         /**< vv_attn_backend_t the context ran     */
 } vv_perf_metrics_t;
 
 /* ─── Log levels ────────────────────────────────────────────────────────── */

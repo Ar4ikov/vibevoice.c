@@ -460,8 +460,8 @@ static void dump_gpu_fp16(const char* name, const void* gpu, size_t n,
  * gets the lifetime and the ownership right at once.
  */
 static size_t decode_scratch_bytes(const vv_llm_config_t* cfg) {
-    return vv_gqa_decode_scratch_bytes(cfg->num_attention_heads,
-                                       cfg->head_dim);
+    return vv_attn_scratch_bytes(cfg->num_attention_heads,
+                                 cfg->num_key_value_heads, cfg->head_dim);
 }
 
 static vv_status_t decoder_layer_impl(
@@ -594,58 +594,36 @@ static vv_status_t decoder_layer_impl(
 
     /* 5. GQA attention over the cache (queries of this chunk see all of it) */
     {
-        const void* k_cached;
-        const void* v_cached;
-        int cache_len;
-        vv_kv_cache_get(kv_cache, layer_idx, &k_cached, &v_cached, &cache_len);
         /*
          * current_len only advances on the last layer, so derive the true
          * length from this call's position instead.
          */
         const int actual_cache_len = position_offset + seq_len;
-        const vv_kv_format_t fmt = (vv_kv_format_t)kv_cache->format;
+        const vv_kv_view_t view = vv_kv_cache_view(kv_cache, layer_idx);
+        const int backend = kv_cache->attn_backend;
+        const bool rotates = vv_kv_rotates((vv_kv_format_t)kv_cache->format);
 
-        if (vv_kv_is_raw(fmt)) {
-            if (seq_len > 1) {
-                s = vv_gqa_attention_prefill_cached_dev(
-                    q_buf, k_cached, v_cached, attn_out,
-                    n_heads, n_kv_heads, head_dim,
-                    seq_len, position_offset, actual_cache_len, true, stream);
-            } else {
-                s = vv_gqa_attention_decode_dev(
-                    q_buf, k_cached, v_cached, attn_out,
-                    n_heads, n_kv_heads, head_dim, actual_cache_len,
-                    d_next, decode_scratch, stream);
-            }
-        } else {
-            const void *k_meta, *v_meta;
-            vv_kv_cache_get_meta(kv_cache, layer_idx, &k_meta, &v_meta);
-            /*
-             * TurboQuant stores rotated vectors. The transform is orthogonal,
-             * so instead of inverting it per key we rotate Q once here and
-             * undo the rotation on the output; the kernels then read stored
-             * values directly.
-             */
-            if (vv_kv_rotates(fmt)) {
-                s = vv_kv_rotate_dev(q_buf, n_heads, head_dim, seq_len, stream);
-                if (s != VV_OK) return s;
-            }
-            if (seq_len > 1) {
-                s = vv_gqa_attention_prefill_q_dev(
-                    q_buf, k_cached, v_cached, k_meta, v_meta, attn_out,
-                    n_heads, n_kv_heads, head_dim,
-                    seq_len, position_offset, actual_cache_len, true,
-                    (int)fmt, stream);
-            } else {
-                s = vv_gqa_attention_decode_q_dev(
-                    q_buf, k_cached, v_cached, k_meta, v_meta, attn_out,
-                    n_heads, n_kv_heads, head_dim, actual_cache_len,
-                    d_next, (int)fmt, decode_scratch, stream);
-            }
-            if (s == VV_OK && vv_kv_rotates(fmt))
-                s = vv_kv_unrotate_dev(attn_out, n_heads, head_dim,
-                                       seq_len, stream);
+        /*
+         * TurboQuant stores rotated vectors. The transform is orthogonal, so
+         * instead of inverting it per key we rotate Q once here and undo the
+         * rotation on the output; the kernels then read stored values
+         * directly, whichever backend they belong to.
+         */
+        if (rotates) {
+            s = vv_kv_rotate_dev(q_buf, n_heads, head_dim, seq_len, stream);
+            if (s != VV_OK) return s;
         }
+        if (seq_len > 1)
+            s = vv_attn_prefill(backend, q_buf, &view, attn_out, n_heads,
+                                seq_len, position_offset, actual_cache_len,
+                                true, decode_scratch, stream);
+        else
+            s = vv_attn_decode(backend, q_buf, &view, attn_out, n_heads,
+                               actual_cache_len, d_next, decode_scratch,
+                               stream);
+        if (s == VV_OK && rotates)
+            s = vv_kv_unrotate_dev(attn_out, n_heads, head_dim, seq_len,
+                                   stream);
     }
     if (s != VV_OK) return s;
 

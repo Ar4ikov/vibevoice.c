@@ -102,6 +102,7 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
     if (devices > 1 && mode == VV_SPLIT_AUTO)
         mode = (n >= devices) ? VV_SPLIT_REPLICA : VV_SPLIT_LAYER;
     ip.split_mode = (int)mode;
+    ip.attn_backend = params->attn_backend;
     if (devices > 1)
         VV_LOG_I("engine: %d devices, %s split", devices,
                  vv_split_mode_name(mode));

@@ -66,6 +66,7 @@ vv_status_t vv_kv_cache_create_range(vv_kv_cache_t** cache,
     c->format        = format;
     c->bytes_per_vec = vv_kv_bytes_per_vec((vv_kv_format_t)format, head_dim);
     c->on_cpu        = on_cpu;
+    c->attn_backend  = VV_ATTN_FA1;
 
     const bool has_meta = vv_kv_has_meta((vv_kv_format_t)format);
     const size_t sb = store_bytes(max_seq_len, n_kv_heads, c->bytes_per_vec);
@@ -281,4 +282,18 @@ vv_status_t vv_kv_cache_free(vv_kv_cache_t* cache) {
 
     vv_free(cache);
     return VV_OK;
+}
+
+vv_kv_view_t vv_kv_cache_view(const vv_kv_cache_t* c, int layer) {
+    vv_kv_view_t v;
+    memset(&v, 0, sizeof(v));
+    if (!c || layer < 0 || layer >= c->num_layers) return v;
+    v.k = c->k_cache[layer];
+    v.v = c->v_cache[layer];
+    v.k_meta = c->k_meta ? c->k_meta[layer] : NULL;
+    v.v_meta = c->v_meta ? c->v_meta[layer] : NULL;
+    v.format = c->format;
+    v.n_kv_heads = c->n_kv_heads;
+    v.head_dim = c->head_dim;
+    return v;
 }

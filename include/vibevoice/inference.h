@@ -8,6 +8,7 @@
 #include "vibevoice/types.h"
 #include "vibevoice/model.h"
 #include "vibevoice/family.h"
+#include "vibevoice/device.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,6 +56,9 @@ typedef struct vv_kv_cache {
      */
     void*    d_len;           /**< device int, GPU caches only               */
     void*    d_len_next;      /**< device int = *d_len + 1                   */
+
+    /** vv_attn_backend_t this cache is read with, already resolved. */
+    int      attn_backend;
 } vv_kv_cache_t;
 
 /**
@@ -123,6 +127,11 @@ vv_status_t vv_kv_cache_reset(vv_kv_cache_t* cache, void* stream);
  * @brief Free KV-cache.
  */
 vv_status_t vv_kv_cache_free(vv_kv_cache_t* cache);
+
+/**
+ * @brief The view attention kernels take for one layer of `cache`.
+ */
+vv_kv_view_t vv_kv_cache_view(const vv_kv_cache_t* cache, int layer);
 
 /* ─── Layer weight streaming pool ───────────────────────────────────────── */
 
