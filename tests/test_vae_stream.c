@@ -13,6 +13,11 @@
  *   - a stateless window == a fresh encode of that window
  *   - arena high-water <= the bound it was sized with
  *   - four threads through one front end at once == one at a time
+ *   - the device connectors against the CPU ones, and nothing written past
+ *     a job's last row
+ *   - the conv-as-GEMM and both FFN GEMM tiles against the direct kernels,
+ *     bit for bit
+ *   - a short job next to a long one leaves before the long one does
  *
  * The GPU cases skip cleanly without a device.
  */
@@ -558,10 +563,18 @@ typedef struct {
     int            frames;
     uint16_t*      result;     /* host copy of the rows */
     vv_status_t    status;
+    int            canary;     /* the row past the last one is untouched */
+    double         t_start, t_done;
 } fe_thread_t;
 
+#define CANARY_BYTE 0x5A
+
+/**
+ * Encode one clip into `frames` rows of a buffer one row longer, filled
+ * with a canary first; *canary_ok says whether that last row survived.
+ */
 static uint16_t* fe_encode(vv_frontend_t* fe, const float* audio, int n,
-                           int frames, vv_status_t* st_out) {
+                           int frames, vv_status_t* st_out, int* canary_ok) {
     vv_frontend_stream_t* st = NULL;
     void* rows = NULL;
     void* ev = NULL;
@@ -571,6 +584,11 @@ static uint16_t* fe_encode(vv_frontend_t* fe, const float* audio, int n,
     if (s == VV_OK) s = vv_dev_alloc(&rows, (size_t)(frames + 1) * HS * 2);
     if (s == VV_OK) s = vv_dev_event_create(&ev);
     if (s == VV_OK) s = vv_dev_stream_create(&stream);
+    if (s == VV_OK)
+        s = vv_dev_memset_async(rows, CANARY_BYTE, (size_t)(frames + 1) * HS * 2,
+                                stream);
+    if (s == VV_OK) s = vv_dev_stream_sync(stream);
+    if (canary_ok) *canary_ok = 0;
     if (s == VV_OK) {
         vv_frontend_job_t job;
         memset(&job, 0, sizeof(job));
@@ -584,7 +602,13 @@ static uint16_t* fe_encode(vv_frontend_t* fe, const float* audio, int n,
         s = vv_frontend_submit(fe, &job);
         if (s == VV_OK && job.n_frames != frames) s = VV_ERR_SHAPE_MISMATCH;
         if (s == VV_OK) s = vv_dev_stream_wait_event(stream, ev);
-        if (s == VV_OK) h = download(rows, (size_t)frames * HS, stream);
+        if (s == VV_OK) h = download(rows, (size_t)(frames + 1) * HS, stream);
+        if (h && canary_ok) {
+            const unsigned char* b = (const unsigned char*)(h + (size_t)frames * HS);
+            int ok = 1;
+            for (int i = 0; i < HS * 2; i++) ok &= b[i] == CANARY_BYTE;
+            *canary_ok = ok;
+        }
     }
     if (stream) vv_dev_stream_destroy(stream);
     if (ev) vv_dev_event_destroy(ev);
@@ -597,8 +621,79 @@ static uint16_t* fe_encode(vv_frontend_t* fe, const float* audio, int n,
 static VV_THREAD_RET fe_worker(void* arg) {
     fe_thread_t* t = (fe_thread_t*)arg;
     vv_dev_set_device(0);
-    t->result = fe_encode(t->fe, t->audio, t->n, t->frames, &t->status);
+    t->t_start = vv_time_ms();
+    t->result = fe_encode(t->fe, t->audio, t->n, t->frames, &t->status,
+                          &t->canary);
+    t->t_done = vv_time_ms();
     VV_THREAD_RETURN;
+}
+
+/**
+ * The rows against a host reference of the path they replace: the same
+ * clip's latents (from the front end, raw), each connector on the CPU, the
+ * two summed in FP32 and cut to FP16 -- what the pipeline did before the
+ * connectors moved to the device. The device GEMMs round through FP16
+ * between fc1, the norm and fc2, so the match is to FP16 precision.
+ */
+static void check_connectors(vv_frontend_t* fe, tiny_conn_t* tc,
+                             const float* audio, int n, int frames,
+                             const uint16_t* rows) {
+    void *dl[2] = { NULL, NULL }, *ev = NULL, *stream = NULL;
+    vv_frontend_stream_t* st = NULL;
+    vv_status_t s = vv_frontend_stream_create(fe, &st);
+    for (int e = 0; e < 2 && s == VV_OK; e++)
+        s = vv_dev_alloc(&dl[e], (size_t)frames * VAE * 2);
+    if (s == VV_OK) s = vv_dev_event_create(&ev);
+    if (s == VV_OK) s = vv_dev_stream_create(&stream);
+    uint16_t* lh[2] = { NULL, NULL };
+    if (s == VV_OK) {
+        vv_frontend_job_t job;
+        memset(&job, 0, sizeof(job));
+        job.audio = audio;
+        job.n_samples = n;
+        job.stream = st;
+        job.is_final = true;
+        job.ac_latents = dl[0];
+        job.sem_latents = dl[1];
+        job.done_event = ev;
+        s = vv_frontend_run(fe, &job, 1);
+        if (s == VV_OK && job.n_frames != frames) s = VV_ERR_SHAPE_MISMATCH;
+        if (s == VV_OK) s = vv_dev_stream_wait_event(stream, ev);
+        for (int e = 0; e < 2 && s == VV_OK; e++)
+            lh[e] = download(dl[e], (size_t)frames * VAE, stream);
+    }
+    double num = 0.0, den = 0.0, worst = 0.0;
+    if (s == VV_OK && lh[0] && lh[1]) {
+        float* out[2] = { NULL, NULL };
+        float* lf = (float*)vv_alloc((size_t)frames * VAE * sizeof(float));
+        for (int e = 0; e < 2 && s == VV_OK; e++) {
+            for (size_t i = 0; i < (size_t)frames * VAE; i++)
+                lf[i] = vv_half_to_float(lh[e][i]);
+            s = vv_connector_forward_cpu(&tc->conn[e], lf, frames, &out[e]);
+        }
+        for (size_t i = 0; s == VV_OK && i < (size_t)frames * HS; i++) {
+            const double want = vv_half_to_float(vv_float_to_half(out[0][i] + out[1][i]));
+            const double got = vv_half_to_float(rows[i]);
+            const double d = fabs(got - want);
+            num += d * d;
+            den += want * want;
+            if (d > worst) worst = d;
+        }
+        vv_free(out[0]);
+        vv_free(out[1]);
+        vv_free(lf);
+    }
+    const double rel = sqrt(num / (den > 0 ? den : 1));
+    printf("    connectors vs host: %d frames rel=%.2e max abs=%.2e\n", frames,
+           rel, worst);
+    TEST_ASSERT(s == VV_OK && den > 0 && rel < 4e-3,
+                "device connectors == CPU connectors + FP32 sum (FP16 tolerance)");
+    vv_free(lh[0]);
+    vv_free(lh[1]);
+    if (stream) vv_dev_stream_destroy(stream);
+    if (ev) vv_dev_event_destroy(ev);
+    for (int e = 0; e < 2; e++) if (dl[e]) vv_dev_free(dl[e]);
+    vv_frontend_stream_free(st);
 }
 
 static void test_frontend(vv_conv_vae_encoder_t* ea, vv_conv_vae_encoder_t* es) {
@@ -629,18 +724,24 @@ static void test_frontend(vv_conv_vae_encoder_t* ea, vv_conv_vae_encoder_t* es) 
     float* audio[NT];
     uint16_t* ref[NT];
     int frames[NT];
-    int ok_split = 1;
+    int ok_split = 1, ok_canary = 1;
     for (int i = 0; i < NT; i++) {
         audio[i] = make_audio(lens[i], 500 + i);
         frames[i] = vv_frontend_frames(fb, lens[i]);
         vv_status_t s;
-        ref[i] = fe_encode(fb, audio[i], lens[i], frames[i], &s);
-        uint16_t* sp = fe_encode(fs, audio[i], lens[i], frames[i], &s);
+        int c1 = 0, c2 = 0;
+        ref[i] = fe_encode(fb, audio[i], lens[i], frames[i], &s, &c1);
+        uint16_t* sp = fe_encode(fs, audio[i], lens[i], frames[i], &s, &c2);
         if (!ref[i] || !sp || memcmp(ref[i], sp, (size_t)frames[i] * HS * 2) != 0)
             ok_split = 0;
+        ok_canary &= c1 & c2;
         vv_free(sp);
     }
     TEST_ASSERT(ok_split, "a clip split over several launches == one launch");
+    TEST_ASSERT(ok_canary, "nothing is written past a job's last row");
+    for (int i = 0; i < NT; i++)
+        if (lens[i] > 1000) check_connectors(fb, &tc, audio[i], lens[i],
+                                             frames[i], ref[i]);
 
     /* Four threads at once through the service, then without it. */
     for (int pass = 0; pass < 2; pass++) {
@@ -660,7 +761,7 @@ static void test_frontend(vv_conv_vae_encoder_t* ea, vv_conv_vae_encoder_t* es) 
             int ok = 1;
             for (int i = 0; i < NT; i++) {
                 vv_thread_join(tid[i]);
-                if (th[i].status != VV_OK || !th[i].result ||
+                if (th[i].status != VV_OK || !th[i].result || !th[i].canary ||
                     memcmp(th[i].result, ref[i], (size_t)frames[i] * HS * 2) != 0)
                     ok = 0;
                 vv_free(th[i].result);
@@ -683,6 +784,49 @@ static void test_frontend(vv_conv_vae_encoder_t* ea, vv_conv_vae_encoder_t* es) 
         }
     }
 
+    /* A short job submitted while a long one is running leaves first: the
+       service schedules launches, not jobs. Both still match alone. */
+    {
+        const int LN = 600000;   /* ~67 launches of the small front end */
+        float* la = make_audio(LN, 900);
+        const int lf = vv_frontend_frames(fb, LN);
+        vv_status_t s;
+        uint16_t* lref = fe_encode(fb, la, LN, lf, &s, NULL);
+        vv_frontend_service_start(fs, 0);
+        fe_thread_t tl, ts;
+        memset(&tl, 0, sizeof(tl));
+        memset(&ts, 0, sizeof(ts));
+        tl.fe = ts.fe = fs;
+        tl.audio = la; tl.n = LN; tl.frames = lf;
+        ts.audio = audio[2]; ts.n = lens[2]; ts.frames = frames[2];
+        uint64_t l0 = 0, l1 = 0;
+        vv_frontend_stats(fs, &l0, NULL);
+        vv_thread_t htl, hts;
+        vv_thread_start(&htl, fe_worker, &tl);
+        for (int spin = 0; spin < 2000; spin++) {       /* long one under way */
+            vv_frontend_stats(fs, &l1, NULL);
+            if (l1 >= l0 + 2) break;
+            vv_sleep_ms(1);
+        }
+        vv_thread_start(&hts, fe_worker, &ts);
+        vv_thread_join(hts);
+        vv_thread_join(htl);
+        vv_frontend_service_stop(fs);
+        printf("    short done at %.1f ms, long at %.1f ms\n",
+               ts.t_done - tl.t_start, tl.t_done - tl.t_start);
+        TEST_ASSERT(ts.status == VV_OK && tl.status == VV_OK &&
+                    ts.t_done < tl.t_done,
+                    "a short job next to a long one finishes first");
+        TEST_ASSERT(lref && ts.result && tl.result &&
+                    memcmp(ts.result, ref[2], (size_t)frames[2] * HS * 2) == 0 &&
+                    memcmp(tl.result, lref, (size_t)lf * HS * 2) == 0,
+                    "short and long jobs sharing launches == alone");
+        vv_free(ts.result);
+        vv_free(tl.result);
+        vv_free(lref);
+        vv_free(la);
+    }
+
     for (int i = 0; i < NT; i++) {
         vv_free(ref[i]);
         vv_free(audio[i]);
@@ -692,18 +836,16 @@ static void test_frontend(vv_conv_vae_encoder_t* ea, vv_conv_vae_encoder_t* es) 
     tiny_free(&tc.conn_w);
 }
 
-/* ─── Split-K GEMM ─────────────────────────────────────────────────────── */
+/* ─── GEMM tiles ───────────────────────────────────────────────────────── */
 
 /**
- * The deep stage-5/6 GEMMs split K into slices. The split must follow K
- * alone: the same columns computed in one call or in two narrower calls
- * (another batch) have to agree bit for bit, and all of it has to match an
- * FP64 reference with every epilogue.
+ * The FFN GEMMs pick a 64 or 128 tile from the grid size, so an item's
+ * result must not depend on it: both tiles, and the same columns in two
+ * narrower calls (another batch), agree bit for bit, and all of it matches
+ * an FP64 reference with every epilogue.
  */
-static void test_gemm_splitk(void* stream) {
+static void test_gemm_tiles(void* stream) {
     const int M = 96, K = 2048, P = 45, P1 = 19;
-    TEST_ASSERT(vv_vae_gemm_splitk(K) == 2 && vv_vae_gemm_splitk(1024) == 1,
-                "split-K depends on K alone");
     uint64_t rng = 99;
     uint16_t* A = (uint16_t*)vv_alloc((size_t)M * K * 2);
     uint16_t* B = (uint16_t*)vv_alloc((size_t)K * P * 2);
@@ -716,16 +858,14 @@ static void test_gemm_splitk(void* stream) {
         bias[i] = vv_float_to_half(frand(&rng) * 0.1f);
         gam[i] = vv_float_to_half(0.5f + frand(&rng) * 0.1f);
     }
-    void *dA, *dB, *dC, *dC2, *db, *dg;
-    float* ws = NULL;
-    const size_t ws_elems = (size_t)2 * M * P;
+    void *dA, *dB, *dC, *dC2, *dC3, *db, *dg;
     vv_dev_alloc(&dA, (size_t)M * K * 2);
     vv_dev_alloc(&dB, (size_t)K * P * 2);
     vv_dev_alloc(&dC, (size_t)M * P * 2);
     vv_dev_alloc(&dC2, (size_t)M * P * 2);
+    vv_dev_alloc(&dC3, (size_t)M * P * 2);
     vv_dev_alloc(&db, (size_t)M * 2);
     vv_dev_alloc(&dg, (size_t)M * 2);
-    vv_dev_alloc((void**)&ws, ws_elems * 4);
     vv_dev_memcpy_h2d(dA, A, (size_t)M * K * 2, stream);
     vv_dev_memcpy_h2d(dB, B, (size_t)K * P * 2, stream);
     vv_dev_memcpy_h2d(db, bias, (size_t)M * 2, stream);
@@ -736,22 +876,28 @@ static void test_gemm_splitk(void* stream) {
     for (int e = 0; e < 3; e++) {
         vv_dev_memcpy_h2d(dC, X, (size_t)M * P * 2, stream);
         vv_dev_memcpy_h2d(dC2, X, (size_t)M * P * 2, stream);
+        vv_dev_memcpy_h2d(dC3, X, (size_t)M * P * 2, stream);
         vv_status_t st = vv_vae_gemm_nn_dev(epis[e], dA, dB, P, dC, P, M, K, P,
-                                            db, dg, NULL, NULL, ws, ws_elems,
-                                            stream);
-        /* The same columns as two calls of 19 and 26. */
+                                            db, dg, NULL, NULL, 128, stream);
+        if (st == VV_OK)
+            st = vv_vae_gemm_nn_dev(epis[e], dA, dB, P, dC3, P, M, K, P,
+                                    db, dg, NULL, NULL, 64, stream);
+        /* The same columns as two calls of 19 and 26, tile chosen freely. */
         if (st == VV_OK)
             st = vv_vae_gemm_nn_dev(epis[e], dA, dB, P, dC2, P, M, K, P1, db,
-                                    dg, NULL, NULL, ws, ws_elems, stream);
+                                    dg, NULL, NULL, 0, stream);
         if (st == VV_OK)
             st = vv_vae_gemm_nn_dev(epis[e], dA, (uint16_t*)dB + P1, P,
                                     (uint16_t*)dC2 + P1, P, M, K, P - P1, db,
-                                    dg, NULL, NULL, ws, ws_elems, stream);
-        TEST_ASSERT(st == VV_OK, "split-K GEMM runs");
+                                    dg, NULL, NULL, 0, stream);
+        TEST_ASSERT(st == VV_OK, "GEMM runs with both tiles");
         uint16_t* c1 = download(dC, (size_t)M * P, stream);
         uint16_t* c2 = download(dC2, (size_t)M * P, stream);
+        uint16_t* c3 = download(dC3, (size_t)M * P, stream);
+        TEST_ASSERT(memcmp(c1, c3, (size_t)M * P * 2) == 0,
+                    "GEMM: 64 tile == 128 tile, bit for bit");
         TEST_ASSERT(memcmp(c1, c2, (size_t)M * P * 2) == 0,
-                    "split-K: one call == two narrower calls, bit for bit");
+                    "GEMM: one call == two narrower calls, bit for bit");
         double num = 0.0, den = 0.0;
         for (int r = 0; r < M; r++)
             for (int c = 0; c < P; c++) {
@@ -773,18 +919,135 @@ static void test_gemm_splitk(void* stream) {
             }
         const double rel = sqrt(num / (den > 0 ? den : 1));
         printf("    epilogue %d rel=%.2e\n", epis[e], rel);
-        TEST_ASSERT(rel < 2e-3, "split-K GEMM matches the FP64 reference");
+        TEST_ASSERT(rel < 2e-3, "GEMM matches the FP64 reference");
         vv_free(c1);
         vv_free(c2);
+        vv_free(c3);
     }
-    /* Too little scratch is an error, never a quiet fallback to one slice. */
-    TEST_ASSERT(vv_vae_gemm_nn_dev(VV_VAE_EPI_BIAS, dA, dB, P, dC, P, M, K, P,
-                                   db, NULL, NULL, NULL, ws, 10, stream)
-                == VV_ERR_OVERFLOW, "split-K refuses short scratch");
     vv_dev_stream_sync(stream);
     vv_dev_free(dA); vv_dev_free(dB); vv_dev_free(dC); vv_dev_free(dC2);
-    vv_dev_free(db); vv_dev_free(dg); vv_dev_free(ws);
+    vv_dev_free(dC3); vv_dev_free(db); vv_dev_free(dg);
     vv_free(A); vv_free(B); vv_free(X);
+}
+
+/* ─── Conv as im2col GEMM ──────────────────────────────────────────────── */
+
+/**
+ * The downsample and head convs run as im2col + an FP32 GEMM that sums in
+ * the direct kernel's order: both must give the direct kernel's bits, for
+ * packed and transposed outputs, with a carried context, a fresh one, the
+ * zero padding past a final chunk, and a column window (p0) mid-item.
+ */
+static void test_conv_gemm(void* stream) {
+    const int IC = 24, OC = 80, KW = 10, SD = 5, CAP = 8;
+    const int in_len[2] = { 203, 97 };
+    const int have[2] = { 5, 5 };
+    const int out_len[2] = { 42, 21 };
+    const int T_in = in_len[0] + in_len[1], T_out = out_len[0] + out_len[1];
+    const int64_t ld_in = 304, ld_out = 64;
+    const int Kc = IC * KW;
+    const int skip0 = 2, OLD = OC + 3;
+    uint64_t rng = 7;
+
+    uint16_t* x = (uint16_t*)vv_alloc((size_t)IC * ld_in * 2);
+    uint16_t* w = (uint16_t*)vv_alloc((size_t)OC * Kc * 2);
+    uint16_t* tl = (uint16_t*)vv_alloc((size_t)IC * CAP * 2);
+    uint16_t b[80];
+    for (size_t i = 0; i < (size_t)IC * ld_in; i++) x[i] = vv_float_to_half(frand(&rng));
+    for (size_t i = 0; i < (size_t)OC * Kc; i++)
+        w[i] = vv_float_to_half(frand(&rng) * 0.1f);
+    for (size_t i = 0; i < (size_t)IC * CAP; i++) tl[i] = vv_float_to_half(frand(&rng));
+    for (int i = 0; i < OC; i++) b[i] = vv_float_to_half(frand(&rng) * 0.1f);
+
+    void *dx, *dw, *dtl, *db, *dy1, *dy2, *dcol, *dr1, *dr2;
+    const size_t rows_elems = (size_t)(out_len[0] + out_len[1]) * OLD;
+    vv_dev_alloc(&dx, (size_t)IC * ld_in * 2);
+    vv_dev_alloc(&dw, (size_t)OC * Kc * 2);
+    vv_dev_alloc(&dtl, (size_t)IC * CAP * 2);
+    vv_dev_alloc(&db, (size_t)OC * 2);
+    vv_dev_alloc(&dy1, (size_t)OC * ld_out * 2);
+    vv_dev_alloc(&dy2, (size_t)OC * ld_out * 2);
+    vv_dev_alloc(&dcol, (size_t)Kc * 64 * 2);
+    vv_dev_alloc(&dr1, rows_elems * 2);
+    vv_dev_alloc(&dr2, rows_elems * 2);
+    vv_dev_memcpy_h2d(dx, x, (size_t)IC * ld_in * 2, stream);
+    vv_dev_memcpy_h2d(dw, w, (size_t)OC * Kc * 2, stream);
+    vv_dev_memcpy_h2d(dtl, tl, (size_t)IC * CAP * 2, stream);
+    vv_dev_memcpy_h2d(db, b, (size_t)OC * 2, stream);
+    vv_dev_memset_async(dy1, 0, (size_t)OC * ld_out * 2, stream);
+    vv_dev_memset_async(dy2, 0, (size_t)OC * ld_out * 2, stream);
+    vv_dev_memset_async(dr1, 0, rows_elems * 2, stream);
+    vv_dev_memset_async(dr2, 0, rows_elems * 2, stream);
+
+    vv_vae_conv_desc_t d;
+    memset(&d, 0, sizeof(d));
+    d.n = 2;
+    d.cap = CAP;
+    int64_t io = 0, oo = 0;
+    for (int i = 0; i < 2; i++) {
+        d.it[i].in_off = io;
+        d.it[i].out_off = oo;
+        d.it[i].tail_in = i == 0 ? dtl : NULL;   /* carried, then fresh */
+        d.it[i].in_len = in_len[i];
+        d.it[i].out_len = out_len[i];
+        d.it[i].have = have[i];
+        io += in_len[i];
+        oo += out_len[i];
+    }
+    (void)T_in;
+
+    /* Packed: direct vs two im2col windows (41 + 22 columns). */
+    vv_status_t st = vv_vae_conv_dev(&d, dx, ld_in, dw, db, dy1, ld_out, IC, OC,
+                                     KW, SD, false, stream);
+    const int cut = 41;
+    for (int part = 0; part < 2 && st == VV_OK; part++) {
+        const int64_t p0 = part ? cut : 0;
+        const int pc = part ? T_out - cut : cut;
+        st = vv_vae_im2col_dev(&d, dx, ld_in, IC, KW, SD, p0, pc, dcol, 64,
+                               stream);
+        if (st == VV_OK)
+            st = vv_vae_conv_gemm_dev(NULL, dw, dcol, 64, db,
+                                      (uint16_t*)dy2 + p0, ld_out, OC, Kc, p0,
+                                      pc, stream);
+    }
+    TEST_ASSERT(st == VV_OK, "conv GEMM runs (packed)");
+    uint16_t* y1 = download(dy1, (size_t)OC * ld_out, stream);
+    uint16_t* y2 = download(dy2, (size_t)OC * ld_out, stream);
+    TEST_ASSERT(memcmp(y1, y2, (size_t)OC * ld_out * 2) == 0,
+                "conv GEMM == direct conv, packed, bit for bit");
+
+    /* Transposed rows with a skipped head frame: the head's layout. */
+    vv_vae_conv_desc_t d1 = d, d2 = d;
+    for (int i = 0; i < 2; i++) {
+        const size_t r0 = i ? (size_t)out_len[0] : 0;
+        d1.it[i].out_ptr = (uint16_t*)dr1 + r0 * OLD;
+        d2.it[i].out_ptr = (uint16_t*)dr2 + r0 * OLD;
+        d1.it[i].out_ld = d2.it[i].out_ld = OLD;
+        d1.it[i].skip = d2.it[i].skip = i == 0 ? skip0 : 0;
+    }
+    st = vv_vae_conv_dev(&d1, dx, ld_in, dw, db, NULL, 0, IC, OC, KW, SD, true,
+                         stream);
+    for (int part = 0; part < 2 && st == VV_OK; part++) {
+        const int64_t p0 = part ? cut : 0;
+        const int pc = part ? T_out - cut : cut;
+        st = vv_vae_im2col_dev(&d2, dx, ld_in, IC, KW, SD, p0, pc, dcol, 64,
+                               stream);
+        if (st == VV_OK)
+            st = vv_vae_conv_gemm_dev(&d2, dw, dcol, 64, db, NULL, 0, OC, Kc,
+                                      p0, pc, stream);
+    }
+    TEST_ASSERT(st == VV_OK, "conv GEMM runs (transposed)");
+    uint16_t* r1 = download(dr1, rows_elems, stream);
+    uint16_t* r2 = download(dr2, rows_elems, stream);
+    TEST_ASSERT(memcmp(r1, r2, rows_elems * 2) == 0,
+                "conv GEMM == direct conv, transposed with skip, bit for bit");
+
+    vv_free(y1); vv_free(y2); vv_free(r1); vv_free(r2);
+    vv_dev_stream_sync(stream);
+    vv_dev_free(dx); vv_dev_free(dw); vv_dev_free(dtl); vv_dev_free(db);
+    vv_dev_free(dy1); vv_dev_free(dy2); vv_dev_free(dcol);
+    vv_dev_free(dr1); vv_dev_free(dr2);
+    vv_free(x); vv_free(w); vv_free(tl);
 }
 
 int main(void) {
@@ -812,7 +1075,8 @@ int main(void) {
         if (s == VV_OK) s = vv_vae_arena_create(ea, 8, 100000, &g.a);
         TEST_ASSERT(s == VV_OK, "GPU weights and arena");
         if (s == VV_OK) {
-            test_gemm_splitk(g.stream);
+            test_gemm_tiles(g.stream);
+            test_conv_gemm(g.stream);
             test_gpu_vs_reference(&g);
             test_gpu_chunking(&g);
             test_gpu_batching(&g);
