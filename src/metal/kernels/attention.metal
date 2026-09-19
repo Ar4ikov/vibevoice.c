@@ -680,10 +680,18 @@ ATT_FA1_INST(KV_TQ1_5, "tq1_5")
 /* ─── Prefill on simdgroup matrices, GQA-packed ─────────────────────────── */
 
 /*
- * A threadgroup takes 32 consecutive packed rows of one KV group -- row R
- * is (position R / G, head R % G) -- as four simdgroups of 8 rows. Q stays
- * in registers as 16 8x8 fragments per simdgroup; each 32-position tile of
- * K and V is decoded to FP16 in threadgroup memory once for all 32 rows.
+ * A threadgroup takes PA_ROWS consecutive packed rows of one KV group --
+ * row R is (position R / G, head R % G) -- as eight simdgroups of 8 rows.
+ * Each PA_BC-position tile of K and V is decoded to FP16 in threadgroup
+ * memory once for all of them, so a wider group re-reads a long cache less
+ * often.
+ *
+ * What makes the width affordable is where Q lives. With Q in registers,
+ * each simdgroup holds 16 FP32 accumulators and 16 Q fragments, and eight
+ * such simdgroups leave too few registers to keep the cores busy: that
+ * arrangement measured 0.2 TFLOP/s at 1024 positions against 0.46 for four
+ * simdgroups of the same shape. Staging Q in threadgroup memory instead
+ * (below) frees the registers the width needs.
  *
  * S = Q K^T and the online softmax run on the fragments' own elements:
  * lane l holds row fm = (l/4 & 4) + (l/2 % 4), columns fn, fn+1 with
@@ -691,11 +699,17 @@ ATT_FA1_INST(KV_TQ1_5, "tq1_5")
  * l, l^1, l^8, l^9. P goes into P V as an FP16 pair (value and remainder),
  * which keeps about 22 bits of each probability.
  */
-#define PA_ROWS 32
-#define PA_BC   32
+#define PA_ROWS 64
+#define PA_BC   16
 #define PA_LD   (ATT_D + 8)
 
-template <int FMT>
+/*
+ * SPLIT keeps about 22 bits of each probability by feeding P V an FP16 pair
+ * (the value and what rounding dropped), which is what `fa2` means here;
+ * `flashinfer` rounds P once, as its CUDA counterpart does, and halves the
+ * P V matrix multiplies.
+ */
+template <int FMT, bool SPLIT>
 kernel void vv_attn_prefill_mma(constant vv_attn_pre_p& p [[buffer(0)]],
                                 device const half* Q [[buffer(1)]],
                                 device const uchar* k_store [[buffer(2)]],
@@ -707,17 +721,34 @@ kernel void vv_attn_prefill_mma(constant vv_attn_pre_p& p [[buffer(0)]],
                                 VV_GRID_ARGS) {
     threadgroup half Ks[PA_BC * PA_LD];
     threadgroup half Vs[PA_BC * PA_LD];
+    threadgroup half Qs[PA_ROWS * PA_LD];
     const uint tid = threadIdx.x;
     const int kv_head = (int)blockIdx.y;
     const int G = p.G;
     const int R0 = (int)blockIdx.x * PA_ROWS;
     const int total_rows = p.q_len * G;
 
-    /* Q rows into Ks, then into registers. */
-    for (uint e = tid; e < (uint)PA_ROWS * 16u; e += 128u) {
+    /* This lane's elements of an 8x8 fragment: row fm, columns fn, fn+1. */
+    const int qid = (int)lane / 4;
+    const int fm = (qid & 4) + (((int)lane / 2) % 4);
+    const int fn = (qid & 2) * 2 + ((int)lane % 2) * 2;
+    const int Rm = R0 + (int)warp * 8 + fm;
+    const bool alive = Rm < total_rows;
+    const int pos_m = alive ? Rm / G : 0;
+    const int head_m = kv_head * G + (alive ? Rm % G : 0);
+    const int qa = p.q_offset + pos_m;
+
+    /*
+     * Q stays in threadgroup memory and its fragments are loaded per tile.
+     * Keeping all 16 in registers next to the 16 FP32 accumulators leaves
+     * too few registers for a second threadgroup per core, and this kernel
+     * is bound by how much of the KV re-read it can hide, not by the loads.
+     * The rows are (position, head) pairs, so each is staged by hand.
+     */
+    for (uint e = tid; e < (uint)PA_ROWS * 16u; e += 256u) {
         const int r = (int)(e >> 4), c = (int)(e & 15u) * 8;
         const int R = R0 + r;
-        threadgroup half* d = Ks + r * PA_LD + c;
+        threadgroup half* d = Qs + r * PA_LD + c;
         if (R < total_rows) {
             const int pos = R / G, h = kv_head * G + R % G;
             device const half4* s4 = (device const half4*)
@@ -729,19 +760,6 @@ kernel void vv_attn_prefill_mma(constant vv_attn_pre_p& p [[buffer(0)]],
             *(threadgroup half4*)(d + 4) = half4(0.0h);
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_half8x8 qf[ATT_D / 8];
-    for (int kk = 0; kk < ATT_D / 8; ++kk)
-        simdgroup_load(qf[kk], Ks + ((int)warp * 8) * PA_LD + kk * 8, PA_LD);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const int qid = (int)lane / 4;
-    const int fm = (qid & 4) + (((int)lane / 2) % 4);
-    const int fn = (qid & 2) * 2 + ((int)lane % 2) * 2;
-    const int Rm = R0 + (int)warp * 8 + fm;
-    const bool alive = Rm < total_rows;
-    const int pos_m = alive ? Rm / G : 0;
-    const int qa = p.q_offset + pos_m;
 
     const int last = min(R0 + PA_ROWS, total_rows) - 1;
     int kv_end = p.causal ? p.q_offset + last / G + 1 : p.kv_len;
@@ -754,8 +772,9 @@ kernel void vv_attn_prefill_mma(constant vv_attn_pre_p& p [[buffer(0)]],
 
     for (int t = 0; t < n_tiles; ++t) {
         const int kv0 = t * PA_BC;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (FMT == KV_FP16) {
-            for (uint e = tid; e < (uint)PA_BC * 16u; e += 128u) {
+            for (uint e = tid; e < (uint)PA_BC * 16u; e += 256u) {
                 const int r = (int)(e >> 4), c = (int)(e & 15u) * 8;
                 const int gp = kv0 + r;
                 threadgroup half* dk = Ks + r * PA_LD + c;
@@ -772,7 +791,7 @@ kernel void vv_attn_prefill_mma(constant vv_attn_pre_p& p [[buffer(0)]],
                 }
             }
         } else {
-            for (int r = (int)warp; r < PA_BC; r += 4) {
+            for (int r = (int)warp; r < PA_BC; r += 8) {
                 const int gp = kv0 + r;
                 float kk[4] = { 0.f, 0.f, 0.f, 0.f }, vv[4] = { 0.f, 0.f, 0.f, 0.f };
                 if (gp < p.kv_len) {                      /* simdgroup-uniform */
@@ -790,10 +809,12 @@ kernel void vv_attn_prefill_mma(constant vv_attn_pre_p& p [[buffer(0)]],
         simdgroup_float8x8 s[PA_BC / 8];
         for (int j = 0; j < PA_BC / 8; ++j) s[j] = simdgroup_float8x8(0.0f);
         for (int kk = 0; kk < ATT_D / 8; ++kk) {
+            simdgroup_half8x8 qf;
+            simdgroup_load(qf, Qs + ((int)warp * 8) * PA_LD + kk * 8, PA_LD);
             for (int j = 0; j < PA_BC / 8; ++j) {
                 simdgroup_half8x8 kf;
                 simdgroup_load(kf, Ks + (j * 8) * PA_LD + kk * 8, PA_LD, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(s[j], qf[kk], kf, s[j]);
+                simdgroup_multiply_accumulate(s[j], qf, kf, s[j]);
             }
         }
 
@@ -825,7 +846,7 @@ kernel void vv_attn_prefill_mma(constant vv_attn_pre_p& p [[buffer(0)]],
                 sum += pr;
                 const half hi = (half)pr;
                 eh[i] = hi;
-                el[i] = (half)(pr - (float)hi);
+                if (SPLIT) el[i] = (half)(pr - (float)hi);
             }
         }
         sum += simd_shuffle_xor(sum, 1);
@@ -843,16 +864,14 @@ kernel void vv_attn_prefill_mma(constant vv_attn_pre_p& p [[buffer(0)]],
                 simdgroup_half8x8 vf;
                 simdgroup_load(vf, Vs + (j * 8) * PA_LD + d * 8, PA_LD);
                 simdgroup_multiply_accumulate(o[d], ph[j], vf, o[d]);
-                simdgroup_multiply_accumulate(o[d], pl[j], vf, o[d]);
+                if (SPLIT) simdgroup_multiply_accumulate(o[d], pl[j], vf, o[d]);
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     if (alive) {
         const float inv_l = (l_i > 1e-20f) ? 1.0f / l_i : 0.0f;
-        const int h = kv_head * G + Rm % G;
-        device half* orow = O + ((ulong)pos_m * (ulong)p.n_q_heads + (ulong)h) * ATT_D;
+        device half* orow = O + ((ulong)pos_m * (ulong)p.n_q_heads + (ulong)head_m) * ATT_D;
         for (int d = 0; d < ATT_D / 8; ++d) {
             thread auto& e = o[d].thread_elements();
             *(device half2*)(orow + d * 8 + fn) = half2((half)(e[0] * inv_l), (half)(e[1] * inv_l));
@@ -860,10 +879,12 @@ kernel void vv_attn_prefill_mma(constant vv_attn_pre_p& p [[buffer(0)]],
     }
 }
 
-typedef decltype(vv_attn_prefill_mma<KV_FP16>) vv_attn_prefill_mma_t;
+typedef decltype(vv_attn_prefill_mma<KV_FP16, true>) vv_attn_prefill_mma_t;
 #define ATT_MMA_INST(F, FN)                                                    \
 template [[host_name("vv_attn_prefill_mma_" FN)]]                              \
-kernel vv_attn_prefill_mma_t vv_attn_prefill_mma<F>;
+kernel vv_attn_prefill_mma_t vv_attn_prefill_mma<F, true>;                     \
+template [[host_name("vv_attn_prefill_fi_" FN)]]                               \
+kernel vv_attn_prefill_mma_t vv_attn_prefill_mma<F, false>;
 ATT_MMA_INST(KV_FP16, "fp16")
 ATT_MMA_INST(KV_FP8_E4M3, "fp8_e4m3")
 ATT_MMA_INST(KV_FP8_E5M2, "fp8_e5m2")

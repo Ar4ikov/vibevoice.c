@@ -233,7 +233,7 @@ typedef struct {
     float scale;
 } pre_p;
 
-static vv_status_t prefill_run(bool scalar, const void* q,
+static vv_status_t prefill_run(bool scalar, bool fi, const void* q,
                                const vv_kv_view_t* kv, void* out,
                                int n_q_heads, int q_len, int q_offset,
                                int kv_len, bool causal, void* stream) {
@@ -253,8 +253,11 @@ static vv_status_t prefill_run(bool scalar, const void* q,
                 vv_kv_bytes_per_vec((vv_kv_format_t)kv->format, ATT_D),
                 kv->page_table != NULL, 1.0f / sqrtf((float)ATT_D) };
     char name[64];
+    /* fa1: the scalar kernel. fa2: P V through an FP16 pair, as CUDA's fa2
+     * keeps the scalar kernels' bits. flashinfer: P rounded once, half the
+     * matrix multiplies, as its CUDA counterpart. */
     snprintf(name, sizeof(name), "vv_attn_prefill_%s_%s",
-             scalar ? "fa1" : "mma", fs);
+             scalar ? "fa1" : (fi ? "fi" : "mma"), fs);
     vv_mtl_launch_t l = launch(name, &p, sizeof(p));
     l.bufs[0] = q; l.bufs[1] = kv->k; l.bufs[2] = kv->v;
     l.bufs[3] = kv->k_meta; l.bufs[4] = kv->v_meta; l.bufs[5] = kv->page_table;
@@ -264,9 +267,9 @@ static vv_status_t prefill_run(bool scalar, const void* q,
         l.grid[1] = (uint32_t)((q_len + 7) / 8);
         l.block[0] = 256;
     } else {
-        l.grid[0] = (uint32_t)(((int64_t)q_len * G + 31) / 32);
+        l.grid[0] = (uint32_t)(((int64_t)q_len * G + 63) / 64);
         l.grid[1] = (uint32_t)kv->n_kv_heads;
-        l.block[0] = 128;
+        l.block[0] = 256;
     }
     return vv_mtl_run(stream, &l);
 }
@@ -276,8 +279,9 @@ vv_status_t vv_attn_prefill(int backend, const void* q, const vv_kv_view_t* kv,
                             int kv_len, bool causal, void* scratch,
                             void* stream) {
     (void)scratch;
-    return prefill_run(backend == VV_ATTN_FA1, q, kv, out, n_q_heads, q_len,
-                       q_offset, kv_len, causal, stream);
+    return prefill_run(backend == VV_ATTN_FA1, backend == VV_ATTN_FLASHINFER,
+                       q, kv, out, n_q_heads, q_len, q_offset, kv_len, causal,
+                       stream);
 }
 
 /** @brief The backend VV_ATTN / VV_ATTN_MMA ask for (the legacy entry). */
@@ -323,8 +327,8 @@ vv_status_t vv_gqa_attention_prefill_q_dev(
     const vv_kv_view_t kv = plain_view(k_store, v_store, k_meta, v_meta,
                                        kv_format, n_kv_heads, head_dim);
     /* The scalar kernel, as the CUDA entry point runs it. */
-    return prefill_run(true, q, &kv, output, n_q_heads, q_len, q_offset,
-                       kv_len, causal, stream);
+    return prefill_run(true, false, q, &kv, output, n_q_heads, q_len,
+                       q_offset, kv_len, causal, stream);
 }
 
 /* ─── KV store ──────────────────────────────────────────────────────────── */
