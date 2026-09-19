@@ -14,6 +14,7 @@
 #include "vibevoice/quant.h"
 #include "vibevoice/family.h"
 #include "vibevoice/cpu_kernels.h"
+#include "vibevoice/device.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -171,7 +172,65 @@ static void test_family_logic(void) {
 /* ─── A synthetic checkpoint ────────────────────────────────────────────── */
 
 enum { HS = 128, NH = 1, NKV = 1, HD = 128, INTER = 256, VOCAB = 64,
-       LAYERS = 2, VAE_A = 4, VAE_S = 8 };
+       LAYERS = 2, VAE_A = 4, VAE_S = 8, TIE_AT = 40 };
+
+/* ─── FP16 rounding ─────────────────────────────────────────────────────── */
+
+/**
+ * @brief Nearest FP16 to `f`, ties to even, found by search rather than by
+ *        bit manipulation, so it shares nothing with the code it checks.
+ *        Finite inputs below 65504 only.
+ */
+static uint16_t half_rne_ref(float f) {
+    const uint16_t sign = (f < 0.0f || (f == 0.0f && 1.0f / f < 0.0f))
+                        ? 0x8000u : 0u;
+    const double a = fabs((double)f);
+    /* Magnitudes are monotonic in the bit pattern: bisect for the last
+       half not above |f|, then compare it with the next one up. */
+    uint16_t lo = 0, hi = 0x7BFF;
+    while (lo < hi) {
+        const uint16_t mid = (uint16_t)((lo + hi + 1) / 2);
+        if ((double)vv_half_to_float(mid) <= a) lo = mid; else hi = mid - 1;
+    }
+    uint16_t best = lo;
+    if (lo < 0x7BFF) {
+        const double d0 = a - (double)vv_half_to_float(lo);
+        const double d1 = (double)vv_half_to_float((uint16_t)(lo + 1)) - a;
+        if (d1 < d0 || (d1 == d0 && (lo & 1u))) best = (uint16_t)(lo + 1);
+    }
+    return (uint16_t)(sign | best);
+}
+
+static void test_half_rne(void) {
+    printf("FP16 round-to-nearest-even:\n");
+    CHECK(vv_float_to_half_rne(1.0f + 1.0f / 2048.0f) == 0x3C00,
+          "1 + 2^-11 -> 1.0 (0x3C00), a tie to even");
+    CHECK(vv_float_to_half_rne(1.0f + 3.0f / 2048.0f) == 0x3C02,
+          "1 + 3*2^-11 -> 0x3C02, a tie to even");
+    CHECK(vv_float_to_half_rne(3.0f * ldexpf(1.0f, -25)) == 0x0002 &&
+          vv_float_to_half_rne(ldexpf(1.0f, -25)) == 0x0000 &&
+          vv_float_to_half_rne(ldexpf(1.0f, -25) * 1.0001f) == 0x0001,
+          "subnormal ties and the underflow edge");
+    CHECK(vv_float_to_half_rne(65520.0f) == 0x7C00 &&
+          vv_float_to_half_rne(65519.0f) == 0x7BFF &&
+          vv_float_to_half_rne(-1.0e9f) == 0xFC00,
+          "65520 rounds to infinity, 65519 does not");
+    uint32_t r = 987654321u;
+    int bad = 0;
+    for (int i = 0; i < 200000; i++) {
+        r = r * 1664525u + 1013904223u;
+        /* Exponents from far below the subnormals to just under 65504. */
+        const uint32_t e = 90u + (r >> 8) % 52u;
+        uint32_t u = (r & 0x80000000u) | (e << 23) | ((r * 2654435761u) >> 9);
+        /* Every eighth value is made an exact tie. */
+        if ((i & 7) == 0) u = (u & ~0x1FFFu) | 0x1000u;
+        float f;
+        memcpy(&f, &u, sizeof(f));
+        if (fabsf(f) >= 65504.0f) continue;
+        if (vv_float_to_half_rne(f) != half_rne_ref(f)) bad++;
+    }
+    CHECK(bad == 0, "200k values, an eighth of them ties, match a search");
+}
 
 typedef struct {
     char        name[128];
@@ -231,6 +290,15 @@ static void build_tensors(bool with_head) {
     const char* P = "model.language_model.";
     snprintf(nm, sizeof(nm), "%sembed_tokens.weight", P);
     add(nm, "F32", VOCAB, HS, 0.05f);
+    {
+        /* Exact FP16 ties: 1 + 2^-11 and 1 + 3 * 2^-11 sit halfway between
+           two halves, as does 3 * 2^-25 between subnormals 1 and 2. */
+        float* e = (float*)g_t[g_n - 1].data;
+        e[TIE_AT]     = 1.0f + 1.0f / 2048.0f;
+        e[TIE_AT + 1] = 1.0f + 3.0f / 2048.0f;
+        e[TIE_AT + 2] = -(1.0f + 1.0f / 2048.0f);
+        e[TIE_AT + 3] = 3.0f * ldexpf(1.0f, -25);
+    }
     snprintf(nm, sizeof(nm), "%snorm.weight", P);
     add(nm, "F16", HS, 0, 1.0f);
     if (with_head) {
@@ -373,8 +441,14 @@ static void test_dense_load(void) {
     exact = m->embed_tokens.dtype == VV_DTYPE_F16;
     for (int i = 0; exact && i < VOCAB * HS; i++)
         exact = ((const uint16_t*)m->embed_tokens.data)[i] ==
-                vv_float_to_half(((float*)es->data)[i]);
+                half_rne_ref(((float*)es->data)[i]);
     CHECK(exact, "F32 embedding becomes FP16, rounded to nearest-even");
+    {
+        const uint16_t* e16 = (const uint16_t*)m->embed_tokens.data;
+        CHECK(e16[TIE_AT] == 0x3C00 && e16[TIE_AT + 1] == 0x3C02 &&
+              e16[TIE_AT + 2] == 0xBC00 && e16[TIE_AT + 3] == 0x0002,
+              "exact ties in the F32 embedding went to even");
+    }
 
     const fake_t* fc = get("model.acoustic_connector.fc1.weight");
     exact = m->acoustic_connector_fc1.tensor.dtype == VV_DTYPE_F32;
@@ -430,29 +504,44 @@ static void test_dense_load(void) {
     write_model(dir, true, NULL, NULL);
 }
 
-/** @brief Largest |dequant - source| relative to the row's largest |w|. */
+/** @brief Weight [n,k] of the source checkpoint, as the BF16 it was stored as. */
+static double src_w(const fake_t* src, int K, int n, int k) {
+    return vv_bf16_to_float(((const uint16_t*)src->data)[(size_t)n * K + k]);
+}
+
+/**
+ * @brief Largest |dequant - source| relative to the row's largest |w|.
+ *
+ * Decodes the codes by the documented layout (quant.h), independently of
+ * the kernels; test_kernels() then checks the kernels agree with it.
+ */
 static double quant_error(const vv_weight_t* w, const fake_t* src, int N, int K) {
     double worst = 0.0;
     extern const float VV_NF4_TABLE[16];
     for (int n = 0; n < N; n++) {
         double amax = 0.0;
         for (int k = 0; k < K; k++) {
-            double v = fabs(vv_bf16_to_float(((uint16_t*)src->data)[n * K + k]));
+            const double v = fabs(src_w(src, K, n, k));
             if (v > amax) amax = v;
         }
         for (int k = 0; k < K; k++) {
-            const uint8_t b = ((const uint8_t*)w->tensor.data)[(n * K + k) / 2];
-            const int code = (k & 1) ? (b & 15) : (b >> 4);
             double d;
-            if (w->quant_kind == VV_QUANT_NF4) {
-                const uint16_t sc = ((const uint16_t*)w->quant.scales.data)[(n * K + k) / 64];
-                d = VV_NF4_TABLE[code] * vv_half_to_float(sc);
+            if (w->quant_kind == VV_QUANT_INT8) {
+                d = ((const int8_t*)w->tensor.data)[(size_t)n * K + k] *
+                    (double)((const float*)w->quant.scales.data)[n];
             } else {
-                const int g = k / w->group_size, G = K / w->group_size;
-                d = code * vv_half_to_float(((const uint16_t*)w->quant.scales.data)[n * G + g])
-                    + vv_half_to_float(((const uint16_t*)w->mins.data)[n * G + g]);
+                const uint8_t b = ((const uint8_t*)w->tensor.data)[(n * K + k) / 2];
+                const int code = (k & 1) ? (b & 15) : (b >> 4);
+                if (w->quant_kind == VV_QUANT_NF4) {
+                    const uint16_t sc = ((const uint16_t*)w->quant.scales.data)[(n * K + k) / 64];
+                    d = VV_NF4_TABLE[code] * vv_half_to_float(sc);
+                } else {
+                    const int g = k / w->group_size, G = K / w->group_size;
+                    d = code * vv_half_to_float(((const uint16_t*)w->quant.scales.data)[n * G + g])
+                        + vv_half_to_float(((const uint16_t*)w->mins.data)[n * G + g]);
+                }
             }
-            const double e = fabs(d - vv_bf16_to_float(((uint16_t*)src->data)[n * K + k]));
+            const double e = fabs(d - src_w(src, K, n, k));
             if (amax > 0 && e / amax > worst) worst = e / amax;
         }
     }
@@ -464,12 +553,164 @@ static bool same_bytes(const vv_tensor_t* a, const vv_tensor_t* b) {
            (a->size_bytes == 0 || memcmp(a->data, b->data, a->size_bytes) == 0);
 }
 
+static double cosine(const float* a, const double* b, size_t n) {
+    double ab = 0, aa = 0, bb = 0;
+    for (size_t i = 0; i < n; i++) {
+        ab += a[i] * b[i]; aa += (double)a[i] * a[i]; bb += b[i] * b[i];
+    }
+    return (aa > 0 && bb > 0) ? ab / sqrt(aa * bb) : 0.0;
+}
+
+/** @brief The CPU kernel the decoder would run for this weight. */
+static vv_status_t cpu_linear(const vv_weight_t* w, const float* x, float* y,
+                              int M, int N, int K) {
+    switch (w->quant_kind) {
+    case VV_QUANT_NF4:
+        return vv_nf4_gemm_cpu(x, (const uint8_t*)w->tensor.data,
+                               w->quant.scales.data, NULL, y, M, N, K);
+    case VV_QUANT_INT4G:
+        return vv_int4g_gemm_cpu(x, (const uint8_t*)w->tensor.data,
+                                 w->quant.scales.data, w->mins.data, NULL, y,
+                                 M, N, K, w->group_size);
+    case VV_QUANT_INT8:
+        return vv_int8_gemm_cpu(x, (const int8_t*)w->tensor.data,
+                                (const float*)w->quant.scales.data, NULL, y,
+                                M, N, K);
+    default:
+        return vv_gemm_f16w_cpu(x, w->tensor.data, NULL, y, M, N, K);
+    }
+}
+
+#ifdef VV_HAS_ACCEL
+/** @brief The GPU kernels quant_linear() in decoder.c dispatches to. */
+static vv_status_t gpu_linear(const vv_weight_t* w, void* const dt[3],
+                              const void* x, void* y, void* scratch,
+                              int M, int N, int K, void* stream) {
+    switch (w->quant_kind) {
+    case VV_QUANT_NF4:
+        return M == 1
+            ? vv_nf4_gemv_dev(x, (const uint8_t*)dt[0], dt[1], NULL, y, N, K,
+                              stream)
+            : vv_nf4_gemm_dev(x, (const uint8_t*)dt[0], dt[1], y, scratch,
+                              M, N, K, 64, stream);
+    case VV_QUANT_INT4G:
+        return M == 1
+            ? vv_awq_gemv_dev(x, (const uint32_t*)dt[0],
+                              (const uint32_t*)dt[2], dt[1], NULL, y, N, K,
+                              w->group_size, stream)
+            : vv_awq_gemm_dev(x, (const uint32_t*)dt[0],
+                              (const uint32_t*)dt[2], dt[1], y, scratch,
+                              M, N, K, w->group_size, stream);
+    case VV_QUANT_INT8:
+        return M == 1
+            ? vv_int8_gemv_dev(x, (const int8_t*)dt[0], (const float*)dt[1],
+                               NULL, y, N, K, stream)
+            : vv_int8_gemm_dev(x, (const int8_t*)dt[0], (const float*)dt[1],
+                               y, scratch, M, N, K, stream);
+    default:
+        return vv_gemm_fp16_dev(x, dt[0], y, M, N, K, 1.0f, 0.0f, stream);
+    }
+}
+#endif
+
+/**
+ * @brief The quantized weight through the kernels that will run it, against
+ *        the dense source: pins the quantizer's layout to the kernels'.
+ *
+ * M = 1 is the decode GEMV, 5 the small-batch path (and the CPU's packed
+ * GEMM), 17 the GPU's dequantize-then-GEMM path.
+ */
+static void test_kernels(const char* nm, const vv_weight_t* w,
+                         const fake_t* src, int N, int K) {
+    enum { MMAX = 17 };
+    static const int Ms[3] = { 1, 5, MMAX };
+    float* x = (float*)malloc((size_t)MMAX * K * sizeof(float));
+    uint16_t* xh = (uint16_t*)malloc((size_t)MMAX * K * sizeof(uint16_t));
+    float* y = (float*)malloc((size_t)MMAX * N * sizeof(float));
+    double* ref = (double*)malloc((size_t)MMAX * N * sizeof(double));
+    for (int i = 0; i < MMAX * K; i++) {
+        xh[i] = vv_float_to_half_rne(frand());
+        x[i] = vv_half_to_float(xh[i]);     /* same inputs on both sides */
+    }
+    for (int m = 0; m < MMAX; m++)
+        for (int n = 0; n < N; n++) {
+            double acc = 0.0;
+            for (int k = 0; k < K; k++)
+                acc += (double)x[(size_t)m * K + k] * src_w(src, K, n, k);
+            ref[(size_t)m * N + n] = acc;
+        }
+    /* Quantization error alone bounds how far off an honest kernel can be;
+       a layout mismatch (wrong nibble order, wrong scale index) scrambles
+       the weights and lands near 0. */
+    const double min_cos = w->quant_kind == VV_QUANT_INT8 ? 0.9999
+                         : w->quant_kind == VV_QUANT_NONE ? 0.99999 : 0.99;
+    char msg[160];
+
+    for (int i = 0; i < 3; i++) {
+        const int M = Ms[i];
+        const vv_status_t s = cpu_linear(w, x, y, M, N, K);
+        const double c = cosine(y, ref, (size_t)M * N);
+        snprintf(msg, sizeof(msg), "%s: CPU kernel M=%d vs dense, cos %.6f",
+                 nm, M, c);
+        CHECK(s == VV_OK && c > min_cos, msg);
+    }
+
+#ifdef VV_HAS_ACCEL
+    size_t total = 0;
+    if (vv_dev_get_device_info(0, &total, NULL, NULL) != VV_OK || total == 0) {
+        printf("  SKIP: %s GPU kernels, no device\n", nm);
+        goto done;
+    }
+    {
+        const vv_tensor_t* ht[3] = { &w->tensor, &w->quant.scales, &w->mins };
+        void* dt[3] = { NULL, NULL, NULL };
+        void *dx = NULL, *dy = NULL, *dscr = NULL, *stream = NULL;
+        bool ok = vv_dev_stream_create(&stream) == VV_OK;
+        for (int j = 0; j < 3 && ok; j++) {
+            if (!ht[j]->data) continue;
+            ok = vv_dev_alloc(&dt[j], ht[j]->size_bytes) == VV_OK &&
+                 vv_dev_memcpy_h2d(dt[j], ht[j]->data, ht[j]->size_bytes,
+                                   stream) == VV_OK;
+        }
+        ok = ok && vv_dev_alloc(&dx, (size_t)MMAX * K * 2) == VV_OK &&
+             vv_dev_alloc(&dy, (size_t)MMAX * N * 2) == VV_OK &&
+             vv_dev_alloc(&dscr, (size_t)N * K * 2) == VV_OK &&
+             vv_dev_memcpy_h2d(dx, xh, (size_t)MMAX * K * 2, stream) == VV_OK;
+        uint16_t* yh = (uint16_t*)malloc((size_t)MMAX * N * sizeof(uint16_t));
+        for (int i = 0; i < 3 && ok; i++) {
+            const int M = Ms[i];
+            vv_status_t s = gpu_linear(w, dt, dx, dy, dscr, M, N, K, stream);
+            if (s == VV_OK) s = vv_dev_stream_sync(stream);
+            if (s == VV_OK)
+                s = vv_dev_memcpy_d2h(yh, dy, (size_t)M * N * 2, stream);
+            if (s == VV_OK) s = vv_dev_stream_sync(stream);
+            for (int j = 0; j < M * N; j++) y[j] = vv_half_to_float(yh[j]);
+            const double c = cosine(y, ref, (size_t)M * N);
+            snprintf(msg, sizeof(msg), "%s: GPU kernel M=%d vs dense, cos %.6f",
+                     nm, M, c);
+            CHECK(s == VV_OK && c > min_cos, msg);
+        }
+        if (!ok) printf("  SKIP: %s GPU kernels, allocation\n", nm);
+        free(yh);
+        for (int j = 0; j < 3; j++) if (dt[j]) vv_dev_free(dt[j]);
+        if (dx) vv_dev_free(dx);
+        if (dy) vv_dev_free(dy);
+        if (dscr) vv_dev_free(dscr);
+        if (stream) vv_dev_stream_destroy(stream);
+    }
+done:
+#endif
+    free(x); free(xh); free(y); free(ref);
+}
+
 static void test_load_quant(void) {
     printf("load-time quantization:\n");
     const char* dir = "test_model_load_dense";
     const fake_t* src = get("model.language_model.layers.1.mlp.down_proj.weight");
-    for (int qi = 0; qi < 2; qi++) {
-        const int q = qi ? VV_LOAD_QUANT_INT4 : VV_LOAD_QUANT_NF4;
+    static const int QS[3] = { VV_LOAD_QUANT_NF4, VV_LOAD_QUANT_INT4,
+                               VV_LOAD_QUANT_INT8 };
+    for (int qi = 0; qi < 3; qi++) {
+        const int q = QS[qi];
         const char* nm = vv_load_quant_name((vv_load_quant_t)q);
         char msg[128];
         vv_model_t *a = NULL, *b = NULL;
@@ -483,6 +724,8 @@ static void test_load_quant(void) {
 #endif
         vv_status_t sb = load(dir, q, &b);
 #ifdef _OPENMP
+        CHECK(omp_get_max_threads() == (max_threads > 1 ? max_threads : 4),
+              "the load puts the caller's thread count back");
         omp_set_num_threads(max_threads);
 #endif
         snprintf(msg, sizeof(msg), "--quant %s loads", nm);
@@ -490,13 +733,22 @@ static void test_load_quant(void) {
         if (!a || !b) { vv_model_free(a); vv_model_free(b); continue; }
 
         const vv_weight_t* w = &a->layers[1].mlp.down_proj;
-        snprintf(msg, sizeof(msg), "%s: kind, packed [N][K/2], scales per group", nm);
-        CHECK(w->quant_kind == (qi ? VV_QUANT_INT4G : VV_QUANT_NF4) &&
-              w->tensor.size_bytes == (size_t)HS * INTER / 2 &&
-              w->quant.scales.size_bytes ==
-                  (size_t)HS * (INTER / (qi ? 128 : 64)) * 2 &&
-              (qi ? w->group_size == 128 && w->mins.data != NULL
-                  : w->mins.data == NULL), msg);
+        snprintf(msg, sizeof(msg), "%s: kind, code and scale sizes", nm);
+        if (q == VV_LOAD_QUANT_INT8)
+            CHECK(w->quant_kind == VV_QUANT_INT8 &&
+                  w->tensor.dtype == VV_DTYPE_I8 &&
+                  w->tensor.size_bytes == (size_t)HS * INTER &&
+                  w->quant.scales.dtype == VV_DTYPE_F32 &&
+                  w->quant.scales.size_bytes == (size_t)HS * 4 &&
+                  w->mins.data == NULL, msg);
+        else
+            CHECK(w->quant_kind == (q == VV_LOAD_QUANT_INT4 ? VV_QUANT_INT4G
+                                                            : VV_QUANT_NF4) &&
+                  w->tensor.size_bytes == (size_t)HS * INTER / 2 &&
+                  w->quant.scales.size_bytes ==
+                      (size_t)HS * (INTER / (q == VV_LOAD_QUANT_INT4 ? 128 : 64)) * 2 &&
+                  (q == VV_LOAD_QUANT_INT4 ? w->group_size == 128 && w->mins.data != NULL
+                                           : w->mins.data == NULL), msg);
 
         bool same = true;
         for (int l = 0; l < LAYERS && same; l++) {
@@ -508,13 +760,26 @@ static void test_load_quant(void) {
         snprintf(msg, sizeof(msg), "%s: same bytes on 1 thread and on many", nm);
         CHECK(same, msg);
 
+        /* Half a step of each format, as a fraction of the row's max:
+           NF4's widest gap is -1 to -0.6962, INT4's step is at most 2/15,
+           INT8's 1/127. */
+        const double bound = q == VV_LOAD_QUANT_NF4 ? 0.153
+                           : q == VV_LOAD_QUANT_INT4 ? 0.07 : 0.0041;
         const double err = quant_error(w, src, HS, INTER);
-        snprintf(msg, sizeof(msg), "%s: worst error %.3f of the row's max",
-                 nm, err);
-        CHECK(err < (qi ? 0.08 : 0.2), msg);
+        snprintf(msg, sizeof(msg), "%s: worst error %.4f of the row's max "
+                 "(bound %.3f)", nm, err, bound);
+        CHECK(err < bound, msg);
+
+        test_kernels(nm, w, src, HS, INTER);
         vv_model_free(a);
         vv_model_free(b);
     }
+
+    /* The dense path through the same check, as the control. */
+    vv_model_t* d = NULL;
+    if (load(dir, VV_LOAD_QUANT_NONE, &d) == VV_OK && d)
+        test_kernels("none", &d->layers[1].mlp.down_proj, src, HS, INTER);
+    vv_model_free(d);
 }
 
 int main(void) {
@@ -522,6 +787,7 @@ int main(void) {
     test_published_configs();
     test_config_refusals();
     test_family_logic();
+    test_half_rne();
     test_dense_load();
     test_load_quant();
     /* Leave nothing behind in the directory ctest runs from. */
