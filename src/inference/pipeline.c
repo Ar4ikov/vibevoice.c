@@ -769,6 +769,13 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
          * On unified memory those three are host bytes that placing them
          * gives back, so they are part of what the budget can spend; on a
          * discrete card they are a second copy across a bus, and are not.
+         *
+         * This counts what an all-resident placement frees. Should the
+         * budget land on a streaming one instead, the layers left on the
+         * host keep their copies and the estimate is that much generous --
+         * but the loop below shrinks the window to the floor before it
+         * gives up on residency, and streaming is the wrong answer here
+         * anyway: the bytes are in the same RAM either way.
          */
         const size_t reclaimable = vv_dev_host_shares_memory(c->gpu_id)
             ? all_layers + embed_sz + lm_head_sz
