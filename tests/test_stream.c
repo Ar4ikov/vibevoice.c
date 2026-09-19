@@ -14,17 +14,27 @@
  * checks the real tokenizer: ids, prompt tokenization and the first jfk
  * chunk's text, all taken from `tools/compare_ref.py dump-stream`, and with
  * VV_TEST_STREAM_REF=<dump dir>[:<dir>...] it rebuilds every chunk text of
- * those dumps from their token ids.
+ * those dumps from their token ids. VV_TEST_STREAM_E2E=1 on top loads the
+ * model (VV_TEST_STREAM_QUANT, default none; VV_TEST_STREAM_CPU=1 for the
+ * CPU path) and runs every reference clip through a real session, chunk
+ * texts compared with upstream's.
+ *
+ * Model-free as well: speaker-turn segments from chunk texts, the streaming
+ * resampler against the whole-file one, and cancelling a session.
  */
 
 #include "vibevoice/stream.h"
 #include "vibevoice/vibevoice.h"
+#include "vibevoice/inference.h"
+#include "vibevoice/audio.h"
+#include "vibevoice/quant.h"
 
 #include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static int g_fail = 0;
 #define CHECK(x) do { if (!(x)) { \
@@ -659,12 +669,12 @@ static void test_session_cap_and_overflow(void) {
     CHECK(vv_stream_open_backend(&b, &p, &s) == VV_ERR_OVERFLOW && !s);
     CHECK(!m.destroyed && m.kv == 0);
 
-    /* Missing ops are rejected; the context-backed open is phase 2. */
+    /* Missing ops are rejected, and so is a context with no model. */
     b.prefill_chunk = NULL;
     CHECK(vv_stream_open_backend(&b, &p, &s) == VV_ERR_INVALID_ARG);
-    int dummy = 0;
-    CHECK(vv_stream_open((struct vv_inference_ctx*)(void*)&dummy, &p, &s) ==
-          VV_ERR_UNSUPPORTED);
+    vv_inference_ctx_t empty;
+    memset(&empty, 0, sizeof(empty));
+    CHECK(vv_stream_open(&empty, &p, &s) == VV_ERR_MODEL_FORMAT && !s);
     free(x);
 }
 
@@ -794,6 +804,243 @@ static void test_tokenizer(void) {
     vv_tokenizer_free(tok);
 }
 
+/* ─── Segments from chunk texts ─────────────────────────────────────────── */
+
+static void test_segments(void) {
+    const double C = 22.0 * 3200.0 / 24000.0;   /* 2.9333 s */
+    /* jfk's four chunks: one turn over all of them. */
+    const char* jfk[] = { " \n Speaker 0:And so, my fellow Americans, ",
+                          "ask not what your ",
+                          "country can do for you, ask what ",
+                          "you can do for your country." };
+    vv_transcription_t* tr = NULL;
+    CHECK(vv_stream_build_transcription(jfk, 4, C, 11.0, &tr) == VV_OK);
+    CHECK(tr && tr->num_segments == 1);
+    if (tr && tr->num_segments == 1) {
+        CHECK(strcmp(tr->segments[0].speaker, "Speaker 0") == 0);
+        CHECK(strcmp(tr->segments[0].text, "And so, my fellow Americans, ask "
+                     "not what your country can do for you, ask what you can "
+                     "do for your country.") == 0);
+        CHECK(tr->segments[0].start_time == 0.0f);
+        CHECK(tr->segments[0].end_time == 11.0f);   /* clamped */
+        CHECK(strcmp(tr->full_text, tr->segments[0].text) == 0);
+    }
+    vv_transcription_free(tr);
+
+    /* A turn marker split across chunks, text before any marker, empty
+     * chunks, and a turn that ends before the last chunk. */
+    const char* two[] = { "hello there \n Spea", "ker 1:how are", "",
+                          " you\n Speaker 0: fine", "" };
+    tr = NULL;
+    CHECK(vv_stream_build_transcription(two, 5, C, 0.0, &tr) == VV_OK);
+    CHECK(tr && tr->num_segments == 3);
+    if (tr && tr->num_segments == 3) {
+        CHECK(strcmp(tr->segments[0].speaker, "Speaker 0") == 0);
+        CHECK(strcmp(tr->segments[0].text, "hello there") == 0);
+        CHECK(tr->segments[0].start_time == 0.0f &&
+              tr->segments[0].end_time == (float)C);
+        CHECK(strcmp(tr->segments[1].speaker, "Speaker 1") == 0);
+        CHECK(strcmp(tr->segments[1].text, "how are you") == 0);
+        CHECK(tr->segments[1].start_time == 0.0f);          /* marker in 0 */
+        CHECK(tr->segments[1].end_time == (float)(4 * C));  /* "you" in 3 */
+        CHECK(strcmp(tr->segments[2].text, "fine") == 0);
+        CHECK(tr->segments[2].start_time == (float)(3 * C));
+        CHECK(strcmp(tr->full_text, "hello there how are you fine") == 0);
+    }
+    vv_transcription_free(tr);
+
+    /* Nothing said: no segments, empty text. */
+    const char* none[] = { "", "  " };
+    tr = NULL;
+    CHECK(vv_stream_build_transcription(none, 2, C, 5.0, &tr) == VV_OK);
+    CHECK(tr && tr->num_segments == 0 && tr->full_text &&
+          tr->full_text[0] == '\0');
+    vv_transcription_free(tr);
+    CHECK(vv_stream_build_transcription(NULL, 0, C, 0.0, &tr) == VV_OK);
+    vv_transcription_free(tr);
+}
+
+/* ─── Streaming resampler == whole-file resampler ───────────────────────── */
+
+static void check_resampler(int in_sr, int n, const size_t* sizes,
+                            int n_sizes) {
+    float* x = (float*)malloc(sizeof(float) * (size_t)n);
+    for (int i = 0; i < n; i++)
+        x[i] = 0.5f * sinf(0.013f * (float)i) + 0.25f * sinf(0.31f * (float)i);
+    float* want = NULL;
+    int n_want = 0;
+    CHECK(vv_audio_resample(x, in_sr, n, &want, 24000, &n_want) == VV_OK);
+
+    vv_resampler_t* r = NULL;
+    CHECK(vv_resampler_create(in_sr, 24000, &r) == VV_OK);
+    float* got = (float*)malloc(sizeof(float) * (size_t)(n_want + 64));
+    int n_got = 0, off = 0, k = 0;
+    while (off < n) {
+        size_t m = sizes[k++ % n_sizes];
+        if (m > (size_t)(n - off)) m = (size_t)(n - off);
+        const float* o = NULL;
+        size_t no = 0;
+        CHECK(vv_resampler_push(r, x + off, m, &o, &no) == VV_OK);
+        if (n_got + (int)no <= n_want + 64) memcpy(got + n_got, o, no * sizeof(float));
+        n_got += (int)no;
+        off += (int)m;
+    }
+    const float* o = NULL;
+    size_t no = 0;
+    CHECK(vv_resampler_finish(r, &o, &no) == VV_OK);
+    if (n_got + (int)no <= n_want + 64) memcpy(got + n_got, o, no * sizeof(float));
+    n_got += (int)no;
+    CHECK(n_got == n_want);
+    CHECK(n_got == n_want && memcmp(got, want, sizeof(float) * (size_t)n_want) == 0);
+    vv_resampler_free(r);
+    vv_free(want);
+    free(got);
+    free(x);
+}
+
+static void test_resampler(void) {
+    const size_t one[] = { 1 };
+    const size_t mixed[] = { 160, 7, 3200, 1, 511, 0, 44100 };
+    const size_t big[] = { 1u << 20 };
+    check_resampler(16000, 48000, one, 1);
+    check_resampler(16000, 160001, mixed, 7);
+    check_resampler(44100, 100000, mixed, 7);
+    check_resampler(48000, 96001, big, 1);
+    check_resampler(8000, 17, one, 1);
+    check_resampler(24000, 5000, mixed, 7);   /* pass-through */
+}
+
+/* ─── Cancel ────────────────────────────────────────────────────────────── */
+
+typedef struct { vv_stream_t* s; int n_chunks, n_errors; } cancel_ev_t;
+
+static void cancel_on_chunk(void* user, const vv_stream_event_t* ev) {
+    cancel_ev_t* c = (cancel_ev_t*)user;
+    if (ev->type == VV_STREAM_EVENT_CHUNK && ++c->n_chunks == 2)
+        vv_stream_cancel(c->s);     /* as a server does when a write fails */
+    if (ev->type == VV_STREAM_EVENT_ERROR) c->n_errors++;
+}
+
+static void test_cancel(void) {
+    mock_t m;
+    memset(&m, 0, sizeof(m));
+    m.cap = 100000;
+    m.feat_ok = 1;
+    static const int32_t say[] = { 'a', 'b', TCE };
+    for (int i = 0; i < 16; i++) { m.script[i] = say; m.script_len[i] = 3; }
+    m.n_script = 16;
+    vv_stream_backend_t b = mock_backend(&m, false);
+    vv_stream_params_t p;
+    vv_stream_params_default(&p);
+    cancel_ev_t ce;
+    memset(&ce, 0, sizeof(ce));
+    p.on_event = cancel_on_chunk;
+    p.user = &ce;
+    vv_stream_t* s = NULL;
+    CHECK(vv_stream_open_backend(&b, &p, &s) == VV_OK);
+    ce.s = s;
+    float* x = (float*)calloc(70400 * 6, sizeof(float));
+    CHECK(vv_stream_push(s, x, 70400 * 6) == VV_ERR_CANCELLED);
+    CHECK(ce.n_chunks == 2 && ce.n_errors == 0);   /* no ERROR for a cancel */
+    CHECK(m.n_prefill_chunks == 2);
+    CHECK(vv_stream_push(s, x, 1) == VV_ERR_CANCELLED);
+    CHECK(vv_stream_finish(s) == VV_ERR_CANCELLED);
+    vv_stream_close(s);
+    CHECK(m.destroyed);
+    free(x);
+}
+
+/* ─── The real model (optional, slow) ───────────────────────────────────── */
+
+typedef struct { char** texts; int n; } e2e_ev_t;
+
+static void e2e_event(void* user, const vv_stream_event_t* ev) {
+    e2e_ev_t* e = (e2e_ev_t*)user;
+    if (ev->type != VV_STREAM_EVENT_CHUNK || e->n >= 4096) return;
+    e->texts[e->n] = (char*)malloc(ev->text_len + 1);
+    memcpy(e->texts[e->n], ev->text, ev->text_len + 1);
+    e->n++;
+}
+
+static void test_model_e2e(void) {
+    const char* dir = getenv("VV_TEST_STREAM_MODEL");
+    const char* refs = getenv("VV_TEST_STREAM_REF");
+    const char* on = getenv("VV_TEST_STREAM_E2E");
+    if (!dir || !dir[0] || !refs || !refs[0] || !on || on[0] != '1') {
+        puts("stream: model run SKIP (set VV_TEST_STREAM_E2E=1, "
+             "VV_TEST_STREAM_MODEL and VV_TEST_STREAM_REF)");
+        return;
+    }
+    vv_init_params_t ip = vv_init_params_default();
+    const char* q = getenv("VV_TEST_STREAM_QUANT");
+    ip.weight_quant = (int)vv_load_quant_parse(q && q[0] ? q : "none");
+    const char* cpu = getenv("VV_TEST_STREAM_CPU");
+    ip.cpu_only = cpu && cpu[0] == '1';
+    vv_inference_ctx_t* ctx = NULL;
+    CHECK(vv_inference_init(dir, 0, &ip, &ctx) == VV_OK);
+    if (!ctx) return;
+
+    char list[2048];
+    snprintf(list, sizeof(list), "%s", refs);
+    for (char* ref = strtok(list, ":"); ref; ref = strtok(NULL, ":")) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/audio24k.f32", ref);
+        FILE* f = fopen(path, "rb");
+        CHECK(f != NULL);
+        if (!f) continue;
+        fseek(f, 0, SEEK_END);
+        const long bytes = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        float* pcm = (float*)malloc((size_t)bytes);
+        CHECK(fread(pcm, 1, (size_t)bytes, f) == (size_t)bytes);
+        fclose(f);
+
+        snprintf(path, sizeof(path), "%s/meta.json", ref);
+        f = fopen(path, "rb");
+        CHECK(f != NULL);
+        if (!f) { free(pcm); continue; }
+        fseek(f, 0, SEEK_END);
+        const long len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char* js = (char*)malloc((size_t)len + 1);
+        CHECK(fread(js, 1, (size_t)len, f) == (size_t)len);
+        js[len] = '\0';
+        fclose(f);
+        cJSON* meta = cJSON_Parse(js);
+        free(js);
+
+        e2e_ev_t e;
+        e.texts = (char**)calloc(4096, sizeof(char*));
+        e.n = 0;
+        vv_transcription_t* tr = NULL;
+        const double t0 = vv_time_ms();
+        CHECK(vv_stream_transcribe(ctx, pcm, (int)(bytes / 4), NULL,
+                                   e2e_event, &e, &tr) == VV_OK);
+        const double ms = vv_time_ms() - t0;
+        int n_ref = 0, n_same = 0;
+        const cJSON* ch;
+        cJSON_ArrayForEach(ch, cJSON_GetObjectItem(meta, "chunks")) {
+            const char* want = cJSON_GetObjectItem(ch, "text")->valuestring;
+            const int same = n_ref < e.n && strcmp(e.texts[n_ref], want) == 0;
+            if (!same && n_ref < e.n)
+                fprintf(stderr, "  %s chunk %d: got '%s' want '%s'\n", ref,
+                        n_ref, e.texts[n_ref], want);
+            n_same += same;
+            n_ref++;
+        }
+        CHECK(e.n == n_ref && n_same == n_ref);
+        printf("stream: %s: %d/%d chunk texts identical through a live "
+               "session (%.0f ms, RTF %.3f)\n", ref, n_same, n_ref, ms,
+               ms / 1000.0 / ((double)bytes / 4 / 24000.0));
+        for (int i = 0; i < e.n; i++) free(e.texts[i]);
+        free(e.texts);
+        vv_transcription_free(tr);
+        cJSON_Delete(meta);
+        free(pcm);
+    }
+    vv_inference_free(ctx);
+}
+
 int main(void) {
     test_geometry();
     test_chunker();
@@ -804,6 +1051,10 @@ int main(void) {
     test_session(false);
     test_session_cap_and_overflow();
     test_tokenizer();
+    test_segments();
+    test_resampler();
+    test_cancel();
+    test_model_e2e();
     if (g_fail) {
         fprintf(stderr, "stream: %d check(s) failed\n", g_fail);
         return 1;

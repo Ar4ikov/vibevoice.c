@@ -10,6 +10,8 @@
 
 #include "vv_http.h"
 #include "vv_queue.h"
+#include "vv_ws.h"
+#include "cJSON.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -272,6 +274,13 @@ static void part_to_str(const vv_http_part_t* p, char* out, size_t n) {
     out[len] = '\0';
 }
 
+static const char* hotbuf_joined(const vv_inference_params_t* ip,
+                                 char* prompt);
+static void sse_transcribe(vv_server_t* sv, vv_http_res_t* res,
+                           const float* pcm, int n_samples, int sample_rate,
+                           const vv_inference_params_t* ip,
+                           const char* context_info, bool token_deltas);
+
 static void handle_transcriptions(vv_server_t* sv, const vv_http_req_t* req,
                                   vv_http_res_t* res) {
     if (strcmp(req->method, "POST") != 0) {
@@ -345,6 +354,18 @@ static void handle_transcriptions(vv_server_t* sv, const vv_http_req_t* req,
         ip.num_hotwords = n_hot;
     }
 
+    char stream_f[16], gran[16];
+    part_to_str(vv_http_part(parts, np, "stream"), stream_f, sizeof(stream_f));
+    part_to_str(vv_http_part(parts, np, "stream_granularity"), gran,
+                sizeof(gran));
+    if (strcmp(stream_f, "true") == 0 || strcmp(stream_f, "1") == 0) {
+        sse_transcribe(sv, res, pcm, n_samples, sample_rate, &ip,
+                       prompt[0] ? hotbuf_joined(&ip, prompt) : NULL,
+                       strcmp(gran, "token") == 0);
+        vv_free(pcm);
+        return;
+    }
+
     vv_transcription_t* tr = NULL;
     vv_perf_metrics_t perf;
     memset(&perf, 0, sizeof(perf));
@@ -405,6 +426,499 @@ static void handle_transcriptions(vv_server_t* sv, const vv_http_req_t* req,
     vv_transcription_free(tr);
 }
 
+/* ─── Streaming: SSE (stream=true) and the WebSocket endpoint ───────────── */
+
+/*
+ * The hotwords joined the way the pipeline joins them for the prompt
+ * ("A, B"), written back over the raw `prompt` field (1024 bytes), whose
+ * split copy the hotword list points into. A streaming session takes the
+ * joined string.
+ */
+static const char* hotbuf_joined(const vv_inference_params_t* ip,
+                                 char* prompt) {
+    char joined[1024];
+    size_t w = 0;
+    joined[0] = '\0';
+    for (int i = 0; i < ip->num_hotwords; i++) {
+        const int k = snprintf(joined + w, sizeof(joined) - w, "%s%s",
+                               w ? ", " : "", ip->hotwords[i]);
+        if (k < 0 || (size_t)k >= sizeof(joined) - w) break;
+        w += (size_t)k;
+    }
+    snprintf(prompt, 1024, "%s", joined);
+    return prompt[0] ? prompt : NULL;
+}
+
+static void count_request(vv_server_t* sv, bool ok, double audio_s,
+                          double compute_s) {
+    vv_mutex_lock(&sv->stats_lock);
+    if (ok) {
+        sv->n_requests++;
+        sv->audio_seconds += audio_s;
+        sv->compute_seconds += compute_s;
+    } else {
+        sv->n_errors++;
+    }
+    vv_mutex_unlock(&sv->stats_lock);
+}
+
+/* An OpenAI error envelope for status `s`. */
+static void error_json(strbuf_t* b, vv_status_t s, const char* prefix) {
+    const bool busy = s == VV_ERR_KV_POOL_EXHAUSTED;
+    sb_puts(b, "{\"type\":\"error\",\"error\":{\"type\":\"");
+    sb_puts(b, busy ? "server_overloaded" : "server_error");
+    sb_puts(b, "\",\"message\":\"");
+    if (prefix) sb_puts(b, prefix);
+    sb_json_escaped(b, vv_status_str(s));
+    sb_puts(b, "\"}}");
+}
+
+typedef struct {
+    vv_http_res_t*      res;
+    vv_engine_stream_t* es;
+    bool                token_deltas;
+    bool                gone;        /* a write failed: the client left */
+    int64_t             chunks;
+} sse_state_t;
+
+static void sse_event(void* user, const vv_stream_event_t* ev) {
+    sse_state_t* st = (sse_state_t*)user;
+    if (st->gone) return;
+    const bool delta = (ev->type == VV_STREAM_EVENT_DELTA && st->token_deltas) ||
+                       (ev->type == VV_STREAM_EVENT_CHUNK && !st->token_deltas);
+    strbuf_t b; sb_init(&b);
+    if (delta) {
+        if (ev->type == VV_STREAM_EVENT_CHUNK) st->chunks++;
+        if (ev->text_len == 0) { sb_free(&b); return; }
+        sb_puts(&b, "{\"type\":\"transcript.text.delta\",\"delta\":\"");
+        sb_json_escaped(&b, ev->text);
+        sb_printf(&b, "\",\"x_vibevoice\":{\"chunk\":%lld",
+                  (long long)ev->chunk_index);
+        if (ev->type == VV_STREAM_EVENT_CHUNK)
+            sb_printf(&b, ",\"start\":%.3f,\"end\":%.3f", ev->audio_start,
+                      ev->audio_end);
+        sb_puts(&b, "}}");
+        if (!vv_http_sse_send(st->res, "transcript.text.delta", b.buf))
+            st->gone = true;
+    } else if (ev->type == VV_STREAM_EVENT_CHUNK) {
+        st->chunks++;
+    }
+    sb_free(&b);
+    /* A client that left cancels the session: the slot is released at the
+     * next token, not after the rest of the file. */
+    if (st->gone && st->es) vv_engine_stream_cancel(st->es);
+}
+
+static void sse_send_done(sse_state_t* st, const char* text, int64_t chunks,
+                          double duration, double rtf) {
+    strbuf_t b; sb_init(&b);
+    sb_puts(&b, "{\"type\":\"transcript.text.done\",\"text\":\"");
+    sb_json_escaped(&b, text ? text : "");
+    sb_printf(&b, "\",\"x_vibevoice\":{\"chunks\":%lld,\"duration\":%.3f,"
+                  "\"rtf\":%.4f}}", (long long)chunks, duration, rtf);
+    if (!vv_http_sse_send(st->res, "transcript.text.done", b.buf))
+        st->gone = true;
+    sb_free(&b);
+}
+
+/*
+ * POST /v1/audio/transcriptions with stream=true. On a streaming model the
+ * upload goes through a session and each chunk's text goes out as it is
+ * produced, paced by compute; on a batch model the transcript is one delta.
+ */
+static void sse_transcribe(vv_server_t* sv, vv_http_res_t* res,
+                           const float* pcm, int n_samples, int sample_rate,
+                           const vv_inference_params_t* ip,
+                           const char* context_info, bool token_deltas) {
+    const double t0 = vv_time_ms();
+    const double duration = sample_rate > 0 ? (double)n_samples / sample_rate
+                                            : 0.0;
+    sse_state_t st;
+    memset(&st, 0, sizeof(st));
+    st.res = res;
+    st.token_deltas = token_deltas;
+
+    if (!vv_engine_is_streaming(sv->engine)) {
+        vv_transcription_t* tr = NULL;
+        vv_perf_metrics_t perf;
+        memset(&perf, 0, sizeof(perf));
+        const vv_status_t s = vv_engine_transcribe(sv->engine, pcm, n_samples,
+                                                   sample_rate, ip, &tr, &perf);
+        if (s != VV_OK || !tr) {
+            count_request(sv, false, 0, 0);
+            vv_http_error(res, s == VV_ERR_KV_POOL_EXHAUSTED ? 503 : 500,
+                          s == VV_ERR_KV_POOL_EXHAUSTED ? "server_overloaded"
+                                                        : "server_error",
+                          vv_status_str(s));
+            return;
+        }
+        vv_http_respond_begin(res, 200, "text/event-stream");
+        vv_stream_event_t ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type = VV_STREAM_EVENT_CHUNK;
+        ev.text = tr->full_text ? tr->full_text : "";
+        ev.text_len = strlen(ev.text);
+        ev.audio_end = tr->duration;
+        st.token_deltas = false;
+        sse_event(&st, &ev);
+        sse_send_done(&st, ev.text, 1, tr->duration, perf.rtf);
+        count_request(sv, true, tr->duration, perf.total_ms / 1000.0);
+        vv_transcription_free(tr);
+        return;
+    }
+
+    vv_stream_params_t sp;
+    vv_stream_params_default(&sp);
+    sp.context_info = context_info;
+    sp.on_event = sse_event;
+    sp.user = &st;
+    (void)ip;
+
+    vv_engine_stream_t* es = NULL;
+    vv_status_t s = vv_engine_stream_open(sv->engine, &sp, sample_rate, &es);
+    if (s != VV_OK) {
+        count_request(sv, false, 0, 0);
+        vv_http_error(res, s == VV_ERR_KV_POOL_EXHAUSTED ? 503 : 500,
+                      s == VV_ERR_KV_POOL_EXHAUSTED ? "server_overloaded"
+                                                    : "server_error",
+                      vv_status_str(s));
+        return;
+    }
+    st.es = es;
+    if (!vv_http_respond_begin(res, 200, "text/event-stream")) st.gone = true;
+    if (st.gone) vv_engine_stream_cancel(es);
+
+    s = vv_engine_stream_push(es, pcm, (size_t)n_samples);
+    if (s == VV_OK) s = vv_engine_stream_finish(es);
+    const double compute = (vv_time_ms() - t0) / 1000.0;
+    if (s == VV_OK) {
+        sse_send_done(&st, vv_stream_transcript(vv_engine_stream_session(es)),
+                      st.chunks, duration,
+                      duration > 0 ? compute / duration : 0.0);
+        count_request(sv, true, duration, compute);
+        VV_LOG_I("server: streamed %.1fs audio in %lld chunks, RTF %.3f",
+                 duration, (long long)st.chunks,
+                 duration > 0 ? compute / duration : 0.0);
+    } else if (s == VV_ERR_CANCELLED) {
+        VV_LOG_I("server: client left after %lld chunks; session cancelled",
+                 (long long)st.chunks);
+        count_request(sv, false, 0, 0);
+    } else {
+        strbuf_t b; sb_init(&b);
+        error_json(&b, s, "transcription failed: ");
+        vv_http_sse_send(res, "error", b.buf);
+        sb_free(&b);
+        count_request(sv, false, 0, 0);
+    }
+    vv_engine_stream_close(es);
+}
+
+/* ─── WebSocket /v1/audio/stream ────────────────────────────────────────── */
+
+#define WS_MAX_MESSAGE (4u << 20)   /* one message of PCM: 4 MB */
+#define WS_IDLE_MS     60000        /* a silent client is dropped after 60 s */
+
+typedef struct {
+    vv_server_t*        sv;
+    vv_http_res_t*      res;
+    vv_engine_stream_t* es;
+    bool                f32;         /* pcm_f32le, else pcm_s16le */
+    int                 sample_rate;
+    uint8_t             carry[4];    /* a sample split across two frames */
+    int                 n_carry;
+    float*              pcm;
+    size_t              pcm_cap;
+    bool                done;        /* stop reading */
+    bool                gone;        /* a send failed */
+    int                 close_code;
+    char                close_reason[96];
+    vv_status_t         failed;
+    double              t_start;
+    int64_t             samples;
+} ws_state_t;
+
+static bool ws_text(ws_state_t* w, const char* json) {
+    if (w->gone) return false;
+    if (!vv_http_ws_send(w->res, VV_WS_OP_TEXT, json, strlen(json))) {
+        w->gone = true;
+        if (w->es) vv_engine_stream_cancel(w->es);
+        return false;
+    }
+    return true;
+}
+
+static void ws_close(ws_state_t* w, int code, const char* reason) {
+    if (w->gone) return;
+    uint8_t buf[2 + 96];
+    size_t n = 2;
+    buf[0] = (uint8_t)(code >> 8);
+    buf[1] = (uint8_t)(code & 0xff);
+    if (reason) {
+        size_t rl = strlen(reason);
+        if (rl > 90) rl = 90;
+        memcpy(buf + 2, reason, rl);
+        n += rl;
+    }
+    vv_http_ws_send(w->res, VV_WS_OP_CLOSE, buf, n);
+}
+
+static void ws_fail(ws_state_t* w, vv_status_t s, int code,
+                    const char* type, const char* msg) {
+    strbuf_t b; sb_init(&b);
+    sb_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"");
+    sb_puts(&b, type);
+    sb_puts(&b, "\",\"message\":\"");
+    sb_json_escaped(&b, msg ? msg : vv_status_str(s));
+    sb_puts(&b, "\"}}");
+    ws_text(w, b.buf);
+    sb_free(&b);
+    w->failed = s;
+    w->done = true;
+    w->close_code = code;
+}
+
+static void ws_event(void* user, const vv_stream_event_t* ev) {
+    ws_state_t* w = (ws_state_t*)user;
+    strbuf_t b; sb_init(&b);
+    if (ev->type == VV_STREAM_EVENT_CHUNK) {
+        sb_puts(&b, "{\"type\":\"transcript.text.delta\",\"delta\":\"");
+        sb_json_escaped(&b, ev->text);
+        sb_printf(&b, "\",\"chunk\":%lld,\"start\":%.3f,\"end\":%.3f}",
+                  (long long)ev->chunk_index, ev->audio_start, ev->audio_end);
+        ws_text(w, b.buf);
+    } else if (ev->type == VV_STREAM_EVENT_DONE) {
+        sb_puts(&b, "{\"type\":\"transcript.text.done\",\"text\":\"");
+        sb_json_escaped(&b, ev->text);
+        sb_printf(&b, "\",\"duration\":%.3f}", ev->audio_end);
+        ws_text(w, b.buf);
+    }
+    sb_free(&b);
+}
+
+static const char* json_str(const cJSON* o, const char* key) {
+    const cJSON* v = cJSON_GetObjectItemCaseSensitive(o, key);
+    return cJSON_IsString(v) ? v->valuestring : NULL;
+}
+
+static void ws_start(ws_state_t* w, const cJSON* msg) {
+    if (w->es) {
+        ws_fail(w, VV_ERR_INVALID_ARG, 1008, "invalid_request_error",
+                "session.start sent twice");
+        return;
+    }
+    const cJSON* sr = cJSON_GetObjectItemCaseSensitive(msg, "sample_rate");
+    w->sample_rate = cJSON_IsNumber(sr) ? (int)sr->valuedouble : 24000;
+    const char* fmt = json_str(msg, "format");
+    if (!fmt || strcmp(fmt, "pcm_s16le") == 0) w->f32 = false;
+    else if (strcmp(fmt, "pcm_f32le") == 0) w->f32 = true;
+    else {
+        ws_fail(w, VV_ERR_INVALID_ARG, 1008, "invalid_request_error",
+                "format is pcm_s16le or pcm_f32le");
+        return;
+    }
+    if (w->sample_rate < 8000 || w->sample_rate > 192000) {
+        ws_fail(w, VV_ERR_INVALID_ARG, 1008, "invalid_request_error",
+                "sample_rate must be 8000..192000");
+        return;
+    }
+    const char* hot = json_str(msg, "hotwords");
+    char ctx_info[1024];
+    ctx_info[0] = '\0';
+    if (hot) {
+        /* "A,B" -> "A, B", as the batch prompt joins hotwords. */
+        size_t k = 0;
+        for (const char* q = hot; *q && k + 3 < sizeof(ctx_info); q++) {
+            if (*q == ',') {
+                ctx_info[k++] = ',';
+                ctx_info[k++] = ' ';
+                while (q[1] == ' ') q++;
+            } else {
+                ctx_info[k++] = *q;
+            }
+        }
+        ctx_info[k] = '\0';
+    }
+
+    vv_stream_params_t sp;
+    vv_stream_params_default(&sp);
+    sp.context_info = ctx_info[0] ? ctx_info : NULL;
+    sp.on_event = ws_event;
+    sp.user = w;
+    const vv_status_t s = vv_engine_stream_open(w->sv->engine, &sp,
+                                                w->sample_rate, &w->es);
+    if (s != VV_OK) {
+        ws_fail(w, s, 1011, s == VV_ERR_KV_POOL_EXHAUSTED ? "server_overloaded"
+                                                          : "server_error",
+                NULL);
+        return;
+    }
+    w->t_start = vv_time_ms();
+    char ok[128];
+    snprintf(ok, sizeof(ok), "{\"type\":\"session.started\",\"sample_rate\":%d,"
+             "\"format\":\"%s\"}", w->sample_rate,
+             w->f32 ? "pcm_f32le" : "pcm_s16le");
+    ws_text(w, ok);
+}
+
+static void ws_pcm(ws_state_t* w, const uint8_t* data, size_t len) {
+    if (!w->es) {
+        ws_fail(w, VV_ERR_INVALID_ARG, 1008, "invalid_request_error",
+                "send session.start before audio");
+        return;
+    }
+    const int bps = w->f32 ? 4 : 2;
+    const size_t total = (size_t)w->n_carry + len;
+    const size_t n = total / (size_t)bps;
+    if (n > w->pcm_cap) {
+        float* np = (float*)vv_realloc(w->pcm, n * sizeof(float));
+        if (!np) {
+            ws_fail(w, VV_ERR_OUT_OF_MEMORY, 1011, "server_error", NULL);
+            return;
+        }
+        w->pcm = np;
+        w->pcm_cap = n;
+    }
+    size_t in = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t b[4];
+        for (int k = 0; k < bps; k++) {
+            if (w->n_carry > 0) {
+                b[k] = w->carry[0];
+                memmove(w->carry, w->carry + 1, (size_t)--w->n_carry);
+            } else {
+                b[k] = data[in++];
+            }
+        }
+        if (w->f32) {
+            float f;
+            memcpy(&f, b, 4);
+            w->pcm[i] = f;
+        } else {
+            const int16_t v = (int16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8));
+            w->pcm[i] = (float)v / 32768.0f;
+        }
+    }
+    while (in < len) w->carry[w->n_carry++] = data[in++];
+    w->samples += (int64_t)n;
+    const vv_status_t s = vv_engine_stream_push(w->es, w->pcm, n);
+    if (s == VV_ERR_CANCELLED) { w->done = true; return; }
+    if (s != VV_OK)
+        ws_fail(w, s, 1011, s == VV_ERR_KV_POOL_EXHAUSTED ? "server_overloaded"
+                                                          : "server_error",
+                NULL);
+}
+
+static void ws_message(void* user, int opcode, const uint8_t* data,
+                       size_t len) {
+    ws_state_t* w = (ws_state_t*)user;
+    if (w->done) return;
+    if (opcode == VV_WS_OP_PING) {
+        if (!vv_http_ws_send(w->res, VV_WS_OP_PONG, data, len)) w->gone = true;
+        return;
+    }
+    if (opcode == VV_WS_OP_PONG) return;
+    if (opcode == VV_WS_OP_CLOSE) {
+        /* The client closed: whatever was not finished is abandoned. */
+        w->done = true;
+        w->close_code = VV_WS_CLOSE_NORMAL;
+        return;
+    }
+    if (opcode == VV_WS_OP_BINARY) { ws_pcm(w, data, len); return; }
+
+    cJSON* msg = cJSON_ParseWithLength((const char*)data, len);
+    const char* type = msg ? json_str(msg, "type") : NULL;
+    if (!type) {
+        ws_fail(w, VV_ERR_PARSE, 1008, "invalid_request_error",
+                "expected a JSON message with a \"type\"");
+    } else if (strcmp(type, "session.start") == 0) {
+        ws_start(w, msg);
+    } else if (strcmp(type, "session.finish") == 0) {
+        if (!w->es) {
+            ws_fail(w, VV_ERR_INVALID_ARG, 1008, "invalid_request_error",
+                    "no session to finish");
+        } else {
+            const vv_status_t s = vv_engine_stream_finish(w->es);
+            if (s == VV_OK) {
+                w->done = true;
+                w->close_code = VV_WS_CLOSE_NORMAL;
+            } else if (s == VV_ERR_CANCELLED) {
+                w->done = true;
+            } else {
+                ws_fail(w, s, 1011, "server_error", NULL);
+            }
+        }
+    } else {
+        ws_fail(w, VV_ERR_INVALID_ARG, 1008, "invalid_request_error",
+                "unknown message type");
+    }
+    cJSON_Delete(msg);
+}
+
+static void handle_ws_stream(vv_server_t* sv, const vv_http_req_t* req,
+                             vv_http_res_t* res) {
+    if (!vv_engine_is_streaming(sv->engine)) {
+        vv_http_error(res, 400, "invalid_request_error",
+                      "the loaded model transcribes whole clips; live "
+                      "streaming needs VibeVoice-ASR-Streaming-7B");
+        return;
+    }
+    if (!vv_http_ws_accept(req, res)) return;
+
+    ws_state_t w;
+    memset(&w, 0, sizeof(w));
+    w.sv = sv;
+    w.res = res;
+    w.close_code = VV_WS_CLOSE_NORMAL;
+    vv_ws_parser_t parser;
+    vv_ws_parser_init(&parser, WS_MAX_MESSAGE);
+
+    /* Frames that rode in with the upgrade request come first. */
+    vv_status_t ps = VV_OK;
+    if (req->body && req->body_len)
+        ps = vv_ws_parser_feed(&parser, (const uint8_t*)req->body,
+                               req->body_len, ws_message, &w);
+    uint8_t* buf = (uint8_t*)vv_alloc(64 * 1024);
+    int idle_ms = 0;
+    while (buf && ps == VV_OK && !w.done && !w.gone) {
+        const int n = vv_http_read(res, buf, 64 * 1024, 1000);
+        if (n == -2) {
+            idle_ms += 1000;
+            if (idle_ms >= WS_IDLE_MS) {
+                ws_fail(&w, VV_ERR_IO, 1001, "invalid_request_error",
+                        "no data for 60 s");
+            }
+            continue;
+        }
+        if (n <= 0) { w.gone = true; break; }   /* the client went away */
+        idle_ms = 0;
+        ps = vv_ws_parser_feed(&parser, buf, (size_t)n, ws_message, &w);
+    }
+    if (ps != VV_OK && !w.gone) {
+        ws_close(&w, parser.close_code ? parser.close_code : 1002, NULL);
+        w.close_code = 0;
+    }
+    vv_free(buf);
+
+    const double compute = w.t_start > 0 ? (vv_time_ms() - w.t_start) / 1000.0
+                                         : 0.0;
+    if (w.es) {
+        const bool ok = w.failed == VV_OK && !w.gone &&
+                        w.close_code == VV_WS_CLOSE_NORMAL;
+        vv_stream_stats_t st;
+        vv_stream_get_stats(vv_engine_stream_session(w.es), &st);
+        count_request(sv, ok, (double)st.samples / 24000.0, compute);
+        VV_LOG_I("server: websocket session %s: %.1fs audio, %lld chunks, "
+                 "%.0f ms per chunk", ok ? "done" : "ended",
+                 (double)st.samples / 24000.0, (long long)st.chunks,
+                 st.chunks ? (st.prefill_ms + st.decode_ms) / st.chunks : 0.0);
+        if (w.gone) vv_engine_stream_cancel(w.es);
+        vv_engine_stream_close(w.es);
+    }
+    if (!w.gone && w.close_code) ws_close(&w, w.close_code, NULL);
+    vv_ws_parser_free(&parser);
+    vv_free(w.pcm);
+}
+
 /*
  * Compare in time that depends only on the lengths, not on how many leading
  * bytes of a guess are right: strcmp() returns at the first difference,
@@ -424,6 +938,26 @@ static bool key_equal(const char* given, const char* key) {
 static bool authorized(const vv_server_t* sv, const vv_http_req_t* req) {
     if (!sv->api_key[0]) return true;
     const char* h = vv_http_header(req, "Authorization");
+    if (!h && strcmp(req->path, "/v1/audio/stream") == 0) {
+        /* Browsers cannot set headers on a WebSocket: ?api_key=... */
+        char key[256];
+        const char* q = req->query;
+        while (q && *q) {
+            if (strncmp(q, "api_key=", 8) == 0) {
+                size_t n = 0;
+                q += 8;
+                while (q[n] && q[n] != '&' && n + 1 < sizeof(key)) {
+                    key[n] = q[n];
+                    n++;
+                }
+                key[n] = '\0';
+                return key_equal(key, sv->api_key);
+            }
+            q = strchr(q, '&');
+            if (q) q++;
+        }
+        return false;
+    }
     if (!h) return false;
     if (strncmp(h, "Bearer ", 7) == 0) h += 7;
     return key_equal(h, sv->api_key);
@@ -460,13 +994,26 @@ static void route(const vv_http_req_t* req, vv_http_res_t* res, void* user) {
         vv_queue_leave(&sv->queue);
         return;
     }
+    if (strcmp(p, "/v1/audio/stream") == 0) {
+        if (!vv_queue_enter(&sv->queue)) {
+            vv_http_error(res, 503, "server_overloaded",
+                          "transcription queue is full; retry later");
+            return;
+        }
+        handle_ws_stream(sv, req, res);
+        vv_queue_leave(&sv->queue);
+        return;
+    }
     if (strcmp(p, "/") == 0) {
         char buf[768];
         const int n = snprintf(buf, sizeof(buf),
             "vibevoice.c server\n\n"
             "model: %s\nslots: %d\n\n"
             "POST /v1/audio/transcriptions   multipart: file, "
-            "[response_format=json|verbose_json|text|srt|vtt], [prompt]\n"
+            "[response_format=json|verbose_json|text|srt|vtt], [prompt], "
+            "[stream=true]\n"
+            "GET  /v1/audio/stream           WebSocket, live PCM "
+            "(streaming models)\n"
             "GET  /v1/models\nGET  /health\nGET  /metrics\n",
             sv->model_name, vv_engine_slots(sv->engine));
         vv_http_respond(res, 200, "text/plain; charset=utf-8", buf, (size_t)n);

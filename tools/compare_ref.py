@@ -586,6 +586,31 @@ def cmd_cmp_stream(args):
                   "later chunks run on a different history)")
             break
 
+    # The whole transcript, every chunk the C side wrote: a word that moves
+    # to the neighbouring chunk diverges the ids but not the text.
+    c_texts = []
+    for ch in meta["chunks"]:
+        tag = f"c{ch['index']:04d}"
+        if not os.path.exists(c_path(f"stream_{tag}_ids")):
+            break
+        tp = c_path(f"stream_{tag}_text")
+        c_texts.append(open(tp, "rb").read().decode("utf-8", "replace")
+                       if os.path.exists(tp) else "")
+    if len(c_texts) == len(meta["chunks"]):
+        rw, cw = meta["transcript"].split(), "".join(c_texts).split()
+        # word-level edit distance
+        prev = list(range(len(cw) + 1))
+        for a, x in enumerate(rw, 1):
+            cur = [a] + [0] * len(cw)
+            for b, y in enumerate(cw, 1):
+                cur[b] = min(prev[b] + 1, cur[b - 1] + 1,
+                             prev[b - 1] + (x != y))
+            prev = cur
+        d = prev[-1]
+        same_tr = "".join(c_texts) == meta["transcript"]
+        print(f"transcript       {'identical' if same_tr else 'DIFFER'} "
+              f"(word edits {d}/{len(rw)}, WER {100.0 * d / max(len(rw), 1):.2f}%)")
+
     total = len(meta["chunks"])
     print(f"summary: ids identical {n_same_ids}/{n_seen}, text identical "
           f"{n_same_text}/{n_seen}, reference has {total} chunks"
