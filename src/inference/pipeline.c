@@ -43,16 +43,7 @@ extern vv_status_t vv_transcription_to_json(const vv_transcription_t* tr,
 extern vv_status_t vv_sample_greedy(const void* logits_fp16, int vocab_size,
                                       int32_t* token_id);
 
-/* Special tokens (see special_tokens.c) */
-extern const char* VV_TOKEN_IM_START;
-extern const char* VV_TOKEN_IM_END;
-extern const char* VV_TOKEN_ENDOFTEXT;
-extern const char* VV_TOKEN_SPEECH_START;
-extern const char* VV_TOKEN_SPEECH_PAD;
-extern const char* VV_TOKEN_SPEECH_END;
-extern const char* VV_TOKEN_START_TRANSCRIPT;
-extern const char* VV_TOKEN_END_TRANSCRIPT;
-extern bool vv_is_end_token(const vv_tokenizer_t* tok, int32_t token_id);
+/* Prompts and stop tokens come from the model family (family.h). */
 
 /* ─── FP32 <-> FP16 conversion helpers ──────────────────────────────────── */
 
@@ -115,46 +106,14 @@ static vv_status_t upload_layer_range(vv_model_t* model, int first,
     if (first + count > model->num_layers) count = model->num_layers - first;
     if (count <= 0) return VV_OK;
     for (int i = first; i < first + count; i++) {
-        vv_layer_weights_t* L = &model->layers[i];
-        vv_status_t s;
-
-        s = upload_tensor_to_gpu(&L->input_layernorm, stream);
-        if (s != VV_OK) return s;
-        total_bytes += L->input_layernorm.size_bytes;
-
-        s = upload_tensor_to_gpu(&L->post_attn_layernorm, stream);
-        if (s != VV_OK) return s;
-        total_bytes += L->post_attn_layernorm.size_bytes;
-
-        #define UPLOAD_WEIGHT(w) do {                                  \
-            s = upload_tensor_to_gpu(&(w).tensor, stream);             \
-            if (s != VV_OK) return s;                                  \
-            total_bytes += (w).tensor.size_bytes;                      \
-            if ((w).quant.scales.data) {                               \
-                s = upload_tensor_to_gpu(&(w).quant.scales, stream);   \
-                if (s != VV_OK) return s;                              \
-                total_bytes += (w).quant.scales.size_bytes;            \
-            }                                                          \
-            if ((w).mins.data) {                                       \
-                s = upload_tensor_to_gpu(&(w).mins, stream);           \
-                if (s != VV_OK) return s;                              \
-                total_bytes += (w).mins.size_bytes;                    \
-            }                                                          \
-            if ((w).bias.data) {                                       \
-                s = upload_tensor_to_gpu(&(w).bias, stream);           \
-                if (s != VV_OK) return s;                              \
-                total_bytes += (w).bias.size_bytes;                    \
-            }                                                          \
-        } while(0)
-
-        UPLOAD_WEIGHT(L->attn.q_proj);
-        UPLOAD_WEIGHT(L->attn.k_proj);
-        UPLOAD_WEIGHT(L->attn.v_proj);
-        UPLOAD_WEIGHT(L->attn.o_proj);
-        UPLOAD_WEIGHT(L->mlp.gate_proj);
-        UPLOAD_WEIGHT(L->mlp.up_proj);
-        UPLOAD_WEIGHT(L->mlp.down_proj);
-        #undef UPLOAD_WEIGHT
+        vv_tensor_t* ts[VV_LAYER_TENSOR_SLOTS];
+        const int nt = vv_layer_tensors(&model->layers[i], ts);
+        for (int k = 0; k < nt; k++) {
+            if (!ts[k]->data) continue;
+            vv_status_t s = upload_tensor_to_gpu(ts[k], stream);
+            if (s != VV_OK) return s;
+            total_bytes += ts[k]->size_bytes;
+        }
     }
     if (count == model->num_layers)
         VV_LOG_I("inference: %d/%d layers resident on GPU (%.1f MB)",
@@ -178,34 +137,14 @@ static vv_status_t upload_layer_weights(vv_model_t* model, int n_layers,
 static void free_layer_gpu_weights(vv_model_t* model) {
     if (!model || !model->layers) return;
     for (int i = 0; i < model->num_layers; i++) {
-        vv_layer_weights_t* L = &model->layers[i];
-        #define FREE_GPU_TENSOR(t) do {                 \
-            if ((t).on_gpu && (t).data) {               \
-                vv_dev_free((t).data);                 \
-                (t).data = NULL;                        \
-                (t).on_gpu = false;                     \
-            }                                           \
-        } while(0)
-
-        FREE_GPU_TENSOR(L->input_layernorm);
-        FREE_GPU_TENSOR(L->post_attn_layernorm);
-
-        #define FREE_GPU_WEIGHT(w) do {                 \
-            FREE_GPU_TENSOR((w).tensor);                \
-            FREE_GPU_TENSOR((w).quant.scales);          \
-            FREE_GPU_TENSOR((w).mins);                  \
-            FREE_GPU_TENSOR((w).bias);                  \
-        } while(0)
-
-        FREE_GPU_WEIGHT(L->attn.q_proj);
-        FREE_GPU_WEIGHT(L->attn.k_proj);
-        FREE_GPU_WEIGHT(L->attn.v_proj);
-        FREE_GPU_WEIGHT(L->attn.o_proj);
-        FREE_GPU_WEIGHT(L->mlp.gate_proj);
-        FREE_GPU_WEIGHT(L->mlp.up_proj);
-        FREE_GPU_WEIGHT(L->mlp.down_proj);
-        #undef FREE_GPU_WEIGHT
-        #undef FREE_GPU_TENSOR
+        vv_tensor_t* ts[VV_LAYER_TENSOR_SLOTS];
+        const int nt = vv_layer_tensors(&model->layers[i], ts);
+        for (int k = 0; k < nt; k++) {
+            if (!ts[k]->on_gpu || !ts[k]->data) continue;
+            vv_dev_free(ts[k]->data);
+            ts[k]->data = NULL;
+            ts[k]->on_gpu = false;
+        }
     }
 }
 
@@ -214,26 +153,23 @@ static void free_layer_gpu_weights(vv_model_t* model) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Calculate per-layer GPU size for one layer (NF4+scales+norms).
+ * @brief GPU bytes of the largest layer, as the loader left it.
+ *
+ * The largest rather than layer 0's: a checkpoint quantized unevenly would
+ * otherwise be budgeted by whichever layer happened to come first.
  */
 static size_t calc_per_layer_gpu_bytes(const vv_model_t* model) {
-    if (model->num_layers == 0) return 0;
-    size_t total = 0;
-    const vv_layer_weights_t* L = &model->layers[0];
-    total += L->input_layernorm.size_bytes;
-    total += L->post_attn_layernorm.size_bytes;
+    size_t most = 0;
+    for (int i = 0; i < model->num_layers; i++) {
+        const size_t b = vv_layer_bytes(&model->layers[i]);
+        if (b > most) most = b;
+    }
+    return most;
+}
 
-    #define ADD_W(w) do { total += (w).tensor.size_bytes; \
-        if ((w).quant.scales.data) total += (w).quant.scales.size_bytes; \
-        if ((w).mins.data) total += (w).mins.size_bytes; \
-        if ((w).bias.data) total += (w).bias.size_bytes; \
-    } while(0)
-    ADD_W(L->attn.q_proj); ADD_W(L->attn.k_proj);
-    ADD_W(L->attn.v_proj); ADD_W(L->attn.o_proj);
-    ADD_W(L->mlp.gate_proj); ADD_W(L->mlp.up_proj);
-    ADD_W(L->mlp.down_proj);
-    #undef ADD_W
-    return total;
+/** @brief Bytes the head adds on its own: none when it is the embedding. */
+static size_t lm_head_own_bytes(const vv_model_t* model) {
+    return model->lm_head_tied ? 0 : model->lm_head.size_bytes;
 }
 
 /*
@@ -477,7 +413,9 @@ static vv_placement_t decide_placement(
     if (cpu_only || available == 0) return VV_PLACE_CPU_ONLY;
 
     size_t base = workspace_bytes + kv_cache_bytes;
-    size_t staging_2 = per_layer_bytes * 2 + 16 * 256 * 2; /* 2 buffers */
+    /* 2 buffers, each with the pool's own alignment slack per tensor. */
+    size_t staging_2 = (per_layer_bytes
+                        + (size_t)VV_LAYER_TENSORS_PER_LAYER * 256) * 2;
 
     VV_LOG_D("budget: available %.1f MB, base %.1f MB (ws+kv), "
              "all_layers %.1f MB, embed %.1f MB, lm_head %.1f MB",
@@ -576,8 +514,10 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     c->use_gpu = !cpu_only;
     strncpy(c->model_dir, model_dir, sizeof(c->model_dir) - 1);
 
-    /* Load model */
-    s = vv_model_load(model_dir, &c->model);
+    /* Load model — quantized now if asked, so every size below is final. */
+    vv_model_load_opts_t lo = vv_model_load_opts_default();
+    lo.quant = p.weight_quant;
+    s = vv_model_load_ex(model_dir, &lo, &c->model);
     if (s != VV_OK) {
         VV_LOG_E("inference: failed to load model: %s", vv_status_str(s));
         vv_free(c);
@@ -609,7 +549,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
 
         const size_t ws = (size_t)512 * 1024 * 1024;
         const size_t head = c->model->embed_tokens.size_bytes
-                          + c->model->lm_head.size_bytes
+                          + lm_head_own_bytes(c->model)
                           + calc_frontend_gpu_bytes(c->model)
                           + VV_ENCODER_SCRATCH_BYTES;
         size_t room[VV_MAX_GPUS];
@@ -664,7 +604,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         size_t per_layer = calc_per_layer_gpu_bytes(c->model);
         size_t all_layers = per_layer * (size_t)c->primary_layers;
         size_t embed_sz = c->model->embed_tokens.size_bytes;
-        size_t lm_head_sz = c->model->lm_head.size_bytes;
+        size_t lm_head_sz = lm_head_own_bytes(c->model);
 
         size_t kv_per_token = vv_kv_cache_bytes(
             c->primary_layers, llm->num_key_value_heads,
@@ -944,7 +884,12 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     }
 
     /* ── LM head: on GPU unless STREAM_EMBED or STREAM_ALL ── */
-    if (c->placement != VV_PLACE_STREAM_EMBED &&
+    if (c->model->lm_head_tied) {
+        /* The head is the embedding table: wherever that went, it went. */
+        c->lm_head_gpu = c->embed_table_gpu;
+        if (c->lm_head_gpu)
+            VV_LOG_I("inference: lm_head is tied to embed_tokens (shared)");
+    } else if (c->placement != VV_PLACE_STREAM_EMBED &&
         c->placement != VV_PLACE_STREAM_ALL &&
         c->model->lm_head.data) {
         size_t sz = c->model->lm_head.size_bytes;
@@ -1017,6 +962,12 @@ static void attach_frontend(vv_inference_ctx_t* c) {
     s = vv_tokenizer_load(c->model_dir, &c->tokenizer);
     if (s != VV_OK)
         VV_LOG_W("inference: failed to load tokenizer from '%s'", c->model_dir);
+
+    c->family_ok = c->tokenizer &&
+        vv_family_init(&c->family, &c->model->config, c->tokenizer) == VV_OK;
+    if (c->tokenizer && !c->family_ok)
+        VV_LOG_W("inference: the tokenizer lacks tokens %s needs",
+                 vv_model_family_name(c->model->config.family));
 
     if (c->model->n_acoustic_weights > 0) {
         s = vv_conv_vae_init(c->model->acoustic_weights,
@@ -1282,127 +1233,6 @@ static void dump_f16_as_f32(const char* name, const uint16_t* v, size_t n) {
     vv_free(tmp);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * ChatML prompt builder for ASR
- *
- * Format (from vibevoice_asr_processor.py):
- *   <|im_start|>system\n
- *   You are a helpful assistant that transcribes audio input
- *   into text output in JSON format.<|im_end|>\n
- *   <|im_start|>user\n
- *   <|object_ref_start|>[box_start × N]<|object_ref_end|>\n
- *   This is a {dur:.2f} seconds audio, please transcribe it
- *   with these keys: Start time, End time, Speaker ID, Content<|im_end|>\n
- *   <|im_start|>assistant\n
- *
- * Audio embeddings replace the N box_start positions.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static vv_status_t build_asr_prompt(
-    const vv_tokenizer_t* tok,
-    int n_audio_frames,
-    float audio_duration_sec,
-    const char* context_info,       /* hotwords / extra info, may be NULL */
-    int32_t** out_ids,
-    int* out_seq_len,
-    int* out_audio_offset)          /* index of first box_start token */
-{
-    /* Look up special token IDs */
-    int im_start = vv_tokenizer_special_id(tok, VV_TOKEN_IM_START);
-    int im_end   = vv_tokenizer_special_id(tok, VV_TOKEN_IM_END);
-    int sp_start = vv_tokenizer_special_id(tok, VV_TOKEN_SPEECH_START);
-    int sp_pad   = vv_tokenizer_special_id(tok, VV_TOKEN_SPEECH_PAD);
-    int sp_end   = vv_tokenizer_special_id(tok, VV_TOKEN_SPEECH_END);
-
-    VV_LOG_D("prompt tokens: im_start=%d im_end=%d speech_start=%d "
-             "speech_pad=%d speech_end=%d",
-             im_start, im_end, sp_start, sp_pad, sp_end);
-
-    if (im_start < 0 || im_end < 0 ||
-        sp_start < 0 || sp_pad < 0 || sp_end < 0) {
-        VV_LOG_E("prompt: missing critical special tokens in tokenizer");
-        return VV_ERR_INVALID_ARG;
-    }
-
-    /*
-     * Exact training/inference format, reproduced from
-     * vibevoice_asr_processor.py::_process_single_audio + the ASR chat
-     * template ("<|im_start|>{role}\n{content}<|im_end|>\n" per message).
-     *
-     * NOTE: the processor does NOT append a generation prompt — the model
-     * emits "<|im_start|>assistant\n" itself as its first tokens.
-     */
-    static const char* SYSTEM_MSG =
-        "<|im_start|>system\n"
-        "You are a helpful assistant that transcribes audio input into text "
-        "output in JSON format.<|im_end|>\n"
-        "<|im_start|>user\n";
-
-    int32_t *pre_ids = NULL, *post_ids = NULL;
-    int n_pre = 0, n_post = 0;
-
-    vv_status_t st = vv_tokenizer_encode(tok, SYSTEM_MSG, &pre_ids, &n_pre);
-    if (st != VV_OK) return st;
-
-    {
-        char buf[1024];
-        static const char* KEYS = "Start time, End time, Speaker ID, Content";
-        if (context_info && context_info[0]) {
-            snprintf(buf, sizeof(buf),
-                     "\nThis is a %.2f seconds audio, with extra info: %s\n\n"
-                     "Please transcribe it with these keys: %s<|im_end|>\n",
-                     (double)audio_duration_sec, context_info, KEYS);
-        } else {
-            snprintf(buf, sizeof(buf),
-                     "\nThis is a %.2f seconds audio, please transcribe it "
-                     "with these keys: %s<|im_end|>\n",
-                     (double)audio_duration_sec, KEYS);
-        }
-        st = vv_tokenizer_encode(tok, buf, &post_ids, &n_post);
-        if (st != VV_OK) { vv_free(pre_ids); return st; }
-    }
-
-    /* [pre] <|object_ref_start|> [pad × N] <|object_ref_end|> [post] */
-    int total = n_pre + 1 + n_audio_frames + 1 + n_post;
-    int32_t* ids = (int32_t*)vv_alloc((size_t)total * sizeof(int32_t));
-    if (!ids) { vv_free(pre_ids); vv_free(post_ids); return VV_ERR_OUT_OF_MEMORY; }
-
-    int p = 0;
-    for (int i = 0; i < n_pre; i++) ids[p++] = pre_ids[i];
-    ids[p++] = sp_start;
-    int audio_off = p;
-    for (int i = 0; i < n_audio_frames; i++) ids[p++] = sp_pad;
-    ids[p++] = sp_end;
-    for (int i = 0; i < n_post; i++) ids[p++] = post_ids[i];
-
-    vv_free(pre_ids);
-    vv_free(post_ids);
-
-    VV_LOG_I("prompt: %d tokens (audio frames %d at offset %d, audio=%.2f sec)",
-             p, n_audio_frames, audio_off, (double)audio_duration_sec);
-    {
-        char line[4096];
-        int w = 0, shown = 0;
-        for (int i = 0; i < p && w < (int)sizeof(line) - 16; i++) {
-            if (i == audio_off && n_audio_frames > 0) {
-                w += snprintf(line + w, sizeof(line) - (size_t)w,
-                              "[%d x%d] ", sp_pad, n_audio_frames);
-                i += n_audio_frames - 1;
-                continue;
-            }
-            w += snprintf(line + w, sizeof(line) - (size_t)w, "%d ", ids[i]);
-            shown++;
-        }
-        VV_LOG_D("prompt ids (%d shown): %s", shown, line);
-    }
-
-    *out_ids = ids;
-    *out_seq_len = p;
-    *out_audio_offset = audio_off;
-    return VV_OK;
-}
-
-
 /**
  * @brief Join hotwords into the processor's `context_info` string.
  *
@@ -1593,6 +1423,39 @@ static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
                     src_gpu, src, src_stream, src_done, bytes);
 }
 
+/**
+ * @brief Whether a one-shot transcription stops at `token_id`.
+ *
+ * The ids were resolved once with the family, so this is two compares, not
+ * two linear scans of the tokenizer's special tokens per generated token.
+ */
+static bool token_ends(const vv_inference_ctx_t* ctx, int32_t token_id) {
+    return vv_family_stop(&ctx->family, token_id) != VV_STOP_CONTINUE;
+}
+
+/**
+ * @brief Greedy token from a head that stays on the host.
+ *
+ * Placements that keep the LM head in system memory land here once per
+ * token: the normalized row comes down (7 KB), the fused FP16 GEMV + argmax
+ * reads the head in place. `h` and `f` are one hidden row each, allocated
+ * by the caller once per request.
+ */
+static vv_status_t cpu_head_argmax(vv_inference_ctx_t* ctx,
+                                   const void* normed_gpu,
+                                   uint16_t* h, float* f, int32_t* token) {
+    const vv_llm_config_t* llm = &ctx->model->config.llm;
+    const int hs = llm->hidden_size;
+    vv_status_t s = vv_dev_stream_sync(ctx->compute_stream);
+    if (s == VV_OK)
+        s = vv_dev_memcpy_d2h(h, normed_gpu, (size_t)hs * 2,
+                              ctx->compute_stream);
+    if (s != VV_OK) return s;
+    for (int d = 0; d < hs; d++) f[d] = vv_half_to_float(h[d]);
+    return vv_lm_head_argmax_cpu(f, ctx->model->lm_head.data,
+                                 llm->vocab_size, hs, token, NULL);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Transcribe — GPU path
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -1765,10 +1628,16 @@ static vv_status_t transcribe_gpu(
     char ctx_info[512];
     build_context_info(params, ctx_info, sizeof(ctx_info));
 
-    s = build_asr_prompt(ctx->tokenizer, n_audio_frames,
-                          perf->audio_duration_sec, ctx_info,
-                          &input_ids, &seq_len, &audio_offset);
-    if (s != VV_OK) { vv_free(combined_fp16); return s; }
+    {
+        vv_prompt_t pr;
+        s = vv_family_build_prompt(&ctx->family, ctx->tokenizer,
+                                   n_audio_frames, perf->audio_duration_sec,
+                                   ctx_info, &pr);
+        if (s != VV_OK) { vv_free(combined_fp16); return s; }
+        input_ids = pr.ids;
+        seq_len = pr.n;
+        audio_offset = pr.audio_offset;
+    }
 
     perf->prefill_tokens = seq_len;
     dump_i32("c_input_ids", input_ids, (size_t)seq_len);
@@ -1896,6 +1765,9 @@ static vv_status_t transcribe_gpu(
     void* argmax_v_gpu   = NULL;
     void* argmax_i_gpu   = NULL;
     void* token_out_gpu  = NULL;
+    /* Host side of a head that stayed on the CPU: one hidden row each. */
+    uint16_t* host_normed_h = NULL;
+    float*    host_normed_f = NULL;
     s = vv_dev_alloc(&normed_gpu, one_hidden);
     if (s != VV_OK) { vv_dev_free(hidden_states_gpu); return s; }
     s = vv_dev_alloc(&hidden_one_gpu, one_hidden);
@@ -1905,7 +1777,15 @@ static vv_status_t transcribe_gpu(
         s = VV_ERR_CUDA_OOM;
         goto cleanup_decode;
     }
-    if (!lm_head_on_cpu) {
+    if (lm_head_on_cpu) {
+        host_normed_h = (uint16_t*)vv_alloc(one_hidden);
+        host_normed_f = (float*)vv_alloc((size_t)hs * sizeof(float));
+        if (!host_normed_h || !host_normed_f || !ctx->model->lm_head.data) {
+            s = ctx->model->lm_head.data ? VV_ERR_OUT_OF_MEMORY
+                                         : VV_ERR_WEIGHT_MISSING;
+            goto cleanup_decode;
+        }
+    } else {
         if (vv_dev_alloc(&logits_f32_gpu, (size_t)vocab_size * sizeof(float)) != VV_OK ||
             vv_dev_alloc(&argmax_v_gpu, VV_ARGMAX_PARTIALS * sizeof(float)) != VV_OK ||
             vv_dev_alloc(&argmax_i_gpu, VV_ARGMAX_PARTIALS * sizeof(int32_t)) != VV_OK) {
@@ -1922,40 +1802,14 @@ static vv_status_t transcribe_gpu(
     /* LM head — GPU or CPU */
     int32_t token_id;
     if (lm_head_on_cpu) {
-        /* Download normed, do GEMM on CPU, argmax on CPU */
-        uint16_t* normed_cpu = (uint16_t*)vv_alloc(one_hidden);
-        if (!normed_cpu) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_decode; }
-        vv_dev_stream_sync(ctx->compute_stream);
-        vv_dev_memcpy_d2h(normed_cpu, normed_gpu, one_hidden,
-                          ctx->compute_stream);
-        /* FP16 → FP32 */
-        float* normed_f32 = (float*)vv_alloc((size_t)hs * sizeof(float));
-        float* logits_f32 = (float*)vv_alloc((size_t)vocab_size * sizeof(float));
-        float* lm_w_f32 = NULL;
-        if (!normed_f32 || !logits_f32) {
-            if (normed_f32) vv_free(normed_f32);
-            if (logits_f32) vv_free(logits_f32);
-            vv_free(normed_cpu);
-            s = VV_ERR_OUT_OF_MEMORY; goto cleanup_decode;
-        }
-        for (int d = 0; d < hs; d++) normed_f32[d] = half_to_float_single(normed_cpu[d]);
-        vv_free(normed_cpu);
-        /* lm_head GEMM: [1, hs] @ [vocab, hs]^T = [1, vocab] */
-        lm_w_f32 = (float*)vv_alloc((size_t)vocab_size * hs * sizeof(float));
-        if (!lm_w_f32) { vv_free(normed_f32); vv_free(logits_f32); s = VV_ERR_OUT_OF_MEMORY; goto cleanup_decode; }
-        {
-            const uint16_t* lm = (const uint16_t*)ctx->model->lm_head.data;
-            for (int i = 0; i < vocab_size * hs; i++) lm_w_f32[i] = half_to_float_single(lm[i]);
-        }
-        /* output[j] = sum_k normed[k] * lm_head[j][k] */
-        for (int j = 0; j < vocab_size; j++) {
-            float sum = 0.0f;
-            for (int k = 0; k < hs; k++) sum += normed_f32[k] * lm_w_f32[j * hs + k];
-            logits_f32[j] = sum;
-        }
-        vv_free(lm_w_f32); vv_free(normed_f32);
-        vv_sample_greedy_cpu(logits_f32, vocab_size, &token_id);
-        vv_free(logits_f32);
+        /*
+         * The head stays where it is, FP16 on the host, and the fused CPU
+         * GEMV + argmax reads it once. This used to widen the whole head to
+         * FP32 first — 2.2 GB for the 7B — and then walk it single-threaded.
+         */
+        s = cpu_head_argmax(ctx, normed_gpu, host_normed_h, host_normed_f,
+                            &token_id);
+        if (s != VV_OK) goto cleanup_decode;
     } else {
         s = vv_lm_head_gemv_dev(normed_gpu, ctx->lm_head_gpu, logits_f32_gpu,
                                   vocab_size, hs, ctx->compute_stream);
@@ -2034,7 +1888,7 @@ static vv_status_t transcribe_gpu(
     const bool echo_tokens = !ctx->quiet &&
                              vv_log_get_level() >= VV_LOG_INFO;
     if (echo_tokens) fprintf(stderr, "\n--- token stream ---\n");
-    if (!vv_is_end_token(ctx->tokenizer, token_id)) {
+    if (!token_ends(ctx, token_id)) {
         output_tokens[n_generated++] = token_id;
         /* Stream first token */
         char* first_text = NULL;
@@ -2047,19 +1901,22 @@ static vv_status_t transcribe_gpu(
     }
 
     while (n_generated < max_new_tokens &&
-           !vv_is_end_token(ctx->tokenizer, token_id)) {
+           !token_ends(ctx, token_id)) {
 
         double t_tok = vv_time_ms();
 
         /* Embed token */
         if (embed_on_cpu) {
-            float embed_f32[4096]; /* head_dim <= 4096 */
-            vv_embedding_cpu(ctx->model->embed_tokens.data, &token_id,
-                              embed_f32, 1, hs);
-            uint16_t embed_h[4096];
-            float_to_half(embed_f32, embed_h, hs);
-            vv_dev_memcpy_h2d(hidden_one_gpu, embed_h, one_hidden,
-                                ctx->compute_stream);
+            /* One FP16 row of the table is exactly the embedding. */
+            if (token_id < 0 || token_id >= vocab_size) {
+                s = VV_ERR_INVALID_ARG;
+                break;
+            }
+            s = vv_dev_memcpy_h2d(hidden_one_gpu,
+                                  (const uint8_t*)ctx->model->embed_tokens.data
+                                  + (size_t)token_id * one_hidden,
+                                  one_hidden, ctx->compute_stream);
+            if (s != VV_OK) break;
         } else {
             /*
              * The token to embed is the one the previous step's argmax left in
@@ -2108,21 +1965,9 @@ static vv_status_t transcribe_gpu(
         if (s != VV_OK) break;
 
         if (lm_head_on_cpu) {
-            uint16_t normed_h[4096];
-            vv_dev_stream_sync(ctx->compute_stream);
-            vv_dev_memcpy_d2h(normed_h, normed_gpu, one_hidden,
-                              ctx->compute_stream);
-            float normed_f[4096], logits_f[152064]; /* max vocab */
-            for (int d = 0; d < hs; d++) normed_f[d] = half_to_float_single(normed_h[d]);
-            /* Simplified: use model->lm_head directly (FP16 on CPU) */
-            const uint16_t* lm = (const uint16_t*)ctx->model->lm_head.data;
-            for (int j = 0; j < vocab_size; j++) {
-                float sum = 0.0f;
-                for (int k = 0; k < hs; k++)
-                    sum += normed_f[k] * half_to_float_single(lm[j*hs+k]);
-                logits_f[j] = sum;
-            }
-            vv_sample_greedy_cpu(logits_f, vocab_size, &token_id);
+            s = cpu_head_argmax(ctx, normed_gpu, host_normed_h, host_normed_f,
+                                &token_id);
+            if (s != VV_OK) break;
         } else {
             s = vv_lm_head_gemv_dev(normed_gpu, ctx->lm_head_gpu,
                                       logits_f32_gpu, vocab_size, hs,
@@ -2139,7 +1984,7 @@ static vv_status_t transcribe_gpu(
 
         if (prof) t_head_ms += vv_time_ms() - t_tok;
 
-        if (vv_is_end_token(ctx->tokenizer, token_id)) break;
+        if (token_ends(ctx, token_id)) break;
 
         if (n_generated >= out_cap) {
             out_cap *= 2;
@@ -2233,6 +2078,8 @@ cleanup_decode:
     if (argmax_v_gpu) vv_dev_free(argmax_v_gpu);
     if (argmax_i_gpu) vv_dev_free(argmax_i_gpu);
     if (token_out_gpu) vv_dev_free(token_out_gpu);
+    vv_free(host_normed_h);
+    vv_free(host_normed_f);
     return s;
 }
 
@@ -2327,10 +2174,16 @@ static vv_status_t transcribe_cpu(
     char ctx_info[512];
     build_context_info(params, ctx_info, sizeof(ctx_info));
 
-    s = build_asr_prompt(ctx->tokenizer, n_audio_frames,
-                          perf->audio_duration_sec, ctx_info,
-                          &prompt_ids, &seq_len, &audio_offset);
-    if (s != VV_OK) { vv_free(combined); return s; }
+    {
+        vv_prompt_t pr;
+        s = vv_family_build_prompt(&ctx->family, ctx->tokenizer,
+                                   n_audio_frames, perf->audio_duration_sec,
+                                   ctx_info, &pr);
+        if (s != VV_OK) { vv_free(combined); return s; }
+        prompt_ids = pr.ids;
+        seq_len = pr.n;
+        audio_offset = pr.audio_offset;
+    }
     perf->prefill_tokens = seq_len;
 
     /* Allocate FP32 hidden states on CPU */
@@ -2372,9 +2225,15 @@ static vv_status_t transcribe_cpu(
     vv_rmsnorm_cpu(last_hidden, norm_w, normed, 1, hs, llm->rms_norm_eps);
 
     int32_t token_id = 0;
-    vv_lm_head_argmax_cpu(normed, ctx->model->lm_head.data,
-                          vocab_size, hs, &token_id, NULL);
+    s = vv_lm_head_argmax_cpu(normed, ctx->model->lm_head.data,
+                              vocab_size, hs, &token_id, NULL);
     vv_free(hidden); hidden = NULL;
+    if (s != VV_OK) {
+        VV_LOG_E("inference: CPU LM head failed: %s", vv_status_str(s));
+        vv_free(normed);
+        vv_free(hidden_one);
+        return s;
+    }
 
     perf->prefill_ms = vv_time_ms() - t_step;
     perf->ttft_ms = vv_time_ms() - t_total_start;
@@ -2387,10 +2246,10 @@ static vv_status_t transcribe_cpu(
     int32_t* output_tokens = (int32_t*)vv_alloc((size_t)out_cap * sizeof(int32_t));
     if (!output_tokens) { s = VV_ERR_OUT_OF_MEMORY; goto cpu_cleanup; }
     int n_generated = 0;
-    if (!vv_is_end_token(ctx->tokenizer, token_id))
+    if (!token_ends(ctx, token_id))
         output_tokens[n_generated++] = token_id;
 
-    while (n_generated < max_new_tokens && !vv_is_end_token(ctx->tokenizer, token_id)) {
+    while (n_generated < max_new_tokens && !token_ends(ctx, token_id)) {
         /* Embed */
         vv_embedding_cpu(ctx->model->embed_tokens.data, &token_id,
                           hidden_one, 1, hs);
@@ -2401,9 +2260,10 @@ static vv_status_t transcribe_cpu(
 
         /* Norm + LM head */
         vv_rmsnorm_cpu(hidden_one, norm_w, normed, 1, hs, llm->rms_norm_eps);
-        vv_lm_head_argmax_cpu(normed, ctx->model->lm_head.data,
-                              vocab_size, hs, &token_id, NULL);
-        if (vv_is_end_token(ctx->tokenizer, token_id)) break;
+        s = vv_lm_head_argmax_cpu(normed, ctx->model->lm_head.data,
+                                  vocab_size, hs, &token_id, NULL);
+        if (s != VV_OK) break;
+        if (token_ends(ctx, token_id)) break;
 
         if (n_generated >= out_cap) {
             out_cap *= 2;
@@ -2475,6 +2335,21 @@ vv_status_t vv_inference_transcribe(
 
     memset(&ctx->last_perf, 0, sizeof(ctx->last_perf));
 
+    if (!ctx->tokenizer || !ctx->family_ok) {
+        VV_LOG_E("inference: no usable tokenizer for this model");
+        return VV_ERR_MODEL_FORMAT;
+    }
+    if (ctx->family.mode != VV_GEN_ONE_SHOT) {
+        /*
+         * The streaming model is prompted without audio and fed chunk by
+         * chunk on one KV cache; a one-shot pass over the whole clip is not
+         * something it was trained for, so it is not attempted here.
+         */
+        VV_LOG_E("inference: %s generates chunk by chunk, which this entry "
+                 "point does not do", vv_model_family_name(ctx->family.id));
+        return VV_ERR_UNSUPPORTED;
+    }
+
     /*
      * CUDA's current device is per-thread and this context was created on
      * another one — the server hands each request to a worker from its
@@ -2514,7 +2389,8 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
         if (ctx->workspace) vv_dev_free(ctx->workspace);
         if (!ctx->is_clone) {
             if (ctx->embed_table_gpu) vv_dev_free(ctx->embed_table_gpu);
-            if (ctx->lm_head_gpu) vv_dev_free(ctx->lm_head_gpu);
+            if (ctx->lm_head_gpu && ctx->lm_head_gpu != ctx->embed_table_gpu)
+                vv_dev_free(ctx->lm_head_gpu);
             if (ctx->final_norm_gpu) vv_dev_free(ctx->final_norm_gpu);
             if (ctx->layer_pool) vv_layer_pool_free(ctx->layer_pool);
         }

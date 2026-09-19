@@ -82,7 +82,13 @@ typedef struct vv_model {
     /* LLM weights */
     vv_tensor_t          embed_tokens;
     vv_tensor_t          final_norm;
+    /**
+     * The LM head. With `lm_head_tied` it is the embedding table itself:
+     * the same host buffer (and, on the GPU, the same device buffer), which
+     * is counted, uploaded and freed once, as `embed_tokens`.
+     */
     vv_tensor_t          lm_head;
+    bool                 lm_head_tied;
     int                  num_layers;
     vv_layer_weights_t*  layers;
 
@@ -91,15 +97,89 @@ typedef struct vv_model {
     int                  n_st_files;
 } vv_model_t;
 
+/* ─── Walking a layer's tensors ─────────────────────────────────────────── */
+
+/**
+ * @brief Tensor slots one transformer layer has: 2 norms, then for each of
+ *        the 7 projections its weight, scales, mins and bias.
+ *
+ * Every slot is always listed, present or not, in a fixed order, so a caller
+ * can index a saved array by slot position; an absent tensor has NULL data.
+ * Whoever adds a per-weight tensor adds it to vv_layer_tensors() and bumps
+ * this, and every upload, stage, pin, size and free follows.
+ */
+#define VV_LAYER_TENSOR_SLOTS (2 + 7 * 4)
+
+/**
+ * @brief Every tensor slot of `L`, in a fixed order.
+ * @return VV_LAYER_TENSOR_SLOTS
+ */
+int vv_layer_tensors(vv_layer_weights_t* L,
+                     vv_tensor_t* out[VV_LAYER_TENSOR_SLOTS]);
+
+/** @brief The 7 projections of `L`, q k v o gate up down. */
+int vv_layer_projections(vv_layer_weights_t* L, vv_weight_t* out[7]);
+
+/** @brief Bytes of every present tensor of `L`. */
+size_t vv_layer_bytes(const vv_layer_weights_t* L);
+
 /**
  * @brief Parse config.json and populate model config.
+ *
+ * LLM dimensions a model cannot run without (hidden size, layers, heads,
+ * intermediate size, vocabulary) are required: a config that lacks one is
+ * refused rather than silently given the 7B value. Activations other than
+ * SiLU, rope scaling and sliding windows are refused as unsupported.
  */
 vv_status_t vv_config_parse(const char* json_path, vv_model_config_t* config);
+
+/**
+ * @brief Read preprocessor_config.json into `config->audio`.
+ *
+ * A missing file is not an error: the reference processor's defaults apply
+ * (24 kHz, 3200 samples per frame, normalize to -25 dBFS). Re-derives
+ * `config->family`, since chunk geometry is what marks a streaming model.
+ */
+vv_status_t vv_config_parse_preprocessor(const char* json_path,
+                                         vv_model_config_t* config);
+
+/**
+ * @brief config.json plus preprocessor_config.json from a model directory,
+ *        and the family they describe.
+ */
+vv_status_t vv_config_load(const char* model_dir, vv_model_config_t* config);
+
+/** @brief "asr-7b" | "asr-bitnet" | "asr-streaming-7b". */
+const char* vv_model_family_name(vv_model_family_t f);
+
+/** @brief Options for vv_model_load_ex(). */
+typedef struct vv_model_load_opts {
+    int quant;   /**< vv_load_quant_t; VV_LOAD_QUANT_AUTO keeps the format */
+} vv_model_load_opts_t;
+
+static inline vv_model_load_opts_t vv_model_load_opts_default(void) {
+    vv_model_load_opts_t o;
+    o.quant = 0;
+    return o;
+}
 
 /**
  * @brief Load the full model from a directory containing safetensors + config.
  */
 vv_status_t vv_model_load(const char* model_dir, vv_model_t** out);
+
+/**
+ * @brief Load with options; NULL opts is vv_model_load().
+ *
+ * Projections are routed by what the file holds, not by their name: U8 with
+ * an `.absmax` companion is NF4, I32 `qweight` is AWQ/GPTQ, and F16, BF16 or
+ * F32 is dense — kept as FP16 or quantized while it is read, per
+ * `opts->quant`. Every tensor the model needs is checked for presence and
+ * shape, and the first one that is wrong fails the load with its name.
+ */
+vv_status_t vv_model_load_ex(const char* model_dir,
+                             const vv_model_load_opts_t* opts,
+                             vv_model_t** out);
 
 /**
  * @brief Free all model weights and resources.

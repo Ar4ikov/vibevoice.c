@@ -88,6 +88,17 @@ vv_status_t vv_audio_prepare(const float* pcm, int n_samples, int sample_rate,
                              float** out, int* out_len);
 
 /**
+ * @brief vv_audio_prepare() with the loudness step optional.
+ *
+ * The streaming model's preprocessor_config.json turns normalization off
+ * (`normalize_audio: false`); the batch models keep it on. The model family
+ * says which (vv_family_t::normalize_audio).
+ */
+vv_status_t vv_audio_prepare_ex(const float* pcm, int n_samples,
+                                int sample_rate, bool normalize,
+                                float** out, int* out_len);
+
+/**
  * @brief Decode any audio file into mono float samples.
  *
  * WAV is parsed directly. Anything else is handed to ffmpeg when it is on

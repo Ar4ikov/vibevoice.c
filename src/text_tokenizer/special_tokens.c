@@ -27,6 +27,9 @@ const char* VV_TOKEN_SPEECH_START = "<|object_ref_start|>";  /* speech_start_id 
 const char* VV_TOKEN_SPEECH_PAD   = "<|box_start|>";         /* speech_pad_id   */
 const char* VV_TOKEN_SPEECH_END   = "<|object_ref_end|>";    /* speech_end_id   */
 
+/* ── Streaming model: ends one chunk of text (151665) ─────────────────── */
+const char* VV_TOKEN_TEXT_CHUNK_END = "<|text_chunk_end|>";
+
 /* Legacy names (kept for link compat, pipeline.c no longer uses them) */
 const char* VV_TOKEN_START_TRANSCRIPT = "<|object_ref_start|>";
 const char* VV_TOKEN_END_TRANSCRIPT   = "<|im_end|>";

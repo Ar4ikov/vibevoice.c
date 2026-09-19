@@ -9,6 +9,32 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- Unquantized checkpoints load: `microsoft/VibeVoice-ASR` in BF16 runs as-is
+  (dense FP16 on the GPU, 56 tok/s, 18.7 GB) or quantized while it is read
+  with `--quant nf4|int4|int8` (`vv_cli`, `serve`, `chat`; `auto` keeps
+  whatever the checkpoint has). `int8` is per-channel symmetric with its own
+  GEMV (97 tok/s, 12.5 GB); `int4` is the fastest (133 tok/s, 9.7 GB). Projections are routed by what the file holds rather
+  than by name, every tensor is checked against the config's shape, and a
+  missing or misshaped one fails the load with its name instead of a
+  "prefill layer 0 failed" later on.
+- Model load runs on the physical cores (unless `OMP_NUM_THREADS` is set)
+  instead of one thread per SMT sibling: the NF4 checkpoint loads in 4.0 s
+  instead of 8.7 s, AWQ in 5.5 s instead of 10.2 s (3090 + 5900X, best of 3).
+- `tie_word_embeddings` is honoured (at the root or in `decoder_config`): the
+  head is the embedding buffer, uploaded and budgeted once.
+- Model families: `asr-7b`, `asr-bitnet` and `asr-streaming-7b` are told
+  apart from `config.json` / `preprocessor_config.json`, each with its own
+  prompt, stop tokens, normalization and chunk geometry (`family.h`).
+- The speech encoder's BF16 weights widen to FP32 exactly; they were
+  truncated to FP16 first, which zeroed 1.2 M of them. F32 LM tensors are
+  rounded to FP16 instead of reaching FP16 kernels unconverted.
+- Prefill appends at the cache's current length on GPU and CPU, and CPU
+  prefill runs in chunks, so CPU-only transcription is no longer capped at
+  about five minutes of audio by a 512 MB workspace.
+- Config dimensions are required: a config without, say,
+  `intermediate_size` is refused instead of silently becoming the 7B.
+  Non-SiLU activations, rope scaling and sliding windows are refused too.
+
 ## [0.2.0](https://github.com/Ar4ikov/vibevoice.c/releases/tag/v0.2.0) — 2026-09-18
 
 - **Security** ([#14](https://github.com/Ar4ikov/vibevoice.c/issues/14)):
@@ -29,6 +55,7 @@ Write the entry for a change under Unreleased in the same pull request.
   segments longer than 1 KB are no longer truncated. `tools/requirements.txt`
   moves past `torch.load` RCE (CVE-2025-32434) and CVE-2024-34062. Closing
   `mic` no longer frees the recorder's stream under the capture thread.
+
 - One model can be split across devices: layers 0..k on the first, the rest
   on the next, each owning the KV cache for its own layers and only the
   hidden state crossing between them. `--split-mode auto|replica|layer`

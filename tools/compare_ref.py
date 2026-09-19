@@ -79,9 +79,16 @@ def cmd_dump(args):
 
     os.makedirs(args.out, exist_ok=True)
     proc = VibeVoiceASRProcessor.from_pretrained(args.model)
+    # `dtype` only from transformers 4.56 on; older releases silently ignore
+    # it and load the unquantised checkpoint in its config dtype (float32,
+    # 35 GB for the 7B), which does not fit a 24 GB card.
+    import transformers
+    major_minor = tuple(int(x) for x in transformers.__version__.split(".")[:2])
+    dtype_kw = ({"dtype": torch.bfloat16} if major_minor >= (4, 56)
+                else {"torch_dtype": torch.bfloat16})
     model = VibeVoiceASRForConditionalGeneration.from_pretrained(
-        args.model, dtype=torch.bfloat16, device_map=args.device,
-        attn_implementation="sdpa").eval()
+        args.model, device_map=args.device,
+        attn_implementation="sdpa", **dtype_kw).eval()
 
     # The speech path is not quantised; run it in fp32 so the reference is a
     # clean target rather than another approximation.

@@ -28,6 +28,13 @@ const char* vv_cpu_simd_name(void);
 /** @brief Threads the CPU kernels will use. */
 int vv_cpu_threads(void);
 
+/**
+ * @brief Physical cores (one per SMT group) this process may run on, or 0
+ *        when the topology cannot be read. Changes nothing: no thread count
+ *        is set and nothing is pinned.
+ */
+int vv_cpu_physical_cores(void);
+
 /* ─── Quantized linear ──────────────────────────────────────────────────── */
 
 /**
@@ -51,6 +58,17 @@ vv_status_t vv_int4g_gemm_cpu(const float* input, const uint8_t* packed,
                               const void* scales, const void* mins,
                               const void* bias, float* output,
                               int M, int N, int K, int group);
+
+/**
+ * @brief Same shape, for per-channel INT8 weights (W8A16).
+ *
+ * @param q      int8 [N, K], row-major
+ * @param scales FP32 [N]; w[n,k] = q[n,k] * scales[n]
+ * @param bias   FP16 [N], or NULL
+ */
+vv_status_t vv_int8_gemm_cpu(const float* input, const int8_t* q,
+                             const float* scales, const void* bias,
+                             float* output, int M, int N, int K);
 
 /** @brief output[M,N] = input[M,K] @ W[N,K]^T + bias, W and bias FP16. */
 vv_status_t vv_gemm_f16w_cpu(const float* input, const void* w_fp16,

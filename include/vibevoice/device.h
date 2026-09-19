@@ -187,6 +187,29 @@ vv_status_t vv_dequant_awq_dev(
     const uint32_t* packed, const uint32_t* mins, const void* scales,
     void* output_fp16, int N, int K, int group_size, void* stream);
 
+/*
+ * INT8 per-channel weights (`--quant int8`), run on FP16 activations:
+ *   q [N][K] int8, scales [N] FP32, w = q * scale. K must be a multiple of 16.
+ */
+
+/** @brief INT8 GEMV (M = 1), scale and bias applied once per row. Bias may
+ *         be NULL. */
+vv_status_t vv_int8_gemv_dev(
+    const void* x, const int8_t* q, const float* scales, const void* bias,
+    void* y, int N, int K, void* stream);
+
+/** @brief INT8 GEMM without bias: a direct kernel for M <= 8, else dequant
+ *         into `temp_weight_fp16` [N, K] + FP16 GEMM. */
+vv_status_t vv_int8_gemm_dev(
+    const void* input_fp16, const int8_t* q, const float* scales,
+    void* output_fp16, void* temp_weight_fp16,
+    int M, int N, int K, void* stream);
+
+/** @brief Standalone INT8 → FP16 dequantization into [N, K]. */
+vv_status_t vv_dequant_int8_dev(
+    const int8_t* q, const float* scales, void* output_fp16,
+    int N, int K, void* stream);
+
 /* ─── Dense linear ───────────────────────────────────────────────────────── */
 
 /** @brief C[M,N] = alpha * A[M,K] @ B[N,K]^T + beta * C. */

@@ -188,6 +188,7 @@ add_library(vibevoice_core STATIC
     src/quant/nf4_table.c
     src/quant/kv_format.c
     src/quant/awq_repack.c
+    src/quant/load_quant.c
     src/quant/dequant_cpu.c
     src/cpu/cpu_kernels.c
     src/inference/pipeline.c
@@ -195,6 +196,7 @@ add_library(vibevoice_core STATIC
     src/inference/kv_cache.c
     src/inference/sampling.c
     src/inference/postprocess.c
+    src/inference/family.c
 )
 # With no accelerator backend the device op set still has to link. The stub
 # implements memory and streams on the host and refuses every compute op,
@@ -257,6 +259,7 @@ if(VV_HAS_CUDA)
         src/cuda/nf4_gemv.cu
         src/cuda/kv_quant.cu
         src/cuda/awq_gemv.cu
+        src/cuda/int8_gemv.cu
         src/cuda/lm_head.cu
         src/cuda/conv1d.cu
         src/cuda/conv_vae.cu
@@ -357,6 +360,10 @@ if(VV_BUILD_TESTS)
     add_dependencies(test_untrusted_input spawn_child)
     target_compile_definitions(test_untrusted_input PRIVATE
         VV_SPAWN_CHILD="$<TARGET_FILE:spawn_child>")
+    vv_add_test(test_model_load tests/test_model_load.c)
+    target_compile_definitions(test_model_load PRIVATE
+                               VV_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data")
+    vv_add_test(test_prefill_append tests/test_prefill_append.c)
     vv_add_test(test_e2e tests/test_e2e.c)
 endif()
 

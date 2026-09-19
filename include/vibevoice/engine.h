@@ -45,6 +45,7 @@ typedef struct vv_engine_params {
      */
     vv_gpu_set_t gpus;
     int          split_mode;  /**< vv_split_mode_t across those devices     */
+    int          weight_quant; /**< vv_load_quant_t; 0 = keep the checkpoint's */
 } vv_engine_params_t;
 
 static inline vv_engine_params_t vv_engine_params_default(void) {
@@ -59,6 +60,7 @@ static inline vv_engine_params_t vv_engine_params_default(void) {
     p.cpu_only = false;
     p.gpus.n = 0;
     p.split_mode = VV_SPLIT_AUTO;
+    p.weight_quant = 0;
     return p;
 }
 

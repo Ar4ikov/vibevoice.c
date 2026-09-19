@@ -71,6 +71,7 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
     ip.max_seq_len = params->max_seq_len;
     ip.kv_format   = params->kv_format;
     ip.gpu_layers  = params->gpu_layers;
+    ip.weight_quant = params->weight_quant;
     ip.gpus        = params->gpus;
     if (ip.gpus.n == 0) { ip.gpus.n = 1; ip.gpus.id[0] = params->gpu_id; }
 
@@ -220,8 +221,11 @@ vv_status_t vv_engine_transcribe(vv_engine_t* e,
     /* Resample and normalize outside the slot: it needs no GPU. */
     float* audio = NULL;
     int n_out = 0;
-    vv_status_t s = vv_audio_prepare(pcm, n_samples, sample_rate,
-                                     &audio, &n_out);
+    /* Every slot runs the same model, so any of them knows its family. */
+    const bool normalize = e->slots[0]->family_ok
+                           ? e->slots[0]->family.normalize_audio : true;
+    vv_status_t s = vv_audio_prepare_ex(pcm, n_samples, sample_rate,
+                                        normalize, &audio, &n_out);
     if (s != VV_OK) return s;
 
     const int slot = acquire_slot(e);

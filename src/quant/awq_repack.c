@@ -106,7 +106,9 @@ vv_status_t vv_int4g_quantize(const float* w, int N, int K, int group_size,
 
     int n;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+    /* The loader hands over a few rows at a time from its own parallel
+       loop; only a large block is worth a region of its own. */
+#pragma omp parallel for schedule(static) if (N >= 64)
 #endif
     for (n = 0; n < N; n++) {
         const float* wrow = w + (size_t)n * K;
@@ -121,11 +123,15 @@ vv_status_t vv_int4g_quantize(const float* w, int N, int K, int group_size,
                 if (wrow[k] < lo) lo = wrow[k];
                 if (wrow[k] > hi) hi = wrow[k];
             }
-            /* Asymmetric range over 16 levels; a flat group gets scale 0. */
-            const float sc = (hi > lo) ? (hi - lo) / 15.0f : 0.0f;
+            /* Asymmetric range over 16 levels; a flat group gets scale 0.
+               The codes are chosen against the FP16 scale and min the
+               kernels will actually use, not the FP32 ones they came from. */
+            srow[g] = vv_float_to_half_rne((hi > lo) ? (hi - lo) / 15.0f
+                                                     : 0.0f);
+            mrow[g] = vv_float_to_half_rne(lo);
+            const float sc = vv_half_to_float(srow[g]);
+            lo = vv_half_to_float(mrow[g]);
             const float inv = (sc > 0.0f) ? 1.0f / sc : 0.0f;
-            srow[g] = vv_float_to_half(sc);
-            mrow[g] = vv_float_to_half(lo);
 
             for (int k = k0; k < k0 + group_size; k += 2) {
                 int q0 = (int)((wrow[k]     - lo) * inv + 0.5f);

@@ -4,6 +4,7 @@
  */
 
 #include "vibevoice/vibevoice.h"
+#include "vibevoice/quant.h"
 
 #include <stdio.h>
 #include <math.h>
@@ -112,6 +113,81 @@ static void test_dequant_block_boundary(void) {
     vv_free(output);
 }
 
+/**
+ * @brief The nearest level as the first version of the load-time quantizer
+ *        found it: binary search to a bracket, then its midpoint, ties low.
+ */
+static int nf4_nearest_bsearch(float x) {
+    int lo = 0, hi = 15;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) >> 1;
+        if (x > VV_NF4_TABLE[mid]) lo = mid; else hi = mid;
+    }
+    const float m = 0.5f * (VV_NF4_TABLE[lo] + VV_NF4_TABLE[hi]);
+    return (x > m) ? hi : lo;
+}
+
+/**
+ * vv_nf4_quantize picks levels by counting midpoints below x. It must give
+ * the same code as the binary search it replaced on every value, the exact
+ * midpoints (ties) and their neighbours included.
+ */
+static void test_quantize_nearest(void) {
+    printf("test_quantize_nearest:\n");
+
+    enum { K = 64, N = 256 };
+    float* w = (float*)vv_alloc((size_t)N * K * sizeof(float));
+    uint8_t* packed = (uint8_t*)vv_alloc((size_t)N * K / 2);
+    uint16_t* scales = (uint16_t*)vv_alloc((size_t)N * sizeof(uint16_t));
+    if (!w || !packed || !scales) {
+        TEST_ASSERT(0, "allocation");
+        vv_free(w); vv_free(packed); vv_free(scales);
+        return;
+    }
+
+    /* Element 0 of every block is 1.0, so the block's scale is exactly 1
+       and x * (1 / scale) is x itself. */
+    int n = 0;
+    uint32_t lcg = 12345u;
+    for (int r = 0; r < N; r++) {
+        w[(size_t)r * K] = 1.0f;
+        for (int k = 1; k < K; k++) {
+            float v;
+            if (n < 15 * 3) {
+                const int j = n / 3, d = n % 3;
+                const float m = 0.5f * (VV_NF4_TABLE[j] + VV_NF4_TABLE[j + 1]);
+                v = d == 0 ? m : d == 1 ? nextafterf(m, -2.0f)
+                                        : nextafterf(m, 2.0f);
+            } else if (n < 15 * 3 + 16) {
+                v = VV_NF4_TABLE[n - 45];
+            } else {
+                lcg = lcg * 1664525u + 1013904223u;
+                v = ((float)(lcg >> 8) / 16777216.0f) * 2.0f - 1.0f;
+            }
+            w[(size_t)r * K + k] = v;
+            n++;
+        }
+    }
+
+    const vv_status_t s = vv_nf4_quantize(w, N, K, packed, scales);
+    TEST_ASSERT(s == VV_OK, "vv_nf4_quantize succeeds");
+
+    int bad = 0, scale_ok = 1;
+    for (int r = 0; r < N; r++) {
+        if (scales[r] != 0x3C00) scale_ok = 0;
+        for (int k = 0; k < K; k++) {
+            const uint8_t b = packed[((size_t)r * K + k) / 2];
+            const int code = (k & 1) ? (b & 15) : (b >> 4);
+            if (code != nf4_nearest_bsearch(w[(size_t)r * K + k])) bad++;
+        }
+    }
+    TEST_ASSERT(scale_ok, "blocks with max 1.0 get scale 1.0 (0x3C00)");
+    TEST_ASSERT(bad == 0,
+                "codes match the binary search on 16k values, ties included");
+
+    vv_free(w); vv_free(packed); vv_free(scales);
+}
+
 static void test_dequant_null_args(void) {
     printf("test_dequant_null_args:\n");
 
@@ -142,6 +218,7 @@ int main(void) {
     test_dequant_basic();
     test_dequant_block_boundary();
     test_dequant_null_args();
+    test_quantize_nearest();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

@@ -34,34 +34,9 @@
  * Layer Pool — stage / unstage helpers
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/**
- * @brief Calculate total GPU buffer size needed for one layer's tensors.
- */
+/** @brief GPU buffer size needed for one layer's tensors. */
 static size_t layer_gpu_size(const vv_layer_weights_t* L) {
-    size_t total = 0;
-    total += L->input_layernorm.size_bytes;
-    total += L->post_attn_layernorm.size_bytes;
-
-    #define ADD_WEIGHT_SIZE(w) do {                   \
-        total += (w).tensor.size_bytes;               \
-        if ((w).quant.scales.data)                    \
-            total += (w).quant.scales.size_bytes;     \
-        if ((w).mins.data)                            \
-            total += (w).mins.size_bytes;             \
-        if ((w).bias.data)                            \
-            total += (w).bias.size_bytes;             \
-    } while(0)
-
-    ADD_WEIGHT_SIZE(L->attn.q_proj);
-    ADD_WEIGHT_SIZE(L->attn.k_proj);
-    ADD_WEIGHT_SIZE(L->attn.v_proj);
-    ADD_WEIGHT_SIZE(L->attn.o_proj);
-    ADD_WEIGHT_SIZE(L->mlp.gate_proj);
-    ADD_WEIGHT_SIZE(L->mlp.up_proj);
-    ADD_WEIGHT_SIZE(L->mlp.down_proj);
-
-    #undef ADD_WEIGHT_SIZE
-    return total;
+    return vv_layer_bytes(L);
 }
 
 vv_status_t vv_layer_pool_create(vv_layer_pool_t** pool,
@@ -151,60 +126,28 @@ vv_status_t vv_layer_pool_stage(vv_layer_pool_t* pool,
     }
     if (pool->loaded[slot] == layer_idx) return VV_OK; /* already staged */
 
-    vv_layer_weights_t* L = &model->layers[layer_idx];
+    vv_tensor_t* ts[VV_LAYER_TENSOR_SLOTS];
+    const int nt = vv_layer_tensors(&model->layers[layer_idx], ts);
     uint8_t* buf = (uint8_t*)pool->gpu_buf[slot];
     size_t off = 0;
-    int idx = 0;
 
     /* A NULL saved pointer tells unstage there is nothing to restore. */
-    #define STAGE_TENSOR(t) do {                                        \
-        pool->saved_ptrs[slot][idx] = (t).on_gpu ? NULL : (t).data;    \
-        if ((t).data && !(t).on_gpu && (t).size_bytes > 0) {           \
-            /* Align to 256 bytes */                                    \
-            off = (off + 255) & ~(size_t)255;                          \
-            if (off + (t).size_bytes > pool->buf_size) {               \
-                VV_LOG_E("layer_pool: staging overflow on layer %d",    \
-                         layer_idx);                                    \
-                return VV_ERR_OVERFLOW;                                 \
-            }                                                          \
-            vv_dev_memcpy_h2d(buf + off, (t).data,                    \
-                               (t).size_bytes, stream);                \
-            (t).data = buf + off;                                      \
-            (t).on_gpu = true;                                         \
-            off += (t).size_bytes;                                     \
-        }                                                              \
-        idx++;                                                         \
-    } while(0)
-
-    STAGE_TENSOR(L->input_layernorm);
-    STAGE_TENSOR(L->post_attn_layernorm);
-    STAGE_TENSOR(L->attn.q_proj.tensor);
-    STAGE_TENSOR(L->attn.q_proj.quant.scales);
-    STAGE_TENSOR(L->attn.q_proj.mins);
-    STAGE_TENSOR(L->attn.q_proj.bias);
-    STAGE_TENSOR(L->attn.k_proj.tensor);
-    STAGE_TENSOR(L->attn.k_proj.quant.scales);
-    STAGE_TENSOR(L->attn.k_proj.mins);
-    STAGE_TENSOR(L->attn.k_proj.bias);
-    STAGE_TENSOR(L->attn.v_proj.tensor);
-    STAGE_TENSOR(L->attn.v_proj.quant.scales);
-    STAGE_TENSOR(L->attn.v_proj.mins);
-    STAGE_TENSOR(L->attn.v_proj.bias);
-    STAGE_TENSOR(L->attn.o_proj.tensor);
-    STAGE_TENSOR(L->attn.o_proj.quant.scales);
-    STAGE_TENSOR(L->attn.o_proj.mins);
-    STAGE_TENSOR(L->attn.o_proj.bias);
-    STAGE_TENSOR(L->mlp.gate_proj.tensor);
-    STAGE_TENSOR(L->mlp.gate_proj.quant.scales);
-    STAGE_TENSOR(L->mlp.gate_proj.mins);
-    STAGE_TENSOR(L->mlp.up_proj.tensor);
-    STAGE_TENSOR(L->mlp.up_proj.quant.scales);
-    STAGE_TENSOR(L->mlp.up_proj.mins);
-    STAGE_TENSOR(L->mlp.down_proj.tensor);
-    STAGE_TENSOR(L->mlp.down_proj.quant.scales);
-    STAGE_TENSOR(L->mlp.down_proj.mins);
-
-    #undef STAGE_TENSOR
+    for (int idx = 0; idx < nt; idx++) {
+        vv_tensor_t* t = ts[idx];
+        pool->saved_ptrs[slot][idx] = t->on_gpu ? NULL : t->data;
+        if (!t->data || t->on_gpu || t->size_bytes == 0) continue;
+        off = (off + 255) & ~(size_t)255;       /* 256-byte aligned */
+        if (off + t->size_bytes > pool->buf_size) {
+            VV_LOG_E("layer_pool: staging overflow on layer %d", layer_idx);
+            return VV_ERR_OVERFLOW;
+        }
+        vv_status_t s = vv_dev_memcpy_h2d(buf + off, t->data, t->size_bytes,
+                                          stream);
+        if (s != VV_OK) return s;
+        t->data = buf + off;
+        t->on_gpu = true;
+        off += t->size_bytes;
+    }
 
     pool->loaded[slot] = layer_idx;
     return VV_OK;
@@ -225,46 +168,13 @@ vv_status_t vv_layer_pool_unstage(vv_layer_pool_t* pool,
     }
     if (slot < 0) return VV_OK; /* not staged */
 
-    vv_layer_weights_t* L = &model->layers[layer_idx];
-    int idx = 0;
-
-    #define UNSTAGE_TENSOR(t) do {                                      \
-        if (pool->saved_ptrs[slot][idx]) {                             \
-            (t).data = pool->saved_ptrs[slot][idx];                    \
-            (t).on_gpu = false;                                        \
-        }                                                              \
-        idx++;                                                         \
-    } while(0)
-
-    UNSTAGE_TENSOR(L->input_layernorm);
-    UNSTAGE_TENSOR(L->post_attn_layernorm);
-    UNSTAGE_TENSOR(L->attn.q_proj.tensor);
-    UNSTAGE_TENSOR(L->attn.q_proj.quant.scales);
-    UNSTAGE_TENSOR(L->attn.q_proj.mins);
-    UNSTAGE_TENSOR(L->attn.q_proj.bias);
-    UNSTAGE_TENSOR(L->attn.k_proj.tensor);
-    UNSTAGE_TENSOR(L->attn.k_proj.quant.scales);
-    UNSTAGE_TENSOR(L->attn.k_proj.mins);
-    UNSTAGE_TENSOR(L->attn.k_proj.bias);
-    UNSTAGE_TENSOR(L->attn.v_proj.tensor);
-    UNSTAGE_TENSOR(L->attn.v_proj.quant.scales);
-    UNSTAGE_TENSOR(L->attn.v_proj.mins);
-    UNSTAGE_TENSOR(L->attn.v_proj.bias);
-    UNSTAGE_TENSOR(L->attn.o_proj.tensor);
-    UNSTAGE_TENSOR(L->attn.o_proj.quant.scales);
-    UNSTAGE_TENSOR(L->attn.o_proj.mins);
-    UNSTAGE_TENSOR(L->attn.o_proj.bias);
-    UNSTAGE_TENSOR(L->mlp.gate_proj.tensor);
-    UNSTAGE_TENSOR(L->mlp.gate_proj.quant.scales);
-    UNSTAGE_TENSOR(L->mlp.gate_proj.mins);
-    UNSTAGE_TENSOR(L->mlp.up_proj.tensor);
-    UNSTAGE_TENSOR(L->mlp.up_proj.quant.scales);
-    UNSTAGE_TENSOR(L->mlp.up_proj.mins);
-    UNSTAGE_TENSOR(L->mlp.down_proj.tensor);
-    UNSTAGE_TENSOR(L->mlp.down_proj.quant.scales);
-    UNSTAGE_TENSOR(L->mlp.down_proj.mins);
-
-    #undef UNSTAGE_TENSOR
+    vv_tensor_t* ts[VV_LAYER_TENSOR_SLOTS];
+    const int nt = vv_layer_tensors(&model->layers[layer_idx], ts);
+    for (int idx = 0; idx < nt; idx++) {
+        if (!pool->saved_ptrs[slot][idx]) continue;
+        ts[idx]->data = pool->saved_ptrs[slot][idx];
+        ts[idx]->on_gpu = false;
+    }
 
     pool->loaded[slot] = -1;
     return VV_OK;
@@ -367,18 +277,17 @@ vv_status_t vv_layer_pool_pin_range(vv_model_t* model, int first, int count) {
     size_t pinned = 0;
     const double t0 = vv_time_ms();
 
-    #define PIN(t) do {                                                             if ((t).data && !(t).on_gpu && (t).size_bytes >= 65536) {                       if (vv_dev_host_register((t).data, (t).size_bytes) == VV_OK)                    pinned += (t).size_bytes;                                           }                                                                       } while (0)
-    #define PIN_W(w) do { PIN((w).tensor); PIN((w).quant.scales);                                     PIN((w).mins); PIN((w).bias); } while (0)
-
+    /* Small tensors (norms, biases) are not worth a registration each. */
     for (int i = first; i < first + count; i++) {
-        vv_layer_weights_t* L = &model->layers[i];
-        PIN_W(L->attn.q_proj); PIN_W(L->attn.k_proj);
-        PIN_W(L->attn.v_proj); PIN_W(L->attn.o_proj);
-        PIN_W(L->mlp.gate_proj); PIN_W(L->mlp.up_proj);
-        PIN_W(L->mlp.down_proj);
+        vv_tensor_t* ts[VV_LAYER_TENSOR_SLOTS];
+        const int nt = vv_layer_tensors(&model->layers[i], ts);
+        for (int k = 0; k < nt; k++) {
+            vv_tensor_t* t = ts[k];
+            if (!t->data || t->on_gpu || t->size_bytes < 65536) continue;
+            if (vv_dev_host_register(t->data, t->size_bytes) == VV_OK)
+                pinned += t->size_bytes;
+        }
     }
-    #undef PIN_W
-    #undef PIN
 
     if (pinned)
         VV_LOG_I("layer_pool: page-locked %.1f MB of streamed weights "
@@ -429,6 +338,14 @@ static vv_status_t quant_linear(
         s = vv_nf4_gemm_dev(x, (const uint8_t*)w->tensor.data,
                              w->quant.scales.data, y, scratch,
                              M, N, K, 64, stream);
+    } else if (w->quant_kind == VV_QUANT_INT8) {
+        if (M == 1)
+            return vv_int8_gemv_dev(x, (const int8_t*)w->tensor.data,
+                                    (const float*)w->quant.scales.data,
+                                    w->bias.data, y, N, K, stream);
+        s = vv_int8_gemm_dev(x, (const int8_t*)w->tensor.data,
+                             (const float*)w->quant.scales.data, y, scratch,
+                             M, N, K, stream);
     } else {
         s = vv_gemm_fp16_dev(x, w->tensor.data, y, M, N, K,
                               1.0f, 0.0f, stream);
@@ -851,6 +768,19 @@ vv_status_t vv_decoder_prefill(
         VV_LOG_I("decoder: prefill in %d chunks of %d tokens",
                  (seq_len + chunk - 1) / chunk, chunk);
 
+    /*
+     * Positions continue from whatever the cache already holds: zero for a
+     * fresh prompt, the running length when a streaming session prefills its
+     * next chunk on top of what it has decoded. Refused up front rather than
+     * half-written when it would not fit.
+     */
+    const int base = kv_cache->current_len;
+    if ((long long)base + seq_len > (long long)kv_cache->max_seq_len) {
+        VV_LOG_E("decoder: prefill of %d tokens at %d overflows the %d-token "
+                 "KV window", seq_len, base, kv_cache->max_seq_len);
+        return VV_ERR_OVERFLOW;
+    }
+
     for (int start = 0; start < seq_len; start += chunk) {
       const int len = (start + chunk <= seq_len) ? chunk : (seq_len - start);
       void* chunk_hidden = (uint8_t*)hidden_states + (size_t)start * hs * 2;
@@ -868,7 +798,7 @@ vv_status_t vv_decoder_prefill(
 
         vv_status_t s = decoder_layer_impl(
             &model->layers[i], &model->config.llm,
-            chunk_hidden, kv_cache, i, start, len,
+            chunk_hidden, kv_cache, i, base + start, len,
             workspace, workspace_size, compute_stream);
 
         if (streaming) vv_layer_prefetch_done(pool, i, compute_stream);
@@ -905,6 +835,28 @@ vv_status_t vv_decoder_prefill(
 /* ═══════════════════════════════════════════════════════════════════════════
  * CPU decoder — per-layer forward (FP32 activations, quantized weights)
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** @brief Run one projection in whatever format its weights are stored in. */
+static vv_status_t cpu_proj(const vv_weight_t* w, const float* in, float* out,
+                            int M, int N, int K) {
+    switch (w->quant_kind) {
+    case VV_QUANT_INT4G:
+        return vv_int4g_gemm_cpu(in, (const uint8_t*)w->tensor.data,
+                                 w->quant.scales.data, w->mins.data,
+                                 w->bias.data, out, M, N, K, w->group_size);
+    case VV_QUANT_NF4:
+        return vv_nf4_gemm_cpu(in, (const uint8_t*)w->tensor.data,
+                               w->quant.scales.data, w->bias.data,
+                               out, M, N, K);
+    case VV_QUANT_INT8:
+        return vv_int8_gemm_cpu(in, (const int8_t*)w->tensor.data,
+                                (const float*)w->quant.scales.data,
+                                w->bias.data, out, M, N, K);
+    default:
+        return vv_gemm_f16w_cpu(in, w->tensor.data, w->bias.data, out,
+                                M, N, K);
+    }
+}
 
 /**
  * @brief One transformer layer on the CPU, FP32 activations.
@@ -949,7 +901,7 @@ static vv_status_t decoder_layer_cpu(
     float* mlp_out  = wp + off;
 
     /** Run one projection in whatever format its weights are stored in. */
-    #define CPU_PROJ(w, in, out_buf, M, N, KK)                                      do {                                                                            if ((w).quant_kind == VV_QUANT_INT4G) {                                         s = vv_int4g_gemm_cpu((in), (const uint8_t*)(w).tensor.data,                        (w).quant.scales.data, (w).mins.data,                                       (w).bias.data, (out_buf), (M), (N), (KK),                                   (w).group_size);                                                } else if ((w).quant_kind == VV_QUANT_NF4) {                                    s = vv_nf4_gemm_cpu((in), (const uint8_t*)(w).tensor.data,                          (w).quant.scales.data, (w).bias.data,                                       (out_buf), (M), (N), (KK));                                     } else {                                                                        s = vv_gemm_f16w_cpu((in), (w).tensor.data,                                         (w).bias.data, (out_buf), (M), (N), (KK));                      }                                                                           if (s != VV_OK) return s;                                               } while (0)
+    #define CPU_PROJ(w, in, out_buf, M, N, KK) do { s = cpu_proj(&(w), (in), (out_buf), (M), (N), (KK)); if (s != VV_OK) return s; } while (0)
 
     s = vv_rmsnorm_cpu(hidden_states, layer->input_layernorm.data, norm_out,
                        seq_len, hs, config->rms_norm_eps);
@@ -1009,20 +961,56 @@ vv_status_t vv_decoder_prefill_cpu(
     float* workspace,
     size_t workspace_size)
 {
-    if (!model || !hidden_states || !kv_cache) return VV_ERR_NULL_PTR;
+    if (!model || !hidden_states || !kv_cache || !workspace)
+        return VV_ERR_NULL_PTR;
+    if (seq_len <= 0) return VV_ERR_INVALID_ARG;
 
-    VV_LOG_I("decoder: CPU prefill %d tokens through %d layers",
-             seq_len, model->num_layers);
+    const vv_llm_config_t* cfg = &model->config.llm;
+    const int hs = cfg->hidden_size;
 
-    for (int i = 0; i < model->num_layers; i++) {
-        vv_status_t s = decoder_layer_cpu(
-            &model->layers[i], &model->config.llm,
-            hidden_states, kv_cache, i, 0, seq_len,
-            workspace, workspace_size);
-        if (s != VV_OK) {
-            VV_LOG_E("decoder: CPU prefill layer %d failed: %s",
-                     i, vv_status_str(s));
-            return s;
+    /*
+     * The activations of one layer cost this many floats per token (the two
+     * intermediate-wide MLP buffers dominate), and the workspace is fixed.
+     * Unchunked, 512 MB ran out at about 2.5K tokens — five minutes of
+     * audio on the 7B. Each chunk attends to everything cached before it,
+     * so chunking changes how the work is cut, not what it computes.
+     */
+    const size_t per_token = sizeof(float) *
+        (3 * (size_t)hs + (size_t)cfg->num_attention_heads * cfg->head_dim +
+         2 * (size_t)cfg->num_key_value_heads * cfg->head_dim +
+         2 * (size_t)cfg->intermediate_size);
+    size_t fit = workspace_size / per_token;
+    if (fit < 1) return VV_ERR_OUT_OF_MEMORY;
+    if (fit > 2048) fit = 2048;
+    const int chunk = (int)fit < seq_len ? (int)fit : seq_len;
+
+    const int base = kv_cache->current_len;
+    if ((long long)base + seq_len > (long long)kv_cache->max_seq_len) {
+        VV_LOG_E("decoder: CPU prefill of %d tokens at %d overflows the "
+                 "%d-token KV window", seq_len, base, kv_cache->max_seq_len);
+        return VV_ERR_OVERFLOW;
+    }
+
+    if (chunk < seq_len)
+        VV_LOG_I("decoder: CPU prefill %d tokens through %d layers in %d "
+                 "chunks of %d", seq_len, model->num_layers,
+                 (seq_len + chunk - 1) / chunk, chunk);
+    else
+        VV_LOG_I("decoder: CPU prefill %d tokens through %d layers",
+                 seq_len, model->num_layers);
+
+    for (int start = 0; start < seq_len; start += chunk) {
+        const int len = (start + chunk <= seq_len) ? chunk : seq_len - start;
+        float* h = hidden_states + (size_t)start * hs;
+        for (int i = 0; i < model->num_layers; i++) {
+            vv_status_t s = decoder_layer_cpu(
+                &model->layers[i], cfg, h, kv_cache, i, base + start, len,
+                workspace, workspace_size);
+            if (s != VV_OK) {
+                VV_LOG_E("decoder: CPU prefill layer %d failed: %s",
+                         i, vv_status_str(s));
+                return s;
+            }
         }
     }
     return VV_OK;

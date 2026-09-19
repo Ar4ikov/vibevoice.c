@@ -60,8 +60,14 @@ static vv_dtype_t parse_dtype(const char* s) {
     if (strcmp(s, "I64") == 0)     return VV_DTYPE_I64;
     if (strcmp(s, "F8_E4M3") == 0) return VV_DTYPE_F8_E4M3;
     if (strcmp(s, "BOOL") == 0)    return VV_DTYPE_BOOL;
-    VV_LOG_W("safetensors: unknown dtype '%s', defaulting to F32", s);
-    return VV_DTYPE_F32;
+    if (strcmp(s, "I8") == 0)      return VV_DTYPE_I8;
+    if (strcmp(s, "I16") == 0)     return VV_DTYPE_I16;
+    if (strcmp(s, "U16") == 0)     return VV_DTYPE_U16;
+    if (strcmp(s, "U32") == 0)     return VV_DTYPE_U32;
+    if (strcmp(s, "F8_E5M2") == 0) return VV_DTYPE_F8_E5M2;
+    /* Guessing F32 here once made an unknown tensor load as garbage. */
+    VV_LOG_W("safetensors: unknown dtype '%s'", s);
+    return VV_DTYPE_UNKNOWN;
 }
 
 static size_t mmap_file(const char* path, const uint8_t** out_data,
