@@ -38,6 +38,19 @@ Write the entry for a change under Unreleased in the same pull request.
   sessions-per-GPU bench), and `cmp-stream` reports the joined transcript's
   word edits. The protocol, reference tooling and numbers are in
   `docs/STREAMING.md`.
+- W8A8 and W4A8: activations quantized to int8 per token, int8 × int8 on
+  the s8 tensor cores for prefill and `dp4a` GEMVs for decode, with no FP16
+  weight copy anywhere. `--quant w8a8|w4a8` quantizes a BF16 checkpoint at
+  load; `--quant w4a8` also runs an AWQ checkpoint exactly (not the NF4
+  one: its codes are not integers);
+  compressed-tensors checkpoints (llm-compressor `int-quantized` /
+  `pack-quantized`, dynamic int8 activations) load directly. SmoothQuant
+  folds in at load from a built-in calibration pass (`--calib <audio>`,
+  `--calib-stats <file>`, also on `serve`). On a 3090 the 32-minute prompt
+  prefills at 7152 tok/s (W8A8) and 5100 (W4A8) against 3451 for `int4`;
+  words are the same as dense BF16 on jfk, test30, test120 and the
+  32-minute file. `VV_SAVE_TOKENS` / `VV_TEACHER_TOKENS` measure
+  teacher-forced top-1 agreement. Default behaviour is unchanged.
 
 ## [0.3.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.2.0...v0.3.0) — 2026-09-19
 

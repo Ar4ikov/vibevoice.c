@@ -16,6 +16,7 @@
 #define VV_CPU_KERNELS_H
 
 #include "vibevoice/types.h"
+#include "vibevoice/q8.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -73,6 +74,47 @@ vv_status_t vv_int8_gemm_cpu(const float* input, const int8_t* q,
 /** @brief output[M,N] = input[M,K] @ W[N,K]^T + bias, W and bias FP16. */
 vv_status_t vv_gemm_f16w_cpu(const float* input, const void* w_fp16,
                              const void* bias_fp16, float* output,
+                             int M, int N, int K);
+
+/* ─── Int8 activations (W8A8, W4A8) ─────────────────────────────────────── */
+
+/** @brief Instruction set the int8 kernels use ("AVX-VNNI", "AVX2", ...). */
+const char* vv_cpu_int8_isa(void);
+
+/**
+ * @brief Per-token int8 quantization: sx[m] = max|x[m,:]| / 127,
+ *        xq = round-half-even(x * 127 / max|x|), clamped to +-127.
+ *
+ * Bit-identical to the GPU quantizers on the same values (see device.h).
+ * @param xsum  int32 [M][K/32] sums of xq per 32 columns, or NULL
+ * K must be a multiple of 32.
+ */
+vv_status_t vv_quant_act_q8_cpu(const float* x, int M, int K, int layout,
+                                int8_t* xq, float* sx, int32_t* xsum);
+
+/**
+ * @brief W8A8: out[m,n] = sx[m] * sw[n] * sum_k xq[m,k] w[n,k] + bias[n].
+ * @param w  int8 [N][K], never -128;  sw  FP32 [N];  bias FP16 [N] or NULL
+ */
+vv_status_t vv_w8a8_gemm_cpu(const int8_t* xq, const float* sx,
+                             const int8_t* w, const float* sw,
+                             const void* bias_f16, float* out,
+                             int M, int N, int K);
+
+/**
+ * @brief W4A8 on the INT4G bytes with integer zero points.
+ *
+ * out[m,n] = sx[m] * sum_g s[n,g] * sum_{k in g} (q[n,k] - z[n,g]) xq[m,k]
+ *            + bias[n]
+ * @param xq      int8 [M][K] in VV_Q8_NIBBLE order
+ * @param xsum    int32 [M][K/32] from the same quantizer call
+ * @param packed  uint8 [N][K/2], high nibble = even k
+ * @param scales  FP16 [N][K/G];  zeros uint8 [N][K/G];  G % 32 == 0
+ */
+vv_status_t vv_w4a8_gemm_cpu(const int8_t* xq, const float* sx,
+                             const int32_t* xsum, const uint8_t* packed,
+                             const void* scales_f16, const uint8_t* zeros,
+                             int G, const void* bias_f16, float* out,
                              int M, int N, int K);
 
 /** @brief Plain FP32 GEMM: C[M,N] = alpha * A[M,K] @ B[K,N] + beta * C. */

@@ -586,6 +586,40 @@ vv_status_t vv_postprocess_text(const char* text, float audio_duration,
  */
 const vv_perf_metrics_t* vv_inference_get_perf(const vv_inference_ctx_t* ctx);
 
+struct vv_smooth_stats;
+
+/**
+ * @brief SmoothQuant calibration: transcribe `pcm` with the dense model and
+ *        collect the per-channel range of every projection input.
+ *
+ * Loads `model_dir` unquantized on one device (or the CPU, as `params`
+ * says), runs the clip greedily and frees the model again; pass the result
+ * as vv_init_params_t.smooth to a quantized load of the same checkpoint.
+ * `pcm` is mono at `sample_rate`, prepared like any input. A dense 7B needs
+ * ~16 GB of VRAM (or streams its layers); the clip can be short: ranges
+ * settle within a minute of speech.
+ *
+ * @param out  statistics; free with vv_smooth_stats_free
+ */
+vv_status_t vv_smooth_calibrate(const char* model_dir, int gpu_id,
+                                const vv_init_params_t* params,
+                                const float* pcm, int n_samples,
+                                int sample_rate,
+                                struct vv_smooth_stats** out);
+
+/**
+ * @brief What the CLI's --calib / --calib-stats ask for.
+ *
+ * Neither: `*out` = NULL. `stats_path` alone: read it. `calib_audio`:
+ * calibrate on that file, and write the statistics to `stats_path` when
+ * one is given, so the next load can skip the dense pass.
+ */
+vv_status_t vv_smooth_from_args(const char* model_dir, int gpu_id,
+                                const vv_init_params_t* params,
+                                const char* calib_audio,
+                                const char* stats_path,
+                                struct vv_smooth_stats** out);
+
 #ifdef __cplusplus
 }
 #endif

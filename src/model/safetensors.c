@@ -65,6 +65,7 @@ static vv_dtype_t parse_dtype(const char* s) {
     if (strcmp(s, "U16") == 0)     return VV_DTYPE_U16;
     if (strcmp(s, "U32") == 0)     return VV_DTYPE_U32;
     if (strcmp(s, "F8_E5M2") == 0) return VV_DTYPE_F8_E5M2;
+    if (strcmp(s, "F64") == 0)     return VV_DTYPE_F64;
     /* Guessing F32 here once made an unknown tensor load as garbage. */
     VV_LOG_W("safetensors: unknown dtype '%s'", s);
     return VV_DTYPE_UNKNOWN;

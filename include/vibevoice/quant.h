@@ -22,9 +22,9 @@ typedef enum vv_quant_kind {
      *   tensor        int8 [N][K]  (VV_DTYPE_I8)
      *   quant.scales  FP32 [N]     w = q * scale
      *   mins          unused
-     * The kernels here run it against FP16/FP32 activations (W8A16). The
-     * layout is the one the W8A8 work (#18) uses, so the same weights can
-     * later run on int8 activations too.
+     * Run against FP16/FP32 activations (W8A16), or, with the weight's
+     * `act_int8` set, against int8 per-token activations (W8A8): the same
+     * bytes either way.
      */
     VV_QUANT_INT8  = 3,
 } vv_quant_kind_t;
@@ -135,11 +135,38 @@ typedef enum vv_load_quant {
     VV_LOAD_QUANT_NF4,       /**< NF4, blockwise absmax 64, FP16 scales    */
     VV_LOAD_QUANT_INT4,      /**< INT4G asymmetric, group 128              */
     VV_LOAD_QUANT_INT8,      /**< INT8 symmetric, per output channel       */
+    /**
+     * INT8 weights exactly as VV_LOAD_QUANT_INT8 stores them, run on int8
+     * activations quantized per token (W8A8). From a dense checkpoint, or an
+     * int8 compressed-tensors one.
+     */
+    VV_LOAD_QUANT_W8A8,
+    /**
+     * INT4G weights exactly as VV_LOAD_QUANT_INT4 stores them (the W4A16
+     * layout on the GPU), run on int8 per-token activations (W4A8). From a
+     * dense checkpoint, AWQ/GPTQ (exact: same codes and scales), or a 4-bit
+     * compressed-tensors one.
+     */
+    VV_LOAD_QUANT_W4A8,
     VV_LOAD_QUANT_COUNT
 } vv_load_quant_t;
 
-/** @brief "auto" | "none" | "nf4" | "int4" | "int8" → value; COUNT when
- *         unknown. */
+/** @brief Whether a load format runs on int8 activations. */
+static inline bool vv_load_quant_act8(int q) {
+    return q == VV_LOAD_QUANT_W8A8 || q == VV_LOAD_QUANT_W4A8;
+}
+
+/**
+ * @brief Whether SmoothQuant can fold into a load format: only into weights
+ *        quantized while they are read (not "auto", not dense "none").
+ *        Front ends check this before running a calibration pass.
+ */
+static inline bool vv_load_quant_takes_smooth(int q) {
+    return q > VV_LOAD_QUANT_NONE && q < VV_LOAD_QUANT_COUNT;
+}
+
+/** @brief "auto" | "none" | "nf4" | "int4" | "int8" | "w8a8" | "w4a8" →
+ *         value; COUNT when unknown. */
 vv_load_quant_t vv_load_quant_parse(const char* name);
 
 /** @brief Name for logs and --help; "?" when out of range. */

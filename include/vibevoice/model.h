@@ -44,6 +44,13 @@ typedef struct vv_weight {
     int             quant_kind;   /**< vv_quant_kind_t                       */
     int             group_size;   /**< INT4G only: weights per scale         */
     int             int4g_layout; /**< INT4G only: vv_int4g_layout_t         */
+    /**
+     * Run on int8 per-token activations: W8A8 for INT8, W4A8 for INT4G.
+     * The weight bytes are the same as without it; only the kernels and the
+     * activations change. Set by --quant w8a8|w4a8 or by a compressed-tensors
+     * checkpoint whose input activations are int8.
+     */
+    bool            act_int8;
     bool            is_quantized; /**< quant_kind != VV_QUANT_NONE           */
 } vv_weight_t;
 
@@ -68,6 +75,13 @@ typedef struct vv_layer_weights {
     vv_tensor_t       post_attn_layernorm;
     vv_attn_weights_t attn;
     vv_mlp_weights_t  mlp;
+    /**
+     * Calibration only (vv_smooth_calibrate): FP32 [width] of a
+     * vv_smooth_stats_t row, on the device the layer runs on. While it is
+     * set, the layer records the per-channel absmax of every projection
+     * input into it. Not owned; NULL otherwise.
+     */
+    float*            calib_absmax;
 } vv_layer_weights_t;
 
 /** @brief Full model weights. */
@@ -166,11 +180,22 @@ const char* vv_model_family_name(vv_model_family_t f);
 /** @brief Options for vv_model_load_ex(). */
 typedef struct vv_model_load_opts {
     int quant;   /**< vv_load_quant_t; VV_LOAD_QUANT_AUTO keeps the format */
+    /**
+     * SmoothQuant statistics (smooth.h) to fold into a dense checkpoint
+     * before it is quantized; NULL for none. Refused on a checkpoint that
+     * is already quantized.
+     */
+    const struct vv_smooth_stats* smooth;
+    float smooth_alpha;   /**< migration strength; 0 = the default       */
+    int   smooth_maps;    /**< vv_smooth_map_t mask; 0 = the default     */
 } vv_model_load_opts_t;
 
 static inline vv_model_load_opts_t vv_model_load_opts_default(void) {
     vv_model_load_opts_t o;
     o.quant = 0;
+    o.smooth = NULL;
+    o.smooth_alpha = 0.0f;
+    o.smooth_maps = 0;
     return o;
 }
 

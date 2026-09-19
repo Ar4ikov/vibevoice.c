@@ -575,6 +575,18 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     /* Load model — quantized now if asked, so every size below is final. */
     vv_model_load_opts_t lo = vv_model_load_opts_default();
     lo.quant = p.weight_quant;
+    lo.smooth = p.smooth;
+    lo.smooth_alpha = p.smooth_alpha;
+    lo.smooth_maps = p.smooth_maps;
+    if (p.smooth) {
+        /* Tuning knobs for the fold, read only when there is one. */
+        const char* ea = getenv("VV_SMOOTH_ALPHA");
+        const char* em = getenv("VV_SMOOTH_MAPS");
+        if (lo.smooth_alpha <= 0.0f && ea && ea[0])
+            lo.smooth_alpha = (float)atof(ea);
+        if (lo.smooth_maps <= 0 && em && em[0])
+            lo.smooth_maps = atoi(em);
+    }
     s = vv_model_load_ex(model_dir, &lo, &c->model);
     if (s != VV_OK) {
         VV_LOG_E("inference: failed to load model: %s", vv_status_str(s));
@@ -1646,6 +1658,90 @@ static bool token_ends(const vv_inference_ctx_t* ctx, int32_t token_id) {
     return vv_family_stop(&ctx->family, token_id) != VV_STOP_CONTINUE;
 }
 
+/* ─── Teacher forcing (accuracy measurement) ────────────────────────────── */
+
+/**
+ * @brief A reference token sequence to decode against.
+ *
+ * With VV_TEACHER_TOKENS=<file> (token ids, whitespace-separated, as
+ * VV_SAVE_TOKENS writes them) every decode step still computes its own
+ * greedy token, which is compared with the reference and then replaced by
+ * it, so the model always continues from the reference prefix. The share of
+ * steps whose own token matched is the teacher-forced top-1 agreement: a
+ * per-token measure of how far a quantized model is from the one that wrote
+ * the reference, free of the divergence a single early flip causes in free
+ * decoding. The step after the last reference token is scored on whether
+ * the model, too, stops there. Debugging aid for one request at a time on
+ * the GPU path: the CPU path ignores both variables (and says so), and
+ * concurrent slots would all write the same VV_SAVE_TOKENS file.
+ */
+typedef struct teacher {
+    int32_t* ids;
+    int      n;
+    int      pos;       /**< reference tokens consumed                     */
+    int      agree;     /**< own greedy token == reference                  */
+    int      scored;
+} teacher_t;
+
+static void teacher_load(teacher_t* t) {
+    memset(t, 0, sizeof(*t));
+    const char* path = getenv("VV_TEACHER_TOKENS");
+    if (!path || !path[0]) return;
+    FILE* f = fopen(path, "rb");
+    if (!f) { VV_LOG_W("teacher: cannot read '%s'", path); return; }
+    int cap = 4096;
+    t->ids = (int32_t*)vv_alloc((size_t)cap * sizeof(int32_t));
+    long v;
+    while (t->ids && fscanf(f, "%ld", &v) == 1) {
+        if (t->n == cap) {
+            int32_t* grown = (int32_t*)vv_realloc(
+                t->ids, (size_t)cap * 2 * sizeof(int32_t));
+            if (!grown) { vv_free(t->ids); t->ids = NULL; break; }
+            t->ids = grown;
+            cap *= 2;
+        }
+        t->ids[t->n++] = (int32_t)v;
+    }
+    fclose(f);
+    if (!t->ids) { t->n = 0; return; }
+    VV_LOG_I("teacher: forcing %d reference tokens from '%s'", t->n, path);
+}
+
+/**
+ * @brief Score the model's own `*token` and swap in the reference one.
+ * @return true when the reference is exhausted (the decode stops).
+ */
+static bool teacher_step(const vv_inference_ctx_t* ctx, teacher_t* t,
+                         int32_t* token) {
+    if (!t->ids) return false;
+    t->scored++;
+    if (t->pos >= t->n) {                  /* the reference stopped here */
+        t->agree += token_ends(ctx, *token);
+        return true;
+    }
+    t->agree += *token == t->ids[t->pos];
+    *token = t->ids[t->pos++];
+    return false;
+}
+
+static void teacher_report(teacher_t* t) {
+    if (t->ids && t->scored > 0)
+        VV_LOG_I("teacher: top-1 agreement %d / %d = %.2f%%", t->agree,
+                 t->scored, 100.0 * t->agree / t->scored);
+    vv_free(t->ids);
+    t->ids = NULL;
+}
+
+/** @brief VV_SAVE_TOKENS=<file>: the generated ids, for VV_TEACHER_TOKENS. */
+static void save_tokens(const int32_t* ids, int n) {
+    const char* path = getenv("VV_SAVE_TOKENS");
+    if (!path || !path[0]) return;
+    FILE* f = fopen(path, "wb");
+    if (!f) { VV_LOG_W("save tokens: cannot write '%s'", path); return; }
+    for (int i = 0; i < n; i++) fprintf(f, "%d\n", (int)ids[i]);
+    fclose(f);
+}
+
 /**
  * @brief Greedy token from a head that stays on the host.
  *
@@ -2253,7 +2349,13 @@ static vv_status_t transcribe_gpu(
     const bool echo_tokens = !ctx->quiet &&
                              vv_log_get_level() >= VV_LOG_INFO;
     if (echo_tokens) fprintf(stderr, "\n--- token stream ---\n");
-    if (!token_ends(ctx, token_id)) {
+    teacher_t teacher;
+    teacher_load(&teacher);
+    bool teacher_done = teacher_step(ctx, &teacher, &token_id);
+    if (teacher.ids && !teacher_done)      /* the embedding reads it there */
+        vv_dev_memcpy_h2d(token_out_gpu, &token_id, sizeof(int32_t),
+                          ctx->compute_stream);
+    if (!teacher_done && !token_ends(ctx, token_id)) {
         output_tokens[n_generated++] = token_id;
         /* Stream first token */
         char* first_text = NULL;
@@ -2265,7 +2367,7 @@ static vv_status_t transcribe_gpu(
         }
     }
 
-    while (n_generated < max_new_tokens &&
+    while (n_generated < max_new_tokens && !teacher_done &&
            !token_ends(ctx, token_id)) {
 
         double t_tok = vv_time_ms();
@@ -2343,6 +2445,11 @@ static vv_status_t transcribe_gpu(
 
         if (prof) t_head_ms += vv_time_ms() - t_tok;
 
+        if (teacher.ids) {
+            if (teacher_step(ctx, &teacher, &token_id)) break;
+            vv_dev_memcpy_h2d(token_out_gpu, &token_id, sizeof(int32_t),
+                              ctx->compute_stream);
+        }
         if (token_ends(ctx, token_id)) break;
 
         if (n_generated >= out_cap) {
@@ -2379,6 +2486,8 @@ static vv_status_t transcribe_gpu(
         fprintf(stderr, "\n--- end stream (%d tokens) ---\n",
                 n_generated);
     fflush(stderr);
+    teacher_report(&teacher);
+    if (s == VV_OK) save_tokens(output_tokens, n_generated);
 
     for (int i = 0; i <= ctx->n_shards; i++)
         if (graphs[i].exec) vv_dev_graph_destroy(graphs[i].exec);
@@ -2478,6 +2587,13 @@ static vv_status_t transcribe_cpu(
 
     VV_LOG_I("inference: CPU transcribe %d samples (%.2f sec)",
              num_samples, perf->audio_duration_sec);
+    {
+        const char* sv = getenv("VV_SAVE_TOKENS");
+        const char* te = getenv("VV_TEACHER_TOKENS");
+        if ((sv && sv[0]) || (te && te[0]))
+            VV_LOG_W("inference: VV_SAVE_TOKENS / VV_TEACHER_TOKENS work on "
+                     "the GPU path only; ignored here");
+    }
 
     if (!ctx->tokenizer) { VV_LOG_E("inference: no tokenizer"); return VV_ERR_NULL_PTR; }
     vv_kv_cache_reset(ctx->kv_cache, ctx->compute_stream);

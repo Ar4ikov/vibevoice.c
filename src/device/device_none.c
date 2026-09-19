@@ -153,6 +153,47 @@ vv_status_t vv_awq_gemm_dev(const void* a, const uint32_t* p, const uint32_t* m,
     U(a) U(p) U(m) U(s) U(o) U(t) U(M) U(N) U(K) U(g) U(st)
     return VV_ERR_UNSUPPORTED;
 }
+vv_status_t vv_col_absmax_dev(const void* x, int M, int K, float* a,
+                              void* st) {
+    U(x) U(M) U(K) U(a) U(st) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_act_quant_dev(const void* x, int M, int K, int l, int8_t* q,
+                             float* sx, int32_t* xs, void* st) {
+    U(x) U(M) U(K) U(l) U(q) U(sx) U(xs) U(st) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_rmsnorm_q8_dev(const void* x, const void* w, int M, int K,
+                              float e, int l, int8_t* q, float* sx,
+                              int32_t* xs, void* st) {
+    U(x) U(w) U(M) U(K) U(e) U(l) U(q) U(sx) U(xs) U(st)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_swiglu_q8_dev(const void* g, const void* u, int M, int K,
+                             int l, int8_t* q, float* sx, int32_t* xs,
+                             void* st) {
+    U(g) U(u) U(M) U(K) U(l) U(q) U(sx) U(xs) U(st) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_w8a8_linear_dev(const int8_t* q, const float* sx,
+                               const int8_t* w, const float* sw, const void* b,
+                               const void* r, void* y, int f, int M, int N,
+                               int K, int pa, void* st) {
+    U(q) U(sx) U(w) U(sw) U(b) U(r) U(y) U(f) U(M) U(N) U(K) U(pa) U(st)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_w4a8_linear_dev(const int8_t* q, int l, const float* sx,
+                               const int32_t* xs, const void* w,
+                               const void* sz, int g,
+                               const void* b, const void* r, void* y, int f,
+                               int M, int N, int K, int pa, void* st) {
+    U(q) U(l) U(sx) U(xs) U(w) U(sz) U(g) U(b) U(r) U(y) U(f) U(M) U(N)
+    U(K) U(pa) U(st) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_i8_linear_multi_dev(const int8_t* q, int l, const float* sx,
+                                   const int32_t* xs, int w4,
+                                   const vv_i8_proj_t* p, int n, int g,
+                                   int M, int K, void* st) {
+    U(q) U(l) U(sx) U(xs) U(w4) U(p) U(n) U(g) U(M) U(K) U(st)
+    return VV_ERR_UNSUPPORTED;
+}
 vv_status_t vv_dequant_awq_dev(const uint32_t* p, const uint32_t* m,
                                const void* s, void* o, int N, int K, int g,
                                void* st) {

@@ -23,8 +23,10 @@
 #include "vibevoice/quant.h"
 #include "vibevoice/vibevoice.h"
 #include "vibevoice/cpu_kernels.h"
+#include "vibevoice/smooth.h"
 #include "cJSON.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +42,39 @@ typedef struct {
     int                 file;
 } st_entry_t;
 
+/* ─── compressed-tensors (llm-compressor) ───────────────────────────────── */
+
+/*
+ * What llm-compressor writes for a quantized Linear, per projection:
+ *
+ *   int-quantized   weight            I8   [N, K]  the integer values
+ *   pack-quantized  weight_packed     I32  [N, K * bits / 32], element k at
+ *                                          bits 4 * (k % 8) of word k / 8,
+ *                                          stored as value + 8 (unsigned)
+ *                   weight_shape      I64  [2] = { N, K }
+ *   both            weight_scale      float [N, 1] (channel) or [N, K/G]
+ *                   weight_zero_point asymmetric only: I8 [N, K/G], or
+ *                                     packed along N like the weight
+ *                                     (I32 [N/8, K/G]) in pack-quantized
+ *                   weight_g_idx      act-order "group" only
+ *
+ * and w = (q - z) * s with q, z signed. The runtime maps 8-bit channel
+ * weights onto INT8 (w = q * s: symmetric only) and 4-bit group weights onto
+ * INT4G, whose codes and zero points are the same numbers shifted by 8 into
+ * 0..15. Nothing is re-rounded except a BF16/F32 group scale to FP16, which
+ * is exact for BF16 scales in FP16's normal range.
+ */
+
+/** @brief quantization_config of a compressed-tensors checkpoint. */
+typedef struct {
+    bool present;      /**< quant_method == "compressed-tensors"            */
+    int  w_bits;       /**< weights.num_bits of the Linear scheme (0: none) */
+    bool act_int8;     /**< input_activations: 8-bit int, dynamic           */
+    bool mixed;        /**< config_groups disagree on weight bits or on
+                            int8 activations; not supported               */
+    char format[32];   /**< "int-quantized", "pack-quantized", ...           */
+} ct_cfg_t;
+
 typedef struct {
     vv_model_t*        m;
     st_entry_t*        ent;      /**< sorted by name */
@@ -51,6 +86,11 @@ typedef struct {
     /** 1 when GPTQ zeros are stored minus one (all but "gptq_v2") */
     int                gptq_bias;
     size_t             proj_bytes;
+    ct_cfg_t           ct;       /**< compressed-tensors quantization_config */
+    /** SmoothQuant statistics to fold in (NULL: none), and how. */
+    const vv_smooth_stats_t* smooth;
+    float              smooth_alpha;
+    int                smooth_maps;
 } loader_t;
 
 static int entry_cmp(const void* a, const void* b) {
@@ -753,6 +793,186 @@ vv_status_t vv_model_int4g_to_gpu_layout(vv_model_t* model, int* n_converted)
     return VV_OK;
 }
 
+/* ─── SmoothQuant folding (smooth.h) ────────────────────────────────────── */
+
+/** @brief An FP16 vector divided by a per-element factor. */
+static void div_f16(vv_tensor_t* t, const float* f) {
+    uint16_t* h = (uint16_t*)t->data;
+    const size_t n = t->size_bytes / sizeof(uint16_t);
+    for (size_t i = 0; i < n; i++)
+        h[i] = vv_float_to_half_rne(vv_half_to_float(h[i]) / f[i]);
+}
+
+/**
+ * @brief acc[k] = max(acc[k], max_r |W[r, k]|) for the dense projection
+ *        `<prefix>layers.<layer>.<which>.weight` [N, K].
+ *
+ * Read straight from the mapping, a few rows per thread; each thread keeps
+ * its own maxima and they meet at the end, so the result does not depend on
+ * the thread count.
+ */
+static vv_status_t dense_col_absmax(const loader_t* L, int layer,
+                                    const char* which, int N, int K,
+                                    float* acc) {
+    char buf[320];
+    snprintf(buf, sizeof(buf), "%slayers.%d.%s.weight", L->prefix, layer,
+             which);
+    const st_entry_t* e = find(L, buf);
+    if (!e || !is_float_dtype(e->info.dtype)) {
+        VV_LOG_E("loader: SmoothQuant folds into dense weights; '%s' is %s",
+                 buf, e ? dtype_name(e->info.dtype) : "missing");
+        return e ? VV_ERR_UNSUPPORTED : VV_ERR_WEIGHT_MISSING;
+    }
+    vv_status_t s = check_shape(e, N, K);
+    if (s != VV_OK) return s;
+    const void* src = data_of(L, e);
+    if (!src) return VV_ERR_MODEL_FORMAT;
+    const size_t es = vv_dtype_size(e->info.dtype);
+
+    enum { ROWS = 8 };
+    int nt = 1;
+#ifdef _OPENMP
+    nt = omp_get_max_threads();
+#endif
+    float* part = (float*)vv_alloc((size_t)nt * (size_t)K * sizeof(float));
+    float* tmp = (float*)vv_alloc((size_t)nt * ROWS * (size_t)K *
+                                  sizeof(float));
+    if (!part || !tmp) {
+        vv_free(part);
+        vv_free(tmp);
+        return VV_ERR_OUT_OF_MEMORY;
+    }
+    memset(part, 0, (size_t)nt * (size_t)K * sizeof(float));
+    const int n_blk = (N + ROWS - 1) / ROWS;
+    int b;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (b = 0; b < n_blk; b++) {
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        float* t = tmp + (size_t)tid * ROWS * (size_t)K;
+        float* p = part + (size_t)tid * (size_t)K;
+        const int r0 = b * ROWS;
+        const int rows = (r0 + ROWS <= N) ? ROWS : N - r0;
+        to_f32_range((const uint8_t*)src + (size_t)r0 * K * es,
+                     e->info.dtype, t, 0, (size_t)rows * K);
+        for (int r = 0; r < rows; r++)
+            for (int k = 0; k < K; k++) {
+                const float v = fabsf(t[(size_t)r * K + k]);
+                if (v > p[k]) p[k] = v;
+            }
+    }
+    for (int i = 0; i < nt; i++)
+        for (int k = 0; k < K; k++)
+            if (part[(size_t)i * K + k] > acc[k])
+                acc[k] = part[(size_t)i * K + k];
+    vv_free(part);
+    vv_free(tmp);
+    return VV_OK;
+}
+
+/** @brief Factors of one layer; NULL members are not smoothed. */
+typedef struct {
+    float* qkv;     /**< [hidden] input_layernorm -> q, k, v           */
+    float* gu;      /**< [hidden] post_attention_layernorm -> gate, up */
+    float* vo;      /**< [kv_dim] v_proj rows -> o_proj                */
+    float* o_cols;  /**< [q_dim]  vo spread over o_proj's columns      */
+    float* ud;      /**< [inter]  up_proj rows -> down_proj            */
+} smooth_fac_t;
+
+/** @brief Smallest and largest factor seen, for the load log. */
+static void smooth_range(const float* f, int n, float* lo, float* hi) {
+    for (int i = 0; f && i < n; i++) {
+        if (f[i] < *lo) *lo = f[i];
+        if (f[i] > *hi) *hi = f[i];
+    }
+}
+
+/**
+ * @brief SmoothQuant factors of layer `li` from the calibration ranges and
+ *        the dense weights' column ranges.
+ *
+ * The members of `f` point into scratch the caller owns; those of maps that
+ * are off are set to NULL. `wmax` is scratch of max(hidden, q_dim, inter)
+ * floats.
+ */
+static vv_status_t smooth_layer(const loader_t* L, int li, float* wmax,
+                                smooth_fac_t* f) {
+    const vv_llm_config_t* c = &L->m->config.llm;
+    const vv_smooth_stats_t* st = L->smooth;
+    const int hs = c->hidden_size, hd = c->head_dim;
+    const int nh = c->num_attention_heads, nkv = c->num_key_value_heads;
+    const int qd = nh * hd, kvd = nkv * hd, inter = c->intermediate_size;
+    const float a = L->smooth_alpha;
+    const float* row = st->absmax + (size_t)li * st->width;
+    vv_status_t s;
+
+    if (!(L->smooth_maps & VV_SMOOTH_QKV)) f->qkv = NULL;
+    if (!(L->smooth_maps & VV_SMOOTH_GATEUP)) f->gu = NULL;
+    if (!(L->smooth_maps & VV_SMOOTH_VO)) f->vo = f->o_cols = NULL;
+    if (!(L->smooth_maps & VV_SMOOTH_UPDOWN)) f->ud = NULL;
+
+    if (f->qkv) {
+        const float* am = row + vv_smooth_offset(st, VV_SMOOTH_ATTN_IN);
+        memset(wmax, 0, (size_t)hs * sizeof(float));
+        if ((s = dense_col_absmax(L, li, "self_attn.q_proj", qd, hs,
+                                  wmax)) != VV_OK ||
+            (s = dense_col_absmax(L, li, "self_attn.k_proj", kvd, hs,
+                                  wmax)) != VV_OK ||
+            (s = dense_col_absmax(L, li, "self_attn.v_proj", kvd, hs,
+                                  wmax)) != VV_OK)
+            return s;
+        for (int k = 0; k < hs; k++)
+            f->qkv[k] = vv_smooth_factor(am[k], wmax[k], a);
+    }
+    if (f->gu) {
+        const float* am = row + vv_smooth_offset(st, VV_SMOOTH_MLP_IN);
+        memset(wmax, 0, (size_t)hs * sizeof(float));
+        if ((s = dense_col_absmax(L, li, "mlp.gate_proj", inter, hs,
+                                  wmax)) != VV_OK ||
+            (s = dense_col_absmax(L, li, "mlp.up_proj", inter, hs,
+                                  wmax)) != VV_OK)
+            return s;
+        for (int k = 0; k < hs; k++)
+            f->gu[k] = vv_smooth_factor(am[k], wmax[k], a);
+    }
+    if (f->vo) {
+        /* KV channel ch = (h / group) * hd + d feeds o_proj column
+           h * hd + d of every query head h of its group: one factor. */
+        const float* am = row + vv_smooth_offset(st, VV_SMOOTH_ATTN_OUT);
+        const int group = nh / nkv;
+        memset(wmax, 0, (size_t)qd * sizeof(float));
+        if ((s = dense_col_absmax(L, li, "self_attn.o_proj", hs, qd,
+                                  wmax)) != VV_OK)
+            return s;
+        for (int ch = 0; ch < kvd; ch++) {
+            float ra = 0.0f, rw = 0.0f;
+            const int g = ch / hd, d = ch % hd;
+            for (int h = g * group; h < (g + 1) * group; h++) {
+                const int j = h * hd + d;
+                if (am[j] > ra) ra = am[j];
+                if (wmax[j] > rw) rw = wmax[j];
+            }
+            f->vo[ch] = vv_smooth_factor(ra, rw, a);
+        }
+        for (int j = 0; j < qd; j++)
+            f->o_cols[j] = f->vo[((j / hd) / group) * hd + j % hd];
+    }
+    if (f->ud) {
+        const float* am = row + vv_smooth_offset(st, VV_SMOOTH_MLP_MID);
+        memset(wmax, 0, (size_t)inter * sizeof(float));
+        if ((s = dense_col_absmax(L, li, "mlp.down_proj", hs, inter,
+                                  wmax)) != VV_OK)
+            return s;
+        for (int k = 0; k < inter; k++)
+            f->ud[k] = vv_smooth_factor(am[k], wmax[k], a);
+    }
+    return VV_OK;
+}
+
 /* ─── Dense projections, kept or quantized on the way in ────────────────── */
 
 /**
@@ -765,7 +985,8 @@ vv_status_t vv_model_int4g_to_gpu_layout(vv_model_t* model, int* n_converted)
  * thread count.
  */
 static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
-                                     int N, int K, vv_weight_t* w) {
+                                     int N, int K, const float* col_mul,
+                                     const float* row_div, vv_weight_t* w) {
     vv_status_t s = check_shape(e, N, K);
     if (s != VV_OK) return s;
     const void* src = data_of(L, e);
@@ -784,9 +1005,11 @@ static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
         return VV_OK;
     }
 
+    /* W8A8 and W4A8 store exactly what INT8 and INT4 store; only the
+       activations they run on differ. */
     const int kind = (q == VV_LOAD_QUANT_NF4) ? VV_QUANT_NF4
-                   : (q == VV_LOAD_QUANT_INT8) ? VV_QUANT_INT8
-                   : VV_QUANT_INT4G;
+                   : (q == VV_LOAD_QUANT_INT8 || q == VV_LOAD_QUANT_W8A8)
+                   ? VV_QUANT_INT8 : VV_QUANT_INT4G;
     /* The group a row is cut into: NF4 blocks, INT4G groups, or the whole
        row for per-channel INT8. */
     const int group = kind == VV_QUANT_NF4 ? VV_NF4_BLOCK
@@ -845,6 +1068,16 @@ static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
         const int rows = (r0 + ROWS <= N) ? ROWS : N - r0;
         to_f32_range((const uint8_t*)src + (size_t)r0 * K * es, dt, t, 0,
                      (size_t)rows * K);
+        /* SmoothQuant: W[r, k] * s_k (input side), / s_r (output side). */
+        if (col_mul || row_div)
+            for (int r = 0; r < rows; r++) {
+                float* tr = t + (size_t)r * K;
+                const float rd = row_div ? 1.0f / row_div[r0 + r] : 1.0f;
+                if (col_mul)
+                    for (int k = 0; k < K; k++) tr[k] *= col_mul[k] * rd;
+                else
+                    for (int k = 0; k < K; k++) tr[k] *= rd;
+            }
         vv_status_t st;
         if (kind == VV_QUANT_NF4)
             st = vv_nf4_quantize(t, rows, K, codes + (size_t)r0 * (K / 2),
@@ -874,6 +1107,7 @@ static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
 
     w->is_quantized = true;
     w->quant_kind = kind;
+    w->act_int8 = vv_load_quant_act8(q);
     if (kind == VV_QUANT_INT8) {
         const int64_t qshape[2] = { N, K };
         const int64_t sshape[1] = { N };
@@ -902,11 +1136,268 @@ static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
     return VV_OK;
 }
 
+/** @brief `n` elements of an integer tensor as int32 (I8 / I32 / I64). */
+static bool ct_ints(const void* src, vv_dtype_t dt, size_t n, int32_t* dst) {
+    size_t i;
+    switch (dt) {
+    case VV_DTYPE_I8:
+        for (i = 0; i < n; i++) dst[i] = ((const int8_t*)src)[i];
+        return true;
+    case VV_DTYPE_I32:
+        memcpy(dst, src, n * sizeof(int32_t));
+        return true;
+    case VV_DTYPE_I64:
+        for (i = 0; i < n; i++) dst[i] = (int32_t)((const int64_t*)src)[i];
+        return true;
+    default:
+        return false;
+    }
+}
+
+/**
+ * @brief A compressed-tensors projection: `e_int` (int-quantized `.weight`)
+ *        or `e_packed` (pack-quantized `.weight_packed`), one of them set.
+ */
+static vv_status_t load_ct_weight(loader_t* L, const char* base,
+                                  const st_entry_t* e_int,
+                                  const st_entry_t* e_packed,
+                                  int N, int K, vv_weight_t* w) {
+    char buf[320];
+    vv_status_t s;
+    const vv_load_quant_t q = L->quant;
+
+    /* How many bits the stored integers are. */
+    int bits;
+    if (e_packed) {
+        if (e_packed->info.dtype != VV_DTYPE_I32 ||
+            (s = check_shape(e_packed, N, (int64_t)K / 8)) != VV_OK) {
+            VV_LOG_E("loader: '%s' is not the int32 [%d, %d] of a packed "
+                     "4-bit [%d x %d] weight", e_packed->info.name, N, K / 8,
+                     N, K);
+            return VV_ERR_UNSUPPORTED;
+        }
+        bits = 4;
+        snprintf(buf, sizeof(buf), "%s.weight_shape", base);
+        const st_entry_t* sh = find(L, buf);
+        int32_t dims[2] = { 0, 0 };
+        if (sh && numel_of(&sh->info) == 2 && check_bytes(sh) == VV_OK) {
+            const void* d = data_of(L, sh);
+            if (d && ct_ints(d, sh->info.dtype, 2, dims) &&
+                (dims[0] != N || dims[1] != K)) {
+                VV_LOG_E("loader: '%s' says [%d, %d], the config [%d, %d]",
+                         buf, dims[0], dims[1], N, K);
+                return VV_ERR_SHAPE_MISMATCH;
+            }
+        }
+    } else {
+        if ((s = check_shape(e_int, N, K)) != VV_OK) return s;
+        bits = L->ct.w_bits ? L->ct.w_bits : 8;
+    }
+    if (bits != 8 && bits != 4) {
+        VV_LOG_E("loader: '%s' is %d-bit; the runtime runs 8- and 4-bit "
+                 "compressed-tensors weights", base, bits);
+        return VV_ERR_UNSUPPORTED;
+    }
+    const bool ok_mode = bits == 8
+        ? (q == VV_LOAD_QUANT_AUTO || q == VV_LOAD_QUANT_INT8 ||
+           q == VV_LOAD_QUANT_W8A8)
+        : (q == VV_LOAD_QUANT_AUTO || q == VV_LOAD_QUANT_INT4 ||
+           q == VV_LOAD_QUANT_W4A8);
+    if (!ok_mode) {
+        VV_LOG_E("loader: the checkpoint is %d-bit compressed-tensors; "
+                 "--quant %s is not available for it (auto, %s)", bits,
+                 vv_load_quant_name(q),
+                 bits == 8 ? "int8 or w8a8" : "int4 or w4a8");
+        return VV_ERR_UNSUPPORTED;
+    }
+
+    /* Scales: one per row (channel) or per group. */
+    snprintf(buf, sizeof(buf), "%s.weight_scale", base);
+    const st_entry_t* se = find(L, buf);
+    if (!se || !is_float_dtype(se->info.dtype) ||
+        (s = check_bytes(se)) != VV_OK) {
+        VV_LOG_E("loader: '%s' is missing or not a float tensor", buf);
+        return VV_ERR_WEIGHT_MISSING;
+    }
+    const int64_t ns = numel_of(&se->info);
+    const int ng = (ns > 0 && ns % N == 0) ? (int)(ns / N) : 0;
+    if (ng <= 0 || K % ng != 0) {
+        VV_LOG_E("loader: '%s' has %lld scales, not a whole number of "
+                 "groups per row of [%d x %d]", buf, (long long)ns, N, K);
+        return VV_ERR_SHAPE_MISMATCH;
+    }
+    const int G = K / ng;
+    if (bits == 8 && ng != 1) {
+        VV_LOG_E("loader: '%s': 8-bit group-wise weights are not supported "
+                 "(per-channel only)", base);
+        return VV_ERR_UNSUPPORTED;
+    }
+    if (bits == 4 && (G % 32) != 0) {
+        VV_LOG_E("loader: '%s': group size %d is not a multiple of 32",
+                 base, G);
+        return VV_ERR_UNSUPPORTED;
+    }
+    float* scale = (float*)vv_alloc((size_t)ns * sizeof(float));
+    if (!scale) return VV_ERR_OUT_OF_MEMORY;
+    to_f32(data_of(L, se), se->info.dtype, scale, (size_t)ns);
+
+    /* Zero points (asymmetric only), as signed ints [N][ng]. */
+    int32_t* zp = NULL;
+    snprintf(buf, sizeof(buf), "%s.weight_zero_point", base);
+    const st_entry_t* ze = find(L, buf);
+    if (ze) {
+        const void* zd = data_of(L, ze);
+        const int64_t nz = numel_of(&ze->info);
+        zp = (int32_t*)vv_alloc((size_t)N * ng * sizeof(int32_t));
+        bool ok = zp && zd && check_bytes(ze) == VV_OK;
+        if (ok && nz == (int64_t)N * ng) {
+            ok = ct_ints(zd, ze->info.dtype, (size_t)nz, zp);
+        } else if (ok && bits == 4 && ze->info.dtype == VV_DTYPE_I32 &&
+                   ze->info.ndim == 2 && ze->info.shape[0] == (N + 7) / 8 &&
+                   ze->info.shape[1] == ng) {
+            /* Packed along N: word (r, g) holds rows 8r..8r+7, + 8. */
+            const uint32_t* pz = (const uint32_t*)zd;
+            for (int n = 0; n < N; n++)
+                for (int g = 0; g < ng; g++)
+                    zp[(size_t)n * ng + g] = (int32_t)(
+                        (pz[(size_t)(n >> 3) * ng + g] >> (4 * (n & 7))) & 15u)
+                        - 8;
+        } else {
+            ok = false;
+        }
+        if (!ok) {
+            const vv_status_t es = zp ? VV_ERR_SHAPE_MISMATCH
+                                      : VV_ERR_OUT_OF_MEMORY;
+            VV_LOG_E("loader: '%s' is not a zero point the runtime reads", buf);
+            vv_free(scale); vv_free(zp);
+            return es;
+        }
+    }
+
+    /* Act-order: only a g_idx that is plain k / G loads. */
+    snprintf(buf, sizeof(buf), "%s.weight_g_idx", base);
+    const st_entry_t* gi = find(L, buf);
+    if (gi) {
+        const void* gd = data_of(L, gi);
+        bool plain = gd && numel_of(&gi->info) == K &&
+                     check_bytes(gi) == VV_OK;
+        int32_t* gv = plain ? (int32_t*)vv_alloc((size_t)K * sizeof(int32_t))
+                            : NULL;
+        plain = plain && gv && ct_ints(gd, gi->info.dtype, (size_t)K, gv);
+        for (int k = 0; plain && k < K; k++) plain = gv[k] == k / G;
+        vv_free(gv);
+        if (!plain) {
+            VV_LOG_E("loader: '%s' is an act-order (group) permutation, which "
+                     "compressed-tensors loading does not take", buf);
+            vv_free(scale); vv_free(zp);
+            return VV_ERR_UNSUPPORTED;
+        }
+    }
+
+    const void* src = data_of(L, e_packed ? e_packed : e_int);
+    if (!src) { vv_free(scale); vv_free(zp); return VV_ERR_MODEL_FORMAT; }
+    w->is_quantized = true;
+    w->act_int8 = (q == VV_LOAD_QUANT_AUTO) ? L->ct.act_int8
+                                            : vv_load_quant_act8(q);
+
+    if (bits == 8) {
+        /* INT8 is w = q * s: a zero point would be an offset it lacks. */
+        for (int n = 0; zp && n < N; n++)
+            if (zp[n] != 0) {
+                VV_LOG_E("loader: '%s' is asymmetric int8; only symmetric "
+                         "int8 weights load", base);
+                vv_free(scale); vv_free(zp);
+                return VV_ERR_UNSUPPORTED;
+            }
+        vv_free(zp);
+        int8_t* codes = (int8_t*)vv_alloc((size_t)N * K);
+        if (!codes) { vv_free(scale); return VV_ERR_OUT_OF_MEMORY; }
+        memcpy(codes, src, (size_t)N * K);
+        const int64_t qshape[2] = { N, K };
+        const int64_t sshape[1] = { N };
+        set_tensor(&w->tensor, codes, VV_DTYPE_I8, (size_t)N * K, 2, qshape);
+        set_tensor(&w->quant.scales, scale, VV_DTYPE_F32,
+                   (size_t)N * sizeof(float), 1, sshape);
+        w->quant_kind = VV_QUANT_INT8;
+        L->n_int8++;
+        L->proj_bytes += (size_t)N * K + (size_t)N * sizeof(float);
+        return VV_OK;
+    }
+
+    /* 4-bit: INT4G codes = q + 8 and zeros = z + 8, both 0..15. */
+    const size_t packed_bytes = (size_t)N * (K / 2);
+    const size_t group_bytes = (size_t)N * ng * sizeof(uint16_t);
+    uint8_t*  packed = (uint8_t*)vv_alloc(packed_bytes);
+    uint16_t* sc = (uint16_t*)vv_alloc(group_bytes);
+    uint16_t* mn = (uint16_t*)vv_alloc(group_bytes);
+    uint8_t*  zr = (uint8_t*)vv_alloc((size_t)N * ng);
+    if (!packed || !sc || !mn || !zr) {
+        vv_free(packed); vv_free(sc); vv_free(mn); vv_free(zr);
+        vv_free(scale); vv_free(zp);
+        return VV_ERR_OUT_OF_MEMORY;
+    }
+    int bad = 0;
+    int n;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(+:bad)
+#endif
+    for (n = 0; n < N; n++) {
+        uint8_t* prow = packed + (size_t)n * (K / 2);
+        for (int k = 0; k < K; k += 2) {
+            int c0, c1;
+            if (e_packed) {
+                const uint32_t* wr = (const uint32_t*)src + (size_t)n * (K / 8);
+                c0 = (int)((wr[k >> 3] >> (4 * (k & 7))) & 15u);
+                c1 = (int)((wr[(k + 1) >> 3] >> (4 * ((k + 1) & 7))) & 15u);
+            } else {
+                const int8_t* wr = (const int8_t*)src + (size_t)n * K;
+                c0 = wr[k] + 8;
+                c1 = wr[k + 1] + 8;
+                if (c0 < 0 || c0 > 15 || c1 < 0 || c1 > 15) {
+                    bad++;
+                    c0 = c0 < 0 ? 0 : (c0 > 15 ? 15 : c0);
+                    c1 = c1 < 0 ? 0 : (c1 > 15 ? 15 : c1);
+                }
+            }
+            prow[k >> 1] = (uint8_t)((c0 << 4) | c1);
+        }
+        for (int g = 0; g < ng; g++) {
+            const size_t i = (size_t)n * ng + g;
+            int z = 8 + (zp ? zp[i] : 0);
+            if (z < 0 || z > 15) { bad++; z = z < 0 ? 0 : 15; }
+            const uint16_t sh = vv_float_to_half_rne(scale[i]);
+            sc[i] = sh;
+            zr[i] = (uint8_t)z;
+            mn[i] = vv_float_to_half_rne(-(float)z * vv_half_to_float(sh));
+        }
+    }
+    vv_free(scale);
+    vv_free(zp);
+    if (bad) {
+        VV_LOG_E("loader: '%s' holds %d values outside 4 bits", base, bad);
+        vv_free(packed); vv_free(sc); vv_free(mn); vv_free(zr);
+        return VV_ERR_MODEL_FORMAT;
+    }
+    const int64_t pshape[2] = { N, K / 2 };
+    const int64_t gshape[2] = { N, ng };
+    set_tensor(&w->tensor, packed, VV_DTYPE_U8, packed_bytes, 2, pshape);
+    set_tensor(&w->quant.scales, sc, VV_DTYPE_F16, group_bytes, 2, gshape);
+    set_tensor(&w->mins, mn, VV_DTYPE_F16, group_bytes, 2, gshape);
+    set_tensor(&w->zeros, zr, VV_DTYPE_U8, (size_t)N * ng, 2, gshape);
+    w->quant_kind = VV_QUANT_INT4G;
+    w->group_size = G;
+    w->int4g_layout = VV_INT4G_ROWMAJOR;
+    L->n_int4g++;
+    L->proj_bytes += packed_bytes + 2 * group_bytes;
+    return VV_OK;
+}
+
 /**
  * @brief One projection of one layer, in whatever form the file holds it.
  */
 static vv_status_t load_projection(loader_t* L, int layer, const char* which,
                                    int N, int K, bool want_bias,
+                                   const float* col_mul, const float* row_div,
                                    vv_weight_t* w) {
     char base[256], buf[320];
     snprintf(base, sizeof(base), "%slayers.%d.%s", L->prefix, layer, which);
@@ -915,6 +1406,10 @@ static vv_status_t load_projection(loader_t* L, int layer, const char* which,
 
     snprintf(buf, sizeof(buf), "%s.weight", base);
     const st_entry_t* e = find(L, buf);
+    /* compressed-tensors pack-quantized keeps no `.weight` at all. */
+    char pbuf[320];
+    snprintf(pbuf, sizeof(pbuf), "%s.weight_packed", base);
+    const st_entry_t* ep = e ? NULL : find(L, pbuf);
     if (e && e->info.dtype == VV_DTYPE_U8) {
         /* bitsandbytes NF4: the codes of [N,K], two to a byte. */
         if (L->quant != VV_LOAD_QUANT_AUTO && L->quant != VV_LOAD_QUANT_NF4) {
@@ -939,25 +1434,43 @@ static vv_status_t load_projection(loader_t* L, int layer, const char* which,
         L->n_nf4++;
         L->proj_bytes += w->tensor.size_bytes + w->quant.scales.size_bytes;
     } else if (e && is_float_dtype(e->info.dtype)) {
-        if ((s = load_dense_weight(L, e, N, K, w)) != VV_OK) return s;
+        if ((s = load_dense_weight(L, e, N, K, col_mul, row_div, w)) != VV_OK)
+            return s;
+    } else if (e && e->info.dtype == VV_DTYPE_I8) {
+        /* compressed-tensors int-quantized: W8A8, or 4-bit in an int8 box */
+        if ((s = load_ct_weight(L, base, e, NULL, N, K, w)) != VV_OK) return s;
     } else if (e) {
-        VV_LOG_E("loader: '%s' is %s, which no projection format uses "
-                 "(int8 checkpoints do not load yet; --quant int8 "
-                 "quantizes a dense one)",
+        VV_LOG_E("loader: '%s' is %s, which no projection format uses",
                  buf, dtype_name(e->info.dtype));
         return VV_ERR_UNSUPPORTED;
+    } else if (ep) {
+        /* compressed-tensors pack-quantized: W4A16 or W4A8 */
+        if ((s = load_ct_weight(L, base, NULL, ep, N, K, w)) != VV_OK) return s;
     } else {
         snprintf(buf, sizeof(buf), "%s.qweight", base);
         if (!find(L, buf)) {
             VV_LOG_E("loader: '%s' has neither .weight nor .qweight", base);
             return VV_ERR_WEIGHT_MISSING;
         }
-        if (L->quant != VV_LOAD_QUANT_AUTO && L->quant != VV_LOAD_QUANT_INT4) {
+        if (L->quant != VV_LOAD_QUANT_AUTO && L->quant != VV_LOAD_QUANT_INT4 &&
+            L->quant != VV_LOAD_QUANT_W4A8) {
             VV_LOG_E("loader: the checkpoint is AWQ/GPTQ int4; --quant %s "
-                     "is not available for it", vv_load_quant_name(L->quant));
+                     "is not available for it (auto, int4 or w4a8)",
+                     vv_load_quant_name(L->quant));
             return VV_ERR_UNSUPPORTED;
         }
         if ((s = load_awq_weight(L, base, N, K, w)) != VV_OK) return s;
+        /* W4A8 on AWQ/GPTQ is exact: the same codes and scales, with the
+           activations quantized instead. Act-order gathers FP16 inputs,
+           which int8 activations do not go through. */
+        if (L->quant == VV_LOAD_QUANT_W4A8) {
+            if (w->perm.data) {
+                VV_LOG_E("loader: '%s' is act-order GPTQ; --quant w4a8 does "
+                         "not take a column permutation", base);
+                return VV_ERR_UNSUPPORTED;
+            }
+            w->act_int8 = true;
+        }
         L->n_int4g++;
         L->proj_bytes += w->tensor.size_bytes + w->quant.scales.size_bytes
                        + w->mins.size_bytes;
@@ -968,6 +1481,7 @@ static vv_status_t load_projection(loader_t* L, int layer, const char* which,
     if (e) {
         if ((s = check_shape(e, N, 0)) != VV_OK) return s;
         if ((s = load_f16(L, e, &w->bias)) != VV_OK) return s;
+        if (row_div) div_f16(&w->bias, row_div);
     } else if (want_bias) {
         VV_LOG_E("loader: '%s' is missing (attention_bias is on)", buf);
         return VV_ERR_WEIGHT_MISSING;
@@ -1018,6 +1532,67 @@ static int gptq_zero_bias(const char* model_dir) {
         bias = 0;
     cJSON_Delete(root);
     return bias;
+}
+
+/** @brief Read quantization_config from config.json (absent: all zero). */
+static void ct_parse(const char* model_dir, ct_cfg_t* ct) {
+    memset(ct, 0, sizeof(*ct));
+    char path[512];
+    build_path(path, sizeof(path), model_dir, "config.json");
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0) { fclose(f); return; }
+    char* json = (char*)vv_alloc((size_t)size + 1);
+    if (!json) { fclose(f); return; }
+    const size_t got = fread(json, 1, (size_t)size, f);
+    fclose(f);
+    json[got] = '\0';
+    cJSON* root = cJSON_Parse(json);
+    vv_free(json);
+    if (!root) return;
+
+    const cJSON* qc = cJSON_GetObjectItem(root, "quantization_config");
+    const cJSON* qm = qc ? cJSON_GetObjectItem(qc, "quant_method") : NULL;
+    if (cJSON_IsString(qm) && qm->valuestring &&
+        strcmp(qm->valuestring, "compressed-tensors") == 0) {
+        ct->present = true;
+        const cJSON* fmt = cJSON_GetObjectItem(qc, "format");
+        if (cJSON_IsString(fmt) && fmt->valuestring)
+            snprintf(ct->format, sizeof(ct->format), "%s", fmt->valuestring);
+        const cJSON* groups = cJSON_GetObjectItem(qc, "config_groups");
+        /*
+         * One scheme for every Linear: the loader applies it by weight dtype,
+         * not by each group's `targets`, so groups that disagree on weight
+         * bits or on int8 activations are flagged and refused.
+         */
+        const cJSON* g;
+        int n_groups = 0;
+        cJSON_ArrayForEach(g, groups) {
+            const cJSON* wa = cJSON_GetObjectItem(g, "weights");
+            const cJSON* nb = wa ? cJSON_GetObjectItem(wa, "num_bits") : NULL;
+            const int bits = cJSON_IsNumber(nb) ? nb->valueint : 0;
+            bool a8 = false;
+            const cJSON* ia = cJSON_GetObjectItem(g, "input_activations");
+            if (ia && !cJSON_IsNull(ia)) {
+                const cJSON* ab = cJSON_GetObjectItem(ia, "num_bits");
+                const cJSON* ty = cJSON_GetObjectItem(ia, "type");
+                a8 = cJSON_IsNumber(ab) && ab->valueint == 8 &&
+                     cJSON_IsString(ty) && ty->valuestring &&
+                     strcmp(ty->valuestring, "int") == 0;
+            }
+            if (n_groups == 0) {
+                ct->w_bits = bits;
+                ct->act_int8 = a8;
+            } else if (bits != ct->w_bits || a8 != ct->act_int8) {
+                ct->mixed = true;
+            }
+            n_groups++;
+        }
+    }
+    cJSON_Delete(root);
 }
 
 /**
@@ -1170,34 +1745,79 @@ static vv_status_t load_layers(loader_t* L) {
         return VV_ERR_SHAPE_MISMATCH;
     }
 
-    for (int i = 0; i < m->num_layers; i++) {
+    /* SmoothQuant scratch: the factors of one layer and one column range. */
+    float* sbuf = NULL;
+    float* wmax = NULL;
+    float lo = 1e30f, hi = 0.0f;
+    if (L->smooth) {
+        const size_t nf = (size_t)2 * hs + kvd + qd + inter;
+        const int wide = inter > qd ? (inter > hs ? inter : hs)
+                                    : (qd > hs ? qd : hs);
+        sbuf = (float*)vv_alloc(nf * sizeof(float));
+        wmax = (float*)vv_alloc((size_t)wide * sizeof(float));
+        if (!sbuf || !wmax) {
+            vv_free(sbuf);
+            vv_free(wmax);
+            return VV_ERR_OUT_OF_MEMORY;
+        }
+    }
+
+    s = VV_OK;
+    for (int i = 0; i < m->num_layers && s == VV_OK; i++) {
         vv_layer_weights_t* Ly = &m->layers[i];
+        smooth_fac_t f = { NULL, NULL, NULL, NULL, NULL };
+        if (sbuf) {
+            f.qkv = sbuf;
+            f.gu = f.qkv + hs;
+            f.vo = f.gu + hs;
+            f.o_cols = f.vo + kvd;
+            f.ud = f.o_cols + qd;
+            if ((s = smooth_layer(L, i, wmax, &f)) != VV_OK) break;
+            smooth_range(f.qkv, hs, &lo, &hi);
+            smooth_range(f.gu, hs, &lo, &hi);
+            smooth_range(f.vo, kvd, &lo, &hi);
+            smooth_range(f.ud, inter, &lo, &hi);
+        }
+
         snprintf(buf, sizeof(buf), "%slayers.%d.input_layernorm.weight",
                  L->prefix, i);
         if ((s = need_f16(L, buf, hs, 0, &Ly->input_layernorm)) != VV_OK)
-            return s;
+            break;
         snprintf(buf, sizeof(buf), "%slayers.%d.post_attention_layernorm.weight",
                  L->prefix, i);
         if ((s = need_f16(L, buf, hs, 0, &Ly->post_attn_layernorm)) != VV_OK)
-            return s;
+            break;
+        /* x / s out of the norms, W * s into the projections they feed. */
+        if (f.qkv) div_f16(&Ly->input_layernorm, f.qkv);
+        if (f.gu) div_f16(&Ly->post_attn_layernorm, f.gu);
 
         if ((s = load_projection(L, i, "self_attn.q_proj", qd, hs, qkv_bias,
-                                 &Ly->attn.q_proj)) != VV_OK ||
+                                 f.qkv, NULL, &Ly->attn.q_proj)) != VV_OK ||
             (s = load_projection(L, i, "self_attn.k_proj", kvd, hs, qkv_bias,
-                                 &Ly->attn.k_proj)) != VV_OK ||
+                                 f.qkv, NULL, &Ly->attn.k_proj)) != VV_OK ||
             (s = load_projection(L, i, "self_attn.v_proj", kvd, hs, qkv_bias,
-                                 &Ly->attn.v_proj)) != VV_OK ||
+                                 f.qkv, f.vo, &Ly->attn.v_proj)) != VV_OK ||
             (s = load_projection(L, i, "self_attn.o_proj", hs, qd, false,
-                                 &Ly->attn.o_proj)) != VV_OK ||
+                                 f.o_cols, NULL, &Ly->attn.o_proj)) != VV_OK ||
             (s = load_projection(L, i, "mlp.gate_proj", inter, hs, false,
-                                 &Ly->mlp.gate_proj)) != VV_OK ||
+                                 f.gu, NULL, &Ly->mlp.gate_proj)) != VV_OK ||
             (s = load_projection(L, i, "mlp.up_proj", inter, hs, false,
-                                 &Ly->mlp.up_proj)) != VV_OK ||
+                                 f.gu, f.ud, &Ly->mlp.up_proj)) != VV_OK ||
             (s = load_projection(L, i, "mlp.down_proj", hs, inter, false,
-                                 &Ly->mlp.down_proj)) != VV_OK)
-            return s;
+                                 f.ud, NULL, &Ly->mlp.down_proj)) != VV_OK)
+            break;
     }
-    return VV_OK;
+    vv_free(sbuf);
+    vv_free(wmax);
+    if (s == VV_OK && L->smooth)
+        VV_LOG_I("loader: SmoothQuant folded (alpha %.2f, maps%s%s%s%s), "
+                 "factors %.3g..%.3g", (double)L->smooth_alpha,
+                 (L->smooth_maps & VV_SMOOTH_QKV) ? " qkv" : "",
+                 (L->smooth_maps & VV_SMOOTH_GATEUP) ? " gate/up" : "",
+                 (L->smooth_maps & VV_SMOOTH_VO) ? " v->o" : "",
+                 (L->smooth_maps & VV_SMOOTH_UPDOWN) ? " up->down" : "",
+                 (double)lo, (double)hi);
+    return s;
 }
 
 static vv_status_t load_lm_globals(loader_t* L) {
@@ -1433,6 +2053,50 @@ static vv_status_t model_load_impl(const char* model_dir,
     L.m = model;
     L.quant = (vv_load_quant_t)o.quant;
     L.gptq_bias = gptq_zero_bias(model_dir);
+    if (o.smooth) {
+        /*
+         * Folding changes what the dense weights are before they are
+         * quantized; kept dense, they would compute the same thing with
+         * extra rounding. So it takes a load-time format and statistics of
+         * this model's shape.
+         */
+        const vv_llm_config_t* c = &model->config.llm;
+        const vv_smooth_stats_t* st = o.smooth;
+        if (L.quant == VV_LOAD_QUANT_AUTO || L.quant == VV_LOAD_QUANT_NONE) {
+            VV_LOG_E("loader: SmoothQuant folds into weights quantized at "
+                     "load; pick --quant w8a8, w4a8, int8, int4 or nf4");
+            vv_model_free(model);
+            return VV_ERR_INVALID_ARG;
+        }
+        if (st->n_layers != n_layers || st->hidden != c->hidden_size ||
+            st->q_dim != c->num_attention_heads * c->head_dim ||
+            st->inter != c->intermediate_size) {
+            VV_LOG_E("loader: the calibration is of a [%d layers, %d, %d, %d] "
+                     "model, this one is [%d, %d, %d, %d]", st->n_layers,
+                     st->hidden, st->q_dim, st->inter, n_layers,
+                     c->hidden_size, c->num_attention_heads * c->head_dim,
+                     c->intermediate_size);
+            vv_model_free(model);
+            return VV_ERR_SHAPE_MISMATCH;
+        }
+        L.smooth = st;
+        L.smooth_alpha = o.smooth_alpha > 0.0f ? o.smooth_alpha
+                                               : VV_SMOOTH_ALPHA_DEFAULT;
+        L.smooth_maps = o.smooth_maps > 0 ? (o.smooth_maps & VV_SMOOTH_ALL)
+                                          : VV_SMOOTH_MAPS_DEFAULT;
+    }
+    ct_parse(model_dir, &L.ct);
+    if (L.ct.mixed) {
+        VV_LOG_E("loader: this compressed-tensors checkpoint mixes schemes "
+                 "(config_groups differ in weight bits or activations); "
+                 "only one scheme for all Linear layers is supported");
+        vv_model_free(model);
+        return VV_ERR_UNSUPPORTED;
+    }
+    if (L.ct.present)
+        VV_LOG_I("loader: compressed-tensors checkpoint (%s, %d-bit weights%s)",
+                 L.ct.format[0] ? L.ct.format : "?", L.ct.w_bits,
+                 L.ct.act_int8 ? ", int8 activations" : "");
 
     s = build_index(&L);
     if (s == VV_OK) s = find_prefix(&L);
@@ -1465,20 +2129,23 @@ static vv_status_t model_load_impl(const char* model_dir,
         return s;
     }
 
-    int n_bias = 0;
+    int n_bias = 0, n_a8 = 0;
     for (int li = 0; li < n_layers; li++) {
         vv_weight_t* p[7];
         vv_layer_projections(&model->layers[li], p);
-        for (int k = 0; k < 7; k++) if (p[k]->bias.data) n_bias++;
+        for (int k = 0; k < 7; k++) {
+            if (p[k]->bias.data) n_bias++;
+            if (p[k]->act_int8) n_a8++;
+        }
     }
 
     VV_LOG_I("loader: %s model loaded in %.0f ms (%d layers under prefix "
              "'%s'; projections %d nf4 / %d int4g / %d int8 / %d fp16, %d "
-             "quantized at load, %.1f MB; head %s; encoders %d+%d tensors; "
-             "%d biases)",
+             "quantized at load, %d on int8 activations, %.1f MB; head %s; "
+             "encoders %d+%d tensors; %d biases)",
              vv_model_family_name(model->config.family),
              vv_time_ms() - t0, n_layers, L.prefix, L.n_nf4, L.n_int4g,
-             L.n_int8, L.n_dense, L.n_converted,
+             L.n_int8, L.n_dense, L.n_converted, n_a8,
              (double)L.proj_bytes / (1024.0 * 1024.0),
              model->lm_head_tied ? "tied to embed_tokens" : "separate",
              model->n_acoustic_weights, model->n_semantic_weights, n_bias);

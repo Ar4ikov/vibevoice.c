@@ -69,7 +69,7 @@ typedef enum vv_dtype {
     VV_DTYPE_F8_E4M3 = 6,  /* FP8 for double-quantization scales */
     VV_DTYPE_NF4    = 7,   /* logical type: NF4 packed as U8 */
     VV_DTYPE_BOOL   = 8,
-    VV_DTYPE_I8     = 9,
+    VV_DTYPE_I8     = 9,   /* int8: W8A8 weights, int8 activations     */
     VV_DTYPE_I16    = 10,
     VV_DTYPE_U16    = 11,
     VV_DTYPE_U32    = 12,
@@ -77,6 +77,7 @@ typedef enum vv_dtype {
     /** A dtype string the parser does not know. Never guessed at: whoever
      *  needs the tensor refuses it by name instead of reading garbage. */
     VV_DTYPE_UNKNOWN = 14,
+    VV_DTYPE_F64    = 15,
 } vv_dtype_t;
 
 /** @brief Size in bytes for a single element of the given dtype. */
@@ -96,6 +97,7 @@ static inline size_t vv_dtype_size(vv_dtype_t dtype) {
         case VV_DTYPE_U16:     return 2;
         case VV_DTYPE_U32:     return 4;
         case VV_DTYPE_F8_E5M2: return 1;
+        case VV_DTYPE_F64:     return 8;
         default:               return 0;
     }
 }
@@ -465,6 +467,15 @@ typedef struct vv_init_params {
      * plus the clones made from it). Sizes a paged pool; 1 otherwise.
      */
     int    n_slots;
+    /**
+     * SmoothQuant statistics (smooth.h) folded into a dense checkpoint as it
+     * is quantized at load (`weight_quant`), with their migration strength
+     * and maps (0: the defaults, or VV_SMOOTH_ALPHA / VV_SMOOTH_MAPS).
+     * NULL: none. Not owned; only read during vv_inference_init.
+     */
+    const struct vv_smooth_stats* smooth;
+    float  smooth_alpha;
+    int    smooth_maps;
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -481,6 +492,9 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.attn_backend = VV_ATTN_AUTO;
     p.kv_paging = VV_KV_PAGED_AUTO;
     p.n_slots = 1;
+    p.smooth = NULL;
+    p.smooth_alpha = 0.0f;
+    p.smooth_maps = 0;
     return p;
 }
 

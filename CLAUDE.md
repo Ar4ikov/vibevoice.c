@@ -53,6 +53,14 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
   `tie_word_embeddings` — head и embedding один буфер. BF16 dense на 3090:
   56 tok/s, 18.7 GB; `--quant int4` — 149 tok/s (W4A16-ядра), `int8` (per-channel) —
   97 tok/s, 12.5 GB; те же слова, что NF4.
+* W8A8 / W4A8 (int8-активации per token, квантуются в той же операции,
+  что их производит): `--quant w8a8|w4a8` из BF16 при загрузке, AWQ как
+  W4A8 без изменения кодов, compressed-tensors чекпоинты llm-compressor.
+  Prefill — s8 `mma.sync` (`gemm_i8.cu`), decode — `dp4a` (`gemv_i8.cu`),
+  CPU — `cpu_int8.c`. SmoothQuant: `--calib <audio>` / `--calib-stats`.
+  32-минутный промпт: 7152 tok/s (W8A8), 5100 (W4A8) против 3451 у `int4`;
+  WER 0 против BF16 на jfk/test30/test120/32 мин. `VV_SAVE_TOKENS` /
+  `VV_TEACHER_TOKENS` — teacher-forced top-1 (W8A8+SQ 98.8%).
 * Семейства моделей (`include/vibevoice/family.h`): `asr-7b`, `asr-bitnet`,
   `asr-streaming-7b` — промпт, стоп-токены, нормализация, геометрия чанков.
   Один проход по слоям — `vv_layer_tensors()`; prefill дописывает с

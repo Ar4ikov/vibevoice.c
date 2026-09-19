@@ -287,7 +287,8 @@ absurd for short clips; this pays it once.
 | **NF4** (bitsandbytes, double-quantized) | loaded directly |
 | **AWQ** (AutoAWQ) | loaded directly |
 | **GPTQ** (AutoGPTQ / GPTQModel) | loaded directly; `gptq_v2` zero points recognised; act-order (`desc_act`) supported |
-| **BF16 / F16 / F32** (unquantized) | dense FP16, or `--quant nf4\|int4\|int8` at load |
+| **BF16 / F16 / F32** (unquantized) | dense FP16, or `--quant nf4\|int4\|int8\|w8a8\|w4a8` at load |
+| **compressed-tensors** (llm-compressor W8A8 / W4A8) | loaded directly; int8 activations |
 
 What a projection is gets decided by what the file holds — U8 with an
 `.absmax` next to it is NF4, an I32 `qweight` is AWQ/GPTQ, anything float is
@@ -379,6 +380,60 @@ AWQ answer on all nine — a smoke test, not a benchmark.
 if you would rather not download a second set of weights. It does not do the
 activation-aware scale search, so it is the weaker of the two; the runtime
 treats both identically.
+
+### Int8 activations: W8A8 and W4A8
+
+Every format above multiplies FP16 activations by the weights. W8A8 and
+W4A8 quantize the activations too — symmetric int8 per token, fused into
+the op that produces them (RMSNorm for q/k/v and gate/up, SwiGLU for down,
+the attention output for o) — and multiply int8 by int8: `mma.sync` s8
+tensor cores for prefill (twice the FP16 rate on Ampere; the W4A8 GEMM keeps
+the weight 4-bit in shared memory and expands it in registers), `dp4a`
+GEMVs for decode, `maddubs`/VNNI/`sdot` on the CPU. The epilogue is
+`acc·sx·sw + bias (+ residual)`, so no FP16 copy of any weight exists.
+
+- `--quant w8a8` / `--quant w4a8` quantize a dense checkpoint at load
+  (per-channel int8; asymmetric group-128 int4 on the W4A16 layout).
+  `--quant w4a8` on an AWQ checkpoint runs its codes and scales unchanged.
+  The NF4 checkpoint is not accepted as W4A8: its codes index a
+  non-uniform table, and re-rounding them onto an int4 grid (tried) made
+  the 32-minute file run on to the KV limit. It keeps its W4A16 path.
+- **compressed-tensors** checkpoints from llm-compressor
+  (`int-quantized` / `pack-quantized`, `input_activations.dynamic`) load as
+  they are; `tests/test_model_load.c` checks the loader integer for integer.
+- **SmoothQuant**: `--calib <audio>` runs the dense model once over a clip,
+  records the per-channel activation ranges and folds the smoothing factors
+  into the weights before they are quantized; `--calib-stats <file>` saves
+  or reuses those ranges (`serve` takes both).
+- `VV_SAVE_TOKENS=<file>` writes the generated tokens, `VV_TEACHER_TOKENS=<file>`
+  feeds them back and reports how often the model's top-1 agrees with them.
+
+`microsoft/VibeVoice-ASR` (BF16) on a 3090, against dense BF16 (`--quant
+none`) as the reference. WER is 0.00% for every row on jfk, test30, test120
+and the 32-minute file (4200 words), and every row stops at the end of the
+32-minute audio (last segment at 1918 s):
+
+| mode | weights | prefill 961 / 14449 tok | decode 0.2K / 14K→24K ctx | RTF 32 min | VRAM 32 min | top-1 (test120, teacher-forced) |
+|---|---|---|---|---|---|---|
+| `none` (FP16) | 12446 MB | 3023 / 3170 tok/s | 57.0 / 49.4 tok/s | 0.109 | 19.0 GB | reference |
+| `int8` (W8A16) | 6228 MB | 2813 / 3015 | 99.8 / 78.3 | 0.070 | 12.9 GB | 99.50% |
+| `int4` (W4A16) | 3306 MB | 3575 / 3451 | 155.1 / 108.3 | 0.052 | 10.1 GB | 97.82% |
+| `w8a8` | 6228 MB | **9639 / 7152** | 99.4 / 78.7 | 0.069 | 12.9 GB | 97.65% |
+| `w8a8` + SmoothQuant | 6228 MB | 9700 / 7156 | 98.4 / 78.6 | 0.069 | 12.9 GB | **98.83%** |
+| `w4a8` | 3306 MB | **5986 / 5100** | 147.4 / 105.5 | 0.052 | 10.1 GB | 97.49% |
+| `w4a8` + SmoothQuant | 3306 MB | 6003 / 5100 | 147.7 / 105.7 | 0.052 | 10.1 GB | 97.82% |
+| compressed-tensors W8A8 (SQ + GPTQ) | 6228 MB | 9787 / 7239 | 99.4 / 78.9 | 0.068 | 12.8 GB | 97.99% |
+| AWQ checkpoint, `--quant w4a8` | 3306 MB | 6052 / 5129 | 145.9 / 105.7 | 0.052 | 10.1 GB | 97.32% |
+
+Prefill doubles to triples; decode is memory-bound and stays where the
+weight width puts it. Where rows differ from BF16 it is in timestamps (mean
+start shift at most 0.3 s) and in one speaker label on test30, the file
+whose middle clip is another voice.
+
+On the CPU (5900X, AVX2, no VNNI; jfk, best of three) the transcripts are
+byte-identical to the GPU ones. W8A8 prefills at 111 tok/s against 69 for
+`int8`, W4A8 at 75 against 73 for `int4`; decode is bandwidth-bound and
+does not move (4.7 vs 5.0, 8.1 vs 8.0 tok/s).
 
 ### KV cache
 

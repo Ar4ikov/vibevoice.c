@@ -19,6 +19,7 @@
 #include "vibevoice/cpu_kernels.h"
 #include "vibevoice/quant.h"
 
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -431,6 +432,149 @@ static vv_status_t quant_linear_group(
     return VV_OK;
 }
 
+/* ─── Int8 activations (W8A8, W4A8) ─────────────────────────────────────── */
+
+/**
+ * @brief Whether a layer runs on int8 activations, and on which device.
+ *
+ * All seven projections must ask for it (`act_int8`) and share one weight
+ * kind, so that one quantized input serves q/k/v and one serves gate/up.
+ * The GPU reads INT4 in the W4A16 layout, the CPU in the row-major one with
+ * its integer zeros; act-order weights gather FP16 inputs and stay on the
+ * FP16 path. On the GPU the fused quantizers also bound the row width
+ * (VV_ACT_QUANT_MIN_K..VV_ACT_QUANT_MAX_K). A layer that does not qualify
+ * runs its (identical) weights on FP16 activations instead, so this never
+ * refuses a model.
+ */
+static int a8_kmax(const vv_llm_config_t* c);
+
+static bool layer_a8(const vv_layer_weights_t* L, const vv_llm_config_t* c,
+                     bool gpu) {
+    if (gpu && (a8_kmax(c) > VV_ACT_QUANT_MAX_K ||
+                c->hidden_size < VV_ACT_QUANT_MIN_K))
+        return false;
+    vv_weight_t* p[7];
+    vv_layer_projections((vv_layer_weights_t*)L, p);
+    for (int i = 0; i < 7; i++) {
+        const vv_weight_t* w = p[i];
+        if (!w->act_int8 || w->perm.data || w->quant_kind != p[0]->quant_kind)
+            return false;
+        if (w->quant_kind == VV_QUANT_INT8) continue;
+        if (w->quant_kind != VV_QUANT_INT4G || (w->group_size % 32) != 0)
+            return false;
+        if (gpu ? w->int4g_layout != VV_INT4G_GPU
+                : (w->int4g_layout != VV_INT4G_ROWMAJOR || !w->zeros.data))
+            return false;
+    }
+    return true;
+}
+
+/** @brief Widest input any projection of this model reads. */
+static int a8_kmax(const vv_llm_config_t* c) {
+    int k = c->hidden_size;
+    if (c->intermediate_size > k) k = c->intermediate_size;
+    if (c->num_attention_heads * c->head_dim > k)
+        k = c->num_attention_heads * c->head_dim;
+    return k;
+}
+
+/** @brief Round a workspace offset up to 256 bytes. */
+static size_t ws_align(size_t off) { return (off + 255) & ~(size_t)255; }
+
+/** @brief Bytes of int8 activations, scales and per-32 sums for M rows. */
+static size_t a8_bytes(const vv_llm_config_t* c, int M) {
+    const size_t k = (size_t)a8_kmax(c);
+    return ws_align((size_t)M * k) + ws_align((size_t)M * 4) +
+           ws_align((size_t)M * (k / 32) * 4) + 256;
+}
+
+/**
+ * @brief Int8 activations shared by the projections that read one input.
+ *
+ * Quantized once by the op that produces the input (RMSNorm, SwiGLU, or the
+ * attention output) and read by every projection behind it.
+ */
+typedef struct a8_act {
+    int8_t*  xq;     /**< [M][K] int8, in `layout` order                    */
+    float*   sx;     /**< [M] per-token scale                               */
+    int32_t* xsum;   /**< [M][K/32] sums of xq, for the W4A8 zero points     */
+    int      layout; /**< vv_q8_layout_t the quantizers write               */
+} a8_act_t;
+
+/**
+ * @brief One W8A8 / W4A8 projection: y = W . act + bias (+ residual).
+ *
+ * `residual` may be `y` itself, which is how o_proj and down_proj add into
+ * the hidden state without a separate kernel.
+ */
+static vv_status_t a8_linear(const vv_weight_t* w, const a8_act_t* a,
+                             void* y, const void* residual,
+                             int M, int N, int K, void* stream)
+{
+    if (w->quant_kind == VV_QUANT_INT8)
+        return vv_w8a8_linear_dev(a->xq, a->sx, (const int8_t*)w->tensor.data,
+                                  (const float*)w->quant.scales.data,
+                                  w->bias.data, residual, y, 0, M, N, K,
+                                  VV_I8_PATH_AUTO, stream);
+    return vv_w4a8_linear_dev(a->xq, a->layout, a->sx, a->xsum,
+                              w->tensor.data, w->quant.scales.data,
+                              w->group_size, w->bias.data, residual, y, 0,
+                              M, N, K, VV_I8_PATH_AUTO, stream);
+}
+
+/**
+ * @brief Projections that read the same int8 input (q/k/v, gate/up): one
+ *        GEMV launch for decode-sized M, one GEMM each otherwise.
+ */
+static vv_status_t a8_group(const vv_weight_t* const* ws, void* const* ys,
+                            const int* Ns, int n, const a8_act_t* a,
+                            int M, int K, void* stream)
+{
+    vv_i8_proj_t p[3];
+    for (int i = 0; i < n; i++) {
+        p[i].w    = ws[i]->tensor.data;
+        p[i].sw   = ws[i]->quant.scales.data;
+        p[i].sz   = ws[i]->quant.scales.data;
+        p[i].bias = ws[i]->bias.data;
+        p[i].y    = ys[i];
+        p[i].N    = Ns[i];
+    }
+    return vv_i8_linear_multi_dev(a->xq, a->layout, a->sx, a->xsum,
+                                  ws[0]->quant_kind == VV_QUANT_INT4G, p, n,
+                                  ws[0]->group_size, M, K, stream);
+}
+
+/* ─── SmoothQuant calibration ───────────────────────────────────────────── */
+
+/*
+ * A layer with `calib_absmax` set (vv_smooth_calibrate, smooth.h) records
+ * the per-channel absmax of each projection input into its row: the two
+ * RMSNorm outputs, the attention output and the SwiGLU output. Only dense
+ * FP16 layers are calibrated, which is what the calibration pass loads.
+ */
+#define CALIB_ATTN_IN(c)  0
+#define CALIB_MLP_IN(c)   ((c)->hidden_size)
+#define CALIB_ATTN_OUT(c) (2 * (c)->hidden_size)
+#define CALIB_MLP_MID(c)  (2 * (c)->hidden_size + \
+                           (c)->num_attention_heads * (c)->head_dim)
+
+static vv_status_t calib_dev(const vv_layer_weights_t* L, int off,
+                             const void* x, int M, int K, void* stream) {
+    if (!L->calib_absmax) return VV_OK;
+    return vv_col_absmax_dev(x, M, K, L->calib_absmax + off, stream);
+}
+
+static void calib_cpu(const vv_layer_weights_t* L, int off, const float* x,
+                      int M, int K) {
+    if (!L->calib_absmax) return;
+    float* acc = L->calib_absmax + off;
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < K; k++) {
+            const float v = fabsf(x[(size_t)m * K + k]);
+            if (v > acc[k]) acc[k] = v;
+        }
+}
+
 /**
  * @brief Dump a GPU FP16 buffer as FP32 to $VV_DUMP_DIR (debug builds only).
  */
@@ -544,14 +688,45 @@ static vv_status_t decoder_layer_impl(
     const size_t temp_bytes = workspace_size > offset
                             ? workspace_size - offset : 0;
 
-    /* 1. Input LayerNorm */
-    s = vv_rmsnorm_dev(hidden_states, layer->input_layernorm.data,
-                         norm_out, seq_len, hs,
-                         config->rms_norm_eps, stream);
+    /*
+     * Int8-activation layers (W8A8, W4A8) dequantize nothing; the scratch
+     * holds the quantized activations instead. INT4 weights want them in
+     * the order the GEMV or the GEMM reads (q8.h), INT8 in column order.
+     */
+    const bool a8 = layer_a8(layer, config, true);
+    a8_act_t act = { NULL, NULL, NULL, VV_Q8_NATURAL };
+    if (a8) {
+        if (layer->attn.q_proj.quant_kind == VV_QUANT_INT4G)
+            act.layout = vv_w4a8_layout_for(seq_len);
+        const size_t kmax = (size_t)a8_kmax(config);
+        size_t o = ws_align(offset);
+        act.xq = (int8_t*)(wp + o);    o = ws_align(o + (size_t)seq_len * kmax);
+        act.sx = (float*)(wp + o);     o = ws_align(o + (size_t)seq_len * 4);
+        act.xsum = (int32_t*)(wp + o); o += (size_t)seq_len * (kmax / 32) * 4;
+        if (o > workspace_size) return VV_ERR_OUT_OF_MEMORY;
+    }
+
+    /* 1. Input LayerNorm (fused with the int8 quantizer on A8 layers) */
+    if (a8)
+        s = vv_rmsnorm_q8_dev(hidden_states, layer->input_layernorm.data,
+                              seq_len, hs, config->rms_norm_eps, act.layout,
+                              act.xq, act.sx, act.xsum, stream);
+    else
+        s = vv_rmsnorm_dev(hidden_states, layer->input_layernorm.data,
+                           norm_out, seq_len, hs,
+                           config->rms_norm_eps, stream);
     if (s != VV_OK) return s;
 
     /* 2. Q, K, V projections (+ bias if present) */
-    {
+    if (a8) {
+        const vv_weight_t* ws[3] = { &layer->attn.q_proj, &layer->attn.k_proj,
+                                     &layer->attn.v_proj };
+        void* ys[3] = { q_buf, k_buf, v_buf };
+        const int ns[3] = { n_heads * head_dim, n_kv_heads * head_dim,
+                            n_kv_heads * head_dim };
+        s = a8_group(ws, ys, ns, 3, &act, seq_len, hs, stream);
+        if (s != VV_OK) return s;
+    } else {
         const vv_weight_t* ws[3] = { &layer->attn.q_proj, &layer->attn.k_proj,
                                      &layer->attn.v_proj };
         void* ys[3] = { q_buf, k_buf, v_buf };
@@ -562,7 +737,11 @@ static vv_status_t decoder_layer_impl(
         if (s != VV_OK) return s;
     }
 
-    if (layer_idx == 0 && seq_len > 1) {
+    if (!a8 && (s = calib_dev(layer, CALIB_ATTN_IN(config), norm_out,
+                              seq_len, hs, stream)) != VV_OK)
+        return s;
+
+    if (layer_idx == 0 && seq_len > 1 && !a8) {
         dump_gpu_fp16("c_l0_norm", norm_out, (size_t)seq_len * hs, stream);
         dump_gpu_fp16("c_l0_q_prerope", q_buf,
                       (size_t)seq_len * n_heads * head_dim, stream);
@@ -630,6 +809,45 @@ static vv_status_t decoder_layer_impl(
     if (layer_idx == 0 && seq_len > 1)
         dump_gpu_fp16("c_l0_attn", attn_out, (size_t)seq_len * hs, stream);
 
+    if (a8) {
+        /*
+         * 6-10 on int8 activations. o_proj and down_proj write the residual
+         * sum straight into the hidden state; the quantizers are fused into
+         * the RMSNorm and the SwiGLU that feed the next projections.
+         */
+        s = vv_act_quant_dev(attn_out, seq_len, n_heads * head_dim,
+                             act.layout, act.xq, act.sx, act.xsum, stream);
+        if (s == VV_OK)
+            s = a8_linear(&layer->attn.o_proj, &act, hidden_states,
+                          hidden_states, seq_len, hs, n_heads * head_dim,
+                          stream);
+        if (s == VV_OK)
+            s = vv_rmsnorm_q8_dev(hidden_states,
+                                  layer->post_attn_layernorm.data, seq_len,
+                                  hs, config->rms_norm_eps, act.layout,
+                                  act.xq, act.sx, act.xsum, stream);
+        if (s == VV_OK) {
+            const vv_weight_t* ws[2] = { &layer->mlp.gate_proj,
+                                         &layer->mlp.up_proj };
+            void* ys[2] = { gate_buf, up_buf };
+            const int ns[2] = { inter_size, inter_size };
+            s = a8_group(ws, ys, ns, 2, &act, seq_len, hs, stream);
+        }
+        if (s == VV_OK)
+            s = vv_swiglu_q8_dev(gate_buf, up_buf, seq_len, inter_size,
+                                 act.layout, act.xq, act.sx, act.xsum,
+                                 stream);
+        if (s == VV_OK)
+            s = a8_linear(&layer->mlp.down_proj, &act, hidden_states,
+                          hidden_states, seq_len, hs, inter_size, stream);
+        (void)mlp_out;
+        return s;
+    }
+
+    s = calib_dev(layer, CALIB_ATTN_OUT(config), attn_out, seq_len,
+                  n_heads * head_dim, stream);
+    if (s != VV_OK) return s;
+
     /* 6. O projection + bias + residual */
     s = quant_linear(&layer->attn.o_proj, attn_out, norm_out, temp_weight, temp_bytes,
                      seq_len, hs, hs, stream);
@@ -646,6 +864,8 @@ static vv_status_t decoder_layer_impl(
                          norm_out, seq_len, hs,
                          config->rms_norm_eps, stream);
     if (s != VV_OK) return s;
+    s = calib_dev(layer, CALIB_MLP_IN(config), norm_out, seq_len, hs, stream);
+    if (s != VV_OK) return s;
 
     /* 8. MLP: gate + up (+ bias if present) */
     {
@@ -661,6 +881,9 @@ static vv_status_t decoder_layer_impl(
     /* 9. SwiGLU */
     s = vv_swiglu_dev(gate_buf, up_buf, gate_buf,
                         seq_len * inter_size, stream);
+    if (s != VV_OK) return s;
+    s = calib_dev(layer, CALIB_MLP_MID(config), gate_buf, seq_len,
+                  inter_size, stream);
     if (s != VV_OK) return s;
 
     /* 10. Down projection + bias + residual */
@@ -832,6 +1055,20 @@ vv_status_t vv_decoder_prefill(
                        + 2 * cfg->intermediate_size) * 2;
     size_t weight_scratch = (size_t)cfg->intermediate_size * hs * 2
                           + decode_scratch_bytes(cfg);
+    /*
+     * Int8-activation layers dequantize no weight; they carve their int8
+     * activations, scales and sums instead, which grow with the chunk.
+     */
+    {
+        bool any_a8 = false, all_a8 = true;
+        for (int i = first_layer; i < last_layer; i++) {
+            const bool a = layer_a8(&model->layers[i], cfg, true);
+            any_a8 |= a;
+            all_a8 &= a;
+        }
+        if (all_a8) weight_scratch = decode_scratch_bytes(cfg) + 4 * 256;
+        if (any_a8) per_token += a8_bytes(cfg, 1);
+    }
     int chunk = seq_len;
     if (workspace_size > weight_scratch + per_token) {
         size_t budget = (workspace_size - weight_scratch) / per_token;
@@ -993,9 +1230,14 @@ static vv_status_t decoder_layer_cpu(
     const int inter = config->intermediate_size;
     vv_status_t s;
 
+    /* Int8 activations, scales and per-32 sums, counted in floats. */
+    const bool a8 = layer_a8(layer, config, false);
+    const size_t kmax = (size_t)a8_kmax(config);
+    const size_t a8_floats = a8
+        ? (size_t)seq_len * (kmax / 4 + 1 + kmax / 32) + 64 : 0;
     const size_t need = (size_t)seq_len *
         (3 * (size_t)hs + (size_t)n_heads * head_dim +
-         2 * (size_t)n_kv_heads * head_dim + 2 * (size_t)inter);
+         2 * (size_t)n_kv_heads * head_dim + 2 * (size_t)inter) + a8_floats;
     if (workspace_size < need * sizeof(float)) return VV_ERR_OUT_OF_MEMORY;
 
     float* wp = workspace;
@@ -1012,10 +1254,48 @@ static vv_status_t decoder_layer_cpu(
     float* gather = wp + need;
     const size_t gather_n = workspace_size / sizeof(float) - need;
 
+    /*
+     * Int8-activation layers: the quantized input lives after mlp_out and is
+     * rebuilt by CPU_Q8 whenever the projections' input changes. The CPU
+     * W4A8 kernel reads row-major INT4 bytes, so its activations come in
+     * the nibble order (q8.h).
+     */
+    int8_t*  a8_xq = NULL;
+    float*   a8_sx = NULL;
+    int32_t* a8_xs = NULL;
+    const int a8_layout = layer->attn.q_proj.quant_kind == VV_QUANT_INT4G
+                        ? VV_Q8_NIBBLE : VV_Q8_NATURAL;
+    if (a8) {
+        float* base = mlp_out + (size_t)seq_len * hs;
+        a8_xq = (int8_t*)base;
+        a8_sx = base + (size_t)seq_len * (kmax / 4);
+        a8_xs = (int32_t*)(a8_sx + seq_len);
+    }
+
+    /** Quantize `in` [seq_len][KK] for the projections behind it. */
+    #define CPU_Q8(in, KK) do {                                              \
+        if (a8) {                                                           \
+            s = vv_quant_act_q8_cpu((in), seq_len, (KK), a8_layout,         \
+                                    a8_xq, a8_sx, a8_xs);                   \
+            if (s != VV_OK) return s;                                       \
+        }                                                                   \
+    } while (0)
+
     /** Run one projection in whatever format its weights are stored in. */
     #define CPU_PROJ(w, in, out_buf, M, N, KK) do {                          \
-        s = cpu_proj(&(w), (in), (out_buf), (M), (N), (KK),                 \
-                     gather, gather_n);                                     \
+        if (a8 && (w).quant_kind == VV_QUANT_INT8)                          \
+            s = vv_w8a8_gemm_cpu(a8_xq, a8_sx,                              \
+                    (const int8_t*)(w).tensor.data,                         \
+                    (const float*)(w).quant.scales.data, (w).bias.data,     \
+                    (out_buf), (M), (N), (KK));                             \
+        else if (a8)                                                        \
+            s = vv_w4a8_gemm_cpu(a8_xq, a8_sx, a8_xs,                       \
+                    (const uint8_t*)(w).tensor.data, (w).quant.scales.data, \
+                    (const uint8_t*)(w).zeros.data, (w).group_size,         \
+                    (w).bias.data, (out_buf), (M), (N), (KK));              \
+        else                                                                \
+            s = cpu_proj(&(w), (in), (out_buf), (M), (N), (KK),             \
+                         gather, gather_n);                                 \
         if (s != VV_OK) return s;                                           \
     } while (0)
 
@@ -1023,6 +1303,8 @@ static vv_status_t decoder_layer_cpu(
                        seq_len, hs, config->rms_norm_eps);
     if (s != VV_OK) return s;
 
+    calib_cpu(layer, CALIB_ATTN_IN(config), norm_out, seq_len, hs);
+    CPU_Q8(norm_out, hs);
     CPU_PROJ(layer->attn.q_proj, norm_out, q_buf, seq_len, n_heads * head_dim, hs);
     CPU_PROJ(layer->attn.k_proj, norm_out, k_buf, seq_len, n_kv_heads * head_dim, hs);
     CPU_PROJ(layer->attn.v_proj, norm_out, v_buf, seq_len, n_kv_heads * head_dim, hs);
@@ -1050,22 +1332,31 @@ static vv_status_t decoder_layer_cpu(
         if (s != VV_OK) return s;
     }
 
-    CPU_PROJ(layer->attn.o_proj, attn_out, norm_out, seq_len, hs, hs);
+    calib_cpu(layer, CALIB_ATTN_OUT(config), attn_out, seq_len,
+              n_heads * head_dim);
+    CPU_Q8(attn_out, n_heads * head_dim);
+    CPU_PROJ(layer->attn.o_proj, attn_out, norm_out, seq_len, hs,
+             n_heads * head_dim);
     vv_residual_add_cpu(hidden_states, norm_out, seq_len * hs);
 
     s = vv_rmsnorm_cpu(hidden_states, layer->post_attn_layernorm.data,
                        norm_out, seq_len, hs, config->rms_norm_eps);
     if (s != VV_OK) return s;
 
+    calib_cpu(layer, CALIB_MLP_IN(config), norm_out, seq_len, hs);
+    CPU_Q8(norm_out, hs);
     CPU_PROJ(layer->mlp.gate_proj, norm_out, gate_buf, seq_len, inter, hs);
     CPU_PROJ(layer->mlp.up_proj,   norm_out, up_buf,   seq_len, inter, hs);
     s = vv_swiglu_cpu(gate_buf, up_buf, gate_buf, seq_len * inter);
     if (s != VV_OK) return s;
 
+    calib_cpu(layer, CALIB_MLP_MID(config), gate_buf, seq_len, inter);
+    CPU_Q8(gate_buf, inter);
     CPU_PROJ(layer->mlp.down_proj, gate_buf, mlp_out, seq_len, hs, inter);
     vv_residual_add_cpu(hidden_states, mlp_out, seq_len * hs);
 
     #undef CPU_PROJ
+    #undef CPU_Q8
     return VV_OK;
 }
 
@@ -1100,6 +1391,13 @@ vv_status_t vv_decoder_prefill_cpu(
     if (model_has_act_order(model))
         per_token += sizeof(float) *
             (size_t)(cfg->intermediate_size > hs ? cfg->intermediate_size : hs);
+    /* Int8 activations: a byte per column plus a scale and the sums. */
+    bool any_a8 = false;
+    for (int i = 0; i < model->num_layers; i++)
+        any_a8 |= layer_a8(&model->layers[i], cfg, false);
+    if (any_a8)
+        per_token += sizeof(float) * ((size_t)a8_kmax(cfg) / 4 + 1 +
+                                      (size_t)a8_kmax(cfg) / 32) + 64;
     size_t fit = workspace_size / per_token;
     if (fit < 1) return VV_ERR_OUT_OF_MEMORY;
     if (fit > 2048) fit = 2048;

@@ -84,7 +84,8 @@ static void usage(const char* which) {
         "  --slots <n>           Concurrent transcriptions\n"
         "  --max-seq-len <n>     KV window\n"
         "  --kv-cache <fmt>      fp16 | fp8 | tq4 | ...\n"
-        "  --quant <fmt>         auto (default) | none | nf4 | int4 | int8\n"
+        "  --quant <fmt>         auto (default) | none | nf4 | int4 | int8 |\n"
+        "                        w8a8 | w4a8\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
         "  --kv-paged <mode>     auto | on | off\n"
@@ -161,7 +162,7 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
         else if (strcmp(s, "--quant") == 0 && next) {
             const vv_load_quant_t q = vv_load_quant_parse(argv[++i]);
             if (q >= VV_LOAD_QUANT_COUNT) {
-                fprintf(stderr, "error: --quant is auto, none, nf4, int4 or int8, "
+                fprintf(stderr, "error: --quant is auto, none, nf4, int4, int8, w8a8 or w4a8, "
                                 "not '%s'\n", argv[i]);
                 return -1;
             }
