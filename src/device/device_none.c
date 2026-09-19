@@ -122,6 +122,8 @@ vv_status_t vv_dev_host_unregister(void* p) { (void)p; return VV_OK; }
 
 const char* vv_dev_backend_name(void) { return "none"; }
 
+bool vv_dev_host_shares_memory(int id) { (void)id; return false; }
+
 void vv_gemm_cleanup(void) {}
 
 /* ─── Compute: not available ────────────────────────────────────────────── */

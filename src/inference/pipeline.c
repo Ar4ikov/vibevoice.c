@@ -240,6 +240,42 @@ static void build_frontend_host(vv_inference_ctx_t* c) {
     }
 }
 
+/**
+ * @brief On unified memory, stop holding what the device already holds.
+ *
+ * Where the GPU's memory is the machine's RAM (Apple Silicon), an uploaded
+ * tensor's host copy is the same bytes a second time. The embedding table
+ * and the head (2 GB of the 7B) are pointed at their device copies, which
+ * the CPU reads directly, so the host paths that use them still work; the
+ * speech encoders' FP32 host weights (2.8 GB), which only the CPU encoder
+ * and the upload read, are freed once the front end has its FP16 ones.
+ * A discrete GPU keeps everything as before.
+ */
+static void share_uploaded(vv_tensor_t* t, void* dev) {
+    if (!t || !dev || !t->data || t->on_gpu) return;
+    vv_free(t->data);
+    t->data = dev;
+    t->on_gpu = true;           /* the context frees it, not vv_tensor_free */
+}
+
+static void release_encoder_host_weights(vv_inference_ctx_t* c) {
+    vv_model_t* m = c->model;
+    if (c->acoustic_encoder) vv_conv_vae_forget_host_weights(c->acoustic_encoder);
+    if (c->semantic_encoder) vv_conv_vae_forget_host_weights(c->semantic_encoder);
+    size_t freed = 0;
+    for (int i = 0; i < m->n_acoustic_weights; i++) {
+        freed += m->acoustic_weights[i].tensor.size_bytes;
+        vv_tensor_free(&m->acoustic_weights[i].tensor);
+    }
+    for (int i = 0; i < m->n_semantic_weights; i++) {
+        freed += m->semantic_weights[i].tensor.size_bytes;
+        vv_tensor_free(&m->semantic_weights[i].tensor);
+    }
+    if (freed)
+        VV_LOG_I("inference: unified memory -- freed the speech encoders' "
+                 "host copies (%.1f MB)", (double)freed / (1024.0 * 1024.0));
+}
+
 static void free_frontend_host(vv_inference_ctx_t* c) {
     if (c->acoustic_encoder) vv_conv_vae_free(c->acoustic_encoder);
     if (c->semantic_encoder) vv_conv_vae_free(c->semantic_encoder);
@@ -1132,6 +1168,12 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         }
     }
 
+    if (vv_dev_host_shares_memory(c->gpu_id)) {
+        share_uploaded(&c->model->embed_tokens, c->embed_table_gpu);
+        if (c->model->lm_head_tied) c->model->lm_head = c->model->embed_tokens;
+        else share_uploaded(&c->model->lm_head, c->lm_head_gpu);
+    }
+
     /* ── Final norm: always on GPU for GPU mode ── */
     if (c->model->final_norm.data) {
         size_t sz = c->model->final_norm.size_bytes;
@@ -1223,6 +1265,7 @@ static void attach_frontend(vv_inference_ctx_t* c) {
         VV_LOG_I("inference: speech front end ready (%.0f ms, %.1f MB)",
                  vv_time_ms() - t_w,
                  (double)vv_frontend_bytes(c->frontend) / (1024.0 * 1024.0));
+        if (vv_dev_host_shares_memory(c->gpu_id)) release_encoder_host_weights(c);
     }
     if (!c->frontend) return;
     s = vv_frontend_stream_create(c->frontend, &c->fe_stream);

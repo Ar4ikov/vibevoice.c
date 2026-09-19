@@ -5,8 +5,8 @@
  * Every GPU kernel the pipeline needs is declared here exactly once. A build
  * links exactly one implementation of these symbols:
  *
- *   src/cuda/*.cu    NVIDIA, via CUDA          (VV_HAS_CUDA)
- *   src/metal/*.m    Apple Silicon, via Metal  (VV_HAS_METAL)
+ *   src/cuda/     NVIDIA, via CUDA                   (VV_HAS_CUDA)
+ *   src/metal/    Apple Silicon, via Metal (MSL)     (VV_HAS_METAL)
  *
  * There is no dispatch table: the two backends never coexist in one binary,
  * so the linker picks the implementation and the call costs nothing. A build
@@ -88,6 +88,17 @@ int vv_dev_device_count(void);
 
 /** @brief The device's name, e.g. "NVIDIA GeForce RTX 3090". */
 vv_status_t vv_dev_get_device_name(int device_id, char* buf, size_t buf_size);
+
+/**
+ * @brief Whether the CPU addresses the device's memory directly.
+ *
+ * True on Apple Silicon, where the GPU's memory is the machine's RAM: a
+ * pointer from vv_dev_alloc is then also a host pointer, readable once the
+ * stream that wrote it has been synchronised, and a host copy of something
+ * already uploaded is the same bytes held twice. False on a discrete GPU,
+ * and when there is no device.
+ */
+bool vv_dev_host_shares_memory(int device_id);
 
 /**
  * @brief Copy between two devices, ordered on `stream`.

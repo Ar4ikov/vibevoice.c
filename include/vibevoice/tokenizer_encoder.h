@@ -73,6 +73,17 @@ typedef struct vv_encoder_stage {
     int                 channels;        /**< Channels inside this stage */
 } vv_encoder_stage_t;
 
+/**
+ * @brief Whether a stage ends in a downsample conv.
+ *
+ * Read from the weight's shape, not its data pointer: the shape stays when
+ * vv_conv_vae_forget_host_weights() drops the data, and the device path
+ * still has to lay the encoder out.
+ */
+static inline bool vv_vae_stage_downsamples(const vv_encoder_stage_t* st) {
+    return st->downsample.weight.ndim > 0;
+}
+
 struct vv_vae_cpu_weights;
 
 /**
@@ -122,6 +133,18 @@ vv_status_t vv_conv_vae_init(const vv_weight_t* model_weights, int n_weights,
  * @brief Whether the encoder has every weight the forward pass reads.
  */
 bool vv_conv_vae_complete(const vv_conv_vae_encoder_t* encoder);
+
+/**
+ * @brief Forget the borrowed host weights, keeping the architecture.
+ *
+ * For an encoder whose device copy is already uploaded, on a machine whose
+ * GPU memory is its RAM (vv_dev_host_shares_memory): the owner frees the
+ * FP32 host tensors, and the encoder must stop pointing at them. Afterwards
+ * vv_conv_vae_complete() is false, so a CPU encode refuses with
+ * VV_ERR_WEIGHT_MISSING instead of reading freed memory; the shapes the
+ * device path sizes its buffers from stay.
+ */
+void vv_conv_vae_forget_host_weights(vv_conv_vae_encoder_t* encoder);
 
 /** @brief Free the encoder structure and its CPU weight copies. */
 vv_status_t vv_conv_vae_free(vv_conv_vae_encoder_t* encoder);

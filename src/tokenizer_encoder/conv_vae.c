@@ -29,7 +29,8 @@
 /* ─── Layer plan ────────────────────────────────────────────────────────── */
 
 static int tensor_dim(const vv_tensor_t* t, int i) {
-    return (t->data && t->ndim > i) ? (int)t->shape[i] : 0;
+    /* The shape, not the data: it outlives vv_conv_vae_forget_host_weights. */
+    return t->ndim > i ? (int)t->shape[i] : 0;
 }
 
 static vv_status_t plan_add(vae_plan_t* p, int kind, int stage, int block,
@@ -81,7 +82,7 @@ vv_status_t vae_plan_build(const vv_conv_vae_encoder_t* enc, vae_plan_t* p) {
                          blk->mixer_conv.kernel_size, 1);
             if (s != VV_OK) return s;
         }
-        if (stage->downsample.weight.data) {
+        if (vv_vae_stage_downsamples(stage)) {
             const int oc = tensor_dim(&stage->downsample.weight, 0);
             if (tensor_dim(&stage->downsample.weight, 1) != ch)
                 return VV_ERR_SHAPE_MISMATCH;
@@ -345,6 +346,33 @@ vv_status_t vv_conv_vae_init(const vv_weight_t* model_weights, int n_weights,
              enc->vae_dim, enc->gaussian,
              n_stages, n_assigned, n_weights);
     return VV_OK;
+}
+
+static void forget_conv(vv_conv1d_weights_t* c) {
+    c->weight.data = NULL;
+    c->bias.data = NULL;
+}
+
+void vv_conv_vae_forget_host_weights(vv_conv_vae_encoder_t* e) {
+    if (!e) return;
+    forget_conv(&e->input_conv);
+    forget_conv(&e->proj_mean);
+    for (int s = 0; e->stages && s < e->n_stages; s++) {
+        vv_encoder_stage_t* st = &e->stages[s];
+        forget_conv(&st->downsample);
+        for (int b = 0; st->blocks && b < st->n_blocks; b++) {
+            vv_encoder_block_t* blk = &st->blocks[b];
+            blk->mixer_norm_weight.data = NULL;
+            forget_conv(&blk->mixer_conv);
+            blk->mixer_layer_scale.data = NULL;
+            blk->ffn_norm_weight.data = NULL;
+            blk->ffn_linear1_weight.data = NULL;
+            blk->ffn_linear1_bias.data = NULL;
+            blk->ffn_linear2_weight.data = NULL;
+            blk->ffn_linear2_bias.data = NULL;
+            blk->ffn_layer_scale.data = NULL;
+        }
+    }
 }
 
 vv_status_t vv_conv_vae_free(vv_conv_vae_encoder_t* encoder) {

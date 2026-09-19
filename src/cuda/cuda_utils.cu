@@ -330,6 +330,12 @@ int vv_dev_device_count(void) {
     return n;
 }
 
+/* A discrete card: host copies are what the CPU paths read. */
+bool vv_dev_host_shares_memory(int device_id) {
+    (void)device_id;
+    return false;
+}
+
 vv_status_t vv_dev_get_device_name(int device_id, char* buf, size_t buf_size) {
     if (!buf || buf_size == 0) return VV_ERR_NULL_PTR;
     cudaDeviceProp prop;

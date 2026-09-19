@@ -611,7 +611,7 @@ vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
             }
         }
 
-        if (e->stages[st].downsample.weight.data) {
+        if (vv_vae_stage_downsamples(&e->stages[st])) {
             L = &P->L[li];
             const int64_t T2 = make_desc(a, li, L, items, n, len, false, &d, nxt);
             const int64_t ld2 = round8(T2);
