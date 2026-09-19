@@ -204,7 +204,10 @@ void vv_engine_stats(const vv_engine_t* e, uint64_t* completed, int* busy) {
     vv_mutex_unlock((vv_mutex_t*)&e->lock);
 }
 
-static int acquire_slot(vv_engine_t* e) {
+/* A free slot, waiting for one for at most `wait_ms` (< 0: for as long as it
+ * takes). -1 when none freed up in time. */
+static int acquire_slot_wait(vv_engine_t* e, int wait_ms) {
+    const double deadline = wait_ms >= 0 ? vv_time_ms() + wait_ms : 0.0;
     vv_mutex_lock(&e->lock);
     for (;;) {
         for (int i = 0; i < e->n_slots; i++) {
@@ -215,9 +218,20 @@ static int acquire_slot(vv_engine_t* e) {
                 return i;
             }
         }
-        vv_cond_wait(&e->slot_free, &e->lock);
+        if (wait_ms < 0) {
+            vv_cond_wait(&e->slot_free, &e->lock);
+            continue;
+        }
+        const double left = deadline - vv_time_ms();
+        if (left <= 0.0) {
+            vv_mutex_unlock(&e->lock);
+            return -1;
+        }
+        vv_cond_timedwait(&e->slot_free, &e->lock, (int)left + 1);
     }
 }
+
+static int acquire_slot(vv_engine_t* e) { return acquire_slot_wait(e, -1); }
 
 static void release_slot(vv_engine_t* e, int idx, bool ok) {
     vv_mutex_lock(&e->lock);
@@ -274,6 +288,13 @@ bool vv_engine_is_streaming(const vv_engine_t* e) {
 vv_status_t vv_engine_stream_open(vv_engine_t* e,
                                   const vv_stream_params_t* params,
                                   int sample_rate, vv_engine_stream_t** out) {
+    return vv_engine_stream_open_ex(e, params, sample_rate, -1, out);
+}
+
+vv_status_t vv_engine_stream_open_ex(vv_engine_t* e,
+                                     const vv_stream_params_t* params,
+                                     int sample_rate, int wait_ms,
+                                     vv_engine_stream_t** out) {
     if (!e || !params || !out) return VV_ERR_NULL_PTR;
     *out = NULL;
     if (!vv_engine_is_streaming(e)) return VV_ERR_UNSUPPORTED;
@@ -290,7 +311,11 @@ vv_status_t vv_engine_stream_open(vv_engine_t* e,
     vv_status_t st = vv_resampler_create(sample_rate, target, &s->rs);
     if (st != VV_OK) { vv_free(s); return st; }
 
-    s->slot = acquire_slot(e);
+    s->slot = acquire_slot_wait(e, wait_ms);
+    if (s->slot < 0) {
+        vv_engine_stream_close(s);
+        return VV_ERR_BUSY;
+    }
     vv_inference_ctx_t* ctx = e->slots[s->slot];
     memset(&ctx->last_perf, 0, sizeof(ctx->last_perf));
     if (ctx->use_gpu) st = vv_dev_set_device(ctx->gpu_id);

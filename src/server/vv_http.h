@@ -96,6 +96,15 @@ bool vv_http_sse_send(vv_http_res_t* res, const char* event, const char* data);
 int vv_http_read(vv_http_res_t* res, void* buf, size_t cap, int timeout_ms);
 
 /**
+ * @brief Whether the client has closed its end (or the socket failed),
+ *        without waiting and without consuming anything it sent.
+ *
+ * Bytes still unread count as "not gone": what the client sent before
+ * closing is read first, and its EOF shows up after.
+ */
+bool vv_http_peer_gone(vv_http_res_t* res);
+
+/**
  * @brief Validate a WebSocket upgrade and answer 101, or 400 if invalid.
  * @return true when the connection is now a WebSocket
  */

@@ -39,6 +39,35 @@ int main(void) {
     CHECK(!vv_queue_enter(&q));
     vv_queue_leave(&q); CHECK(vv_queue_enter(&q));
     vv_queue_leave(&q); vv_queue_leave(&q); vv_queue_destroy(&q);
-    puts("queue: FIFO, overflow, reuse and zero-capacity passed");
+
+    /* try_enter: in when a slot is free, out after the wait when not. */
+    vv_queue_init(&q, 1, 4);
+    CHECK(vv_queue_try_enter(&q, 0));
+    const double t0 = vv_time_ms();
+    CHECK(!vv_queue_try_enter(&q, 50));
+    const double waited = vv_time_ms() - t0;
+    CHECK(waited >= 40 && waited < 2000);
+    CHECK(q.rejected == 1);
+    vv_queue_leave(&q);
+    CHECK(vv_queue_try_enter(&q, 0));
+    /* ... and never ahead of a request already queued for the slot. */
+    count = 0;
+    order[0] = order[1] = -1;
+    vv_thread_t th;
+    CHECK(vv_thread_start(&th, run, &tasks[0]));
+    for (int tries = 0; tries < 5000; tries++) {
+        int waiting = 0;
+        vv_mutex_lock(&q.lock); waiting = q.waiting; vv_mutex_unlock(&q.lock);
+        if (waiting == 1) break;
+        vv_sleep_ms(1);
+    }
+    vv_queue_leave(&q);
+    vv_thread_join(th);
+    CHECK(count == 1);
+    CHECK(q.active == 0);
+    CHECK(vv_queue_try_enter(&q, 0));
+    vv_queue_leave(&q);
+    vv_queue_destroy(&q);
+    puts("queue: FIFO, overflow, reuse, zero-capacity and try_enter passed");
     return 0;
 }

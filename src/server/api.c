@@ -13,6 +13,7 @@
 #include "vv_ws.h"
 #include "cJSON.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,9 @@ struct vv_server {
     char         model_name[128];
     char         api_key[256];
     int          acoustic_sampling;
+    int          stream_idle_ms;
+    int          stream_slot_wait_ms;
+    double       stream_reserve_sec;
     uint64_t     started_at;
     uint64_t     n_requests;
     uint64_t     n_errors;
@@ -436,15 +440,8 @@ static void handle_transcriptions(vv_server_t* sv, const vv_http_req_t* req,
  */
 static const char* hotbuf_joined(const vv_inference_params_t* ip,
                                  char* prompt) {
-    char joined[1024];
-    size_t w = 0;
-    joined[0] = '\0';
-    for (int i = 0; i < ip->num_hotwords; i++) {
-        const int k = snprintf(joined + w, sizeof(joined) - w, "%s%s",
-                               w ? ", " : "", ip->hotwords[i]);
-        if (k < 0 || (size_t)k >= sizeof(joined) - w) break;
-        w += (size_t)k;
-    }
+    char joined[VV_HOTWORDS_MAX];
+    vv_hotwords_join(ip->hotwords, ip->num_hotwords, joined, sizeof(joined));
     snprintf(prompt, 1024, "%s", joined);
     return prompt[0] ? prompt : NULL;
 }
@@ -471,6 +468,8 @@ static const char* stream_status_msg(vv_status_t s) {
         case VV_ERR_KV_POOL_EXHAUSTED:
             return "KV cache pool exhausted by concurrent sessions; retry "
                    "later";
+        case VV_ERR_BUSY:
+            return "every slot is held by a live session; retry later";
         default:
             return vv_status_str(s);
     }
@@ -478,7 +477,7 @@ static const char* stream_status_msg(vv_status_t s) {
 
 /* An OpenAI error envelope for status `s`. */
 static void error_json(strbuf_t* b, vv_status_t s, const char* prefix) {
-    const bool busy = s == VV_ERR_KV_POOL_EXHAUSTED;
+    const bool busy = s == VV_ERR_KV_POOL_EXHAUSTED || s == VV_ERR_BUSY;
     sb_puts(b, "{\"type\":\"error\",\"error\":{\"type\":\"");
     sb_puts(b, busy ? "server_overloaded" : "server_error");
     sb_puts(b, "\",\"message\":\"");
@@ -518,6 +517,11 @@ static void sse_event(void* user, const vv_stream_event_t* ev) {
         st->chunks++;
     }
     sb_free(&b);
+    /* Between chunks nothing is written, so a write cannot fail: look at
+     * the socket instead, once per token. */
+    if (!st->gone && ev->type == VV_STREAM_EVENT_DELTA &&
+        vv_http_peer_gone(st->res))
+        st->gone = true;
     /* A client that left cancels the session: the slot is released at the
      * next token, not after the rest of the file. */
     if (st->gone && st->es) vv_engine_stream_cancel(st->es);
@@ -586,16 +590,20 @@ static void sse_transcribe(vv_server_t* sv, vv_http_res_t* res,
     sp.context_info = context_info;
     sp.on_event = sse_event;
     sp.user = &st;
+    /* The whole upload's KV, or a 503 now rather than a stall halfway. */
+    sp.kv_reserve_sec = duration;
+    sp.kv_no_wait = true;
     (void)ip;
 
     vv_engine_stream_t* es = NULL;
-    vv_status_t s = vv_engine_stream_open(sv->engine, &sp, sample_rate, &es);
+    vv_status_t s = vv_engine_stream_open_ex(sv->engine, &sp, sample_rate,
+                                             sv->stream_slot_wait_ms, &es);
     if (s != VV_OK) {
+        const bool busy = s == VV_ERR_KV_POOL_EXHAUSTED || s == VV_ERR_BUSY;
         count_request(sv, false, 0, 0);
-        vv_http_error(res, s == VV_ERR_KV_POOL_EXHAUSTED ? 503 : 500,
-                      s == VV_ERR_KV_POOL_EXHAUSTED ? "server_overloaded"
-                                                    : "server_error",
-                      vv_status_str(s));
+        vv_http_error(res, busy ? 503 : 500,
+                      busy ? "server_overloaded" : "server_error",
+                      stream_status_msg(s));
         return;
     }
     st.es = es;
@@ -630,7 +638,7 @@ static void sse_transcribe(vv_server_t* sv, vv_http_res_t* res,
 /* ─── WebSocket /v1/audio/stream ────────────────────────────────────────── */
 
 #define WS_MAX_MESSAGE (4u << 20)   /* one message of PCM: 4 MB */
-#define WS_IDLE_MS     60000        /* a silent client is dropped after 60 s */
+#define WS_CLOSE_TRY_AGAIN 1013     /* RFC 6455 "try again later" */
 
 typedef struct {
     vv_server_t*        sv;
@@ -648,6 +656,7 @@ typedef struct {
     char                close_reason[96];
     vv_status_t         failed;
     double              t_start;
+    double              t_data;      /* last audio or JSON message */
     int64_t             samples;
 } ws_state_t;
 
@@ -705,6 +714,12 @@ static void ws_event(void* user, const vv_stream_event_t* ev) {
         sb_json_escaped(&b, ev->text);
         sb_printf(&b, "\",\"duration\":%.3f}", ev->audio_end);
         ws_text(w, b.buf);
+    } else if (ev->type == VV_STREAM_EVENT_DELTA && !w->gone &&
+               vv_http_peer_gone(w->res)) {
+        /* Deltas are not sent here, so no write would fail until the chunk
+         * is done: a client that left is noticed at the next token. */
+        w->gone = true;
+        if (w->es) vv_engine_stream_cancel(w->es);
     }
     sb_free(&b);
 }
@@ -721,7 +736,15 @@ static void ws_start(ws_state_t* w, const cJSON* msg) {
         return;
     }
     const cJSON* sr = cJSON_GetObjectItemCaseSensitive(msg, "sample_rate");
-    w->sample_rate = cJSON_IsNumber(sr) ? (int)sr->valuedouble : 24000;
+    /* The range on the double, before any cast: converting a value an int
+     * cannot hold (1e300, NaN) is undefined behaviour. */
+    const double rate = cJSON_IsNumber(sr) ? sr->valuedouble : 24000.0;
+    if (!(rate >= 8000.0 && rate <= 192000.0)) {
+        ws_fail(w, VV_ERR_INVALID_ARG, 1008, "invalid_request_error",
+                "sample_rate must be 8000..192000");
+        return;
+    }
+    w->sample_rate = (int)rate;
     const char* fmt = json_str(msg, "format");
     if (!fmt || strcmp(fmt, "pcm_s16le") == 0) w->f32 = false;
     else if (strcmp(fmt, "pcm_f32le") == 0) w->f32 = true;
@@ -730,40 +753,28 @@ static void ws_start(ws_state_t* w, const cJSON* msg) {
                 "format is pcm_s16le or pcm_f32le");
         return;
     }
-    if (w->sample_rate < 8000 || w->sample_rate > 192000) {
-        ws_fail(w, VV_ERR_INVALID_ARG, 1008, "invalid_request_error",
-                "sample_rate must be 8000..192000");
-        return;
-    }
-    const char* hot = json_str(msg, "hotwords");
-    char ctx_info[1024];
-    ctx_info[0] = '\0';
-    if (hot) {
-        /* "A,B" -> "A, B", as the batch prompt joins hotwords. */
-        size_t k = 0;
-        for (const char* q = hot; *q && k + 3 < sizeof(ctx_info); q++) {
-            if (*q == ',') {
-                ctx_info[k++] = ',';
-                ctx_info[k++] = ' ';
-                while (q[1] == ' ') q++;
-            } else {
-                ctx_info[k++] = *q;
-            }
-        }
-        ctx_info[k] = '\0';
-    }
+    /* "A,B" -> "A, B", the way every prompt joins hotwords. */
+    char ctx_info[VV_HOTWORDS_MAX];
+    vv_hotwords_join_csv(json_str(msg, "hotwords"), ctx_info,
+                         sizeof(ctx_info));
 
     vv_stream_params_t sp;
     vv_stream_params_default(&sp);
     sp.context_info = ctx_info[0] ? ctx_info : NULL;
     sp.on_event = ws_event;
     sp.user = w;
-    const vv_status_t s = vv_engine_stream_open(w->sv->engine, &sp,
-                                                w->sample_rate, &w->es);
+    /* Admission against the shared KV pool, and a pool that runs dry later
+     * ends this session rather than parking it (its socket unread). */
+    sp.kv_reserve_sec = w->sv->stream_reserve_sec;
+    sp.kv_no_wait = true;
+    const vv_status_t s = vv_engine_stream_open_ex(w->sv->engine, &sp,
+                                                   w->sample_rate,
+                                                   w->sv->stream_slot_wait_ms,
+                                                   &w->es);
     if (s != VV_OK) {
-        ws_fail(w, s, 1011, s == VV_ERR_KV_POOL_EXHAUSTED ? "server_overloaded"
-                                                          : "server_error",
-                NULL);
+        const bool busy = s == VV_ERR_KV_POOL_EXHAUSTED || s == VV_ERR_BUSY;
+        ws_fail(w, s, busy ? WS_CLOSE_TRY_AGAIN : 1011,
+                busy ? "server_overloaded" : "server_error", NULL);
         return;
     }
     w->t_start = vv_time_ms();
@@ -817,8 +828,9 @@ static void ws_pcm(ws_state_t* w, const uint8_t* data, size_t len) {
     const vv_status_t s = vv_engine_stream_push(w->es, w->pcm, n);
     if (s == VV_ERR_CANCELLED) { w->done = true; return; }
     if (s != VV_OK)
-        ws_fail(w, s, 1011, s == VV_ERR_KV_POOL_EXHAUSTED ? "server_overloaded"
-                                                          : "server_error",
+        ws_fail(w, s, s == VV_ERR_KV_POOL_EXHAUSTED ? WS_CLOSE_TRY_AGAIN : 1011,
+                s == VV_ERR_KV_POOL_EXHAUSTED ? "server_overloaded"
+                                              : "server_error",
                 NULL);
 }
 
@@ -837,7 +849,15 @@ static void ws_message(void* user, int opcode, const uint8_t* data,
         w->close_code = VV_WS_CLOSE_NORMAL;
         return;
     }
-    if (opcode == VV_WS_OP_BINARY) { ws_pcm(w, data, len); return; }
+    /* Only audio and requests keep a session alive; pings and pongs are
+     * answered but do not, or a client could hold a slot on pings alone. */
+    w->t_data = vv_time_ms();
+    if (opcode == VV_WS_OP_BINARY) {
+        ws_pcm(w, data, len);
+        /* The chunks it ran are server time, not client silence. */
+        w->t_data = vv_time_ms();
+        return;
+    }
 
     cJSON* msg = cJSON_ParseWithLength((const char*)data, len);
     const char* type = msg ? json_str(msg, "type") : NULL;
@@ -892,20 +912,39 @@ static void handle_ws_stream(vv_server_t* sv, const vv_http_req_t* req,
         ps = vv_ws_parser_feed(&parser, (const uint8_t*)req->body,
                                req->body_len, ws_message, &w);
     uint8_t* buf = (uint8_t*)vv_alloc(64 * 1024);
-    int idle_ms = 0;
+    /* Idle is counted from the last audio or JSON message (connecting
+     * counts as one), not the last byte: pings do not hold a slot. */
+    w.t_data = vv_time_ms();
+    const int idle_ms = sv->stream_idle_ms > 0 ? sv->stream_idle_ms : 60000;
     while (buf && ps == VV_OK && !w.done && !w.gone) {
-        const int n = vv_http_read(res, buf, 64 * 1024, 1000);
-        if (n == -2) {
-            idle_ms += 1000;
-            if (idle_ms >= WS_IDLE_MS) {
-                ws_fail(&w, VV_ERR_IO, 1001, "invalid_request_error",
-                        "no data for 60 s");
-            }
-            continue;
+        const int n = vv_http_read(res, buf, 64 * 1024,
+                                   idle_ms < 1000 ? idle_ms : 1000);
+        if (n > 0) {
+            ps = vv_ws_parser_feed(&parser, buf, (size_t)n, ws_message, &w);
+        } else if (n != -2) {
+            w.gone = true;                      /* the client went away */
+            break;
         }
-        if (n <= 0) { w.gone = true; break; }   /* the client went away */
-        idle_ms = 0;
-        ps = vv_ws_parser_feed(&parser, buf, (size_t)n, ws_message, &w);
+        if (!w.done && !w.gone && vv_time_ms() - w.t_data >= idle_ms) {
+            char why[96];
+            snprintf(why, sizeof(why), "no audio or message for %d s",
+                     idle_ms / 1000);
+            ws_fail(&w, VV_ERR_IO, 1008, "invalid_request_error", why);
+        }
+        /*
+         * A trickle of audio (a few samples a minute) would keep the idle
+         * timer happy and the slot held for ever. Past one idle window a
+         * session must have sent at least a tenth of the wall time it has
+         * held the slot for; a live microphone sends all of it.
+         */
+        if (!w.done && !w.gone && w.es && w.sample_rate > 0) {
+            const double held = vv_time_ms() - w.t_start;
+            const double audio_ms = (double)w.samples * 1000.0 /
+                                    (double)w.sample_rate;
+            if (held > idle_ms && audio_ms * 10.0 < held - idle_ms)
+                ws_fail(&w, VV_ERR_IO, 1008, "invalid_request_error",
+                        "audio arrives at under a tenth of real time");
+        }
     }
     if (ps != VV_OK && !w.gone) {
         ws_close(&w, parser.close_code ? parser.close_code : 1002, NULL);
@@ -953,16 +992,29 @@ static bool authorized(const vv_server_t* sv, const vv_http_req_t* req) {
     if (!sv->api_key[0]) return true;
     const char* h = vv_http_header(req, "Authorization");
     if (!h && strcmp(req->path, "/v1/audio/stream") == 0) {
-        /* Browsers cannot set headers on a WebSocket: ?api_key=... */
-        char key[256];
+        /* Browsers cannot set headers on a WebSocket: ?api_key=..., which
+         * a browser percent-encodes ('+', '/', '=' of a base64 key). A
+         * value longer than any key (sv->api_key is 256 bytes) cannot
+         * match, so it is refused rather than cut to size. */
+        char key[sizeof(sv->api_key) + 1];
         const char* q = req->query;
         while (q && *q) {
             if (strncmp(q, "api_key=", 8) == 0) {
                 size_t n = 0;
                 q += 8;
-                while (q[n] && q[n] != '&' && n + 1 < sizeof(key)) {
-                    key[n] = q[n];
-                    n++;
+                while (*q && *q != '&') {
+                    if (n + 1 >= sizeof(key)) return false;
+                    int c = (unsigned char)*q++;
+                    if (c == '+') {
+                        c = ' ';
+                    } else if (c == '%' && isxdigit((unsigned char)q[0]) &&
+                               isxdigit((unsigned char)q[1])) {
+                        const char hx[3] = { q[0], q[1], 0 };
+                        c = (int)strtol(hx, NULL, 16);
+                        q += 2;
+                    }
+                    if (c == 0) return false;
+                    key[n++] = (char)c;
                 }
                 key[n] = '\0';
                 return key_equal(key, sv->api_key);
@@ -1009,9 +1061,19 @@ static void route(const vv_http_req_t* req, vv_http_res_t* res, void* user) {
         return;
     }
     if (strcmp(p, "/v1/audio/stream") == 0) {
-        if (!vv_queue_enter(&sv->queue)) {
+        /*
+         * A live session holds its slot for as long as its audio lasts, so
+         * it is not queued behind other holders: a slot free within
+         * --stream-slot-wait, or 503 before the upgrade.
+         */
+        if (!vv_engine_is_streaming(sv->engine)) {
+            handle_ws_stream(sv, req, res);     /* answers 400 */
+            return;
+        }
+        if (!vv_queue_try_enter(&sv->queue, sv->stream_slot_wait_ms)) {
             vv_http_error(res, 503, "server_overloaded",
-                          "transcription queue is full; retry later");
+                          "every slot is held by a live session; retry "
+                          "later");
             return;
         }
         handle_ws_stream(sv, req, res);
@@ -1067,6 +1129,11 @@ vv_status_t vv_server_run(vv_engine_t* engine, const vv_server_params_t* params,
     }
     if (p.api_key) snprintf(sv->api_key, sizeof(sv->api_key), "%s", p.api_key);
     sv->acoustic_sampling = p.acoustic_sampling;
+    sv->stream_idle_ms = p.stream_idle_ms > 0 ? p.stream_idle_ms : 60000;
+    sv->stream_slot_wait_ms = p.stream_slot_wait_ms >= 0
+                              ? p.stream_slot_wait_ms : 5000;
+    sv->stream_reserve_sec = p.stream_reserve_sec > 0.0
+                             ? p.stream_reserve_sec : 0.0;
 
     const int conns = p.max_conns > 0 ? p.max_conns
                                       : vv_engine_slots(engine) + p.queue_size + 8;
@@ -1075,6 +1142,11 @@ vv_status_t vv_server_run(vv_engine_t* engine, const vv_server_params_t* params,
     VV_LOG_I("server: model '%s', %d slot(s)%s",
              sv->model_name, vv_engine_slots(engine),
              sv->api_key[0] ? ", api key required" : "");
+    if (vv_engine_is_streaming(engine))
+        VV_LOG_I("server: live sessions hold a slot each; %.0f s of KV "
+                 "reserved per session, dropped after %d s without audio, "
+                 "%d ms to wait for a slot", sv->stream_reserve_sec,
+                 sv->stream_idle_ms / 1000, sv->stream_slot_wait_ms);
     if (sv->acoustic_sampling)
         VV_LOG_W("server: acoustic sampling is '%s', so identical audio may "
                  "come back worded differently",

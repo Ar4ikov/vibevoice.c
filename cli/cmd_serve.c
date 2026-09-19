@@ -51,6 +51,16 @@ static void usage(void) {
         "                        off — slots share one pool of KV pages\n"
         "  --acoustic-sampling M mode (default) | fix | gaussian; a draw per\n"
         "                        request, so answers stop being reproducible\n"
+        "  --stream-reserve <s>  Streaming models: seconds of audio whose KV a\n"
+        "                        live session must get at open, or it is\n"
+        "                        refused (503 / close 1013). Default 180;\n"
+        "                        0 = none\n"
+        "  --stream-idle <s>     Close a WebSocket after this long without\n"
+        "                        audio or a message; pings do not count\n"
+        "                        (default: 60)\n"
+        "  --stream-slot-wait <s> How long a new live session waits for a\n"
+        "                        free slot before server_overloaded\n"
+        "                        (default: 5)\n"
         "  --vram-budget <0-1>   Fraction of free VRAM to use\n"
         "  --cpu                 CPU-only\n"
         "  --verbose\n\n"
@@ -134,6 +144,27 @@ int vv_cmd_serve(int argc, char** argv) {
                 return 1;
             }
             sp.acoustic_sampling = (int)m;
+        }
+        else if (strcmp(a, "--stream-reserve") == 0 && next) {
+            sp.stream_reserve_sec = atof(argv[++i]);
+            if (sp.stream_reserve_sec < 0) sp.stream_reserve_sec = 0;
+        }
+        else if (strcmp(a, "--stream-idle") == 0 && next) {
+            const double v = atof(argv[++i]);
+            if (!(v > 0 && v < 86400)) {
+                fprintf(stderr, "serve: --stream-idle is seconds, 0..86400\n");
+                return 1;
+            }
+            sp.stream_idle_ms = (int)(v * 1000.0);
+        }
+        else if (strcmp(a, "--stream-slot-wait") == 0 && next) {
+            const double v = atof(argv[++i]);
+            if (!(v >= 0 && v < 3600)) {
+                fprintf(stderr, "serve: --stream-slot-wait is seconds, "
+                                "0..3600\n");
+                return 1;
+            }
+            sp.stream_slot_wait_ms = (int)(v * 1000.0);
         }
         else if (strcmp(a, "--cpu") == 0) { ep.cpu_only = true; }
         else if (strcmp(a, "--verbose") == 0) { verbose = true; }

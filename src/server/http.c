@@ -650,6 +650,23 @@ int vv_http_read(vv_http_res_t* res, void* buf, size_t cap, int timeout_ms) {
     return n < 0 ? -1 : n;
 }
 
+bool vv_http_peer_gone(vv_http_res_t* res) {
+    if (!res) return true;
+    const SOCKET fd = (SOCKET)(intptr_t)res->fd;
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(fd, &rd);
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    const int r = select((int)fd + 1, &rd, NULL, NULL, &tv);
+    if (r == 0) return false;          /* nothing to read: still there */
+    if (r < 0) return true;
+    char c;
+    const int n = (int)recv(fd, &c, 1, MSG_PEEK);
+    return n <= 0;                     /* EOF or a reset */
+}
+
 static bool header_has_token(const char* value, const char* token) {
     /* Comma-separated, case-insensitive: "keep-alive, Upgrade". */
     const size_t tl = strlen(token);

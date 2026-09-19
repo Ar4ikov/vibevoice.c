@@ -116,6 +116,22 @@ vv_status_t vv_engine_stream_open(vv_engine_t* e,
                                   const vv_stream_params_t* params,
                                   int sample_rate, vv_engine_stream_t** out);
 
+/**
+ * @brief vv_engine_stream_open() that waits at most `wait_ms` for a slot
+ *        (< 0: as long as it takes).
+ *
+ * A live session keeps its slot for as long as the audio lasts, so a server
+ * cannot let the next client queue behind it indefinitely: it asks with a
+ * bound and turns VV_ERR_BUSY into "overloaded, retry".
+ *
+ * @return VV_ERR_BUSY when no slot freed up in time; VV_ERR_KV_POOL_EXHAUSTED
+ *         when the shared KV pool cannot cover `params->kv_reserve_sec`.
+ */
+vv_status_t vv_engine_stream_open_ex(vv_engine_t* e,
+                                     const vv_stream_params_t* params,
+                                     int sample_rate, int wait_ms,
+                                     vv_engine_stream_t** out);
+
 /** @brief Push mono PCM at the session's rate; runs every ready chunk. */
 vv_status_t vv_engine_stream_push(vv_engine_stream_t* s, const float* pcm,
                                   size_t n);
@@ -123,7 +139,8 @@ vv_status_t vv_engine_stream_push(vv_engine_stream_t* s, const float* pcm,
 /** @brief End of audio: the resampler's tail, the padded windows, DONE. */
 vv_status_t vv_engine_stream_finish(vv_engine_stream_t* s);
 
-/** @brief Stop at the next token (any thread); see vv_stream_cancel(). */
+/** @brief Stop at the next token (safe from any thread); see
+ *         vv_stream_cancel(). */
 void vv_engine_stream_cancel(vv_engine_stream_t* s);
 
 /** @brief The underlying session (transcript, stats). */
