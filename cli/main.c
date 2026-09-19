@@ -110,8 +110,9 @@ static void print_usage(const char* prog) {
         "  --kv-cache FMT        KV-cache storage: fp16 (default), fp8,\n"
         "                        fp8-e5m2, tq4, tq3, tq2, tq1.5\n"
         "  --quant <fmt>         Weights: auto (default: as the checkpoint\n"
-        "                        stores them) | none | nf4 | int4 — the last\n"
-        "                        three quantize a dense checkpoint at load\n"
+        "                        stores them) | none | nf4 | int4 | int8 — the\n"
+        "                        last three quantize a dense checkpoint at\n"
+        "                        load\n"
         "  --vram-budget <0-1>   VRAM fraction for model (default: 1.0)\n"
         "  --gpu-layers <N>      Layers to keep on the GPU (-1 = fit to VRAM)\n"
         "  --acoustic-sampling M mode (default, deterministic) | fix |\n"
@@ -313,7 +314,7 @@ int main(int argc, char** argv) {
     if (args.quant) {
         const vv_load_quant_t q = vv_load_quant_parse(args.quant);
         if (q >= VV_LOAD_QUANT_COUNT) {
-            fprintf(stderr, "error: --quant is auto, none, nf4 or int4, "
+            fprintf(stderr, "error: --quant is auto, none, nf4, int4 or int8, "
                             "not '%s'\n", args.quant);
             vv_free(raw_audio);
             return 1;

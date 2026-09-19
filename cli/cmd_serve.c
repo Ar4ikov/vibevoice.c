@@ -42,8 +42,9 @@ static void usage(void) {
         "                        the model on each device, or one split across\n"
         "  --max-seq-len <n>     Per-slot KV window (default: 32768)\n"
         "  --kv-cache <fmt>      fp16 | fp8 | fp8-e5m2 | tq4 | tq3 | tq2 | tq1.5\n"
-        "  --quant <fmt>         auto (default) | none | nf4 | int4 — weights\n"
-        "                        of a dense checkpoint, quantized at load\n"
+        "  --quant <fmt>         auto (default) | none | nf4 | int4 | int8 —\n"
+        "                        weights of a dense checkpoint, quantized at\n"
+        "                        load\n"
         "  --acoustic-sampling M mode (default) | fix | gaussian; a draw per\n"
         "                        request, so answers stop being reproducible\n"
         "  --vram-budget <0-1>   Fraction of free VRAM to use\n"
@@ -97,7 +98,7 @@ int vv_cmd_serve(int argc, char** argv) {
         else if (strcmp(a, "--quant") == 0 && next) {
             const vv_load_quant_t q = vv_load_quant_parse(argv[++i]);
             if (q >= VV_LOAD_QUANT_COUNT) {
-                fprintf(stderr, "error: --quant is auto, none, nf4 or int4, "
+                fprintf(stderr, "error: --quant is auto, none, nf4, int4 or int8, "
                                 "not '%s'\n", argv[i]);
                 return 1;
             }

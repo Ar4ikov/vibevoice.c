@@ -338,6 +338,14 @@ static vv_status_t quant_linear(
         s = vv_nf4_gemm_dev(x, (const uint8_t*)w->tensor.data,
                              w->quant.scales.data, y, scratch,
                              M, N, K, 64, stream);
+    } else if (w->quant_kind == VV_QUANT_INT8) {
+        if (M == 1)
+            return vv_int8_gemv_dev(x, (const int8_t*)w->tensor.data,
+                                    (const float*)w->quant.scales.data,
+                                    w->bias.data, y, N, K, stream);
+        s = vv_int8_gemm_dev(x, (const int8_t*)w->tensor.data,
+                             (const float*)w->quant.scales.data, y, scratch,
+                             M, N, K, stream);
     } else {
         s = vv_gemm_fp16_dev(x, w->tensor.data, y, M, N, K,
                               1.0f, 0.0f, stream);
@@ -828,6 +836,28 @@ vv_status_t vv_decoder_prefill(
  * CPU decoder — per-layer forward (FP32 activations, quantized weights)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/** @brief Run one projection in whatever format its weights are stored in. */
+static vv_status_t cpu_proj(const vv_weight_t* w, const float* in, float* out,
+                            int M, int N, int K) {
+    switch (w->quant_kind) {
+    case VV_QUANT_INT4G:
+        return vv_int4g_gemm_cpu(in, (const uint8_t*)w->tensor.data,
+                                 w->quant.scales.data, w->mins.data,
+                                 w->bias.data, out, M, N, K, w->group_size);
+    case VV_QUANT_NF4:
+        return vv_nf4_gemm_cpu(in, (const uint8_t*)w->tensor.data,
+                               w->quant.scales.data, w->bias.data,
+                               out, M, N, K);
+    case VV_QUANT_INT8:
+        return vv_int8_gemm_cpu(in, (const int8_t*)w->tensor.data,
+                                (const float*)w->quant.scales.data,
+                                w->bias.data, out, M, N, K);
+    default:
+        return vv_gemm_f16w_cpu(in, w->tensor.data, w->bias.data, out,
+                                M, N, K);
+    }
+}
+
 /**
  * @brief One transformer layer on the CPU, FP32 activations.
  *
@@ -871,7 +901,7 @@ static vv_status_t decoder_layer_cpu(
     float* mlp_out  = wp + off;
 
     /** Run one projection in whatever format its weights are stored in. */
-    #define CPU_PROJ(w, in, out_buf, M, N, KK)                                      do {                                                                            if ((w).quant_kind == VV_QUANT_INT4G) {                                         s = vv_int4g_gemm_cpu((in), (const uint8_t*)(w).tensor.data,                        (w).quant.scales.data, (w).mins.data,                                       (w).bias.data, (out_buf), (M), (N), (KK),                                   (w).group_size);                                                } else if ((w).quant_kind == VV_QUANT_NF4) {                                    s = vv_nf4_gemm_cpu((in), (const uint8_t*)(w).tensor.data,                          (w).quant.scales.data, (w).bias.data,                                       (out_buf), (M), (N), (KK));                                     } else {                                                                        s = vv_gemm_f16w_cpu((in), (w).tensor.data,                                         (w).bias.data, (out_buf), (M), (N), (KK));                      }                                                                           if (s != VV_OK) return s;                                               } while (0)
+    #define CPU_PROJ(w, in, out_buf, M, N, KK) do { s = cpu_proj(&(w), (in), (out_buf), (M), (N), (KK)); if (s != VV_OK) return s; } while (0)
 
     s = vv_rmsnorm_cpu(hidden_states, layer->input_layernorm.data, norm_out,
                        seq_len, hs, config->rms_norm_eps);

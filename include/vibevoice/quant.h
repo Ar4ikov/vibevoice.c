@@ -16,6 +16,17 @@ typedef enum vv_quant_kind {
     VV_QUANT_NONE  = 0,  /**< Dense FP16/BF16                               */
     VV_QUANT_NF4   = 1,  /**< bitsandbytes NF4, block 64, double-quantized  */
     VV_QUANT_INT4G = 2,  /**< INT4 group-affine (AWQ / GPTQ, repacked)      */
+    /**
+     * INT8, symmetric, one FP32 scale per output channel. Slots of
+     * vv_weight_t:
+     *   tensor        int8 [N][K]  (VV_DTYPE_I8)
+     *   quant.scales  FP32 [N]     w = q * scale
+     *   mins          unused
+     * The kernels here run it against FP16/FP32 activations (W8A16). The
+     * layout is the one the W8A8 work (#18) uses, so the same weights can
+     * later run on int8 activations too.
+     */
+    VV_QUANT_INT8  = 3,
 } vv_quant_kind_t;
 
 /**
@@ -62,10 +73,12 @@ typedef enum vv_load_quant {
     VV_LOAD_QUANT_NONE,      /**< dense FP16                               */
     VV_LOAD_QUANT_NF4,       /**< NF4, blockwise absmax 64, FP16 scales    */
     VV_LOAD_QUANT_INT4,      /**< INT4G asymmetric, group 128              */
+    VV_LOAD_QUANT_INT8,      /**< INT8 symmetric, per output channel       */
     VV_LOAD_QUANT_COUNT
 } vv_load_quant_t;
 
-/** @brief "auto" | "none" | "nf4" | "int4" → value; COUNT when unknown. */
+/** @brief "auto" | "none" | "nf4" | "int4" | "int8" → value; COUNT when
+ *         unknown. */
 vv_load_quant_t vv_load_quant_parse(const char* name);
 
 /** @brief Name for logs and --help; "?" when out of range. */
@@ -92,6 +105,18 @@ const char* vv_load_quant_name(vv_load_quant_t q);
  */
 vv_status_t vv_nf4_quantize(const float* w, int N, int K,
                             uint8_t* out_packed, uint16_t* out_scales);
+
+/**
+ * @brief Per-output-channel symmetric int8 quantization of dense rows.
+ *
+ * scale[n] = max|w[n,:]| / 127 and q = round-half-even(w / scale), clamped
+ * to [-127, 127]; -128 is never produced. A row of zeros gets scale 0 and
+ * zero codes; NaN weights become 0.
+ *
+ * Rows are independent: the result does not depend on the thread count.
+ */
+vv_status_t vv_int8_quantize_rows(const float* w, int N, int K,
+                                  int8_t* out_q, float* out_scale);
 
 #ifdef __cplusplus
 }

@@ -307,6 +307,11 @@ int vv_cpu_threads(void) {
 #endif
 }
 
+int vv_cpu_physical_cores(void) {
+    const int n = physical_cores();
+    return n > 0 ? n : 0;
+}
+
 /* ─── Dequantize one weight row ─────────────────────────────────────────── */
 
 static void nf4_row_scalar(const uint8_t* __restrict w,
@@ -425,6 +430,46 @@ static void f16_row_avx2(const uint16_t* __restrict src,
             _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(src + i))));
     for (; i < n; i++) dst[i] = vv_half_to_float(src[i]);
 }
+
+__attribute__((target("avx2")))
+static void int8_row_avx2(const int8_t* __restrict q, float scale,
+                          float* __restrict dst, int n) {
+    const __m256 s = _mm256_set1_ps(scale);
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(s, _mm256_cvtepi32_ps(
+            _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(q + i))))));
+    for (; i < n; i++) dst[i] = (float)q[i] * scale;
+}
+
+/**
+ * @brief sum_k q[k] * x[k] for one int8 row; the caller applies the scale.
+ *
+ * Two independent chains, sixteen weights per step: the row is read once,
+ * straight into the FMA, which is what decode (M = 1) is bound by.
+ */
+__attribute__((target("avx2,fma")))
+static float int8_dot_avx2(const int8_t* __restrict q,
+                           const float* __restrict x, int n) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m128i b = _mm_loadu_si128((const __m128i*)(q + i));
+        a0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b)),
+                             _mm256_loadu_ps(x + i), a0);
+        a1 = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b, 8))),
+            _mm256_loadu_ps(x + i + 8), a1);
+    }
+    const __m256 acc = _mm256_add_ps(a0, a1);
+    __m128 lo = _mm_add_ps(_mm256_castps256_ps128(acc),
+                           _mm256_extractf128_ps(acc, 1));
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float sum = _mm_cvtss_f32(lo);
+    for (; i < n; i++) sum += (float)q[i] * x[i];
+    return sum;
+}
 #endif /* VV_X86 && __GNUC__ */
 
 #ifdef VV_NEON
@@ -511,6 +556,13 @@ static void int4g_row_scalar(const uint8_t* __restrict w,
             o[2 * j + 1] = (float)(wb[j] & 0xF) * s + m;
         }
     }
+}
+
+static void int8_row(const int8_t* q, float scale, float* dst, int n) {
+#if defined(VV_X86) && defined(__GNUC__)
+    if (simd_kind() == SIMD_AVX2) { int8_row_avx2(q, scale, dst, n); return; }
+#endif
+    for (int i = 0; i < n; i++) dst[i] = (float)q[i] * scale;
 }
 
 static void f16_row(const uint16_t* src, float* dst, int n) {
@@ -659,6 +711,8 @@ typedef struct {
     const uint16_t* wf16;     /**< FP16 weights, when there are no codes    */
     int             group;    /**< weights per scale (64 for NF4)           */
     int             K;
+    const int8_t*   w8;       /**< INT8 codes [N][K]                        */
+    const float*    rscale;   /**< INT8 only: one FP32 scale per row        */
 } bpanel_src_t;
 
 /**
@@ -752,6 +806,14 @@ static void packb_f16_ref(const bpanel_src_t* s, int n0, int kb, int kc,
     VV_PACKB_REF(f16_row(s->wf16 + (size_t)(n0 + r) * s->K + kb, tmp, kc))
 }
 
+static void packb_int8_ref(const bpanel_src_t* s, int n0, int kb, int kc,
+                           float* bp, float* tmp) {
+    VV_PACKB_REF(int8_row(s->w8 + (size_t)(n0 + r) * s->K + kb,
+                          s->rscale[n0 + r], tmp, kc))
+}
+
+static const ukernel_t UK_REF_INT8  = { VV_REF_MR, VV_REF_NR, micro_ref,
+                                        packb_int8_ref };
 static const ukernel_t UK_REF_NF4   = { VV_REF_MR, VV_REF_NR, micro_ref,
                                         packb_nf4_ref };
 static const ukernel_t UK_REF_INT4G = { VV_REF_MR, VV_REF_NR, micro_ref,
@@ -939,6 +1001,24 @@ static void packb_f16_avx2(const bpanel_src_t* s, int n0, int kb, int kc,
     VV_PACKB_AVX2(kc, gs[r] = gm[r] = 0.0f, f16_8_avx2(s, n, kk))
 }
 
+__attribute__((target("avx2"), always_inline))
+static inline __m256 int8_8_avx2(const bpanel_src_t* s, int n, int kk,
+                                 float scale) {
+    return _mm256_mul_ps(_mm256_set1_ps(scale), _mm256_cvtepi32_ps(
+        _mm256_cvtepi8_epi32(_mm_loadl_epi64(
+            (const __m128i*)(s->w8 + (size_t)n * s->K + kk)))));
+}
+
+__attribute__((target("avx2,fma")))
+static void packb_int8_avx2(const bpanel_src_t* s, int n0, int kb, int kc,
+                            float* bp, float* tmp) {
+    (void)tmp;
+    VV_PACKB_AVX2(kc, gs[r] = s->rscale[n]; gm[r] = 0.0f,
+                  int8_8_avx2(s, n, kk, gs[r]))
+}
+
+static const ukernel_t UK_AVX2_INT8  = { VV_MR, VV_NR, micro_6x16_avx2,
+                                         packb_int8_avx2 };
 static const ukernel_t UK_AVX2_NF4   = { VV_MR, VV_NR, micro_6x16_avx2,
                                          packb_nf4_avx2 };
 static const ukernel_t UK_AVX2_INT4G = { VV_MR, VV_NR, micro_6x16_avx2,
@@ -1048,9 +1128,11 @@ static const ukernel_t* pick_ukernel(int kind) {
 #if defined(VV_X86) && defined(__GNUC__)
     if (simd_kind() == SIMD_AVX2)
         return kind == 0 ? &UK_AVX2_NF4
-             : kind == 1 ? &UK_AVX2_INT4G : &UK_AVX2_F16;
+             : kind == 1 ? &UK_AVX2_INT4G
+             : kind == 3 ? &UK_AVX2_INT8 : &UK_AVX2_F16;
 #endif
-    return kind == 0 ? &UK_REF_NF4 : kind == 1 ? &UK_REF_INT4G : &UK_REF_F16;
+    return kind == 0 ? &UK_REF_NF4 : kind == 1 ? &UK_REF_INT4G
+         : kind == 3 ? &UK_REF_INT8 : &UK_REF_F16;
 }
 
 /**
@@ -1253,6 +1335,56 @@ vv_status_t vv_gemm_f16w_cpu(const float* input, const void* w_fp16,
         }
     }
     return VV_OK;
+}
+
+vv_status_t vv_int8_gemm_cpu(const float* input, const int8_t* q,
+                             const float* scales, const void* bias,
+                             float* output, int M, int N, int K) {
+    if (!input || !q || !scales || !output) return VV_ERR_NULL_PTR;
+    if (M <= 0 || N <= 0 || K <= 0) return VV_ERR_INVALID_ARG;
+    const uint16_t* bs = (const uint16_t*)bias;
+
+    const bpanel_src_t bsrc = { NULL, NULL, NULL, NULL, 8, K, q, scales };
+    const int n_lo = gemm_packed_try(input, &bsrc, bs, output, M, N, K, 3);
+    if (n_lo == N) return VV_OK;
+
+#if defined(VV_X86) && defined(__GNUC__)
+    if (simd_kind() == SIMD_AVX2 && M == 1) {
+        int n;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (n = n_lo; n < N; n++)
+            output[n] = int8_dot_avx2(q + (size_t)n * K, input, K) * scales[n]
+                        + (bs ? vv_half_to_float(bs[n]) : 0.0f);
+        return VV_OK;
+    }
+#endif
+
+    vv_status_t st = VV_OK;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+        float* row = (float*)malloc((size_t)K * sizeof(float));
+        /* A worker without its row would leave its share unwritten; it
+           still takes part in the loop, which every thread must reach. */
+        if (!row) st = VV_ERR_OUT_OF_MEMORY;
+        int n;
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (n = n_lo; n < N; n++) {
+            if (!row) continue;
+            int8_row(q + (size_t)n * K, scales[n], row, K);
+            const float b = bs ? vv_half_to_float(bs[n]) : 0.0f;
+            for (int m = 0; m < M; m++)
+                output[(size_t)m * N + n] =
+                    dot_f32(input + (size_t)m * K, row, K) + b;
+        }
+        free(row);
+    }
+    return st;
 }
 
 vv_status_t vv_gemm_f32_cpu(const float* A, const float* B, float* C,

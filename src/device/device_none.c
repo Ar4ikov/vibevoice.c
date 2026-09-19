@@ -154,6 +154,18 @@ vv_status_t vv_dequant_awq_dev(const uint32_t* p, const uint32_t* m,
                                void* st) {
     U(p) U(m) U(s) U(o) U(N) U(K) U(g) U(st) return VV_ERR_UNSUPPORTED;
 }
+vv_status_t vv_int8_gemv_dev(const void* x, const int8_t* q, const float* s,
+                             const void* b, void* y, int N, int K, void* st) {
+    U(x) U(q) U(s) U(b) U(y) U(N) U(K) U(st) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_int8_gemm_dev(const void* a, const int8_t* q, const float* s,
+                             void* o, void* t, int M, int N, int K, void* st) {
+    U(a) U(q) U(s) U(o) U(t) U(M) U(N) U(K) U(st) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_dequant_int8_dev(const int8_t* q, const float* s, void* o,
+                                int N, int K, void* st) {
+    U(q) U(s) U(o) U(N) U(K) U(st) return VV_ERR_UNSUPPORTED;
+}
 vv_status_t vv_gemm_fp16_dev(const void* A, const void* B, void* C,
                              int M, int N, int K, float al, float be, void* s) {
     U(A) U(B) U(C) U(M) U(N) U(K) U(al) U(be) U(s) return VV_ERR_UNSUPPORTED;

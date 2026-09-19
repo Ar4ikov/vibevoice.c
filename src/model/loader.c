@@ -6,8 +6,9 @@
  *
  *   projection `.weight` U8 + `.absmax`  → NF4 (bitsandbytes)
  *   projection `.qweight` I32            → INT4G (AWQ / GPTQ, repacked)
- *   projection `.weight` F16/BF16/F32    → dense FP16, or quantized to NF4 or
- *                                          INT4G while it is read (--quant)
+ *   projection `.weight` F16/BF16/F32    → dense FP16, or quantized to NF4,
+ *                                          INT4G or INT8 while it is read
+ *                                          (--quant)
  *   everything else in the LM            → FP16, rounded to nearest-even
  *   speech encoders and connectors       → FP32, exactly
  *
@@ -21,11 +22,16 @@
 #include "vibevoice/model.h"
 #include "vibevoice/quant.h"
 #include "vibevoice/vibevoice.h"
+#include "vibevoice/cpu_kernels.h"
 #include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* ─── Tensor index over every shard ─────────────────────────────────────── */
 
@@ -41,7 +47,7 @@ typedef struct {
     vv_load_quant_t    quant;
     char               prefix[128];  /**< "model." / "model.language_model." */
     /* What the projections turned out to be, for the summary line. */
-    int                n_nf4, n_int4g, n_dense, n_converted;
+    int                n_nf4, n_int4g, n_int8, n_dense, n_converted;
     size_t             proj_bytes;
 } loader_t;
 
@@ -142,6 +148,20 @@ static const char* dtype_name(vv_dtype_t d) {
  */
 #define CONV_BLOCK 65536
 
+/** @brief Elements [i0, i1) of `src` to FP32, in the calling thread. */
+static void to_f32_range(const void* src, vv_dtype_t dt, float* dst,
+                         size_t i0, size_t i1) {
+    if (dt == VV_DTYPE_BF16) {
+        const uint16_t* s = (const uint16_t*)src;
+        for (size_t i = i0; i < i1; i++) dst[i] = vv_bf16_to_float(s[i]);
+    } else if (dt == VV_DTYPE_F16) {
+        const uint16_t* s = (const uint16_t*)src;
+        for (size_t i = i0; i < i1; i++) dst[i] = vv_half_to_float(s[i]);
+    } else {
+        memcpy(dst + i0, (const float*)src + i0, (i1 - i0) * sizeof(float));
+    }
+}
+
 static void to_f32(const void* src, vv_dtype_t dt, float* dst, size_t n) {
     const int blocks = (int)((n + CONV_BLOCK - 1) / CONV_BLOCK);
     int b;
@@ -151,15 +171,7 @@ static void to_f32(const void* src, vv_dtype_t dt, float* dst, size_t n) {
     for (b = 0; b < blocks; b++) {
         const size_t i0 = (size_t)b * CONV_BLOCK;
         const size_t i1 = (i0 + CONV_BLOCK < n) ? i0 + CONV_BLOCK : n;
-        if (dt == VV_DTYPE_BF16) {
-            const uint16_t* s = (const uint16_t*)src;
-            for (size_t i = i0; i < i1; i++) dst[i] = vv_bf16_to_float(s[i]);
-        } else if (dt == VV_DTYPE_F16) {
-            const uint16_t* s = (const uint16_t*)src;
-            for (size_t i = i0; i < i1; i++) dst[i] = vv_half_to_float(s[i]);
-        } else {
-            memcpy(dst + i0, (const float*)src + i0, (i1 - i0) * sizeof(float));
-        }
+        to_f32_range(src, dt, dst, i0, i1);
     }
 }
 
@@ -183,10 +195,11 @@ static void to_f16(const void* src, vv_dtype_t dt, uint16_t* dst, size_t n) {
         if (dt == VV_DTYPE_BF16) {
             const uint16_t* s = (const uint16_t*)src;
             for (size_t i = i0; i < i1; i++)
-                dst[i] = vv_float_to_half(vv_bf16_to_float(s[i]));
+                dst[i] = vv_float_to_half_rne(vv_bf16_to_float(s[i]));
         } else if (dt == VV_DTYPE_F32) {
             const float* s = (const float*)src;
-            for (size_t i = i0; i < i1; i++) dst[i] = vv_float_to_half(s[i]);
+            for (size_t i = i0; i < i1; i++)
+                dst[i] = vv_float_to_half_rne(s[i]);
         } else {
             memcpy(dst + i0, (const uint16_t*)src + i0,
                    (i1 - i0) * sizeof(uint16_t));
@@ -415,10 +428,17 @@ static vv_status_t load_nf4_scales(const loader_t* L, const char* wname,
             return VV_ERR_WEIGHT_MISSING;
         }
         const float* nested = (const float*)data_of(L, en);
-        const int n_super = (int)numel_of(&en->info);
+        const int64_t n_super_ll = numel_of(&en->info);
+        if (!nested || n_super_ll <= 0 || n_super_ll > (int64_t)n_blocks) {
+            VV_LOG_E("loader: '%s' holds %lld scales for %zu blocks", buf,
+                     (long long)n_super_ll, n_blocks);
+            vv_free(scales);
+            return VV_ERR_MODEL_FORMAT;
+        }
+        const size_t n_super = (size_t)n_super_ll;
 
         float nested_offset = 0.0f;
-        int nested_block = 256;
+        size_t nested_block = 256;
         const float* qmap = BNB_DEFAULT_CODE;
         float custom[256];
 
@@ -436,8 +456,12 @@ static vv_status_t load_nf4_scales(const loader_t* L, const char* wname,
                     if (off && cJSON_IsNumber(off))
                         nested_offset = (float)off->valuedouble;
                     cJSON* nbs = cJSON_GetObjectItem(root, "nested_blocksize");
+                    /* Clamped before the cast: a value past the block
+                       count means one superblock, and a double beyond
+                       the integer range is undefined to convert. */
                     if (nbs && cJSON_IsNumber(nbs) && nbs->valuedouble >= 1.0)
-                        nested_block = (int)nbs->valuedouble;
+                        nested_block = nbs->valuedouble >= (double)n_blocks
+                                     ? n_blocks : (size_t)nbs->valuedouble;
                     cJSON* nqm = cJSON_GetObjectItem(root, "nested_quant_map");
                     if (nqm && cJSON_IsArray(nqm)) {
                         const int m = cJSON_GetArraySize(nqm);
@@ -456,10 +480,19 @@ static vv_status_t load_nf4_scales(const loader_t* L, const char* wname,
             }
         }
 
+        /* Every block needs its superblock scale. */
+        if ((n_blocks + nested_block - 1) / nested_block > n_super) {
+            VV_LOG_E("loader: '%s.nested_absmax' has %zu scales; %zu blocks "
+                     "of %zu need %zu", wname, n_super, n_blocks,
+                     nested_block,
+                     (n_blocks + nested_block - 1) / nested_block);
+            vv_free(scales);
+            return VV_ERR_SHAPE_MISMATCH;
+        }
+
         const uint8_t* codes = (const uint8_t*)abs_src;
         for (size_t i = 0; i < n_blocks; i++) {
-            int si = (int)(i / (size_t)nested_block);
-            if (si >= n_super) si = n_super - 1;
+            const size_t si = i / nested_block;
             scales[i] = f32_to_half_trunc(qmap[codes[i]] * nested[si]
                                           + nested_offset);
         }
@@ -583,13 +616,13 @@ static vv_status_t load_awq_weight(const loader_t* L, const char* base,
 /* ─── Dense projections, kept or quantized on the way in ────────────────── */
 
 /**
- * @brief A dense [N,K] projection: FP16, or NF4 / INT4G quantized straight
- *        from the mapping.
+ * @brief A dense [N,K] projection: FP16, or NF4 / INT4G / INT8 quantized
+ *        straight from the mapping.
  *
- * Quantization goes through an FP32 slab of rows at a time (about 32 MB), so
- * peak memory is the quantized model plus one slab, never a dense copy of
- * the whole thing. Rows are independent, so the bytes do not depend on the
- * thread count or the slab size.
+ * Quantization goes through a few FP32 rows per thread at a time, so peak
+ * memory is the quantized model plus a few MB, never a dense copy of the
+ * whole thing. Rows are independent, so the bytes do not depend on the
+ * thread count.
  */
 static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
                                      int N, int K, vv_weight_t* w) {
@@ -611,67 +644,114 @@ static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
         return VV_OK;
     }
 
-    const bool nf4 = (q == VV_LOAD_QUANT_NF4);
-    const int group = nf4 ? VV_NF4_BLOCK : VV_INT4G_LOAD_GROUP;
+    const int kind = (q == VV_LOAD_QUANT_NF4) ? VV_QUANT_NF4
+                   : (q == VV_LOAD_QUANT_INT8) ? VV_QUANT_INT8
+                   : VV_QUANT_INT4G;
+    /* The group a row is cut into: NF4 blocks, INT4G groups, or the whole
+       row for per-channel INT8. */
+    const int group = kind == VV_QUANT_NF4 ? VV_NF4_BLOCK
+                    : kind == VV_QUANT_INT4G ? VV_INT4G_LOAD_GROUP : K;
     if (K % group != 0) {
         VV_LOG_E("loader: '%s' has K=%d, not a multiple of the %s group %d",
                  e->info.name, K, vv_load_quant_name(q), group);
         return VV_ERR_UNSUPPORTED;
     }
     const int n_groups = K / group;
-    const size_t packed_bytes = (size_t)N * (size_t)(K / 2);
-    const size_t scale_bytes = (size_t)N * (size_t)n_groups * sizeof(uint16_t);
+    const size_t code_bytes = kind == VV_QUANT_INT8
+                            ? (size_t)N * (size_t)K : (size_t)N * (size_t)(K / 2);
+    const size_t scale_bytes = kind == VV_QUANT_INT8
+                             ? (size_t)N * sizeof(float)
+                             : (size_t)N * (size_t)n_groups * sizeof(uint16_t);
 
-    uint8_t*  packed = (uint8_t*)vv_alloc(packed_bytes);
-    uint16_t* sc = (uint16_t*)vv_alloc(scale_bytes);
-    uint16_t* mn = nf4 ? NULL : (uint16_t*)vv_alloc(scale_bytes);
-    int slab = (int)(((size_t)32 << 20) / ((size_t)K * sizeof(float)));
-    if (slab < 1) slab = 1;
-    if (slab > N) slab = N;
-    float* tmp = (float*)vv_alloc((size_t)slab * (size_t)K * sizeof(float));
-    if (!packed || !sc || (!nf4 && !mn) || !tmp) {
-        vv_free(packed); vv_free(sc); vv_free(mn); vv_free(tmp);
+    /*
+     * One parallel region per projection. Each worker converts a few rows
+     * into its own FP32 buffer and quantizes them there, so the rows go from
+     * the mapping to their codes while they are still in cache. Converting a
+     * 32 MB slab and then quantizing it opened two regions per slab, and with
+     * a thread on every SMT sibling most of the load went to their barriers.
+     */
+    enum { ROWS = 8 };
+    int nt = 1;
+#ifdef _OPENMP
+    nt = omp_get_max_threads();
+#endif
+    uint8_t* codes = (uint8_t*)vv_alloc(code_bytes);
+    void* sc = vv_alloc(scale_bytes);
+    uint16_t* mn = kind == VV_QUANT_INT4G ? (uint16_t*)vv_alloc(scale_bytes)
+                                          : NULL;
+    float* tmp = (float*)vv_alloc((size_t)nt * ROWS * (size_t)K * sizeof(float));
+    if (!codes || !sc || (kind == VV_QUANT_INT4G && !mn) || !tmp) {
+        vv_free(codes); vv_free(sc); vv_free(mn); vv_free(tmp);
         return VV_ERR_OUT_OF_MEMORY;
     }
 
-    for (int r0 = 0; r0 < N && s == VV_OK; r0 += slab) {
-        const int rows = (r0 + slab <= N) ? slab : N - r0;
-        to_f32((const uint8_t*)src + (size_t)r0 * K * es, dt, tmp,
-               (size_t)rows * K);
-        if (nf4)
-            s = vv_nf4_quantize(tmp, rows, K,
-                                packed + (size_t)r0 * (K / 2),
-                                sc + (size_t)r0 * n_groups);
+    const int n_blk = (N + ROWS - 1) / ROWS;
+    vv_status_t first_err = VV_OK;
+    int b;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 4)
+#endif
+    for (b = 0; b < n_blk; b++) {
+#ifdef _OPENMP
+        float* t = tmp + (size_t)omp_get_thread_num() * ROWS * (size_t)K;
+#else
+        float* t = tmp;
+#endif
+        const int r0 = b * ROWS;
+        const int rows = (r0 + ROWS <= N) ? ROWS : N - r0;
+        to_f32_range((const uint8_t*)src + (size_t)r0 * K * es, dt, t, 0,
+                     (size_t)rows * K);
+        vv_status_t st;
+        if (kind == VV_QUANT_NF4)
+            st = vv_nf4_quantize(t, rows, K, codes + (size_t)r0 * (K / 2),
+                                 (uint16_t*)sc + (size_t)r0 * n_groups);
+        else if (kind == VV_QUANT_INT8)
+            st = vv_int8_quantize_rows(t, rows, K,
+                                       (int8_t*)codes + (size_t)r0 * K,
+                                       (float*)sc + r0);
         else
-            s = vv_int4g_quantize(tmp, rows, K, group,
-                                  packed + (size_t)r0 * (K / 2),
-                                  sc + (size_t)r0 * n_groups,
-                                  mn + (size_t)r0 * n_groups);
+            st = vv_int4g_quantize(t, rows, K, group,
+                                   codes + (size_t)r0 * (K / 2),
+                                   (uint16_t*)sc + (size_t)r0 * n_groups,
+                                   mn + (size_t)r0 * n_groups);
+        if (st != VV_OK) {
+#ifdef _OPENMP
+#pragma omp critical(vv_loader_quant_err)
+#endif
+            first_err = st;
+        }
     }
     vv_free(tmp);
-    if (s != VV_OK) {
-        vv_free(packed); vv_free(sc); vv_free(mn);
-        return s;
+    if (first_err != VV_OK) {
+        vv_free(codes); vv_free(sc); vv_free(mn);
+        return first_err;
     }
 
-    const int64_t pshape[2] = { N, K / 2 };
-    const int64_t gshape[2] = { N, n_groups };
-    set_tensor(&w->tensor, packed, VV_DTYPE_U8, packed_bytes, 2, pshape);
-    set_tensor(&w->quant.scales, sc, VV_DTYPE_F16, scale_bytes, 2, gshape);
     w->is_quantized = true;
-    if (nf4) {
-        w->quant_kind = VV_QUANT_NF4;
-        w->quant.block_size = VV_NF4_BLOCK;
-        w->quant.double_quant = false;
-        L->n_nf4++;
+    w->quant_kind = kind;
+    if (kind == VV_QUANT_INT8) {
+        const int64_t qshape[2] = { N, K };
+        const int64_t sshape[1] = { N };
+        set_tensor(&w->tensor, codes, VV_DTYPE_I8, code_bytes, 2, qshape);
+        set_tensor(&w->quant.scales, sc, VV_DTYPE_F32, scale_bytes, 1, sshape);
+        L->n_int8++;
     } else {
-        set_tensor(&w->mins, mn, VV_DTYPE_F16, scale_bytes, 2, gshape);
-        w->quant_kind = VV_QUANT_INT4G;
-        w->group_size = group;
-        L->n_int4g++;
+        const int64_t pshape[2] = { N, K / 2 };
+        const int64_t gshape[2] = { N, n_groups };
+        set_tensor(&w->tensor, codes, VV_DTYPE_U8, code_bytes, 2, pshape);
+        set_tensor(&w->quant.scales, sc, VV_DTYPE_F16, scale_bytes, 2, gshape);
+        if (kind == VV_QUANT_NF4) {
+            w->quant.block_size = VV_NF4_BLOCK;
+            w->quant.double_quant = false;
+            L->n_nf4++;
+        } else {
+            set_tensor(&w->mins, mn, VV_DTYPE_F16, scale_bytes, 2, gshape);
+            w->group_size = group;
+            L->n_int4g++;
+        }
     }
     L->n_converted++;
-    L->proj_bytes += packed_bytes + scale_bytes * (nf4 ? 1 : 2);
+    L->proj_bytes += code_bytes + scale_bytes * (mn ? 2 : 1);
     return VV_OK;
 }
 
@@ -715,7 +795,8 @@ static vv_status_t load_projection(loader_t* L, int layer, const char* which,
         if ((s = load_dense_weight(L, e, N, K, w)) != VV_OK) return s;
     } else if (e) {
         VV_LOG_E("loader: '%s' is %s, which no projection format uses "
-                 "(int8 checkpoints are not supported yet)",
+                 "(int8 checkpoints do not load yet; --quant int8 "
+                 "quantizes a dense one)",
                  buf, dtype_name(e->info.dtype));
         return VV_ERR_UNSUPPORTED;
     } else {
@@ -1076,9 +1157,39 @@ vv_status_t vv_model_load(const char* model_dir, vv_model_t** out) {
     return vv_model_load_ex(model_dir, NULL, out);
 }
 
+static vv_status_t model_load_impl(const char* model_dir,
+                                   const vv_model_load_opts_t* opts,
+                                   vv_model_t** out);
+
 vv_status_t vv_model_load_ex(const char* model_dir,
                              const vv_model_load_opts_t* opts,
                              vv_model_t** out) {
+#ifdef _OPENMP
+    /*
+     * The conversions and quantizers are bound by memory and by the FP
+     * units a core's SMT siblings share. OpenMP's default of one thread per
+     * logical CPU only adds barrier spinning: on the 5900X a BF16 --quant
+     * int4 load took 15 s at 24 threads and 2.7 s at 12. So the load runs on
+     * the physical cores unless OMP_NUM_THREADS says otherwise, and puts the
+     * caller's setting back afterwards. Nothing is pinned: a GPU run's
+     * threads should stay free to move.
+     */
+    const int prev = omp_get_max_threads();
+    if (!getenv("OMP_NUM_THREADS")) {
+        const int cores = vv_cpu_physical_cores();
+        if (cores > 0 && cores < prev) omp_set_num_threads(cores);
+    }
+    const vv_status_t s = model_load_impl(model_dir, opts, out);
+    omp_set_num_threads(prev);
+    return s;
+#else
+    return model_load_impl(model_dir, opts, out);
+#endif
+}
+
+static vv_status_t model_load_impl(const char* model_dir,
+                                   const vv_model_load_opts_t* opts,
+                                   vv_model_t** out) {
     if (!model_dir || !out) return VV_ERR_NULL_PTR;
     *out = NULL;
     const vv_model_load_opts_t o = opts ? *opts : vv_model_load_opts_default();
@@ -1179,11 +1290,12 @@ vv_status_t vv_model_load_ex(const char* model_dir,
     }
 
     VV_LOG_I("loader: %s model loaded in %.0f ms (%d layers under prefix "
-             "'%s'; projections %d nf4 / %d int4g / %d fp16, %d quantized "
-             "at load, %.1f MB; head %s; encoders %d+%d tensors; %d biases)",
+             "'%s'; projections %d nf4 / %d int4g / %d int8 / %d fp16, %d "
+             "quantized at load, %.1f MB; head %s; encoders %d+%d tensors; "
+             "%d biases)",
              vv_model_family_name(model->config.family),
              vv_time_ms() - t0, n_layers, L.prefix, L.n_nf4, L.n_int4g,
-             L.n_dense, L.n_converted,
+             L.n_int8, L.n_dense, L.n_converted,
              (double)L.proj_bytes / (1024.0 * 1024.0),
              model->lm_head_tied ? "tied to embed_tokens" : "separate",
              model->n_acoustic_weights, model->n_semantic_weights, n_bias);

@@ -259,6 +259,7 @@ if(VV_HAS_CUDA)
         src/cuda/nf4_gemv.cu
         src/cuda/kv_quant.cu
         src/cuda/awq_gemv.cu
+        src/cuda/int8_gemv.cu
         src/cuda/lm_head.cu
         src/cuda/conv1d.cu
         src/cuda/conv_vae.cu

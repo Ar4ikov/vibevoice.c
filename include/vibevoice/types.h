@@ -118,7 +118,14 @@ static inline float vv_half_to_float(uint16_t h) {
     return c.f;
 }
 
-/** @brief float → IEEE-754 half (round-to-nearest-even, host side). */
+/**
+ * @brief float → IEEE-754 half, rounding half away from zero (host side).
+ *
+ * An exact tie (1 + 2^-11, say) goes up, not to even. Kept as it is because
+ * the AWQ repack's FP16 mins are computed with it and existing transcripts
+ * depend on those bytes; new code converting weights wants
+ * vv_float_to_half_rne().
+ */
 static inline uint16_t vv_float_to_half(float f) {
     union { float f; uint32_t u; } c;
     c.f = f;
@@ -141,6 +148,41 @@ static inline uint16_t vv_float_to_half(float f) {
     if (man & 0x400u) { man = 0; exp++; }
     if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
     return (uint16_t)(sign | ((uint32_t)exp << 10) | man);
+}
+
+/**
+ * @brief float → IEEE-754 half, round-to-nearest-even (host side).
+ *
+ * What PyTorch's `.half()` and the CUDA intrinsics do: an exact tie goes to
+ * the even mantissa, so 1 + 2^-11 becomes 1.0 (0x3C00) and 1 + 3 * 2^-11
+ * becomes 1 + 2^-9 (0x3C02). Overflow gives infinity, NaN stays NaN, and
+ * values below half the smallest subnormal become signed zero.
+ */
+static inline uint16_t vv_float_to_half_rne(float f) {
+    union { float f; uint32_t u; } c;
+    c.f = f;
+    const uint32_t sign = (c.u >> 16) & 0x8000u;
+    const uint32_t absu = c.u & 0x7FFFFFFFu;
+    if (absu >= 0x7F800000u)                       /* inf or NaN */
+        return (uint16_t)(sign | 0x7C00u | (absu > 0x7F800000u ? 0x200u : 0u));
+    if (absu >= 0x477FF000u)                       /* rounds past 65504 */
+        return (uint16_t)(sign | 0x7C00u);
+    if (absu < 0x38800000u) {                      /* FP16 subnormal or 0 */
+        if (absu < 0x33000001u) return (uint16_t)sign;  /* <= 2^-25: to 0 */
+        const uint32_t e = absu >> 23;             /* 102 .. 112 */
+        const uint32_t m = (absu & 0x7FFFFFu) | 0x800000u;
+        const uint32_t shift = 126u - e;           /* 14 .. 24 */
+        uint32_t h = m >> shift;
+        const uint32_t rest = m & ((1u << shift) - 1u);
+        const uint32_t half = 1u << (shift - 1u);
+        if (rest > half || (rest == half && (h & 1u))) h++;
+        return (uint16_t)(sign | h);
+    }
+    /* Normal: rebias the exponent, then round the 13 dropped bits. */
+    uint32_t h = ((absu >> 13) - (112u << 10));
+    const uint32_t rest = absu & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (h & 1u))) h++;
+    return (uint16_t)(sign | h);
 }
 
 /**
