@@ -81,7 +81,14 @@ Write the entry for a change under Unreleased in the same pull request.
 - **Paged KV cache**: the slots of a device share one pool of 64-position
   pages instead of a full window each (`--kv-paged auto|on|off`, on by
   default with several slots whose kernels read pages). The pool honours
-  the VRAM budget, which clones' slabs never did.
+  the VRAM budget, which clones' slabs never did. A request reserves its
+  expected pages before it starts and waits while others hold them; a step
+  that finds the pool dry waits for pages too, and only when no other
+  holder could ever free any does one request fail, with the new
+  `VV_ERR_KV_POOL_EXHAUSTED` (503 from `serve`). A pool never truncates a
+  transcript and reports success.
+- A decode step that fails now fails the request; before, the tokens so far
+  were post-processed and returned as a complete transcript.
 
 ## [0.2.0](https://github.com/Ar4ikov/vibevoice.c/releases/tag/v0.2.0) — 2026-09-18
 

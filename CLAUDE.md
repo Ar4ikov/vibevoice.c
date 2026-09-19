@@ -474,7 +474,10 @@ vibevoice.c/
 
 ### Запрещено
 - `malloc()` / `free()` напрямую (только через `vv_alloc` / `vv_free`).
-- Глобальные переменные (кроме thread-local логгера).
+- Глобальные переменные (кроме thread-local логгера и thread-local кэша
+  неизменяемых свойств устройства — compute capability, число SM — по
+  номеру устройства, как `att_device()` в `attention_fi.cu` и выбор ядра в
+  `attention.cu`).
 - `#include <python.h>` или любые Python/ML-framework headers.
 - Хардкодить пути. Все пути — через параметры или env vars.
 - `cudaMalloc` в hot path (только при init / resize).

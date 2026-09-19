@@ -717,7 +717,7 @@ the last bits of the result.
 | | prefill | decode | KV formats | pages |
 |---|---|---|---|---|
 | `fa1` | scalar, a warp per query row | scalar, per head, split over the cache | all | no |
-| `fa2` (`auto`) | FA2 on tensor cores, GQA-packed | scalar, a GQA group per block | all | FP16 |
+| `fa2` (`auto`) | FP16 cache: FA2 on tensor cores, GQA-packed; fp8/tq: scalar, per head | scalar, a GQA group per block | all | FP16 |
 | `flashinfer` | the same, plus split KV for few rows | tensor cores, a GQA group per MMA | all, dequantized into shared memory | all |
 
 Qwen2-7B has 7 query heads per KV head. The kernels this replaces gave each
@@ -744,7 +744,11 @@ prefill of a few rows against a long cache — a chat turn, a streaming chunk
 — splits over the cache too instead of leaving most SMs idle. FP8 and
 TurboQuant tiles are decoded into shared memory as FP16 (FP8 exactly) and go
 through the same tensor-core kernels, where the other two backends drop to
-scalar code. P goes into P·V as two FP16 halves, hi + lo, so it keeps 22 bits
+scalar code -- so `auto` (fa2) on a `--kv-cache fp8|tq*` cache runs a
+scalar prefill and a CUDA-core decode, and `--attn flashinfer` is the fast
+path for those formats (16K-position decode, fp8: 147.7 against 42.4 µs;
+tq4: 153.3 against 39.5). `auto` stays on fa2 there too, because a default
+must not move timestamps. P goes into P·V as two FP16 halves, hi + lo, so it keeps 22 bits
 — one rounding of P was enough to move a timestamp on the 32-minute file.
 What is left is summation order. No word changes anywhere in the parity set;
 timestamps do, by one or two hundredths: on fp16 one of the 32-minute file's
@@ -800,10 +804,18 @@ ones that the budget never saw (21.3 GB at peak); paging keeps the
 budget: one 896 MB pool, a 16K window any of the four may fill (15.3 GB at
 peak).
 
-Pages for the next 1024 positions — the decode's shape bucket — are mapped
-before the step, outside any graph capture; the kernels read the table from
-device memory, so a replayed decode follows new pages without re-capture. A
-pool that runs dry ends that transcript with a warning, like a full window.
+A request takes its pages before it starts: the prompt plus the decode it
+is expected to run (8 tokens per second of audio and 256 more; real
+transcripts run about 5), waiting while other requests hold them. Past
+that, each decode step maps its own page before the step, outside any graph
+capture; the kernels read the table from device memory, so a replayed
+decode follows new pages without re-capture. A step that finds the pool
+empty waits for another slot to give pages back. Only when that cannot
+happen -- every other request holding pages is waiting too -- does one
+request fail, with `VV_ERR_KV_POOL_EXHAUSTED` (HTTP 503 from `serve`); a
+pool never cuts a transcript short and calls it done. With `--slots 4
+--gpu-memory 9GiB` and four concurrent 415 s files, all four come back
+identical to a solo run, two at a time.
 
 
 ### The decode step is one submission

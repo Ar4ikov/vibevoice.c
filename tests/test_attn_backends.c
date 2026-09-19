@@ -613,55 +613,108 @@ static void bench_prefill(int seq) {
     vv_dev_free(scratch);
 }
 
+/*
+ * Decode reads the whole cache once per call, so its figure is K+V bytes over
+ * time -- but only if those bytes come from DRAM. One 1K fp16 cache is 2 MB
+ * and a 4K one 8 MB against the 3090's 6 MB L2; timed back to back on the
+ * same buffers they are L2 hits. So the calls rotate over enough copies to
+ * pass 64 MB, each filled with random data (a constant pattern is also what
+ * a compressing memory system likes best).
+ */
+#define BENCH_ROTATE_BYTES ((size_t)64 << 20)
+#define BENCH_MAX_COPIES   32
+
+static void fill_random(void* dev, size_t bytes, int fmt, bool is_meta) {
+    uint8_t* h = (uint8_t*)malloc(bytes);
+    if (!h) return;
+    if (fmt == VV_KV_FP16 || is_meta) {
+        /* Halves: values for K/V, small positive scales for metadata. */
+        uint16_t* hv = (uint16_t*)h;
+        for (size_t i = 0; i < bytes / 2; i++)
+            hv[i] = vv_float_to_half(is_meta ? 0.01f + 0.5f * (frand() + 1.0f)
+                                             : frand());
+    } else {
+        /* Codes: keep fp8 clear of its NaN/Inf encodings. */
+        for (size_t i = 0; i < bytes; i++) h[i] = (uint8_t)(irand(256) & 0xBB);
+    }
+    vv_dev_memcpy_h2d(dev, h, bytes, g_stream);
+    vv_dev_stream_sync(g_stream);
+    free(h);
+}
+
 static void bench_decode(int fmt, int len) {
     const gqa_t* g = &GQA[0];
     const int be = backend_for(fmt, false, g);
     const int bpv = vv_kv_bytes_per_vec((vv_kv_format_t)fmt, HEAD_DIM);
-    const size_t sb = (size_t)len * g->nkv * bpv;
-    void *dQ = NULL, *dO = NULL, *K = NULL, *V = NULL, *KM = NULL, *VM = NULL;
-    void *scratch = NULL, *dl = NULL;
-    vv_dev_alloc(&dQ, (size_t)g->nq * HEAD_DIM * 2);
-    vv_dev_alloc(&dO, (size_t)g->nq * HEAD_DIM * 2);
-    if (vv_dev_alloc(&K, sb) != VV_OK || vv_dev_alloc(&V, sb) != VV_OK) return;
-    vv_dev_memset(K, 0x11, sb); vv_dev_memset(V, 0x11, sb);
-    vv_dev_memset(dQ, 0x11, (size_t)g->nq * HEAD_DIM * 2);
     const bool meta = vv_kv_has_meta((vv_kv_format_t)fmt);
-    if (meta) {
-        vv_dev_alloc(&KM, (size_t)len * g->nkv * 2);
-        vv_dev_alloc(&VM, (size_t)len * g->nkv * 2);
-        vv_dev_memset(KM, 0x11, (size_t)len * g->nkv * 2);
-        vv_dev_memset(VM, 0x11, (size_t)len * g->nkv * 2);
+    const size_t sb = (size_t)len * g->nkv * bpv;
+    const size_t mb = meta ? (size_t)len * g->nkv * 2 : 0;
+    const size_t per_copy = 2 * (sb + mb);
+    int n_copies = (int)((BENCH_ROTATE_BYTES + per_copy - 1) / per_copy);
+    if (n_copies < 2) n_copies = 2;
+    if (n_copies > BENCH_MAX_COPIES) n_copies = BENCH_MAX_COPIES;
+
+    void *dQ = NULL, *dO = NULL, *scratch = NULL, *dl = NULL;
+    void *K[BENCH_MAX_COPIES] = {0}, *V[BENCH_MAX_COPIES] = {0};
+    void *KM[BENCH_MAX_COPIES] = {0}, *VM[BENCH_MAX_COPIES] = {0};
+    vv_kv_view_t kv[BENCH_MAX_COPIES];
+    bool ok = vv_dev_alloc(&dQ, (size_t)g->nq * HEAD_DIM * 2) == VV_OK &&
+              vv_dev_alloc(&dO, (size_t)g->nq * HEAD_DIM * 2) == VV_OK &&
+              vv_dev_alloc(&scratch, vv_attn_scratch_bytes(g->nq, g->nkv,
+                                                           HEAD_DIM)) == VV_OK &&
+              vv_dev_alloc(&dl, sizeof(int)) == VV_OK;
+    for (int c = 0; ok && c < n_copies; c++) {
+        ok = vv_dev_alloc(&K[c], sb) == VV_OK && vv_dev_alloc(&V[c], sb) == VV_OK;
+        if (ok && meta)
+            ok = vv_dev_alloc(&KM[c], mb) == VV_OK &&
+                 vv_dev_alloc(&VM[c], mb) == VV_OK;
+        if (!ok) break;
+        fill_random(K[c], sb, fmt, false);
+        fill_random(V[c], sb, fmt, false);
+        if (meta) { fill_random(KM[c], mb, fmt, true); fill_random(VM[c], mb, fmt, true); }
+        memset(&kv[c], 0, sizeof(kv[c]));
+        kv[c].k = K[c]; kv[c].v = V[c]; kv[c].k_meta = KM[c]; kv[c].v_meta = VM[c];
+        kv[c].format = fmt; kv[c].n_kv_heads = g->nkv; kv[c].head_dim = HEAD_DIM;
     }
-    vv_dev_alloc(&scratch, vv_attn_scratch_bytes(g->nq, g->nkv, HEAD_DIM));
-    vv_dev_alloc(&dl, sizeof(int));
-    vv_dev_memcpy_h2d(dl, &len, sizeof(int), NULL);
-    vv_kv_view_t kv;
-    memset(&kv, 0, sizeof(kv));
-    kv.k = K; kv.v = V; kv.k_meta = KM; kv.v_meta = VM; kv.format = fmt;
-    kv.n_kv_heads = g->nkv; kv.head_dim = HEAD_DIM;
-    for (int i = 0; i < 5; i++)
-        vv_attn_decode(be, dQ, &kv, dO, g->nq, len, (const int*)dl, scratch, g_stream);
-    vv_dev_stream_sync(g_stream);
-    double best = 1e30;
-    for (int rep = 0; rep < 3; rep++) {
-        const int iters = 50;
-        const double t0 = vv_time_ms();
-        for (int i = 0; i < iters; i++)
-            vv_attn_decode(be, dQ, &kv, dO, g->nq, len, (const int*)dl, scratch,
-                           g_stream);
+    if (ok) {
+        fill_random(dQ, (size_t)g->nq * HEAD_DIM * 2, VV_KV_FP16, false);
+        vv_dev_memcpy_h2d(dl, &len, sizeof(int), g_stream);
+        for (int i = 0; i < n_copies; i++)
+            vv_attn_decode(be, dQ, &kv[i], dO, g->nq, len, (const int*)dl,
+                           scratch, g_stream);
         vv_dev_stream_sync(g_stream);
-        const double ms = (vv_time_ms() - t0) / iters;
-        if (ms < best) best = ms;
+        double best = 1e30;
+        for (int rep = 0; rep < 3; rep++) {
+            const int iters = n_copies * ((50 + n_copies - 1) / n_copies);
+            const double t0 = vv_time_ms();
+            for (int i = 0; i < iters; i++)
+                vv_attn_decode(be, dQ, &kv[i % n_copies], dO, g->nq, len,
+                               (const int*)dl, scratch, g_stream);
+            vv_dev_stream_sync(g_stream);
+            const double ms = (vv_time_ms() - t0) / iters;
+            if (ms < best) best = ms;
+        }
+        const double bytes = (double)per_copy;
+        printf("  decode %-8s %6d: %7.1f us  %6.1f GB/s of KV from DRAM "
+               "(%d caches, %.0f MB) [%s]\n",
+               vv_kv_format_name((vv_kv_format_t)fmt), len, best * 1e3,
+               bytes / (best * 1e-3) / 1e9, n_copies,
+               (double)per_copy * n_copies / (1024.0 * 1024.0),
+               vv_attn_backend_name((vv_attn_backend_t)be));
+    } else {
+        printf("  decode %-8s %6d: skipped, allocation failed\n",
+               vv_kv_format_name((vv_kv_format_t)fmt), len);
     }
-    const double bytes = 2.0 * sb + (meta ? 2.0 * len * g->nkv * 2 : 0.0);
-    printf("  decode %-8s %6d: %7.1f us  %6.1f GB/s of KV [%s]\n",
-           vv_kv_format_name((vv_kv_format_t)fmt), len, best * 1e3,
-           bytes / (best * 1e-3) / 1e9,
-           vv_attn_backend_name((vv_attn_backend_t)be));
-    vv_dev_free(dQ); vv_dev_free(dO); vv_dev_free(K); vv_dev_free(V);
-    if (KM) vv_dev_free(KM);
-    if (VM) vv_dev_free(VM);
-    vv_dev_free(scratch); vv_dev_free(dl);
+    for (int c = 0; c < n_copies; c++) {
+        if (K[c]) vv_dev_free(K[c]);
+        if (V[c]) vv_dev_free(V[c]);
+        if (KM[c]) vv_dev_free(KM[c]);
+        if (VM[c]) vv_dev_free(VM[c]);
+    }
+    if (dQ) vv_dev_free(dQ);
+    if (dO) vv_dev_free(dO);
+    if (scratch) vv_dev_free(scratch);
+    if (dl) vv_dev_free(dl);
 }
 
 /* ─── Driver ─────────────────────────────────────────────────────────────── */
