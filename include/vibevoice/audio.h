@@ -124,6 +124,20 @@ vv_status_t vv_audio_prepare_ex(const float* pcm, int n_samples,
                                 float** out, int* out_len);
 
 /**
+ * @brief vv_audio_prepare_ex() the way VibeASR.cpp prepares audio for
+ *        VibeVoice-ASR-BitNet (utils/audio_io.h): linear-interpolation
+ *        resampling to 24 kHz (`floor(n / ratio)` samples) and the gain
+ *        `10^(-25/20) / (rms + 1e-6)` with the RMS taken as a float.
+ *
+ * Its int8 speech encoder quantizes the whole clip with one scale, so a
+ * gain that differs in the last bit already moves int8 samples; matching
+ * the reference's transcripts needs its audio.
+ */
+vv_status_t vv_audio_prepare_vibeasr(const float* pcm, int n_samples,
+                                     int sample_rate, bool normalize,
+                                     float** out, int* out_len);
+
+/**
  * @brief Decode any audio file into mono float samples.
  *
  * WAV is parsed directly. Anything else is handed to ffmpeg when it is on
