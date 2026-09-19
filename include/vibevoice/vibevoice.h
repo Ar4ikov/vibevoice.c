@@ -22,8 +22,8 @@ extern "C" {
  */
 #define VV_VERSION_MAJOR 0
 #define VV_VERSION_MINOR 4
-#define VV_VERSION_PATCH 0
-#define VV_VERSION_STRING "0.4.0"
+#define VV_VERSION_PATCH 1
+#define VV_VERSION_STRING "0.4.1"
 
 /**
  * @brief Full SemVer 2.0 version of this build.

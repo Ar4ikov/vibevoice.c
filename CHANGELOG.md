@@ -9,6 +9,8 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+## [0.4.1](https://github.com/Ar4ikov/vibevoice.c/compare/v0.4.0...v0.4.1) — 2026-09-19
+
 - **Streaming-7B chunks prefill on kernels sized for them in every format**
   ([#35](https://github.com/Ar4ikov/vibevoice.c/issues/35)).
   A linear layer of 9..64 rows -- a 29-row chunk, a short prompt, the tail of
