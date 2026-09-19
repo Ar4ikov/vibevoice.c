@@ -30,7 +30,7 @@ $ vv_cli --model ./model_hf --audio meeting.wav --output transcript.json
                              your country.
 [ 11.73 -  22.29] Speaker 1  He hoped there would be stew for dinner, turnips
                              and carrots and bruised potatoes...
-RTF 0.065  (120 s of audio in 7.8 s)
+RTF 0.055  (120 s of audio in 6.5 s)
 ```
 
 ---
@@ -69,14 +69,14 @@ RTX 3090, CUDA 12.4, Ryzen 9 5900X. Defaults unless noted.
 | Model load | **9.5 s** |
 | Speech encoding | **243 ms** per 11 s of audio |
 | Prefill | **3056 tok/s** on a 14449-token prompt |
-| Decode | **128 tok/s** at 0.2K context, 112 at 1.5K, 76 averaged over a 14K-to-24K window |
-| RTF | **0.065** on a 120 s file, **0.079** on 32 minutes |
+| Decode | **131 tok/s** at 0.2K context, 123 at 1.5K, 93 averaged over a 14K-to-24K window; 132 / 129 / 107 with `--attn flashinfer` |
+| RTF | **0.055** on a 120 s file, **0.067** on 32 minutes (0.060 with `--attn flashinfer`) |
 | VRAM | 9.8 GB (3.2 GB weights + 1.8 GB KV at a 32K window) |
 
 `transformers` + `bitsandbytes` on the same GPU and checkpoint: 27.6 tok/s.
 
-A 32-minute recording transcribes in 152 s: 14449 prompt tokens, 9522
-generated, 168 segments, flat memory throughout.
+A 32-minute recording transcribes in 128 s (115 s with `--attn flashinfer`):
+14449 prompt tokens, 9522 generated, 168 segments, flat memory throughout.
 
 ### CPU only
 
@@ -159,6 +159,8 @@ finish in 4.2 s together against 5.8 s back to back, returning identical
 transcripts either way. Not 2×, because decode
 is bandwidth-bound on the weights and interleaves — everything either side of
 it overlaps. With `--kv-cache tq4 --max-seq-len 8192` a slot is 115 MB.
+Several slots on a device share one pool of KV pages rather than a window
+each (`--kv-paged`, see [Paged KV cache](#paged-kv-cache)).
 
 ```mermaid
 sequenceDiagram
@@ -352,10 +354,14 @@ invariant to a constant shift of every key, so the cache stores K relative to
 a per-layer reference vector built from the first prefill chunk. That single
 change takes FP8 from 0.856 to 0.9995 and TQ4 from 0.673 to 0.995.
 
-At long context the sub-byte formats cost throughput: on the 32-minute file,
-`fp16` decodes at 56.7 tok/s and `tq4` at 30.4, because unpacking bits with
-warp shuffles is work the FP16 path does not do. `tq4` wins prefill for the
-same reason it loses decode — there is a quarter as much cache to read.
+At long context the sub-byte formats used to cost throughput, because
+unpacking bits with warp shuffles is work the FP16 path does not do, and the
+per-head decode did it seven times per position. On the 32-minute file `tq4`
+decoded at 33.4 tok/s (RTF 0.174); unpacking once per GQA group (`fa2`, the
+default, same transcript) takes it to 73.7 (RTF 0.091), and decoding the
+tiles into shared memory for tensor cores (`--attn flashinfer`) to 111.2 —
+faster than `fp16`, at RTF 0.060. `tq4` wins prefill for the same reason:
+there is a quarter as much cache to read.
 
 ---
 
@@ -566,7 +572,8 @@ the performance cores. **There is no Metal backend.** See "Not done" below.
 VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
-Twenty-one suites. The ones that need weights report SKIP without
+Twenty-two entries — the attention suites run once per backend
+(`VV_ATTN=fa1|fa2|flashinfer`). The ones that need weights report SKIP without
 `VV_TEST_MODEL`. `test_cpu_kernels` checks every CPU kernel against a scalar
 reference, which is what makes the SIMD paths verifiable per architecture —
 it passes natively on AVX2 and under `qemu-aarch64` on NEON, both to 4e-7
@@ -648,15 +655,19 @@ The kernels that matter:
   q/k/v, one for gate/up) and a Marlin-style tensor-core GEMM over one
   shared weight layout, int4 kept packed through shared memory and
   dequantized in registers with `LOP3`.
-- **`attention.cu`**, **`attention_mma.cuh`** — FlashAttention-2 prefill with
-  both matmuls on tensor cores, and a split-KV flash decode where each warp
-  owns a slice of the cache and a second kernel merges the partial softmax
-  states. The prefill kernel issues `mma.sync` as PTX rather than through the
-  WMMA API, because the online softmax has to rescale the output accumulator
-  per row and only `mma.sync` documents which row each accumulator register
-  holds. That layout pays twice: the A operand of the next matmul is laid out
-  exactly like the accumulator of the previous one, so the softmax
-  probabilities feed P·V from the registers they were computed in.
+- **`attention_fi.cu`**, **`attention_decode.cu`**, **`attention.cu`** — the
+  three attention backends behind one dispatch point (see
+  [Attention backends](#attention-backends)): FlashAttention-2 prefill with
+  both matmuls on tensor cores and the heads of a GQA group packed into one
+  block, split-KV decode where each warp owns a slice of the cache and a
+  second kernel merges the partial softmax states, and tensor-core decode
+  over any KV format and a paged cache. The prefill kernel issues
+  `mma.sync` as PTX rather than through the WMMA API, because the online
+  softmax has to rescale the output accumulator per row and only
+  `mma.sync` documents which row each accumulator register holds. That
+  layout pays twice: the A operand of the next matmul is laid out exactly
+  like the accumulator of the previous one, so the softmax probabilities
+  feed P·V from the registers they were computed in.
 - **`kv_quant.cu`** — the FP8 and TurboQuant stores, plus attention kernels
   that read them. Sub-byte codes are laid out so lane L owns dims 4L..4L+3,
   putting its bits in a contiguous run the warp fetches with one coalesced
@@ -693,10 +704,107 @@ The text is identical. Four of the 336 timestamps the model emits move by
 10 ms, which is FP16 rounding inside the P·V product landing on the other side
 of a digit, and is inside the ±100 ms the timestamps are held to.
 
-`VV_ATTN_MMA=0` forces the scalar kernel, which is also what `ctest` runs the
-attention suite a second time under: both have to agree with an FP64 reference
-across fourteen shapes, on and off every tile boundary, with and without the
-chunked-prefill offset.
+`VV_ATTN_MMA=0` still forces the scalar kernel; it is now one of the attention
+backends below.
+
+### Attention backends
+
+`--attn auto|fa1|fa2|flashinfer` (or `VV_ATTN=`) picks the attention kernels
+per context, in `vv_cli`, `serve`, `chat` and `mic`. All three are checked
+against the same FP64 reference; they differ in how they use the card and in
+the last bits of the result.
+
+| | prefill | decode | KV formats | pages |
+|---|---|---|---|---|
+| `fa1` | scalar, a warp per query row | scalar, per head, split over the cache | all | no |
+| `fa2` (`auto`) | FA2 on tensor cores, GQA-packed | scalar, a GQA group per block | all | FP16 |
+| `flashinfer` | the same, plus split KV for few rows | tensor cores, a GQA group per MMA | all, dequantized into shared memory | all |
+
+Qwen2-7B has 7 query heads per KV head. The kernels this replaces gave each
+query head its own blocks, so the same K and V were read, and for TurboQuant
+unpacked, seven times over. Both new backends read a position once per group.
+
+**`fa2` is what `auto` runs, and it is bit-identical to the kernels before
+it.** Its prefill packs the 7 heads of a group into the rows of one block —
+row r is position r / 7, head r % 7 — so a K/V tile is loaded once for all of
+them, but every row still sees the same tiles in the same order with the same
+`mma.sync` sequence and the same natural-base `__expf`. Its decode keeps the
+old kernel's slices of the cache and its FP32 arithmetic per head, and puts
+the group's seven warps in one block, so six of them read from L1 (on a long
+quantized cache one warp carries all seven heads instead, so a vector is also
+decoded once). The tests
+compare `fa2` decode to `fa1` bit for bit on every format, and every parity
+transcript — `jfk`, `test30`, `test120` on fp16, fp8 and tq4, and the
+32-minute file on fp16 — is byte-identical to the previous release.
+
+**`flashinfer` is faster and is not bit-identical**, which is why it is not
+the default. Decode runs Q·Kᵀ and P·V on tensor cores with the group's 7
+heads as MMA rows, the cache split into up to 64 slices and merged after;
+prefill of a few rows against a long cache — a chat turn, a streaming chunk
+— splits over the cache too instead of leaving most SMs idle. FP8 and
+TurboQuant tiles are decoded into shared memory as FP16 (FP8 exactly) and go
+through the same tensor-core kernels, where the other two backends drop to
+scalar code. P goes into P·V as two FP16 halves, hi + lo, so it keeps 22 bits
+— one rounding of P was enough to move a timestamp on the 32-minute file.
+What is left is summation order. No word changes anywhere in the parity set;
+timestamps do, by one or two hundredths: on fp16 one of the 32-minute file's
+336, on fp8 7 of `test120`'s 22, on tq4 13 of `test120`'s 22 and one of
+`test30`'s 6 — all inside the ±100 ms the timestamps are held to.
+
+Decode attention for one layer, 28/4 heads, RTX 3090, effective bandwidth is
+the K and V bytes the step must read over its time (936 GB/s peak):
+
+| cache | fa1 | fa2 | flashinfer |
+|---|---|---|---|
+| 1K, fp16 | 62.0 µs | 26.8 µs | **13.1 µs** |
+| 4K, fp16 | 101.0 µs | 41.3 µs | **19.1 µs** (440 GB/s) |
+| 16K, fp16 | 193.9 µs | 92.4 µs | **56.5 µs** (594 GB/s) |
+| 32K, fp16 | 310.1 µs | 154.3 µs | **94.6 µs** (710 GB/s) |
+| 16K, fp8 | 216.5 µs | 147.7 µs | **42.4 µs** |
+| 16K, tq4 | 249.2 µs | 153.3 µs | **39.5 µs** |
+
+End to end, same card, best of three:
+
+| | before (fa1 decode) | `fa2` (`auto`) | `flashinfer` |
+|---|---|---|---|
+| `jfk`, decode at 0.2K context | 126.8 tok/s | 131.1 | **132.1** |
+| `test120`, decode at ~1.5K | 110.8 tok/s | 123.5 | **128.8** |
+| `test120`, RTF | 0.059 | 0.055 | **0.053** |
+| 32 minutes, decode over 14K-24K | 75.0 tok/s | 93.5 | **107.5** |
+| 32 minutes, wall and RTF | 153.0 s, 0.080 | 128.1 s, 0.067 | **114.5 s, 0.060** |
+
+`test_attn_backends` runs every backend against the reference — prefill on
+and off every tile edge, resumed at an offset, few rows against a long cache;
+decode at 1, 1023, 1024, 1025, 4097, 16385 and 32767 positions, both sides
+of every split bucket; GQA 28/4 and 12/2; every KV format — plus a graph
+captured at one length and replayed at the next twenty against direct
+launches, and a paged cache with a shuffled page table and a partial last
+page against the contiguous one, bit for bit. `ctest` registers it and
+`test_concurrent_decode` once per backend; `test_attn_backends --bench`
+prints the tables above.
+
+### Paged KV cache
+
+A slab per slot means `--slots 4` at a 32K window reserves four full windows
+whether the requests need them or not. With paging, a device keeps one pool
+of 64-position pages and each slot maps the pages it uses through its own
+device-side page table; a finished request gives its pages back. The pool is
+sized for every slot's window when that fits and for what the budget leaves
+otherwise, but never below one window, so a slot running alone can always use
+all of it. `--kv-paged auto` (the default) pages when a device holds several
+slots and the resolved kernels read pages — fa2 on fp16, flashinfer on any
+format — so paging changes memory and nothing else: the transcripts through
+four paged slots are byte-identical to four slabs. With `--gpu-memory 9GiB
+--slots 4` on a 3090, the slabs had one 25856-position window and three 32K
+ones that the budget never saw (21.3 GB at peak); paging keeps the
+budget: one 896 MB pool, a 16K window any of the four may fill (15.3 GB at
+peak).
+
+Pages for the next 1024 positions — the decode's shape bucket — are mapped
+before the step, outside any graph capture; the kernels read the table from
+device memory, so a replayed decode follows new pages without re-capture. A
+pool that runs dry ends that transcript with a warning, like a full window.
+
 
 ### The decode step is one submission
 
