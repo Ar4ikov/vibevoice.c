@@ -31,6 +31,7 @@ pair, which works chunk by chunk (docs/STREAMING.md has the protocol):
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
@@ -597,19 +598,29 @@ def cmd_cmp_stream(args):
         c_texts.append(open(tp, "rb").read().decode("utf-8", "replace")
                        if os.path.exists(tp) else "")
     if len(c_texts) == len(meta["chunks"]):
-        rw, cw = meta["transcript"].split(), "".join(c_texts).split()
-        # word-level edit distance
-        prev = list(range(len(cw) + 1))
-        for a, x in enumerate(rw, 1):
-            cur = [a] + [0] * len(cw)
-            for b, y in enumerate(cw, 1):
-                cur[b] = min(prev[b] + 1, cur[b - 1] + 1,
-                             prev[b - 1] + (x != y))
-            prev = cur
-        d = prev[-1]
-        same_tr = "".join(c_texts) == meta["transcript"]
+        def edits(rw, cw):
+            prev = list(range(len(cw) + 1))
+            for a, x in enumerate(rw, 1):
+                cur = [a] + [0] * len(cw)
+                for b, y in enumerate(cw, 1):
+                    cur[b] = min(prev[b] + 1, cur[b - 1] + 1,
+                                 prev[b - 1] + (x != y))
+                prev = cur
+            return prev[-1]
+
+        def norm(t):
+            # WER convention: case and punctuation do not count
+            t = re.sub(r"[^\w\s']", " ", t.lower())
+            return t.split()
+        c_tr = "".join(c_texts)
+        rw, cw = meta["transcript"].split(), c_tr.split()
+        d = edits(rw, cw)
+        nr, nc = norm(meta["transcript"]), norm(c_tr)
+        dn = edits(nr, nc)
+        same_tr = c_tr == meta["transcript"]
         print(f"transcript       {'identical' if same_tr else 'DIFFER'} "
-              f"(word edits {d}/{len(rw)}, WER {100.0 * d / max(len(rw), 1):.2f}%)")
+              f"(word edits {d}/{len(rw)}; normalized WER "
+              f"{100.0 * dn / max(len(nr), 1):.2f}%)")
 
     total = len(meta["chunks"])
     print(f"summary: ids identical {n_same_ids}/{n_seen}, text identical "
