@@ -158,7 +158,8 @@ vv_status_t vv_nf4_gemv_dev(
     const void* x, const uint8_t* packed, const void* scales,
     const void* bias, void* y, int N, int K, void* stream);
 
-/** @brief NF4 dequant to `temp_weight`, then FP16 GEMM. */
+/** @brief NF4 dequant to `temp_weight`, then FP16 GEMM; 9..64 rows run the
+ *         small-M tensor-core kernel instead (no scratch, same bits). */
 vv_status_t vv_nf4_gemm_dev(
     const void* input_fp16, const uint8_t* weight_packed,
     const void* weight_scales_fp16, void* output_fp16,
@@ -205,8 +206,9 @@ vv_status_t vv_int8_gemv_dev(
     const void* x, const int8_t* q, const float* scales, const void* bias,
     void* y, int N, int K, void* stream);
 
-/** @brief INT8 GEMM without bias: a direct kernel for M <= 8, else dequant
- *         into `temp_weight_fp16` [N, K] + FP16 GEMM. */
+/** @brief INT8 GEMM without bias: a direct kernel for M <= 8, the small-M
+ *         tensor-core kernel for 9..64 (no scratch), else dequant into
+ *         `temp_weight_fp16` [N, K] + FP16 GEMM. */
 vv_status_t vv_int8_gemm_dev(
     const void* input_fp16, const int8_t* q, const float* scales,
     void* output_fp16, void* temp_weight_fp16,
@@ -401,10 +403,64 @@ vv_status_t vv_i8_linear_multi_dev(
 
 /* ─── Dense linear ───────────────────────────────────────────────────────── */
 
-/** @brief C[M,N] = alpha * A[M,K] @ B[N,K]^T + beta * C. */
+/**
+ * @brief C[M,N] = alpha * A[M,K] @ B[N,K]^T + beta * C.
+ *
+ * M <= 8 runs a CUDA-core kernel, 9..64 with beta = 0 the small-M
+ * tensor-core kernels (vv_skinny_linear_dev), the rest the 128x128 tile.
+ */
 vv_status_t vv_gemm_fp16_dev(
     const void* A, const void* B, void* C,
     int M, int N, int K, float alpha, float beta, void* stream);
+
+/**
+ * @brief The 128x128 tensor-core tile GEMM alone, whatever M. What
+ *        vv_gemm_fp16_dev runs above 64 rows, and the reference the
+ *        small-M kernels are held to bit for bit.
+ */
+vv_status_t vv_gemm_fp16_tile_dev(
+    const void* A, const void* B, void* C,
+    int M, int N, int K, float alpha, float beta, void* stream);
+
+/*
+ * Linear layers for 9..64 rows (a Streaming-7B chunk prefills 29), on the
+ * weight formats the dequant + tile GEMM path serves:
+ *   VV_SKINNY_F16   dense FP16 [N][K]
+ *   VV_SKINNY_INT8  int8 [N][K], FP32 scale per row (`--quant int8`)
+ *   VV_SKINNY_NF4   NF4 [N][K/2] high nibble first, FP16 absmax per 64
+ */
+typedef enum vv_skinny_format {
+    VV_SKINNY_F16  = 0,
+    VV_SKINNY_INT8 = 1,
+    VV_SKINNY_NF4  = 2,
+} vv_skinny_format_t;
+
+#define VV_SKINNY_M_MIN 9
+#define VV_SKINNY_M_MAX 64
+
+/** @brief One projection of a small-M launch. */
+typedef struct vv_skinny_proj {
+    const void* w;        /**< weight, in the launch's format                */
+    const void* scales;   /**< INT8: FP32 [N]; NF4: FP16 [N*K/64]; F16: NULL */
+    const void* bias;     /**< FP16 [N] or NULL                              */
+    void*       y;        /**< FP16 [M][N] output                            */
+    int         N;        /**< output columns, a multiple of 8               */
+} vv_skinny_proj_t;
+
+/**
+ * @brief y_i = alpha * A[M,K] . W_i^T (+ bias_i) for up to three projections
+ *        of the same A (q/k/v, gate/up) in one launch, M in 9..64.
+ *
+ * Tensor cores on sm_80+, each weight read once in its stored form and
+ * dequantized in registers. Bit-identical to dequantizing into FP16
+ * (vv_dequant_int8_dev / vv_dequant_nf4_dev), vv_gemm_fp16_tile_dev and
+ * vv_bias_add_dev. Returns VV_ERR_UNSUPPORTED, having launched nothing, when
+ * the device, M, K or an alignment is outside what it covers, or under
+ * VV_SKINNY=0; the caller then runs that path itself. Graph-capturable.
+ */
+vv_status_t vv_skinny_linear_dev(const void* A, int format,
+                                 const vv_skinny_proj_t* projs, int n_proj,
+                                 int M, int K, float alpha, void* stream);
 
 /** @brief C[M,P] = alpha * A[M,K] @ B[K,P] + beta * C. */
 vv_status_t vv_gemm_fp16_nn_dev(

@@ -334,11 +334,49 @@ static vv_status_t ternary_linear(const vv_weight_t* w, const int8_t* q,
                                1, M, N, K, stream);
 }
 
+/**
+ * @brief The small-M kernel format of a weight, or -1 when it has none.
+ *
+ * Dense, INT8 and NF4 weights: the formats whose rows 9..64 used to go
+ * through an FP16 copy of the weight and the tile GEMM. vv_skinny_linear_dev
+ * gives the same bits without either.
+ */
+static int skinny_format(const vv_weight_t* w) {
+    switch (w->quant_kind) {
+        case VV_QUANT_NONE: return VV_SKINNY_F16;
+        case VV_QUANT_INT8: return VV_SKINNY_INT8;
+        case VV_QUANT_NF4:  return VV_SKINNY_NF4;
+        default:            return -1;
+    }
+}
+
+static bool skinny_rows(int M) {
+    return M >= VV_SKINNY_M_MIN && M <= VV_SKINNY_M_MAX;
+}
+
+static vv_skinny_proj_t skinny_proj(const vv_weight_t* w, void* y, int N) {
+    vv_skinny_proj_t p;
+    p.w = w->tensor.data;
+    p.scales = w->quant_kind == VV_QUANT_NONE ? NULL : w->quant.scales.data;
+    p.bias = w->bias.data;
+    p.y = y;
+    p.N = N;
+    return p;
+}
+
 static vv_status_t quant_linear(
     const vv_weight_t* w, const void* x, void* y,
     void* scratch, size_t scratch_bytes, int M, int N, int K, void* stream)
 {
     vv_status_t s;
+
+    /* 9..64 rows (a streaming chunk): bias fused, no weight scratch. */
+    if (skinny_rows(M) && skinny_format(w) >= 0) {
+        const vv_skinny_proj_t p = skinny_proj(w, y, N);
+        s = vv_skinny_linear_dev(x, skinny_format(w), &p, 1, M, K, 1.0f,
+                                 stream);
+        if (s != VV_ERR_UNSUPPORTED) return s;
+    }
 
     if (w->quant_kind == VV_QUANT_TERNARY) {
         /* W1.58A8: quantize the rows, then the ternary product (bias fused). */
@@ -433,7 +471,9 @@ static vv_status_t quant_linear(
  * For one token, W4A16 weights of one group size go through a single GEMV
  * launch (q/k/v, gate/up): the 512-row k and v projections are too short
  * to get past the kernel's ramp-up on their own and ride along behind q
- * instead. Everything else, and every M > 1, is one quant_linear each.
+ * instead. So do 9..64 rows of dense, INT8 or NF4 weights, through the
+ * small-M kernel: alone, k and v would be 8-16 blocks on an 82-SM card.
+ * Everything else is one quant_linear each.
  */
 static vv_status_t quant_linear_group(
     const vv_weight_t* const* ws, void* const* ys, const int* Ns, int n,
@@ -450,6 +490,18 @@ static vv_status_t quant_linear_group(
         for (int i = 0; i < n && s == VV_OK; i++)
             s = ternary_linear(ws[i], q, sc, sum, ys[i], M, Ns[i], K, stream);
         return s;
+    }
+    if (skinny_rows(M) && n <= 3 && skinny_format(ws[0]) >= 0) {
+        bool same = true;
+        for (int i = 1; i < n; i++)
+            same = same && skinny_format(ws[i]) == skinny_format(ws[0]);
+        if (same) {
+            vv_skinny_proj_t p[3];
+            for (int i = 0; i < n; i++) p[i] = skinny_proj(ws[i], ys[i], Ns[i]);
+            vv_status_t s = vv_skinny_linear_dev(x, skinny_format(ws[0]), p, n,
+                                                 M, K, 1.0f, stream);
+            if (s != VV_ERR_UNSUPPORTED) return s;
+        }
     }
     bool fuse = M == 1 && n <= 3;
     for (int i = 0; i < n && fuse; i++)

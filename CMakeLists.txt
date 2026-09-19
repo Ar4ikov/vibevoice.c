@@ -262,6 +262,7 @@ if(VV_HAS_CUDA)
         src/cuda/attention_decode.cu
         src/cuda/swiglu.cu
         src/cuda/gemm.cu
+        src/cuda/gemm_skinny.cu
         src/cuda/embedding.cu
         src/cuda/cuda_utils.cu
         src/cuda/bitnet.cu
@@ -336,6 +337,10 @@ if(VV_BUILD_TESTS)
     # The same path through the loader on a real AWQ / GPTQ checkpoint
     # (VV_TEST_MODEL; skipped without one).
     vv_add_test(test_w4a16_model tests/test_w4a16_model.c)
+    # Dense, INT8 and NF4 linear layers at 9..64 rows: the small-M kernels
+    # byte for byte against the dequant + tile GEMM path, and both against
+    # the CPU kernels and an FP64 reference.
+    vv_add_test(test_skinny tests/test_skinny.c)
     # Every attention backend against the FP64 reference, once per backend.
     add_executable(test_attn_backends tests/test_attn_backends.c)
     target_link_libraries(test_attn_backends PRIVATE vibevoice_core)

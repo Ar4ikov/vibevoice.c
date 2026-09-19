@@ -14,6 +14,8 @@
  * Both use a 128x128x32 block tile split over 8 warps (each warp owns a 64x32
  * quadrant = 4x2 WMMA fragments), double-buffered through shared memory so the
  * global loads for step k+1 are in flight while step k is on the tensor cores.
+ * A TN call of 9..64 rows goes to gemm_skinny.cu instead, which gives the same
+ * bits without padding the rows to 128 or leaving most SMs idle.
  *
  * IMPORTANT: All linear-layer callers pass weight in [N, K] layout
  * (i.e., [out_features, in_features], the standard PyTorch convention).
@@ -396,9 +398,35 @@ vv_status_t vv_gemm_fp16_dev(
         return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
     }
 
+    /* 9..64 rows: the small-M kernels, same bits as the tile below. */
+    if (M <= VV_SKINNY_M_MAX && beta == 0.0f) {
+        const vv_skinny_proj_t p = { B, NULL, NULL, C, N };
+        const vv_status_t s = vv_skinny_linear_dev(A, VV_SKINNY_F16, &p, 1,
+                                                   M, K, alpha, stream);
+        if (s != VV_ERR_UNSUPPORTED) return s;
+    }
+
+    return vv_gemm_fp16_tile_dev(A, B, C, M, N, K, alpha, beta, stream);
+}
+
+/**
+ * @brief The 128x128 tile kernel whatever M:  C = alpha * A @ B^T + beta * C
+ *
+ * Above 64 rows this is what vv_gemm_fp16_dev runs; below, the small-M
+ * kernels are held to it bit for bit (tests/test_skinny.c).
+ */
+vv_status_t vv_gemm_fp16_tile_dev(
+    const void* A, const void* B, void* C,
+    int M, int N, int K,
+    float alpha, float beta,
+    void* stream)
+{
+    if (!A || !B || !C) return VV_ERR_NULL_PTR;
+    if (M <= 0 || N <= 0 || K <= 0) return VV_ERR_INVALID_ARG;
+
     const size_t shmem = (size_t)2 * (BM + BN) * LDK * sizeof(half);
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    gemm_tn_kernel<<<grid, THREADS, shmem, st>>>(
+    gemm_tn_kernel<<<grid, THREADS, shmem, (cudaStream_t)stream>>>(
         (const half*)A, (const half*)B, (half*)C, M, N, K, alpha, beta);
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
@@ -429,7 +457,7 @@ vv_status_t vv_gemm_fp16_nn_dev(
 }
 
 /**
- * @brief NF4 dequant + FP16 GEMM.
+ * @brief NF4 dequant + FP16 GEMM (9..64 rows: vv_skinny_linear_dev).
  *
  * input:  [M, K] FP16
  * weight: [N, K/2] uint8 (NF4 packed, row-major [out, in/2])
@@ -448,9 +476,19 @@ vv_status_t vv_nf4_gemm_dev(
     void* stream)
 {
     if (!input_fp16 || !weight_packed || !weight_scales_fp16 ||
-        !output_fp16 || !temp_weight_fp16) {
+        !output_fp16) {
         return VV_ERR_NULL_PTR;
     }
+
+    /* 9..64 rows: dequantized in registers, no scratch, same bits. */
+    if (M > SMALL_M_MAX && M <= VV_SKINNY_M_MAX && block_size == 64) {
+        const vv_skinny_proj_t p = { weight_packed, weight_scales_fp16, NULL,
+                                     output_fp16, N };
+        vv_status_t s = vv_skinny_linear_dev(input_fp16, VV_SKINNY_NF4, &p, 1,
+                                             M, K, 1.0f, stream);
+        if (s != VV_ERR_UNSUPPORTED) return s;
+    }
+    if (!temp_weight_fp16) return VV_ERR_NULL_PTR;
 
     vv_status_t s = vv_dequant_nf4_dev(
         weight_packed, weight_scales_fp16,
