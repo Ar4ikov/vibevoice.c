@@ -66,8 +66,14 @@ Write the entry for a change under Unreleased in the same pull request.
   tok/s decode, 4.2 GB VRAM. `docs/BITNET.md` has the formats, numerics and
   measurements; `tools/bitnet_ref.py` is a numpy fake-quant reference.
 - `serve --cpu` ran every request's OpenMP team on one core (RTF 13.7 on
-  jfk.wav): the calling thread no longer pins itself to core 0, so threads
-  created from it are not pinned with it.
+  jfk.wav, now 0.23): the connection threads inherited the accepting
+  thread's core-0 pin and now drop it (`vv_cpu_thread_unbind`). The main
+  thread stays pinned: leaving it unpinned cost the 7B CPU path a third
+  (prefill 73 -> 47 tok/s, decode 8.0 -> 5.3).
+- An asr-bitnet run that placement sends to the CPU (a small
+  `--gpu-memory`, a busy card) is loaded again the way `--cpu` loads it;
+  before, it read the GPU's F16 norms as FP32 and decoded garbage until the
+  KV window was full.
 - The front end's counters (`vv_frontend_stats`) have their own lock; a
   reader no longer waits behind the service thread for a whole long file.
 

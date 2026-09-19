@@ -376,6 +376,7 @@ if(VV_BUILD_TESTS)
     set_tests_properties(test_bitnet_dp4a PROPERTIES
                          ENVIRONMENT "VV_BITNET_MMA=0")
     vv_add_test(test_bitnet_vae tests/test_bitnet_vae.c)
+    vv_add_test(test_bitnet_placement tests/test_bitnet_placement.c)
     # Again with every op recomputing its FP32 results in the second pass
     # instead of keeping them: the other half of each two-pass op.
     add_test(NAME test_bitnet_vae_recompute COMMAND test_bitnet_vae)

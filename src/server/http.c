@@ -13,6 +13,7 @@
 #include "vv_ws.h"
 
 #include "vibevoice/vibevoice.h"
+#include "vibevoice/cpu_kernels.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -423,6 +424,7 @@ static VV_THREAD_RET conn_thread(void* arg) {
     vv_http_t* srv = ca->srv;
     const SOCKET fd = ca->fd;
     vv_free(ca);
+    vv_cpu_thread_unbind();   /* not the accept thread's core-0 pin */
 
     vv_http_req_t req;
     char* buf = NULL;

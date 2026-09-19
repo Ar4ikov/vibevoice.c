@@ -150,6 +150,9 @@ static GROUP_AFFINITY g_core_cpu[VV_MAX_CORES];
 static int g_core_cpu[VV_MAX_CORES];  /**< one logical CPU per usable core  */
 #endif
 static int g_n_cores = -1;            /**< -1 = topology not read yet       */
+#if defined(__linux__)
+static cpu_set_t g_allowed;           /**< the CPUs the process started with */
+#endif
 static vv_once_t g_topo_once = VV_ONCE_INIT;
 
 #if defined(__linux__)
@@ -181,6 +184,7 @@ static void detect_topology(void) {
 #if defined(__linux__)
     cpu_set_t allowed, taken;
     if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return;
+    g_allowed = allowed;
     CPU_ZERO(&taken);
     for (int cpu = 0; cpu < CPU_SETSIZE && g_n_cores < VV_MAX_CORES; cpu++) {
         if (!CPU_ISSET(cpu, &allowed) || CPU_ISSET(cpu, &taken)) continue;
@@ -272,22 +276,27 @@ static void bind_worker(int slot) {
 #endif
 }
 
-/**
- * @brief Pin every worker of the current team except the calling thread.
- *        Call inside a parallel region.
- *
- * The caller stays unpinned: every thread it creates later inherits its
- * affinity, and `serve` creates its connection threads from here. With the
- * caller on core 0, each request's OpenMP team -- created by a connection
- * thread, so not this pool -- ran all its workers on that one core: jfk.wav
- * took RTF 13.7 through `serve --cpu` instead of 0.23.
- */
+/** @brief Pin every worker of the current team. Call inside a parallel region. */
 static void bind_team(void) {
 #ifdef _OPENMP
-    const int id = omp_get_thread_num();
-    if (id > 0) bind_worker(id);
+    bind_worker(omp_get_thread_num());
 #else
-    (void)bind_worker;
+    bind_worker(0);
+#endif
+}
+
+/*
+ * The thread that first sets up the kernels is pinned to core 0 with its
+ * team, and on Linux a thread inherits its creator's affinity. A thread that
+ * will run CPU work of its own -- `serve`'s connection threads -- lets go of
+ * that pin first, or its whole OpenMP team would sit on core 0: jfk.wav took
+ * RTF 13.7 through `serve --cpu` instead of 0.23. Windows gives a new thread
+ * the process's mask, so there is nothing to undo.
+ */
+void vv_cpu_thread_unbind(void) {
+#if defined(__linux__)
+    if (!binding_wanted() || physical_cores() <= 0) return;
+    sched_setaffinity(0, sizeof(g_allowed), &g_allowed);
 #endif
 }
 
