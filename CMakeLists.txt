@@ -375,6 +375,13 @@ if(VV_BUILD_TESTS)
     vv_add_test(test_e2e tests/test_e2e.c)
     vv_add_test(test_gguf tests/test_gguf.c)
     vv_add_test(test_bitnet tests/test_bitnet.c)
+    # Its expected values repeat the kernels' "same two operations in the
+    # same order"; a compiler that fuses them into one FMA (clang on arm64
+    # does by default) makes the test disagree with a correct library.
+    if(NOT MSVC)
+        set_source_files_properties(tests/test_bitnet.c PROPERTIES
+            COMPILE_OPTIONS "-ffp-contract=off")
+    endif()
     # Again with the tensor-core GEMM off: the dp4a fallback that pre-Ampere
     # GPUs take has to agree with the CPU bit for bit as well.
     add_test(NAME test_bitnet_dp4a COMMAND test_bitnet)
