@@ -746,8 +746,8 @@ TurboQuant tiles are decoded into shared memory as FP16 (FP8 exactly) and go
 through the same tensor-core kernels, where the other two backends drop to
 scalar code -- so `auto` (fa2) on a `--kv-cache fp8|tq*` cache runs a
 scalar prefill and a CUDA-core decode, and `--attn flashinfer` is the fast
-path for those formats (16K-position decode, fp8: 147.7 against 42.4 µs;
-tq4: 153.3 against 39.5). `auto` stays on fa2 there too, because a default
+path for those formats (16K-position decode, fp8: 154.7 against 45.0 µs;
+tq4: 185.1 against 43.7). `auto` stays on fa2 there too, because a default
 must not move timestamps. P goes into P·V as two FP16 halves, hi + lo, so it keeps 22 bits
 — one rounding of P was enough to move a timestamp on the 32-minute file.
 What is left is summation order. No word changes anywhere in the parity set;
@@ -755,17 +755,30 @@ timestamps do, by one or two hundredths: on fp16 one of the 32-minute file's
 336, on fp8 7 of `test120`'s 22, on tq4 13 of `test120`'s 22 and one of
 `test30`'s 6 — all inside the ±100 ms the timestamps are held to.
 
-Decode attention for one layer, 28/4 heads, RTX 3090, effective bandwidth is
-the K and V bytes the step must read over its time (936 GB/s peak):
+Decode attention for one layer, 28/4 heads, RTX 3090 (the x16 card), best of
+three. Each call reads a different cache out of copies adding up to 64 MB of
+random data, so K and V come from DRAM and not from the 6 MB L2; bandwidth
+is the K and V bytes the step must read over its time (936 GB/s peak):
 
 | cache | fa1 | fa2 | flashinfer |
 |---|---|---|---|
-| 1K, fp16 | 62.0 µs | 26.8 µs | **13.1 µs** |
-| 4K, fp16 | 101.0 µs | 41.3 µs | **19.1 µs** (440 GB/s) |
-| 16K, fp16 | 193.9 µs | 92.4 µs | **56.5 µs** (594 GB/s) |
-| 32K, fp16 | 310.1 µs | 154.3 µs | **94.6 µs** (710 GB/s) |
-| 16K, fp8 | 216.5 µs | 147.7 µs | **42.4 µs** |
-| 16K, tq4 | 249.2 µs | 153.3 µs | **39.5 µs** |
+| 1K, fp16 | 95.0 µs | 36.2 µs | **14.2 µs** (148 GB/s) |
+| 4K, fp16 | 103.7 µs | 41.0 µs (205 GB/s) | **19.6 µs** (429 GB/s) |
+| 16K, fp16 | 207.5 µs | 98.1 µs (342 GB/s) | **58.1 µs** (578 GB/s) |
+| 32K, fp16 | 333.0 µs | 165.0 µs (407 GB/s) | **96.7 µs** (694 GB/s) |
+| 16K, fp8 | 236.0 µs | 154.7 µs | **45.0 µs** |
+| 16K, tq4 | 570.4 µs | 185.1 µs | **43.7 µs** |
+
+fa2's decode is latency-bound well short of the bus: a warp walks its slice
+one position at a time with one load in flight. Keeping two to four
+positions in flight would not change its arithmetic; it is left for a
+follow-up.
+
+Prefill, same card, three interleaved runs against the previous release:
+causal 1K / 4K / 8K go from 41.8–43.0 / 57.2 / 59.9 TFLOP/s to
+41.7–42.1 / 58.4–58.5 / 61.3–61.4, the same at 1K and 2% faster above. The
+MMA work was already near the FP16 ceiling; what the GQA packing and the
+`cp.async` / `ldmatrix` loads buy in prefill is small.
 
 End to end, same card, best of three:
 
