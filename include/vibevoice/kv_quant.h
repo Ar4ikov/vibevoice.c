@@ -43,6 +43,14 @@ typedef enum vv_kv_format {
     VV_KV_FORMAT_COUNT
 } vv_kv_format_t;
 
+/**
+ * @brief Positions per page of a paged KV cache.
+ *
+ * Equal to the KV tile of the tensor-core attention kernels, so a tile never
+ * straddles two pages and each one costs a single table lookup.
+ */
+#define VV_KV_PAGE_SIZE 64
+
 /** @brief Parse a format name ("fp16", "fp8", "fp8-e5m2", "tq4"...). */
 vv_kv_format_t vv_kv_format_parse(const char* name);
 

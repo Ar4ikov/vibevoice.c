@@ -20,9 +20,9 @@
 #include <float.h>
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "decode_split.h"
-#include "attention_mma.cuh"
 
 /* ─── Tile sizes ─────────────────────────────────────────────────────────── */
 
@@ -325,6 +325,8 @@ extern "C" {
 #include "vibevoice/types.h"
 
 #include "vibevoice/device.h"
+#include "vibevoice/kv_quant.h"
+#include "attn_internal.h"
 
 size_t vv_gqa_decode_scratch_bytes(int n_q_heads, int head_dim) {
     return vv_decode_parts_bytes(n_q_heads, head_dim);
@@ -369,7 +371,8 @@ vv_status_t vv_gqa_attention_decode_dev(
 }
 
 /**
- * @brief Multi-token attention against a KV cache.
+ * @brief fa1: multi-token attention against a KV cache, one warp per query
+ *        row, no tensor cores.
  *
  * @param q         [q_len, n_q_heads, head_dim] queries for this chunk
  * @param k_cache   [kv_len, n_kv_heads, head_dim] keys, absolute positions
@@ -380,39 +383,7 @@ vv_status_t vv_gqa_attention_decode_dev(
  * Chunked prefill needs this: the queries of chunk N must see every key from
  * position 0, not just the ones inside the chunk.
  */
-/**
- * @brief Whether the current device can run the tensor-core prefill kernel.
- *
- * `mma.sync.m16n8k16` and `ldmatrix.trans` both need sm_80, so Turing keeps
- * the scalar kernel. Cached per thread and per device, because a thread binds
- * one device per request and a process may hold two engines on two cards.
- * VV_ATTN_MMA=0 forces the scalar path, which is how the two are compared.
- */
-static bool prefill_use_mma(void) {
-    static thread_local int cached_dev = -1;
-    static thread_local int usable = 0;
-    static thread_local int allowed = -1;
-
-    if (allowed < 0) {
-        const char* e = getenv("VV_ATTN_MMA");
-        allowed = (e && e[0] == '0') ? 0 : 1;
-    }
-    if (!allowed) return false;
-
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return false;
-    if (dev != cached_dev) {
-        int major = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                                   dev) != cudaSuccess)
-            return false;
-        usable = (major >= 8);
-        cached_dev = dev;
-    }
-    return usable != 0;
-}
-
-vv_status_t vv_gqa_attention_prefill_cached_dev(
+vv_status_t vv_attn_fa1_prefill_dev(
     const void* q, const void* k_cache, const void* v_cache,
     void* output,
     int n_q_heads, int n_kv_heads, int head_dim,
@@ -420,20 +391,9 @@ vv_status_t vv_gqa_attention_prefill_cached_dev(
 {
     if (!q || !k_cache || !v_cache || !output) return VV_ERR_NULL_PTR;
     if (q_len == 0 || kv_len == 0) return VV_OK;
+    if (head_dim > 256 || head_dim % 32) return VV_ERR_UNSUPPORTED;
 
     float scale = 1.0f / sqrtf((float)head_dim);
-
-    if (head_dim == MMA_D && prefill_use_mma()) {
-        dim3 grid(n_q_heads, (q_len + MMA_BR - 1) / MMA_BR);
-        dim3 block(32, MMA_WARPS);
-        flash_attn_prefill_mma_kernel<<<grid, block, MMA_SMEM_BYTES,
-                                        (cudaStream_t)stream>>>(
-            (const half*)q, (const half*)k_cache, (const half*)v_cache,
-            (half*)output, n_q_heads, n_kv_heads,
-            q_len, q_offset, kv_len, scale, causal);
-        return cudaGetLastError() == cudaSuccess ? VV_OK
-                                                 : VV_ERR_CUDA_LAUNCH;
-    }
 
     int num_q_tiles = (q_len + FA2_BR - 1) / FA2_BR;
     dim3 grid(n_q_heads, num_q_tiles);
@@ -450,6 +410,41 @@ vv_status_t vv_gqa_attention_prefill_cached_dev(
 
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
+/**
+ * @brief FP16 prefill through whatever backend the environment selects.
+ *
+ * Kept for callers that predate the backends; new code calls
+ * vv_attn_prefill with the backend its context resolved.
+ */
+vv_status_t vv_gqa_attention_prefill_cached_dev(
+    const void* q, const void* k_cache, const void* v_cache,
+    void* output,
+    int n_q_heads, int n_kv_heads, int head_dim,
+    int q_len, int q_offset, int kv_len, bool causal, void* stream)
+{
+    if (!q || !k_cache || !v_cache || !output) return VV_ERR_NULL_PTR;
+    /* The same environment vv_attn_backend_from_env reads; this library
+     * cannot call into the core one. */
+    int want = VV_ATTN_AUTO;
+    const char* e = getenv("VV_ATTN");
+    const char* m = getenv("VV_ATTN_MMA");
+    if (e && strcmp(e, "fa1") == 0) want = VV_ATTN_FA1;
+    else if (e && strcmp(e, "fa2") == 0) want = VV_ATTN_FA2;
+    else if (e && (strcmp(e, "flashinfer") == 0 || strcmp(e, "fi") == 0))
+        want = VV_ATTN_FLASHINFER;
+    else if (m && m[0] == '0') want = VV_ATTN_FA1;
+    const int backend = vv_attn_resolve(want, VV_KV_FP16, false,
+                                        n_q_heads, n_kv_heads, head_dim);
+    vv_kv_view_t kv;
+    memset(&kv, 0, sizeof(kv));
+    kv.k = k_cache; kv.v = v_cache;
+    kv.format = VV_KV_FP16; kv.n_kv_heads = n_kv_heads; kv.head_dim = head_dim;
+    /* No scratch here, so flashinfer keeps to its unsplit kernel. */
+    return vv_attn_prefill(backend == VV_ATTN_FLASHINFER ? VV_ATTN_FA2 : backend,
+                           q, &kv, output, n_q_heads, q_len, q_offset, kv_len,
+                           causal, NULL, stream);
 }
 
 vv_status_t vv_gqa_attention_prefill_dev(

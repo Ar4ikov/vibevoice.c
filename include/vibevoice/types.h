@@ -386,6 +386,43 @@ const char* vv_split_mode_name(vv_split_mode_t mode);
 
 #define VV_SPLIT_MODE_COUNT 3
 
+/**
+ * @brief Which attention kernels a context runs.
+ *
+ * All of them compute the same thing to within FP16 rounding; they differ in
+ * how they use the card. `auto` picks per device and KV format (see
+ * vv_attn_resolve in device.h) and is what every caller should leave it at
+ * unless it is comparing kernels.
+ */
+typedef enum vv_attn_backend {
+    VV_ATTN_AUTO = 0,     /**< fa2 where it runs (sm_75+), else fa1          */
+    VV_ATTN_FA1,          /**< tiled scalar kernels, one query head at a
+                               time, no tensor cores; the reference          */
+    VV_ATTN_FA2,          /**< FlashAttention-2 prefill on tensor cores and a
+                               GQA-grouped split-KV decode, bit-identical to
+                               the kernels before the backends; pages on
+                               FP16; sm_75+                                  */
+    VV_ATTN_FLASHINFER,   /**< tensor-core prefill and decode, split KV for
+                               few rows, any KV format, paged; fastest, and
+                               within FP16 rounding of fa2; sm_75+           */
+} vv_attn_backend_t;
+
+#define VV_ATTN_BACKEND_COUNT 4
+
+/** @brief Parse "auto" | "fa1" | "fa2" | "flashinfer" ("fi"); count on failure. */
+vv_attn_backend_t vv_attn_backend_parse(const char* name);
+
+/** @brief Name for logging. */
+const char* vv_attn_backend_name(vv_attn_backend_t b);
+
+/**
+ * @brief Apply the environment to a requested backend.
+ *
+ * An explicit request wins. `auto` defers to VV_ATTN=fa1|fa2|flashinfer, and
+ * VV_ATTN_MMA=0 (the older switch) still means fa1.
+ */
+vv_attn_backend_t vv_attn_backend_from_env(vv_attn_backend_t requested);
+
 /** @brief Parameters for vv_inference_init(). Pass NULL for defaults. */
 typedef struct vv_init_params {
     float  vram_budget;   /**< 0.0-1.0 fraction of free VRAM. Default: 1.0   */

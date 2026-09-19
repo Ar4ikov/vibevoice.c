@@ -322,6 +322,103 @@ vv_status_t vv_residual_add_dev(void* x, const void* y, int total, void* stream)
 vv_status_t vv_bias_add_dev(void* output, const void* bias,
                             int M, int N, void* stream);
 
+/* ─── Attention: one entry point, several backends ───────────────────────── */
+
+/**
+ * @brief One layer of a KV cache as the attention kernels see it.
+ *
+ * `k`/`v` hold [row][n_kv_heads][bytes_per_vec] in the cache's format. With
+ * `page_table` NULL, row = position. Otherwise position t lives at row
+ * page_table[t / VV_KV_PAGE_SIZE] * VV_KV_PAGE_SIZE + t % VV_KV_PAGE_SIZE of
+ * a pool shared with other contexts, and only the flashinfer backend reads
+ * it. The table is device memory, so a replayed graph follows new pages.
+ */
+typedef struct vv_kv_view {
+    const void* k;
+    const void* v;
+    const void* k_meta;       /**< per-vector FP16 scales (TurboQuant) or NULL */
+    const void* v_meta;
+    const int*  page_table;   /**< device, or NULL for a contiguous cache     */
+    int         format;       /**< vv_kv_format_t                              */
+    int         n_kv_heads;
+    int         head_dim;
+} vv_kv_view_t;
+
+/**
+ * @brief The backend a context should run, `auto` resolved for this device.
+ *
+ * Checks what the current device can execute and what the backend supports
+ * (head_dim, GQA group, KV format, paging) and steps down to the next one
+ * that works, logging nothing. Never returns VV_ATTN_AUTO.
+ */
+int vv_attn_resolve(int requested, int kv_format, bool paged,
+                    int n_q_heads, int n_kv_heads, int head_dim);
+
+/**
+ * @brief Scratch one context needs for any backend's attention.
+ *
+ * The maximum over backends, so a context sized once can switch kernels and
+ * the workspace layout does not move.
+ */
+size_t vv_attn_scratch_bytes(int n_q_heads, int n_kv_heads, int head_dim);
+
+/**
+ * @brief The decode attention's launch shape for `backend` at `cache_len`.
+ *
+ * A captured decode step replays the grid it recorded, so the caller
+ * re-captures whenever this changes. Only equality means anything.
+ */
+int vv_attn_decode_shape(int backend, int n_q_heads, int n_kv_heads,
+                         int cache_len);
+
+/**
+ * @brief `q_len` query rows at absolute positions `q_offset..` against the
+ *        first `kv_len` positions of a cache (which already holds this
+ *        chunk's own K and V).
+ *
+ * Q and O are [q_len][n_q_heads][head_dim] FP16. For a TurboQuant cache Q
+ * must already be rotated and O comes back rotated (vv_kv_rotate_dev).
+ * @param scratch  vv_attn_scratch_bytes() of device memory owned by the
+ *                 caller; the split-KV path of flashinfer uses it.
+ */
+vv_status_t vv_attn_prefill(int backend, const void* q, const vv_kv_view_t* kv,
+                            void* out, int n_q_heads, int q_len, int q_offset,
+                            int kv_len, bool causal, void* scratch,
+                            void* stream);
+
+/**
+ * @brief One query row per head against the whole cache.
+ * @param cache_len    Sizes the launch; with `d_cache_len` it need only be in
+ *                     the same vv_attn_decode_shape() bucket as the truth.
+ * @param d_cache_len  Device int holding the exact length, or NULL.
+ */
+vv_status_t vv_attn_decode(int backend, const void* q, const vv_kv_view_t* kv,
+                           void* out, int n_q_heads, int cache_len,
+                           const int* d_cache_len, void* scratch,
+                           void* stream);
+
+/**
+ * @brief Quantize (or copy, for FP16) K/V vectors into a cache layer, at
+ *        rows from `page_table` when it is set.
+ *
+ * Same contract as vv_kv_quant_store_dev, plus FP16 and paging.
+ */
+vv_status_t vv_kv_store_dev(
+    const void* k_fp16, const void* v_fp16,
+    void* k_store, void* v_store, void* k_meta, void* v_meta,
+    void* k_ref, bool build_ref,
+    int n_kv_heads, int head_dim, int pos, const int* d_pos,
+    int n_positions, int kv_format, const int* page_table, void* stream);
+
+/**
+ * @brief `page_table[first + i] = pages[i]` for i < n, ordered on `stream`.
+ *
+ * `pages` is host memory and is consumed before this returns. Not for use
+ * inside a graph capture: the ids are baked into the launch.
+ */
+vv_status_t vv_kv_page_map_dev(int* page_table, int first, int n,
+                               const int* pages, void* stream);
+
 /**
  * @brief Scratch bytes the split-K decode attention needs for one caller.
  *

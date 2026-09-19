@@ -61,20 +61,27 @@ typedef struct {
 
 static size_t q_elems(void) { return (size_t)N_Q_HEADS * HEAD_DIM; }
 
+/* The backend under test (VV_ATTN, as ctest sets it per run) for each of the
+ * two caches. Resolved once, before any thread starts. */
+static int be_raw = 0, be_q = 0;
+
 /** @brief One decode through both the raw and the quantized kernel. */
 static vv_status_t decode_once(worker_t* w, uint16_t* dst) {
-    vv_status_t s = vv_gqa_attention_decode_dev(
-        w->q, w->k, w->v, w->out, N_Q_HEADS, N_KV_HEADS, HEAD_DIM, N_POS,
-        NULL, w->scratch, w->stream);
+    vv_kv_view_t kv;
+    memset(&kv, 0, sizeof(kv));
+    kv.k = w->k; kv.v = w->v; kv.format = VV_KV_FP16;
+    kv.n_kv_heads = N_KV_HEADS; kv.head_dim = HEAD_DIM;
+    vv_status_t s = vv_attn_decode(be_raw, w->q, &kv, w->out, N_Q_HEADS,
+                                   N_POS, NULL, w->scratch, w->stream);
     if (s != VV_OK) return s;
     vv_dev_stream_sync(w->stream);
     vv_dev_memcpy_d2h(dst, w->out, q_elems() * 2, w->stream);
     vv_dev_stream_sync(w->stream);
 
-    s = vv_gqa_attention_decode_q_dev(
-        w->q, w->ks, w->vs, w->km, w->vm, w->out,
-        N_Q_HEADS, N_KV_HEADS, HEAD_DIM, N_POS, NULL, (int)VV_KV_TQ4,
-        w->scratch, w->stream);
+    kv.k = w->ks; kv.v = w->vs; kv.k_meta = w->km; kv.v_meta = w->vm;
+    kv.format = VV_KV_TQ4;
+    s = vv_attn_decode(be_q, w->q, &kv, w->out, N_Q_HEADS, N_POS, NULL,
+                       w->scratch, w->stream);
     if (s != VV_OK) return s;
     vv_dev_stream_sync(w->stream);
     vv_dev_memcpy_d2h(dst + q_elems(), w->out, q_elems() * 2, w->stream);
@@ -142,7 +149,15 @@ int main(void) {
     worker_t w[N_THREADS];
     memset(w, 0, sizeof(w));
     const size_t scratch_bytes =
-        vv_gqa_decode_scratch_bytes(N_Q_HEADS, HEAD_DIM);
+        vv_attn_scratch_bytes(N_Q_HEADS, N_KV_HEADS, HEAD_DIM);
+    const int want = (int)vv_attn_backend_from_env(VV_ATTN_AUTO);
+    be_raw = vv_attn_resolve(want, VV_KV_FP16, false, N_Q_HEADS, N_KV_HEADS,
+                             HEAD_DIM);
+    be_q = vv_attn_resolve(want, VV_KV_TQ4, false, N_Q_HEADS, N_KV_HEADS,
+                           HEAD_DIM);
+    printf("backends: fp16 %s, tq4 %s\n",
+           vv_attn_backend_name((vv_attn_backend_t)be_raw),
+           vv_attn_backend_name((vv_attn_backend_t)be_q));
 
     for (int i = 0; i < N_THREADS; i++) {
         w[i].id = i;

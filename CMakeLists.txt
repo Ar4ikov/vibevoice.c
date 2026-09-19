@@ -166,6 +166,7 @@ add_library(vibevoice_core STATIC
     src/core/version.c
     src/core/gpu_select.c
     src/core/vv_spawn.c
+    src/core/attn_backend.c
     src/audio/wav.c
     src/audio/resample.c
     src/audio/normalize.c
@@ -267,6 +268,8 @@ if(VV_HAS_CUDA)
         src/cuda/rmsnorm.cu
         src/cuda/rope.cu
         src/cuda/attention.cu
+        src/cuda/attention_fi.cu
+        src/cuda/attention_decode.cu
         src/cuda/swiglu.cu
         src/cuda/gemm.cu
         src/cuda/embedding.cu
@@ -361,6 +364,21 @@ if(VV_BUILD_TESTS)
     # The same path through the loader on a real AWQ / GPTQ checkpoint
     # (VV_TEST_MODEL; skipped without one).
     vv_add_test(test_w4a16_model tests/test_w4a16_model.c)
+    # Every attention backend against the FP64 reference, once per backend.
+    add_executable(test_attn_backends tests/test_attn_backends.c)
+    target_link_libraries(test_attn_backends PRIVATE vibevoice_core)
+    if(VV_HAS_CUDA)
+        target_link_libraries(test_attn_backends PRIVATE vibevoice_cuda)
+    endif()
+    foreach(backend fa1 fa2 flashinfer)
+        add_test(NAME test_attn_${backend} COMMAND test_attn_backends)
+        set_tests_properties(test_attn_${backend} PROPERTIES
+                             ENVIRONMENT "VV_ATTN=${backend}")
+        add_test(NAME test_concurrent_decode_${backend}
+                 COMMAND test_concurrent_decode)
+        set_tests_properties(test_concurrent_decode_${backend} PROPERTIES
+                             ENVIRONMENT "VV_ATTN=${backend}")
+    endforeach()
     vv_add_test(test_cpu_kernels tests/test_cpu_kernels.c)
 
     # Arguments to helper programs, uploads and HTTP heads stay data (#14).
