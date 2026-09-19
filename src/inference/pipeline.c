@@ -1620,8 +1620,11 @@ static vv_status_t cpu_head_argmax(vv_inference_ctx_t* ctx,
  *
  * The draw is taken once over the whole clip, after the segments are
  * concatenated, which is where the reference takes it; so the latents have
- * to exist in full before the connectors run. Off the default path, and the
- * only place a request allocates for its audio.
+ * to exist in full before the connectors run. Off the default path. The
+ * latents and the FP32 staging live in a per-context buffer that only grows
+ * (a longer clip than any before), so in serve this mode does not cudaFree
+ * -- and stall the other slots -- per request. The dump path (VV_DUMP_DIR,
+ * debugging only) still allocates its connector scratch per call.
  */
 static vv_status_t encode_audio_host(vv_inference_ctx_t* ctx,
                                      const vv_inference_params_t* params,
@@ -1639,9 +1642,27 @@ static vv_status_t encode_audio_host(vv_inference_ctx_t* ctx,
     const size_t fr = (size_t)(frames > 0 ? frames : 1);
     const size_t maxv = (size_t)(vd[0] > vd[1] ? vd[0] : vd[1]);
 
-    for (int e = 0; e < 2 && s == VV_OK; e++)
-        s = vv_dev_alloc(&lat[e], fr * (size_t)vd[e] * 2);
-    if (s == VV_OK) s = vv_dev_alloc(&f32, fr * maxv * sizeof(float));
+    {
+        const size_t al = 256;
+        const size_t b0 = (fr * (size_t)vd[0] * 2 + al - 1) / al * al;
+        const size_t b1 = (fr * (size_t)vd[1] * 2 + al - 1) / al * al;
+        const size_t need = b0 + b1 + fr * maxv * sizeof(float);
+        if (ctx->fe_lat_bytes < need) {
+            if (ctx->fe_lat_buf) {
+                vv_dev_stream_sync(ctx->compute_stream);
+                vv_dev_free(ctx->fe_lat_buf);
+            }
+            ctx->fe_lat_buf = NULL;
+            ctx->fe_lat_bytes = 0;
+            s = vv_dev_alloc(&ctx->fe_lat_buf, need);
+            if (s == VV_OK) ctx->fe_lat_bytes = need;
+        }
+        if (s == VV_OK) {
+            lat[0] = ctx->fe_lat_buf;
+            lat[1] = (char*)ctx->fe_lat_buf + b0;
+            f32 = (char*)ctx->fe_lat_buf + b0 + b1;
+        }
+    }
     h16 = (uint16_t*)vv_alloc(fr * maxv * 2);
     h32 = (float*)vv_alloc(fr * maxv * sizeof(float));
     if (s == VV_OK && (!h16 || !h32)) s = VV_ERR_OUT_OF_MEMORY;
@@ -1666,7 +1687,7 @@ static vv_status_t encode_audio_host(vv_inference_ctx_t* ctx,
         const size_t n = (size_t)frames * (size_t)vd[e];
         s = vv_dev_memcpy_d2h(h16, lat[e], n * 2, ctx->compute_stream);
         if (s != VV_OK) break;
-        for (size_t i = 0; i < n; i++) h32[i] = half_to_float_single(h16[i]);
+        for (size_t i = 0; i < n; i++) h32[i] = vv_half_to_float(h16[i]);
         dump_f32(names[e], h32, n);
         if (e != 0 || !params ||
             params->acoustic_sampling == VV_ACOUSTIC_MODE)
@@ -1699,7 +1720,7 @@ static vv_status_t encode_audio_host(vv_inference_ctx_t* ctx,
                 vv_dev_memcpy_d2h(th, tmp, (size_t)frames * hs * 2,
                                   ctx->compute_stream);
                 for (size_t i = 0; i < (size_t)frames * hs; i++)
-                    tf[i] = half_to_float_single(th[i]);
+                    tf[i] = vv_half_to_float(th[i]);
                 dump_f32(fn[e], tf, (size_t)frames * hs);
             }
             vv_dev_free(tmp);
@@ -1715,8 +1736,6 @@ static vv_status_t encode_audio_host(vv_inference_ctx_t* ctx,
                                 ctx->fe_ready, ctx->fe_done);
     if (s == VV_OK) s = vv_dev_event_sync(ctx->fe_done);
 
-    for (int e = 0; e < 2; e++) if (lat[e]) vv_dev_free(lat[e]);
-    if (f32) vv_dev_free(f32);
     vv_free(h16);
     vv_free(h32);
     return s;
@@ -2707,6 +2726,7 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
     if (ctx->fe_stream) vv_frontend_stream_free(ctx->fe_stream);
     if (ctx->fe_ready) vv_dev_event_destroy(ctx->fe_ready);
     if (ctx->fe_done) vv_dev_event_destroy(ctx->fe_done);
+    if (ctx->fe_lat_buf) vv_dev_free(ctx->fe_lat_buf);
     /* Clones borrow the device's front end; the parent goes last. */
     if (!ctx->is_clone && ctx->frontend) vv_frontend_free(ctx->frontend);
     free_frontend_host(ctx);

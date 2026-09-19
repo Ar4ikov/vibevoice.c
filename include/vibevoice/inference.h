@@ -497,6 +497,10 @@ typedef struct vv_inference_ctx {
     struct vv_frontend_stream* fe_stream;
     void*                      fe_ready;   /**< event: prompt rows embedded */
     void*                      fe_done;    /**< event: audio rows written   */
+    /** Latents + FP32 staging for the acoustic draw and dumps, grown to the
+        longest clip seen and kept, so those modes do not allocate per request. */
+    void*                      fe_lat_buf;
+    size_t                     fe_lat_bytes;
 
     /* Model directory path (for loading tokenizer) */
     char           model_dir[512];
