@@ -17,6 +17,7 @@
 #include "vibevoice/device.h"
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,6 +88,22 @@ static void test_published_configs(void) {
     s = vv_config_parse_preprocessor("does/not/exist.json", &c);
     CHECK(s == VV_OK && c.audio.normalize_audio &&
           c.audio.compress_ratio == 3200, "missing preprocessor = defaults");
+}
+
+/*
+ * Append to a fixed buffer, refusing rather than overflowing: snprintf's
+ * return is what it *would* have written, so adding it to the length
+ * unchecked walks past the end once the buffer fills.
+ */
+static int appendf(char* buf, size_t cap, size_t* len, const char* fmt, ...) {
+    if (*len >= cap) return -1;
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf(buf + *len, cap - *len, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - *len) return -1;
+    *len += (size_t)n;
+    return 0;
 }
 
 static int write_text(const char* path, const char* text) {
@@ -367,7 +384,8 @@ static int write_model(const char* dir, bool tie, const char* skip,
     /* Header: JSON, padded with spaces to a multiple of 8. */
     size_t cap = 65536, len = 0, off = 0;
     char* hdr = (char*)malloc(cap);
-    len += (size_t)snprintf(hdr + len, cap - len, "{");
+    if (!hdr) return 1;
+    int trunc = appendf(hdr, cap, &len, "{");
     bool first = true;
     for (int i = 0; i < g_n; i++) {
         const fake_t* t = &g_t[i];
@@ -375,20 +393,21 @@ static int write_model(const char* dir, bool tie, const char* skip,
         int64_t d0 = t->shape[0];
         if (bad && strcmp(t->name, bad) == 0) d0 /= 2;   /* bytes stay */
         if (t->ndim == 2)
-            len += (size_t)snprintf(hdr + len, cap - len,
+            trunc |= appendf(hdr, cap, &len,
                 "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%lld,%lld],"
                 "\"data_offsets\":[%zu,%zu]}", first ? "" : ",", t->name,
                 t->dtype, (long long)d0, (long long)t->shape[1],
                 off, off + t->bytes);
         else
-            len += (size_t)snprintf(hdr + len, cap - len,
+            trunc |= appendf(hdr, cap, &len,
                 "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%lld],"
                 "\"data_offsets\":[%zu,%zu]}", first ? "" : ",", t->name,
                 t->dtype, (long long)d0, off, off + t->bytes);
         off += t->bytes;
         first = false;
     }
-    len += (size_t)snprintf(hdr + len, cap - len, "}");
+    trunc |= appendf(hdr, cap, &len, "}");
+    if (trunc || len + 8 > cap) { free(hdr); return 1; }   /* header too big */
     while (len % 8) hdr[len++] = ' ';
 
     snprintf(path, sizeof(path), "%s/model.safetensors", dir);
