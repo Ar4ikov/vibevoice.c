@@ -17,6 +17,7 @@ project(vibevoice VERSION ${VV_VERSION} LANGUAGES C CXX)
 vv_compute_version("${CMAKE_CURRENT_SOURCE_DIR}")
 
 option(VV_ENABLE_CUDA  "Enable CUDA GPU support"       ON)
+option(VV_ENABLE_METAL "Enable Metal GPU support (Apple Silicon)" ON)
 option(VV_ENABLE_BLAS  "Enable OpenBLAS for CPU GEMM"   OFF)
 option(VV_BUILD_TESTS  "Build test executables"          ON)
 option(VV_BUILD_BENCH  "Build benchmark executable"      ON)
@@ -37,6 +38,27 @@ if(VV_ENABLE_CUDA)
     endif()
 else()
     message(STATUS "CUDA disabled — building CPU-only")
+endif()
+
+# ─── Metal (macOS, when CUDA is not in the build) ────────────────────────────
+#
+# One backend per binary (device.h): CUDA wins if both are asked for, which
+# on a Mac cannot happen anyway. The kernels are Metal Shading Language
+# compiled at run time, so this needs no Xcode -- the Command Line Tools'
+# clang and the macOS SDK's Metal framework are enough.
+set(VV_HAS_METAL OFF)
+if(APPLE AND VV_ENABLE_METAL AND NOT VV_HAS_CUDA)
+    enable_language(OBJC)
+    set(VV_HAS_METAL ON)
+    message(STATUS "Metal enabled")
+endif()
+
+# The library every executable links next to vibevoice_core, if any.
+set(VV_ACCEL_LIB "")
+if(VV_HAS_CUDA)
+    set(VV_ACCEL_LIB vibevoice_cuda)
+elseif(VV_HAS_METAL)
+    set(VV_ACCEL_LIB vibevoice_metal)
 endif()
 
 # ─── Standards ────────────────────────────────────────────────────────────────
@@ -218,9 +240,12 @@ if(OpenMP_C_FOUND)
     target_link_libraries(vibevoice_core PUBLIC OpenMP::OpenMP_C)
 endif()
 
-# Propagate VV_HAS_CUDA define to C code
+# Propagate the backend define to C code
 if(VV_HAS_CUDA)
     target_compile_definitions(vibevoice_core PUBLIC VV_HAS_CUDA=1)
+endif()
+if(VV_HAS_METAL)
+    target_compile_definitions(vibevoice_core PUBLIC VV_HAS_METAL=1)
 endif()
 
 # OpenBLAS
@@ -274,21 +299,57 @@ if(VV_HAS_CUDA)
     endif()
 endif()
 
+# ─── vibevoice_metal (Metal kernels) ──────────────────────────────────────────
+if(VV_HAS_METAL)
+    # common.metal defines what the others use, so it goes first.
+    file(GLOB VV_METAL_KERNEL_FILES CONFIGURE_DEPENDS
+         ${CMAKE_SOURCE_DIR}/src/metal/kernels/*.metal)
+    list(REMOVE_ITEM VV_METAL_KERNEL_FILES
+         ${CMAKE_SOURCE_DIR}/src/metal/kernels/common.metal)
+    list(SORT VV_METAL_KERNEL_FILES)
+    set(VV_METAL_KERNELS
+        ${CMAKE_SOURCE_DIR}/src/metal/kernels/common.metal
+        ${VV_METAL_KERNEL_FILES})
+    file(GLOB VV_METAL_OPS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/metal/mtl_*.c)
+    set(VV_METAL_EMBED "${VV_GENERATED_DIR}/vv_metal_source.c")
+    add_custom_command(
+        OUTPUT "${VV_METAL_EMBED}"
+        COMMAND "${CMAKE_COMMAND}"
+                "-DVV_OUT=${VV_METAL_EMBED}"
+                "-DVV_SRCS=${VV_METAL_KERNELS}"
+                -P "${CMAKE_SOURCE_DIR}/cmake/EmbedMetal.cmake"
+        DEPENDS ${VV_METAL_KERNELS} "${CMAKE_SOURCE_DIR}/cmake/EmbedMetal.cmake"
+        COMMENT "Embedding the Metal kernels"
+        VERBATIM)
+    add_library(vibevoice_metal STATIC
+        src/metal/metal_runtime.m
+        src/metal/metal_stubs.c
+        ${VV_METAL_OPS}
+        "${VV_METAL_EMBED}"
+    )
+    target_include_directories(vibevoice_metal PRIVATE ${CMAKE_SOURCE_DIR}/src/metal)
+    set_source_files_properties(src/metal/metal_runtime.m PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(vibevoice_metal PUBLIC vibevoice_core
+        "-framework Metal" "-framework Foundation"
+        "-framework IOKit" "-framework CoreFoundation")
+endif()
+
 # ─── vibevoice shared library ─────────────────────────────────────────────────
 add_library(vibevoice SHARED
     src/core/alloc.c  # re-add for DLL export; in production use object libs
 )
 target_link_libraries(vibevoice PUBLIC vibevoice_core)
-if(VV_HAS_CUDA)
-    target_link_libraries(vibevoice PUBLIC vibevoice_cuda)
+if(VV_ACCEL_LIB)
+    target_link_libraries(vibevoice PUBLIC ${VV_ACCEL_LIB})
 endif()
 
 # ─── CLI executable ───────────────────────────────────────────────────────────
 if(VV_BUILD_CLI)
     add_executable(vv_cli cli/main.c cli/cmd_serve.c cli/cmd_chat.c)
     target_link_libraries(vv_cli PRIVATE vibevoice_core)
-    if(VV_HAS_CUDA)
-        target_link_libraries(vv_cli PRIVATE vibevoice_cuda)
+    if(VV_ACCEL_LIB)
+        target_link_libraries(vv_cli PRIVATE ${VV_ACCEL_LIB})
     endif()
 endif()
 
@@ -299,13 +360,14 @@ if(VV_BUILD_TESTS)
     function(vv_add_test name src)
         add_executable(${name} ${src})
         target_link_libraries(${name} PRIVATE vibevoice_core)
-        if(VV_HAS_CUDA)
-            target_link_libraries(${name} PRIVATE vibevoice_cuda)
+        if(VV_ACCEL_LIB)
+            target_link_libraries(${name} PRIVATE ${VV_ACCEL_LIB})
         endif()
         add_test(NAME ${name} COMMAND ${name})
     endfunction()
 
     vv_add_test(test_audio tests/test_audio.c)
+    vv_add_test(test_device_memory tests/test_device_memory.c)
     vv_add_test(test_queue tests/test_queue.c)
     vv_add_test(test_gpu_select tests/test_gpu_select.c)
     vv_add_test(test_safetensors tests/test_safetensors.c)
@@ -344,8 +406,8 @@ if(VV_BUILD_TESTS)
     # Every attention backend against the FP64 reference, once per backend.
     add_executable(test_attn_backends tests/test_attn_backends.c)
     target_link_libraries(test_attn_backends PRIVATE vibevoice_core)
-    if(VV_HAS_CUDA)
-        target_link_libraries(test_attn_backends PRIVATE vibevoice_cuda)
+    if(VV_ACCEL_LIB)
+        target_link_libraries(test_attn_backends PRIVATE ${VV_ACCEL_LIB})
     endif()
     foreach(backend fa1 fa2 flashinfer)
         add_test(NAME test_attn_${backend} COMMAND test_attn_backends)
@@ -400,19 +462,19 @@ endif()
 if(VV_BUILD_BENCH)
     add_executable(vv_bench bench/benchmark.c)
     target_link_libraries(vv_bench PRIVATE vibevoice_core)
-    if(VV_HAS_CUDA)
-        target_link_libraries(vv_bench PRIVATE vibevoice_cuda)
+    if(VV_ACCEL_LIB)
+        target_link_libraries(vv_bench PRIVATE ${VV_ACCEL_LIB})
     endif()
     # Speech front end throughput, alone and under concurrency.
     add_executable(vv_bench_encoder bench/bench_encoder.c)
     target_link_libraries(vv_bench_encoder PRIVATE vibevoice_core)
-    if(VV_HAS_CUDA)
-        target_link_libraries(vv_bench_encoder PRIVATE vibevoice_cuda)
+    if(VV_ACCEL_LIB)
+        target_link_libraries(vv_bench_encoder PRIVATE ${VV_ACCEL_LIB})
     endif()
     add_executable(vv_bench_bitnet bench/bench_bitnet.c)
     target_link_libraries(vv_bench_bitnet PRIVATE vibevoice_core)
-    if(VV_HAS_CUDA)
-        target_link_libraries(vv_bench_bitnet PRIVATE vibevoice_cuda)
+    if(VV_ACCEL_LIB)
+        target_link_libraries(vv_bench_bitnet PRIVATE ${VV_ACCEL_LIB})
     endif()
 endif()
 
@@ -433,6 +495,7 @@ message(STATUS "")
 message(STATUS "  vibevoice.c ${VV_VERSION_FULL} build configuration:")
 message(STATUS "    Revision:  ${VV_REVISION}")
 message(STATUS "    CUDA:      ${VV_HAS_CUDA}")
+message(STATUS "    Metal:     ${VV_HAS_METAL}")
 message(STATUS "    OpenBLAS:  ${VV_HAS_BLAS}")
 message(STATUS "    CLI:       ${VV_BUILD_CLI}")
 message(STATUS "    Tests:     ${VV_BUILD_TESTS}")
