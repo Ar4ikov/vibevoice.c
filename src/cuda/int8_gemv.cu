@@ -15,8 +15,10 @@
  *
  * Decode (M = 1) reads each weight byte once, half the bytes of FP16 and
  * twice those of the 4-bit formats. Small batches (M <= 8) reuse the
- * converted weights across rows; larger M dequantizes into the FP16 scratch
- * and runs the tensor-core GEMM, like the other formats do.
+ * converted weights across rows; 9..64 rows go to the small-M tensor-core
+ * kernels (gemm_skinny.cu), which dequantize in registers; larger M
+ * dequantizes into the FP16 scratch and runs the tile GEMM, like the other
+ * formats do. The last two give the same bits.
  */
 
 #include <cuda_runtime.h>
@@ -203,6 +205,14 @@ vv_status_t vv_int8_gemm_dev(
         int8_gemm_small_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
             (const half*)input_fp16, q, scales, (half*)output_fp16, M, N, K);
         return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+    }
+
+    /* 9..64 rows: dequantized in registers, no scratch, same bits. */
+    if (M <= VV_SKINNY_M_MAX) {
+        const vv_skinny_proj_t p = { q, scales, NULL, output_fp16, N };
+        vv_status_t s = vv_skinny_linear_dev(input_fp16, VV_SKINNY_INT8, &p, 1,
+                                             M, K, 1.0f, stream);
+        if (s != VV_ERR_UNSUPPORTED) return s;
     }
 
     if (!temp_weight_fp16) return VV_ERR_NULL_PTR;

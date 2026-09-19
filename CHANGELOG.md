@@ -9,6 +9,25 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- **Streaming-7B chunks prefill on kernels sized for them in every format**
+  ([#35](https://github.com/Ar4ikov/vibevoice.c/issues/35)).
+  A linear layer of 9..64 rows -- a 29-row chunk, a short prompt, the tail of
+  a chunked one -- on dense FP16, `--quant int8` or NF4 weights now runs on
+  tensor-core kernels built for it (`src/cuda/gemm_skinny.cu`) instead of the
+  128-row tile GEMM: 64 output columns per block, q/k/v and gate/up in one
+  launch each so every SM has blocks, and the weight read once in the form
+  it is stored, INT8 and NF4 dequantized in registers rather than written
+  out as an FP16 copy first. The output is bit-identical to the old path
+  (the same `mma.m16n8k16` sequence in the same k order, no split-K, the
+  same dequant and bias arithmetic), so no transcript moves wherever a
+  prefill chunk boundary falls: 37 of 37 outputs byte-identical to 0.4.0
+  (streaming none/int8/nf4, one-shot NF4 and AWQ on jfk, test30, test120
+  and the 32-minute file, and two NF4 prompts that do land a chunk in 9..64
+  rows). 3090, test120, chunk latency: FP16 281 → 210 ms, int8 227 → 130 ms,
+  nf4 205 → 110 ms; one 7B layer at 29 rows 5.3-8.4x faster.
+  `VV_SKINNY=0` restores the old path; `tests/test_skinny.c` holds the
+  kernels to it byte for byte and to the CPU kernels.
+
 ## [0.4.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.3.0...v0.4.0) — 2026-09-19
 
 - **`microsoft/VibeVoice-ASR-Streaming-7B` runs** ([#20](https://github.com/Ar4ikov/vibevoice.c/issues/20)):

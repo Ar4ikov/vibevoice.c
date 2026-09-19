@@ -251,10 +251,10 @@ With `--quant none` every chunk's tokens equal upstream
 
 | weights | per chunk (encode + prefill + decode) | RTF, file | VRAM | transcript vs upstream |
 |---|---|---|---|---|
-| `--quant none` (FP16) | 306 ms | 0.106 | 18.6 GB | identical |
+| `--quant none` (FP16) | 210 ms | 0.072 | 18.6 GB | identical |
 | `--quant int4` | **92 ms** | **0.032** | 9.8 GB | identical |
-| `--quant int8` | 259 ms | 0.090 | 12.5 GB | identical |
-| `--quant nf4` | 263 ms | 0.091 | 9.8 GB | punctuation differs, same words |
+| `--quant int8` | 130 ms | 0.045 | 12.5 GB | identical |
+| `--quant nf4` | 110 ms | 0.038 | 9.8 GB | punctuation differs, same words |
 
 `serve --quant int4` carries about 24 live WebSocket streams on one 3090
 with chunk latency under 300 ms at p95 (32 at the edge, 1.1 s p95), each
@@ -1033,14 +1033,15 @@ speech encoder or the connectors touches the default stream any more.
   claim that cannot be stood behind. The seam exists:
   `include/vibevoice/device.h` declares the op set, a build links exactly one
   implementation of it, and `src/device/device_none.c` shows the shape.
-- **Streaming-7B follow-ups.** A 29-row chunk prefill is fast only on the
-  W4A16 kernels (`--quant int4`); dense FP16, int8 and nf4 run it through
-  GEMMs sized for long prompts, and so does the CPU path, which is why it
-  runs slower than real time. A session that outgrows its KV window (about
-  40 minutes at 32K positions) ends cleanly instead of rolling over into a
-  fresh cache. Live sessions are time-sliced: nothing batches decode steps
-  or chunk prefills across slots, which is what caps a 3090 at about 24-32
-  live int4 streams.
+- **Streaming-7B follow-ups.** The CPU path runs a 29-row chunk prefill
+  through GEMMs sized for long prompts, which is why it runs slower than
+  real time. On the GPU every format has kernels for it, but int8 and nf4
+  reach about half of their memory or tensor bound at 29 rows (split-K
+  would help, and would change the bits). A session that outgrows its KV
+  window (about 40 minutes at 32K positions) ends cleanly instead of
+  rolling over into a fresh cache. Live sessions are time-sliced: nothing
+  batches decode steps or chunk prefills across slots, which is what caps a
+  3090 at about 24-32 live int4 streams.
 
 ---
 

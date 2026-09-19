@@ -238,6 +238,16 @@ vv_status_t vv_gemm_fp16_dev(const void* A, const void* B, void* C,
                              int M, int N, int K, float al, float be, void* s) {
     U(A) U(B) U(C) U(M) U(N) U(K) U(al) U(be) U(s) return VV_ERR_UNSUPPORTED;
 }
+vv_status_t vv_gemm_fp16_tile_dev(const void* A, const void* B, void* C,
+                                  int M, int N, int K, float al, float be,
+                                  void* s) {
+    U(A) U(B) U(C) U(M) U(N) U(K) U(al) U(be) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_skinny_linear_dev(const void* A, int f,
+                                 const vv_skinny_proj_t* p, int n, int M,
+                                 int K, float al, void* s) {
+    U(A) U(f) U(p) U(n) U(M) U(K) U(al) U(s) return VV_ERR_UNSUPPORTED;
+}
 vv_status_t vv_gemm_fp16_nn_dev(const void* A, const void* B, void* C,
                                 int M, int K, int P, float al, float be,
                                 void* s) {

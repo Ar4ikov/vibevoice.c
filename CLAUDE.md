@@ -61,6 +61,16 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
   32-минутный промпт: 7152 tok/s (W8A8), 5100 (W4A8) против 3451 у `int4`;
   WER 0 против BF16 на jfk/test30/test120/32 мин. `VV_SAVE_TOKENS` /
   `VV_TEACHER_TOKENS` — teacher-forced top-1 (W8A8+SQ 98.8%).
+* Линейные слои на 9..64 строках (чанк Streaming-7B — 29, короткий промпт,
+  хвост чанкованного) для плотного FP16, `int8` и NF4 — `gemm_skinny.cu`:
+  блок на 64 столбца, q/k/v и gate/up одним запуском, вес читается в своём
+  формате, INT8/NF4 деквантуются в регистрах теми же выражениями, что
+  `int8_dequant_kernel`/`vv_dequant_nf4_kernel`, bias — в эпилоге. Бит в
+  бит равно старому пути (деквант в scratch → `vv_gemm_fp16_tile_dev` →
+  `vv_bias_add_dev`): тот же `mma.m16n8k16` в том же порядке по k, без
+  split-K. Поэтому транскрипты не двигаются, где бы ни лёг чанк prefill.
+  Чанк test120 на 3090: FP16 281 → 210 мс, int8 227 → 130, nf4 205 → 110.
+  `VV_SKINNY=0` — старый путь; `tests/test_skinny.c`.
 * Семейства моделей (`include/vibevoice/family.h`): `asr-7b`, `asr-bitnet`,
   `asr-streaming-7b` — промпт, стоп-токены, нормализация, геометрия чанков.
   Один проход по слоям — `vv_layer_tensors()`; prefill дописывает с
@@ -78,7 +88,8 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
   `/v1/audio/stream` (слот на сессию, отключение клиента отменяет сессию).
   `--quant none` посимвольно совпадает с upstream `streaming_generate` на
   jfk/test30/test120 (156/156 чанков); int4 на 3090 — 92 мс на чанк,
-  RTF 0.032 (32 мин — 114 мс, 0.042); `serve` держит ~24 живых
+  RTF 0.032 (32 мин — 114 мс, 0.042), nf4 — 110 мс, int8 — 130, FP16 —
+  210; `serve` держит ~24 живых
   int4-потока на 3090 (p95 < 300 мс) — предел time-slicing: каждый слот
   декодирует сам, батча между слотами нет. Живая сессия резервирует KV на
   `--stream-reserve` секунд при открытии (иначе 503 / close 1013), idle
@@ -693,7 +704,7 @@ VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
 `ctest` без `VV_TEST_MODEL` тоже проходит — тесты, которым нужны веса,
-рапортуют SKIP. Всего 39 записей (attention-наборы идут по разу на бэкенд).
+рапортуют SKIP. Всего 40 записей (attention-наборы идут по разу на бэкенд).
 
 Streaming-7B: `VV_TEST_STREAM_MODEL=<каталог модели>` включает проверки
 токенизатора, `VV_TEST_STREAM_REF=<dump-stream>[:<dump>...]` — сверку
