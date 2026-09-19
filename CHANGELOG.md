@@ -9,6 +9,8 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+## [0.3.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.2.0...v0.3.0) — 2026-09-19
+
 - Unquantized checkpoints load: `microsoft/VibeVoice-ASR` in BF16 runs as-is
   (dense FP16 on the GPU, 56 tok/s, 18.7 GB) or quantized while it is read
   with `--quant nf4|int4|int8` (`vv_cli`, `serve`, `chat`; `auto` keeps
