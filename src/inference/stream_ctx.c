@@ -68,6 +68,12 @@ typedef struct {
     bool     head_on_cpu;
     vv_graph_slot_t graphs[VV_MAX_GPUS];
     bool     graph_ok;
+    /* Windows encoded ahead of their prefill (encode_ahead). */
+    void*    ahead;          /* [AHEAD_MAX][frames][hs] FP16 */
+    void*    ahead_ev[VV_STREAM_AHEAD_MAX];
+    int64_t  ahead_first;
+    int      ahead_n;
+    int      ahead_frames;
 
     /* CPU */
     float*   hid32;          /* [rows_cap][hs] */
@@ -255,36 +261,48 @@ static vv_status_t gpu_prefill_chunk(void* self, const vv_stream_chunk_t* ch,
     s = vv_dev_event_record(ctx->fe_ready, ctx->compute_stream);
     if (s != VV_OK) return s;
 
-    const double t0 = vv_time_ms();
-    vv_frontend_job_t job;
-    memset(&job, 0, sizeof(job));
-    job.audio = window;
-    job.n_samples = (int64_t)(ch->n_frames) * ctx->family.frame_samples;
-    job.stream = NULL;                 /* a stateless window */
-    job.is_final = true;
-    job.rows = (uint8_t*)b->hidden + (size_t)ch->feat_offset * b->hs * 2;
-    job.rows_ld = b->hs;
-    job.wait_event = ctx->fe_ready;
-    job.done_event = ctx->fe_done;
-    s = vv_frontend_submit(ctx->frontend, &job);
-    if (s == VV_OK && job.n_frames != ch->n_frames) {
-        VV_LOG_E("stream: the window encoded to %d frames, the chunk has %d",
-                 job.n_frames, ch->n_frames);
-        s = VV_ERR_SHAPE_MISMATCH;
+    void* rows = (uint8_t*)b->hidden + (size_t)ch->feat_offset * b->hs * 2;
+    const size_t feat_bytes = (size_t)ch->n_frames * (size_t)b->hs * 2;
+    if (b->ahead_n > 0 && ch->index >= b->ahead_first &&
+        ch->index < b->ahead_first + b->ahead_n &&
+        ch->n_frames == b->ahead_frames) {
+        /* Encoded already, with the windows around it. */
+        const size_t k = (size_t)(ch->index - b->ahead_first);
+        s = vv_dev_memcpy_d2d(rows, (const uint8_t*)b->ahead + k * feat_bytes,
+                              feat_bytes, ctx->compute_stream);
+        if (s != VV_OK) return s;
+    } else {
+        const double t0 = vv_time_ms();
+        vv_frontend_job_t job;
+        memset(&job, 0, sizeof(job));
+        job.audio = window;
+        job.n_samples = (int64_t)(ch->n_frames) * ctx->family.frame_samples;
+        job.stream = NULL;                 /* a stateless window */
+        job.is_final = true;
+        job.rows = rows;
+        job.rows_ld = b->hs;
+        job.wait_event = ctx->fe_ready;
+        job.done_event = ctx->fe_done;
+        s = vv_frontend_submit(ctx->frontend, &job);
+        if (s == VV_OK && job.n_frames != ch->n_frames) {
+            VV_LOG_E("stream: the window encoded to %d frames, the chunk has "
+                     "%d", job.n_frames, ch->n_frames);
+            s = VV_ERR_SHAPE_MISMATCH;
+        }
+        if (s == VV_OK && b->profile) {
+            s = vv_dev_event_sync(ctx->fe_done);
+            *ch->encode_ms = vv_time_ms() - t0;
+        }
+        if (s == VV_OK) s = vv_dev_stream_wait_event(ctx->compute_stream,
+                                                     ctx->fe_done);
+        if (s != VV_OK) return s;
     }
-    if (s == VV_OK && b->profile) {
-        s = vv_dev_event_sync(ctx->fe_done);
-        *ch->encode_ms = vv_time_ms() - t0;
-    }
-    if (s == VV_OK) s = vv_dev_stream_wait_event(ctx->compute_stream,
-                                                 ctx->fe_done);
-    if (s != VV_OK) return s;
 
     if (vv_debug_dump_dir()) {
         char name[64];
         snprintf(name, sizeof(name), "stream_c%04lld_feats",
                  (long long)ch->index);
-        dump_f16_rows(name, b, job.rows, ch->n_frames);
+        dump_f16_rows(name, b, rows, ch->n_frames);
     }
 
     s = vv_pipeline_prefill(ctx, b->hidden, n);
@@ -296,6 +314,63 @@ static vv_status_t gpu_prefill_chunk(void* self, const vv_stream_chunk_t* ch,
     /* Decode reads the length on the device. */
     vv_pipeline_kv_publish(ctx);
     return VV_OK;
+}
+
+/*
+ * Several ready windows in one go: the front end packs stateless windows
+ * into shared launches (8 of them fit its 30 s launch), which costs little
+ * more than one window alone. Batched windows come out bit for bit what
+ * each would alone (tests/test_vae_stream.c), so this changes timing only.
+ */
+static vv_status_t gpu_encode_ahead(void* self, int64_t first, int n,
+                                    const float* windows, double* encode_ms) {
+    sbe_t* b = (sbe_t*)self;
+    vv_inference_ctx_t* ctx = b->ctx;
+    const vv_family_t* f = &ctx->family;
+    const int frames = f->chunk_frames + f->lookahead_frames;
+    const int64_t W = (int64_t)frames * f->frame_samples;
+    *encode_ms = 0.0;
+    b->ahead_n = 0;
+    if (n <= 0 || n > VV_STREAM_AHEAD_MAX) return VV_ERR_INVALID_ARG;
+    vv_status_t s = bind(b);
+    if (s != VV_OK) return s;
+    const size_t feat_bytes = (size_t)frames * (size_t)b->hs * 2;
+    if (!b->ahead) {
+        s = vv_dev_alloc(&b->ahead, feat_bytes * VV_STREAM_AHEAD_MAX);
+        for (int i = 0; s == VV_OK && i < VV_STREAM_AHEAD_MAX; i++)
+            s = vv_dev_event_create(&b->ahead_ev[i]);
+        if (s != VV_OK) return s;
+    }
+    /* The previous batch's rows were copied out by chunks that have
+     * finished (each ends in a sync), so the buffer is free. */
+    vv_frontend_job_t jobs[VV_STREAM_AHEAD_MAX];
+    memset(jobs, 0, sizeof(jobs));
+    for (int i = 0; i < n; i++) {
+        jobs[i].audio = windows + (size_t)i * (size_t)W;
+        jobs[i].n_samples = W;
+        jobs[i].stream = NULL;
+        jobs[i].is_final = true;
+        jobs[i].rows = (uint8_t*)b->ahead + (size_t)i * feat_bytes;
+        jobs[i].rows_ld = b->hs;
+        jobs[i].done_event = b->ahead_ev[i];
+    }
+    const double t0 = vv_time_ms();
+    s = vv_frontend_run(ctx->frontend, jobs, n);
+    for (int i = 0; s == VV_OK && i < n; i++) {
+        if (jobs[i].status != VV_OK) s = jobs[i].status;
+        else if (jobs[i].n_frames != frames) s = VV_ERR_SHAPE_MISMATCH;
+        if (s == VV_OK)
+            s = vv_dev_stream_wait_event(ctx->compute_stream, b->ahead_ev[i]);
+    }
+    if (s != VV_OK) return s;
+    if (b->profile) {
+        s = vv_dev_event_sync(b->ahead_ev[n - 1]);
+        *encode_ms = vv_time_ms() - t0;
+    }
+    b->ahead_first = first;
+    b->ahead_n = n;
+    b->ahead_frames = frames;
+    return s;
 }
 
 static vv_status_t gpu_decode_step(void* self, int32_t token, int32_t* next) {
@@ -340,6 +415,9 @@ static void gpu_destroy(void* self) {
     /* An idle slot must not sit on pages another slot could use. */
     vv_pipeline_kv_release(ctx);
     gpu_free_rows(b);
+    if (b->ahead) vv_dev_free(b->ahead);
+    for (int i = 0; i < VV_STREAM_AHEAD_MAX; i++)
+        if (b->ahead_ev[i]) vv_dev_event_destroy(b->ahead_ev[i]);
     if (b->normed) vv_dev_free(b->normed);
     if (b->hidden_one) vv_dev_free(b->hidden_one);
     if (b->logits) vv_dev_free(b->logits);
@@ -588,6 +666,9 @@ vv_status_t vv_stream_open(vv_inference_ctx_t* ctx,
         be.prefill_chunk = gpu_prefill_chunk;
         be.decode_step = gpu_decode_step;
         be.destroy = gpu_destroy;
+        /* VV_STREAM_AHEAD=0: every window on its own, for comparison. */
+        const char* ah = getenv("VV_STREAM_AHEAD");
+        if (!(ah && ah[0] == '0')) be.encode_ahead = gpu_encode_ahead;
     } else {
         if (!ctx->model->lm_head.data || !ctx->model->final_norm.data)
             s = VV_ERR_WEIGHT_MISSING;

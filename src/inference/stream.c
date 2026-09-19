@@ -415,6 +415,7 @@ struct vv_stream {
     vv_stream_chunker_t* chunker;
     vv_stream_text_t*   text;
     float*              window;        /* window_samples */
+    float*              ahead;         /* VV_STREAM_AHEAD_MAX windows, lazily */
     int32_t*            rows;          /* chunk layout */
     int                 rows_cap;
     sbuf_t              chunk_text;    /* current chunk, for the CHUNK event */
@@ -506,7 +507,8 @@ static void dump_chunk(const vv_stream_t* s, int64_t idx,
 }
 
 /* One window: prefill, greedy decode to a stop, then the chunk end. */
-static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
+static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
+                             const float* window, double encoded_ms) {
     const int n_frames = vv_stream_window_frames(&s->p.geom);
     const int64_t idx = w->index;
     int feat_off = 0;
@@ -537,9 +539,11 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
 
     int32_t tok = -1;
     const double t0 = vv_time_ms();
-    vv_status_t st = s->be.prefill_chunk(s->be.self, &ch, s->window, &tok);
+    vv_status_t st = s->be.prefill_chunk(s->be.self, &ch, window, &tok);
     if (st != VV_OK) return fail(s, st, idx);
     const double t1 = vv_time_ms();
+    /* Its share of a batched encode done before it. */
+    encode_ms += encoded_ms;
     s->pending_lead = -1;
     s->stats.prefill_rows += n_rows;
 
@@ -621,10 +625,11 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
                 s->chunk_text.len))
         return fail(s, VV_ERR_OUT_OF_MEMORY, idx);
     s->stats.chunks++;
-    s->stats.prefill_ms += t1 - t0;
+    s->stats.prefill_ms += t1 - t0 + encoded_ms;
     s->stats.encode_ms += encode_ms;
     s->stats.decode_ms += t2 - t1;
-    if (t2 - t0 > s->stats.max_chunk_ms) s->stats.max_chunk_ms = t2 - t0;
+    if (t2 - t0 + encoded_ms > s->stats.max_chunk_ms)
+        s->stats.max_chunk_ms = t2 - t0 + encoded_ms;
 
     vv_stream_event_t ev;
     memset(&ev, 0, sizeof(ev));
@@ -637,7 +642,7 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
     ev.audio_start = (double)w->start / s->p.geom.sample_rate;
     ev.audio_end = (double)(w->start + vv_stream_chunk_samples(&s->p.geom)) /
                    s->p.geom.sample_rate;
-    ev.prefill_ms = t1 - t0;
+    ev.prefill_ms = t1 - t0 + encoded_ms;
     ev.encode_ms = encode_ms;
     ev.decode_ms = t2 - t1;
     ev.kv_len = kv_len(s);
@@ -645,13 +650,48 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
     return s->cancel ? fail(s, VV_ERR_CANCELLED, idx) : VV_OK;
 }
 
+/*
+ * Run every ready window. One at a time is the live case: a window becomes
+ * ready, its chunk runs, and the next one is seconds away. When several are
+ * ready at once -- an uploaded file, or a session that fell behind -- and
+ * the backend can, their encodes go out together first (the front end packs
+ * them into shared launches) and the chunks then run on the results.
+ */
 static vv_status_t drain(vv_stream_t* s) {
-    vv_stream_window_t w;
-    while (vv_stream_chunker_next(s->chunker, s->window, &w)) {
-        vv_status_t st = run_chunk(s, &w);
+    const int64_t W = vv_stream_window_samples(&s->p.geom);
+    for (;;) {
+        const int64_t ready = vv_stream_chunker_ready(s->chunker);
+        if (ready <= 0) return VV_OK;
+        if (s->cancel) return fail(s, VV_ERR_CANCELLED, -1);
+
+        if (ready >= 2 && s->be.encode_ahead) {
+            if (!s->ahead) {
+                s->ahead = (float*)vv_alloc(sizeof(float) * (size_t)W *
+                                            VV_STREAM_AHEAD_MAX);
+                if (!s->ahead) return fail(s, VV_ERR_OUT_OF_MEMORY, -1);
+            }
+            vv_stream_window_t info[VV_STREAM_AHEAD_MAX];
+            int n = 0;
+            while (n < VV_STREAM_AHEAD_MAX &&
+                   vv_stream_chunker_next(s->chunker, s->ahead + (size_t)n * W,
+                                          &info[n]))
+                n++;
+            double ms = 0.0;
+            vv_status_t st = s->be.encode_ahead(s->be.self, info[0].index, n,
+                                                s->ahead, &ms);
+            if (st != VV_OK) return fail(s, st, info[0].index);
+            for (int i = 0; i < n; i++) {
+                st = run_chunk(s, &info[i], s->ahead + (size_t)i * W, ms / n);
+                if (st != VV_OK) return st;
+            }
+            continue;
+        }
+
+        vv_stream_window_t w;
+        if (!vv_stream_chunker_next(s->chunker, s->window, &w)) return VV_OK;
+        const vv_status_t st = run_chunk(s, &w, s->window, 0.0);
         if (st != VV_OK) return st;
     }
-    return VV_OK;
 }
 
 vv_status_t vv_stream_open_backend(const vv_stream_backend_t* backend,
@@ -787,6 +827,7 @@ void vv_stream_close(vv_stream_t* s) {
     vv_stream_chunker_free(s->chunker);
     vv_stream_text_free(s->text);
     vv_free(s->window);
+    vv_free(s->ahead);
     vv_free(s->rows);
     vv_free(s->chunk_text.p);
     vv_free(s->transcript.p);

@@ -270,6 +270,9 @@ typedef struct {
 
 typedef void (*vv_stream_event_fn)(void* user, const vv_stream_event_t* ev);
 
+/** @brief Most windows one encode_ahead call takes. */
+#define VV_STREAM_AHEAD_MAX 8
+
 /** @brief Describes one chunk prefill to the backend. */
 typedef struct {
     int64_t        index;
@@ -311,6 +314,18 @@ typedef struct {
                                  const float* window, int32_t* first);
     /** Feed one token at the current length and return the next argmax. */
     vv_status_t (*decode_step)(void* self, int32_t token, int32_t* next);
+    /**
+     * Optional. Encode `n` (<= VV_STREAM_AHEAD_MAX) consecutive ready
+     * windows, chunk indices `first`.., in one go, ahead of their prefills:
+     * an uploaded file, or a live session that fell behind. `windows` holds
+     * them back to back. The prefill_chunk calls that follow for those
+     * chunks use the result instead of encoding again; the features must be
+     * the same as encoding each window alone. `encode_ms` receives the
+     * time taken (0 when not measured). NULL: every window is encoded in its
+     * own prefill_chunk.
+     */
+    vv_status_t (*encode_ahead)(void* self, int64_t first, int n,
+                                const float* windows, double* encode_ms);
     /**
      * Feed tokens whose logits nobody needs (the trailing
      * <|text_chunk_end|>). NULL: the session folds that token into the next

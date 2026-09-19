@@ -792,14 +792,18 @@ vv_status_t vv_decoder_prefill(
     if (first_layer < 0 || n_layers <= 0 || last_layer > model->num_layers)
         return VV_ERR_INVALID_ARG;
 
+    /* A prefill on top of a filled cache is a streaming chunk, one every
+     * three seconds per session: not worth a line each. */
+    const vv_log_level_t lvl = kv_cache->current_len ? VV_LOG_DEBUG
+                                                     : VV_LOG_INFO;
     if (n_layers == model->num_layers)
-        VV_LOG_I("decoder: prefill %d tokens through %d layers%s",
-                 seq_len, n_layers,
-                 (pool && !pool->all_resident) ? " (streaming)" : "");
+        vv_log(lvl, "decoder: prefill %d tokens through %d layers%s",
+               seq_len, n_layers,
+               (pool && !pool->all_resident) ? " (streaming)" : "");
     else
-        VV_LOG_I("decoder: prefill %d tokens through layers %d..%d%s",
-                 seq_len, first_layer, last_layer - 1,
-                 (pool && !pool->all_resident) ? " (streaming)" : "");
+        vv_log(lvl, "decoder: prefill %d tokens through layers %d..%d%s",
+               seq_len, first_layer, last_layer - 1,
+               (pool && !pool->all_resident) ? " (streaming)" : "");
 
     bool streaming = pool && !pool->all_resident;
 
@@ -1108,7 +1112,10 @@ vv_status_t vv_decoder_prefill_cpu(
         return VV_ERR_OVERFLOW;
     }
 
-    if (chunk < seq_len)
+    if (kv_cache->current_len)
+        VV_LOG_D("decoder: CPU prefill %d tokens at %d", seq_len,
+                 kv_cache->current_len);
+    else if (chunk < seq_len)
         VV_LOG_I("decoder: CPU prefill %d tokens through %d layers in %d "
                  "chunks of %d", seq_len, model->num_layers,
                  (seq_len + chunk - 1) / chunk, chunk);

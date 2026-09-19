@@ -462,6 +462,20 @@ static void count_request(vv_server_t* sv, bool ok, double audio_s,
     vv_mutex_unlock(&sv->stats_lock);
 }
 
+/* What a streaming client is told when its session ends early. */
+static const char* stream_status_msg(vv_status_t s) {
+    switch (s) {
+        case VV_ERR_OVERFLOW:
+            return "the session outgrew its KV window (the server's "
+                   "--max-seq-len)";
+        case VV_ERR_KV_POOL_EXHAUSTED:
+            return "KV cache pool exhausted by concurrent sessions; retry "
+                   "later";
+        default:
+            return vv_status_str(s);
+    }
+}
+
 /* An OpenAI error envelope for status `s`. */
 static void error_json(strbuf_t* b, vv_status_t s, const char* prefix) {
     const bool busy = s == VV_ERR_KV_POOL_EXHAUSTED;
@@ -469,7 +483,7 @@ static void error_json(strbuf_t* b, vv_status_t s, const char* prefix) {
     sb_puts(b, busy ? "server_overloaded" : "server_error");
     sb_puts(b, "\",\"message\":\"");
     if (prefix) sb_puts(b, prefix);
-    sb_json_escaped(b, vv_status_str(s));
+    sb_json_escaped(b, stream_status_msg(s));
     sb_puts(b, "\"}}");
 }
 
@@ -668,7 +682,7 @@ static void ws_fail(ws_state_t* w, vv_status_t s, int code,
     sb_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"");
     sb_puts(&b, type);
     sb_puts(&b, "\",\"message\":\"");
-    sb_json_escaped(&b, msg ? msg : vv_status_str(s));
+    sb_json_escaped(&b, msg ? msg : stream_status_msg(s));
     sb_puts(&b, "\"}}");
     ws_text(w, b.buf);
     sb_free(&b);

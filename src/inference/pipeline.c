@@ -926,7 +926,14 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
             (size_t)256 * 1024 * 1024,
         };
         s = VV_ERR_CUDA_OOM;
-        for (int wi = 0; wi < 3; wi++) {
+        /*
+         * A streaming model never prefills more than one chunk (29 rows) or
+         * its prompt at a time: the weight scratch plus a few MB of
+         * activations. The smallest size leaves room for more slots.
+         */
+        const int ws_first =
+            c->model->config.family == VV_FAMILY_ASR_STREAMING_7B ? 2 : 0;
+        for (int wi = ws_first; wi < 3; wi++) {
             c->workspace_size = ws_sizes[wi];
             s = vv_dev_alloc(&c->workspace, c->workspace_size);
             if (s == VV_OK) break;
