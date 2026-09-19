@@ -338,15 +338,31 @@ the session until it closes.
   it packs into shared launches, and the chunks then copy their rows from
   there. Batched windows are bit-identical to single ones, so this changes
   timing only. `VV_STREAM_AHEAD=0` turns it off.
-- **Paged KV**: a chunk reserves its rows plus the chunk end before it runs,
-  waiting while other slots hold pages; decode steps take pages one at a
-  time. Pages go back to the pool when the session closes.
+- **Paged KV**: a chunk reserves its rows plus the chunk end before it runs;
+  decode steps take pages one at a time. Pages go back to the pool when the
+  session closes. Two parameters make a shared pool safe for live sessions:
+  `kv_reserve_sec` maps pages for that much audio when the session opens,
+  all of them or none (`VV_ERR_KV_POOL_EXHAUSTED` from `vv_stream_open`, so
+  a server refuses the session up front instead of letting it squeeze the
+  ones already running), and `kv_no_wait` makes a pool that has run dry
+  later end the session instead of blocking it until another slot finishes
+  -- for a live stream that may be never, and meanwhile nobody reads its
+  socket. Without them (the CLI, `vv_stream_transcribe`) a chunk waits for
+  pages as a batch request does.
+- **Buffers**: every device buffer, the prompt's rows included, is
+  allocated at open, and a closed session parks them on its context for the
+  next one (`ctx->stream_bufs`). Opening and closing sessions in `serve`
+  does not `cudaMalloc` or `cudaFree`, either of which would synchronise
+  the device under every other live session. Token text is decoded into a
+  buffer, not allocated per token.
 - **Refusal**: the session checks the KV window before every chunk and every
   step and ends with `VV_ERR_OVERFLOW` (an ERROR event, and the server tells
   the client why) instead of writing past it. A pool that cannot supply
   pages ends it with `VV_ERR_KV_POOL_EXHAUSTED`.
-- **Cancel**: `vv_stream_cancel()` from any thread, or from inside the event
-  callback; the session stops at the next token.
+- **Cancel**: `vv_stream_cancel()` from any thread (the flag is an atomic),
+  or from inside the event callback; the session stops at the next token.
+- **Head**: the final norm, LM head and argmax of a step are the batch
+  loop's own (`vv_pipeline_head_argmax`), not a copy.
 - **CPU**: the same sequence over the host kernels (`--cpu`): the window
   through both CPU encoders and connectors, `vv_decoder_prefill_cpu` at the
   current length, the fused host head.
@@ -362,7 +378,9 @@ from, and `full_text` joins them.
 The engine holds one slot for a session's life (`vv_engine_stream_open`,
 `_push`, `_finish`, `_close`), resampling any input rate on the fly with a
 resampler that gives exactly what the whole-file resample gives. Sessions
-count against `--slots` and the server queue.
+count against `--slots` and the server queue. `vv_engine_stream_open_ex`
+waits at most a given time for a slot and returns `VV_ERR_BUSY` when none
+freed up.
 
 ---
 
@@ -397,8 +415,12 @@ data: {"type":"transcript.text.done","text":" \n Speaker 0:And so, ... your coun
   control strings.
 - On failure the server sends `event: error` with the OpenAI error envelope
   and closes.
-- A failed write means the client disconnected. It cancels the session: the
-  decode loop checks a flag between tokens and the slot is released.
+- A client that disconnects cancels the session at the next token: a failed
+  write, or between chunks (when nothing is written) a non-blocking look at
+  the socket once per token (`vv_http_peer_gone`). The slot is released.
+- The upload's whole duration of KV is reserved when the session opens; a
+  shared pool that cannot cover it answers `503 server_overloaded` before
+  any event, instead of stalling the stream halfway.
 
 A file upload is already complete when the handler runs, so the whole file
 is pushed at once. The chunks come out as fast as the GPU produces them;
@@ -416,6 +438,8 @@ Client to server:
   Any rate other than 24000 goes through a streaming resampler that
   reproduces the whole-file resample sample for sample. The server answers
   `{"type":"session.started",...}` once the session holds a slot.
+  `sample_rate` outside 8000..192000 (checked on the number before any
+  conversion) is an error and close 1008.
 - Then binary frames of raw PCM, any size.
 - `{"type":"session.finish"}` flushes the zero-padded tail. Closing the
   socket instead abandons the tail.
@@ -426,7 +450,27 @@ Server to client (text frames):
 - `{"type":"transcript.text.done","text":"..."}`
 - `{"type":"error","error":{...}}`
 
-Then a close frame with 1000, or 1011 on an internal error.
+Then a close frame with 1000; 1008 for a protocol or policy violation
+(bad message, idle, trickle); 1013 "try again later" when the KV pool
+cannot take the session; 1011 on an internal error.
+
+Admission. A live session holds a slot for as long as its audio lasts, so
+it is not queued behind other holders the way a batch request is:
+
+- The upgrade is answered only when a slot is free within
+  `--stream-slot-wait` (default 5 s) and no request is queued ahead of it;
+  otherwise `503 server_overloaded`, before the upgrade.
+- `session.start` reserves `--stream-reserve` seconds of KV (default 180)
+  in the shared page pool. A pool that cannot cover it refuses the session
+  (error `server_overloaded`, close 1013). Past the reservation a session
+  keeps taking pages while the pool has them, and ends with the same error
+  when it runs dry, rather than blocking on its own socket thread.
+- Idle time counts from the last audio or JSON message, not the last byte:
+  pings and pongs are answered but do not keep a session. After
+  `--stream-idle` (default 60 s) without either it is closed (1008).
+- A trickle does not keep it either: past one idle window a session must
+  have sent at least a tenth of the wall time it has held the slot for
+  (a live microphone sends all of it), or it is closed (1008).
 
 - Latency is one window: 3.47 s of audio before the first chunk can run,
   plus the chunk's compute (about 0.1 s with `--quant int4`, section 5).
@@ -437,8 +481,9 @@ Then a close frame with 1000, or 1011 on an internal error.
 - If the session falls behind real time, which only happens when a GPU is
   shared across too many sessions, the chunker queues windows and their
   encodes go out together.
-- A client that sends nothing for 60 s is dropped; one that closes the
-  socket abandons its tail and releases its slot.
+- A client that closes the socket abandons its tail and releases its slot,
+  at the next token (a look at the socket per token) rather than at the next
+  chunk.
 
 ### What `http.c` needs
 
@@ -449,7 +494,7 @@ Then a close frame with 1000, or 1011 on an internal error.
 | WebSocket upgrade: validate `Upgrade` / `Connection` / `Sec-WebSocket-Version: 13`, `Sec-WebSocket-Accept` = base64(SHA-1(key + GUID)), 101 | **done**: `vv_http_ws_accept`, `vv_ws_accept_key`, `vv_sha1` |
 | WebSocket frames: incremental parser (masking, 16/64-bit lengths, fragmentation, control frames interleaved, size cap, protocol errors → close code), server frame header, send | **done**: `vv_ws_parser_t`, `vv_ws_frame_header`, `vv_http_ws_send` |
 | Read after the request (frames) with a timeout | **done**: `vv_http_read`. Bytes that arrived with the upgrade request are in `req->body` and are fed first. |
-| Disconnect detection | **done**: `vv_http_write` returns false, and `MSG_NOSIGNAL` means no SIGPIPE |
+| Disconnect detection | **done**: `vv_http_write` returns false, and `MSG_NOSIGNAL` means no SIGPIPE; between writes `vv_http_peer_gone` (a zero-timeout `select` + `MSG_PEEK`) |
 | Incremental request-body read (a chunked or long upload feeding a session while it arrives) | Not done. `read_request` buffers the whole body; live input goes over the WebSocket instead. |
 | Keep-alive, chunked transfer encoding | Not needed. Every streaming response closes its connection. |
 | Text-frame UTF-8 validation (close 1007) | Not done. Control messages are parsed as JSON, which rejects garbage anyway. |
@@ -463,6 +508,15 @@ Then a close frame with 1000, or 1011 on an internal error.
 - a loopback round trip through the real server (POSIX): an SSE response,
   and a WebSocket handshake with a frame in the same packet, echoed back
   and then closed.
+
+`tests/test_stream_server.c` drives `serve`'s session logic on a real
+Streaming-7B engine over loopback (POSIX, `VV_TEST_STREAM_E2E=1`): a
+`session.start` fragmented around a ping, 4801-byte frames against
+96000-byte ones (same transcript), audio before `session.start` (1008), a
+ping-only holder of the only slot closed after the idle time while a second
+client gets 503 after the slot wait, a trickle closed too, and a client
+that drops mid-stream giving its slot back. `tests/test_queue.c` covers
+`vv_queue_try_enter`.
 
 ---
 
@@ -498,7 +552,10 @@ is over lower-cased words with punctuation dropped.
   transcript.
 - KV formats with int4 weights, test120: `--kv-cache fp8` is 39/41 with the
   same transcript; `tq4` is 36/41 with 3 word edits (WER 0.71%).
-- `--attn flashinfer` with int4 is 39/41 with the same transcript.
+- The table is under `auto`, which is flashinfer for this family (below).
+  `--attn fa2` gives the same ids on every row checked: with `--quant none`
+  156/156, and with int4 the output JSON is byte-identical on test120 and
+  on the 32-minute long30m.
 - `test_stream` with the model: the emitter rebuilds 159/159 reference chunk
   texts from the reference ids, and a live session (PCM pushed in small
   blocks) reproduces jfk and test30 chunk for chunk.
@@ -512,17 +569,31 @@ per launch, less when ready windows share a launch.
 | weights | per chunk, mean (p95) | RTF | decode | VRAM |
 |---|---|---|---|---|
 | `--quant none` (FP16) | 306 ms (379) | 0.106 | 55 tok/s | 18.6 GB |
-| `--quant int4` | **96 ms** (139) | **0.033** | 147 tok/s | 9.8 GB |
+| `--quant int4` | **92 ms** (135) | **0.032** | 155 tok/s | 9.8 GB |
+| `--quant int4`, `--attn fa2` | 96 ms (137) | 0.033 | 148 tok/s | 9.8 GB |
 | `--quant int8` | 259 ms | 0.090 | – | 12.5 GB |
 | `--quant nf4` | 263 ms (313) | 0.091 | 97 tok/s | 9.8 GB |
-| `--quant int4`, `--attn flashinfer` | 145 ms (238) | 0.050 | 120 tok/s | 9.8 GB |
-| `--quant int4`, 300 s excerpt | 129 ms (172) | 0.045 | 131 tok/s | 9.8 GB |
+| `--quant int4`, long30m (32 min, 654 chunks) | **114 ms** (191) | **0.042** | 134 tok/s | 9.8 GB |
+| `--quant int4`, long30m, `--attn fa2` | 134 ms (214) | 0.048 | 120 tok/s | 9.8 GB |
 | `--quant none`, 300 s excerpt | 342 ms (455) | 0.118 | 52 tok/s | 18.6 GB |
 
-The int8, nf4, FP16 and 300 s rows predate encoding ready windows ahead,
-which took about 11 ms off each int4 chunk; they would move by about as
-much. Only int4 uses kernels built for a 29-row prefill: the other formats
-run it through GEMMs sized for long prompts, which is most of the gap.
+`auto` attention is flashinfer for this family (fa2 for the batch model).
+A chunk prefills 29 rows on top of a cache that keeps growing; fa2 runs
+them as one packed-rows kernel -- 7 query heads per KV head make 203 rows,
+4 KV heads x 4 row tiles = 16 blocks on an 82-SM card, each walking the
+whole cache -- while flashinfer splits the cache across the idle SMs, and
+its decode is on tensor cores. The gap grows with the session: 4% on
+test120, 15% over 32 minutes. The output JSON of both is byte-identical on
+test120 and on long30m, and `--quant none` under flashinfer still matches
+upstream 156/156 chunks. The batch model stays on fa2 because its
+transcripts are pinned bit for bit to the old kernels; this family has no
+such history.
+
+The int8, nf4 and FP16 rows predate encoding ready windows ahead, which
+took about 11 ms off each int4 chunk, and the flashinfer default; they
+would move by about as much. Only int4 uses kernels built for a 29-row
+prefill: the other formats run it through GEMMs sized for long prompts,
+which is most of the gap.
 
 CPU (`--cpu`, 12 cores, jfk, one run each): int4 2.8 s per chunk, RTF 1.09;
 int8 4.2 s, RTF 1.58; FP16 4.4 s, RTF 1.68. It works, but does not keep up

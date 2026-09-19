@@ -252,7 +252,7 @@ With `--quant none` every chunk's tokens equal upstream
 | weights | per chunk (encode + prefill + decode) | RTF, file | VRAM | transcript vs upstream |
 |---|---|---|---|---|
 | `--quant none` (FP16) | 306 ms | 0.106 | 18.6 GB | identical |
-| `--quant int4` | **96 ms** | **0.033** | 9.8 GB | identical |
+| `--quant int4` | **92 ms** | **0.032** | 9.8 GB | identical |
 | `--quant int8` | 259 ms | 0.090 | 12.5 GB | identical |
 | `--quant nf4` | 263 ms | 0.091 | 9.8 GB | punctuation differs, same words |
 
@@ -816,7 +816,9 @@ query head its own blocks, so the same K and V were read, and for TurboQuant
 unpacked, seven times over. Both new backends read a position once per group.
 
 **`fa2` is what `auto` runs, and it is bit-identical to the kernels before
-it.** Its prefill packs the 7 heads of a group into the rows of one block —
+it.** (Streaming-7B is the exception: its 29-row chunk prefills on a
+growing cache need flashinfer's split KV, it has no older transcripts to
+stay identical to, so `auto` is flashinfer there.) Its prefill packs the 7 heads of a group into the rows of one block —
 row r is position r / 7, head r % 7 — so a K/V tile is loaded once for all of
 them, but every row still sees the same tiles in the same order with the same
 `mma.sync` sequence and the same natural-base `__expf`. Its decode keeps the

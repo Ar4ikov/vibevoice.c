@@ -28,7 +28,7 @@ Write the entry for a change under Unreleased in the same pull request.
   on jfk, test30 and test120 (156/156); on a 300 s excerpt 101/103 chunks,
   one word moving across a chunk boundary, same transcript. int4 and int8
   give the same transcripts, nf4 the same words with different punctuation.
-  3090, test120: 96 ms per chunk and RTF 0.033 with int4 (9.8 GB), 306 ms
+  3090, test120: 92 ms per chunk and RTF 0.032 with int4 (9.8 GB), 306 ms
   and 0.106 in FP16 (18.6 GB). `serve` carries about 24 live int4 streams per 3090 under 300 ms p95
   chunk latency; streaming slots are budgeted at their real 256 MB
   workspace so the shared KV pool gets the rest of the card. A session refuses a chunk that
