@@ -13,8 +13,13 @@ Write the entry for a change under Unreleased in the same pull request.
   the run command passes `--gpus all`, so a replica uses every GPU GPUStack
   assigned to it instead of only the first. GPUStack spreads a replica
   over several GPUs on its own when no single card has room for its 8.3 GiB
-  estimate. `--split-mode`, `--gpu-memory`, `--gpus` and
-  `--acoustic-sampling` are offered in the UI. The deployment guide covers
+  estimate. The UI offers every `serve` option added since the manifest was
+  written (`--split-mode`, `--gpu-memory`, `--gpus`, `--quant`, `--attn`,
+  `--kv-paged`, `--calib`, the BitNet and streaming ones). The deployment
+  guide gains a table of models: which repositories GPUStack can pull
+  as-is, since the dense and NF4 ones ship no `tokenizer.json`, their
+  parameters, and GPUStack's VRAM estimate against what each actually
+  holds (2-3x too high for Streaming-7B and BitNet). It also covers
   replicas vs layer split per GPU, why `{{gpu_ids}}` must not be used (it
   holds host indexes), what `--gpu-memory` counts, and CPU-only replicas.
 
