@@ -974,7 +974,9 @@ speech encoder or the connectors touches the default stream any more.
   GEMMs sized for long prompts, and so does the CPU path, which is why it
   runs slower than real time. A session that outgrows its KV window (about
   40 minutes at 32K positions) ends cleanly instead of rolling over into a
-  fresh cache.
+  fresh cache. Live sessions are time-sliced: nothing batches decode steps
+  or chunk prefills across slots, which is what caps a 3090 at about 24-32
+  live int4 streams.
 
 ---
 

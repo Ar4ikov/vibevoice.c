@@ -617,7 +617,16 @@ Latency is from sending a window's last sample to receiving its text.
 
 So one 3090 carries about **24 live int4 streams** with sub-300 ms chunk
 latency, and about 32 at the edge; past that the queue grows. Every session
-produced the same text as a session alone, with no errors.
+produced the same text as a session alone, with no errors. The clips were
+two minutes long, and the table was measured under fa2, before `auto`
+became flashinfer for this family.
+
+This is a time-slicing limit, not the card's: every slot runs its own
+decode steps and chunk prefills, so N sessions read the 3.3 GB of int4
+weights N times per token. 24 sessions at about 96 ms per chunk are 2.3 s
+of GPU time per 2.93 s chunk period. Batching the ready sessions' decode
+steps and chunk prefills into one M=N GEMM is the follow-up that would
+raise it.
 
 Memory per session is a 256 MB workspace plus KV at about 45 MB per minute
 of audio (FP16) from the shared page pool. With 48 slots the server sizes
