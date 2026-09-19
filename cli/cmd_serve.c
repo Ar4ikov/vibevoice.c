@@ -42,9 +42,9 @@ static void usage(void) {
         "                        the model on each device, or one split across\n"
         "  --max-seq-len <n>     Per-slot KV window (default: 32768)\n"
         "  --kv-cache <fmt>      fp16 | fp8 | fp8-e5m2 | tq4 | tq3 | tq2 | tq1.5\n"
-        "  --quant <fmt>         auto (default) | none | nf4 | int4 | int8 —\n"
-        "                        weights of a dense checkpoint, quantized at\n"
-        "                        load\n"
+        "  --quant <fmt>         auto (default) | none | nf4 | int4 | int8 |\n"
+        "                        w8a8 | w4a8 — weights quantized at load; the\n"
+        "                        last two also run on int8 activations\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
         "  --kv-paged <mode>     auto (default: on with several slots) | on |\n"
@@ -130,7 +130,7 @@ int vv_cmd_serve(int argc, char** argv) {
         else if (strcmp(a, "--quant") == 0 && next) {
             const vv_load_quant_t q = vv_load_quant_parse(argv[++i]);
             if (q >= VV_LOAD_QUANT_COUNT) {
-                fprintf(stderr, "error: --quant is auto, none, nf4, int4 or int8, "
+                fprintf(stderr, "error: --quant is auto, none, nf4, int4, int8, w8a8 or w4a8, "
                                 "not '%s'\n", argv[i]);
                 return 1;
             }

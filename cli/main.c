@@ -110,9 +110,11 @@ static void print_usage(const char* prog) {
         "  --kv-cache FMT        KV-cache storage: fp16 (default), fp8,\n"
         "                        fp8-e5m2, tq4, tq3, tq2, tq1.5\n"
         "  --quant <fmt>         Weights: auto (default: as the checkpoint\n"
-        "                        stores them) | none | nf4 | int4 | int8 — the\n"
-        "                        last three quantize a dense checkpoint at\n"
-        "                        load\n"
+        "                        stores them) | none | nf4 | int4 | int8 —\n"
+        "                        quantize a dense checkpoint at load — or\n"
+        "                        w8a8 | w4a8: int8 / int4 weights on int8\n"
+        "                        per-token activations (dense, AWQ/GPTQ for\n"
+        "                        w4a8, or compressed-tensors checkpoints)\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
         "  --kv-paged <mode>     auto (default) | on | off — take KV from a\n"
@@ -372,7 +374,7 @@ int main(int argc, char** argv) {
     if (args.quant) {
         const vv_load_quant_t q = vv_load_quant_parse(args.quant);
         if (q >= VV_LOAD_QUANT_COUNT) {
-            fprintf(stderr, "error: --quant is auto, none, nf4, int4 or int8, "
+            fprintf(stderr, "error: --quant is auto, none, nf4, int4, int8, w8a8 or w4a8, "
                             "not '%s'\n", args.quant);
             vv_free(raw_audio);
             return 1;

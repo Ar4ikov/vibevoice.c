@@ -44,6 +44,13 @@ typedef struct vv_weight {
     int             quant_kind;   /**< vv_quant_kind_t                       */
     int             group_size;   /**< INT4G only: weights per scale         */
     int             int4g_layout; /**< INT4G only: vv_int4g_layout_t         */
+    /**
+     * Run on int8 per-token activations: W8A8 for INT8, W4A8 for INT4G.
+     * The weight bytes are the same as without it; only the kernels and the
+     * activations change. Set by --quant w8a8|w4a8 or by a compressed-tensors
+     * checkpoint whose input activations are int8.
+     */
+    bool            act_int8;
     bool            is_quantized; /**< quant_kind != VV_QUANT_NONE           */
 } vv_weight_t;
 

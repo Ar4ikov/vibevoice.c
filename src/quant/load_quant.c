@@ -21,7 +21,7 @@
 #define VV_QUANT_PAR_ROWS 64
 
 static const char* const LOAD_QUANT_NAMES[VV_LOAD_QUANT_COUNT] = {
-    "auto", "none", "nf4", "int4", "int8",
+    "auto", "none", "nf4", "int4", "int8", "w8a8", "w4a8",
 };
 
 vv_load_quant_t vv_load_quant_parse(const char* name) {
