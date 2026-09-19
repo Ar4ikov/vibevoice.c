@@ -67,7 +67,7 @@ RTX 3090, CUDA 12.4, Ryzen 9 5900X. Defaults unless noted.
 | | |
 |---|---|
 | Model load | **9.5 s** |
-| Speech encoding | **45 ms** per 11 s of audio, 315 ms per 120 s, 4.8 s per 32 min |
+| Speech encoding | **50 ms** per 11 s of audio, 352 ms per 120 s, 5.4 s per 32 min |
 | Prefill | **3056 tok/s** on a 14449-token prompt |
 | Decode | **131 tok/s** at 0.2K context, 123 at 1.5K, 93 averaged over a 14K-to-24K window; 132 / 129 / 107 with `--attn flashinfer` |
 | RTF | **0.055** on a 120 s file, **0.067** on 32 minutes (0.060 with `--attn flashinfer`) |
@@ -159,14 +159,21 @@ curl http://localhost:8080/v1/audio/transcriptions \
 `--slots N` runs N requests concurrently against **one** copy of the weights,
 the speech encoders' included; each slot costs only its own KV cache,
 workspace and 1.4 MB of encoder state. Their encoder work goes through one
-worker per device that gathers what arrives within 2 ms into shared
-launches. Eight 30-second files on one 3090:
+worker per device that plans one launch at a time from whatever has
+arrived, so concurrent requests share launches and a short request that
+arrives while a long file is encoding goes out in the long file's next
+launch instead of after all of it. Eight 30-second files on one 3090:
 
 | `--slots` | before | now | VRAM per slot added |
 |---|---|---|---|
-| 1 | 15.8 s | **13.2 s** | |
-| 2 | 13.9 s | **11.3 s** | |
-| 4 | 13.3 s | **10.6 s** | 3.6 GB -> **2.3 GB** |
+| 1 | 18.5 s | **14.4 s** | |
+| 2 | 18.1 s | **14.8 s** | |
+| 4 | 18.2 s | **14.8 s** | 3.6 GB -> **2.3 GB** |
+
+A short request that arrives while a long file is being encoded joins the
+long file's next launch, and the encoder runs at background stream
+priority, so the short one's decode is not queued behind it: an 11 s clip
+sent 0.3 s after a 32-minute one returns in 2.3 s (0.75 s alone).
  Two 30-second files
 finish in 4.2 s together against 5.8 s back to back, returning identical
 transcripts either way. Not 2×, because decode
@@ -656,11 +663,14 @@ from zero context the way Streaming-7B encodes its 26-frame windows.
 The acoustic and semantic encoders run concurrently on two streams. Each
 mixer is one kernel (RMSNorm, depthwise conv, gamma residual), the FFN's
 norm is applied while its GEMM stages the operand and its bias, GELU and
-residual are the GEMMs' epilogues, the downsamples are tensor-core GEMMs over
-im2col tiles, and the stage-5/6 GEMMs -- a few hundred columns, thousands
-deep -- split along K by a rule that depends on K alone, so the split never
-depends on who shares the launch. The connectors then write the prompt's
-hidden rows in place, the semantic one accumulating onto the acoustic one.
+residual are the GEMMs' epilogues. The downsample and head convolutions run
+as a tiled FP32 GEMM over im2col columns that adds each output's products
+in the direct convolution's order, and the few-column deep-stage FFN GEMMs
+use a smaller tile rather than a K split -- nothing re-associates a sum,
+so the latents, the prompt embedding and the transcript are bit-identical
+to the per-request encoder this replaced. The connectors then write the
+prompt's hidden rows in place, the semantic one accumulating onto the
+acoustic one.
 
 ### The acoustic latent is a distribution
 
