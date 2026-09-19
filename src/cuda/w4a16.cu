@@ -779,8 +779,8 @@ vv_status_t launch_gemm_cfg(w4_dev_info* info, int cfg,
     return VV_OK;
 }
 
-/** @brief Pick a tile configuration for M x N x K (VV_W4A16_CFG overrides). */
-int w4_pick_cfg(int M, int N, int K) {
+/** @brief Pick a tile configuration for M (VV_W4A16_CFG overrides). */
+int w4_pick_cfg(int M) {
     static thread_local int v = -2;
     const int forced = w4_env_int("VV_W4A16_CFG", &v, -1);
     if (forced >= 0 && forced < W4G_N_CFG) return forced;
@@ -788,15 +788,19 @@ int w4_pick_cfg(int M, int N, int K) {
      * Swept on a 3090 over the 7B projections: 16x64x128 is best up to 16
      * rows (the narrow N tile keeps 2-4x more blocks in flight while the
      * layer is weight-bound), 32x128x128 at 17-32, 64x128x128 from there on
-     * and 128x128x64 only once the grid is several waves deep. The square
-     * 3584x3584 q/o projection stays on 64x128x128 even at 1024-2048 rows
-     * (918 against 970 us at 2048): its 448 big tiles leave a partial last
-     * wave on 82 one-block SMs that the 64-row tile spreads more evenly.
+     * and 128x128x64 only once the grid is several waves deep.
+     *
+     * The square 3584x3584 q/o projection would be ~5% faster at 1024-2048
+     * rows on 64x128x128 (918 against 970 us at 2048); that is ~0.5% of a
+     * prefill, and its different split-K changes the FP32 summation order
+     * enough to move 126 of the 168 segment boundaries of the 32-minute
+     * test file by up to 50 ms (text and speakers unchanged), so it is not
+     * taken.
      */
     if (M <= 16) return 2;
     if (M <= 32) return 3;
     if (M <= 512) return 6;
-    return (long long)N * K >= 32LL * 1024 * 1024 ? 7 : 6;
+    return 7;
 }
 
 vv_status_t launch_gemm(w4_dev_info* info, int cfg, const void* A,
@@ -905,7 +909,7 @@ vv_status_t vv_w4a16_gemm_dev(const void* A, const void* packed,
     if (!info) return VV_ERR_CUDA_LAUNCH;
 
     if (info->major >= 8 && w4_mma_allowed()) {
-        vv_status_t s = launch_gemm(info, w4_pick_cfg(M, N, K), A, packed, sz, bias,
+        vv_status_t s = launch_gemm(info, w4_pick_cfg(M), A, packed, sz, bias,
                                     C, scratch, scratch_bytes, M, N, K, gs,
                                     st);
         if (s != VV_ERR_UNSUPPORTED) return s;
