@@ -465,6 +465,11 @@ it is not queued behind other holders the way a batch request is:
   (error `server_overloaded`, close 1013). Past the reservation a session
   keeps taking pages while the pool has them, and ends with the same error
   when it runs dry, rather than blocking on its own socket thread.
+  The reservation is an estimate, not a guarantee: it counts 29 prefill
+  rows plus 16 decoded tokens per 2.93 s chunk (test120 averages 10, dense
+  speech 12-14). Faster speech, or a chunk that runs to `max_new_tokens`,
+  uses the reserve up sooner, so on a pool with no spare pages the session
+  can end before `--stream-reserve` seconds of audio.
 - Idle time counts from the last audio or JSON message, not the last byte:
   pings and pongs are answered but do not keep a session. After
   `--stream-idle` (default 60 s) without either it is closed (1008).
