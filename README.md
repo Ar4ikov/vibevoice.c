@@ -67,7 +67,7 @@ RTX 3090, CUDA 12.4, Ryzen 9 5900X. Defaults unless noted.
 | | |
 |---|---|
 | Model load | **9.5 s** |
-| Speech encoding | **243 ms** per 11 s of audio |
+| Speech encoding | **45 ms** per 11 s of audio, 315 ms per 120 s, 4.8 s per 32 min |
 | Prefill | **3056 tok/s** on a 14449-token prompt |
 | Decode | **131 tok/s** at 0.2K context, 123 at 1.5K, 93 averaged over a 14K-to-24K window; 132 / 129 / 107 with `--attn flashinfer` |
 | RTF | **0.055** on a 120 s file, **0.067** on 32 minutes (0.060 with `--attn flashinfer`) |
@@ -88,8 +88,11 @@ defaulted to physical cores.
 | Prefill | **77 tok/s**, 991 GFLOP/s across the quantized GEMMs |
 | Decode | **7.9 tok/s** (12 cores, AVX2) |
 | RTF | **0.81** on a 30 s file |
+| Speech encoder | **2.4 s** per 11 s of audio (was 70 s) |
 
-Output is identical to the GPU path.
+Output is identical to the GPU path. The CPU speech encoder is time-tiled
+with carried context, so its memory is bounded by the tile rather than the
+file, and its FFNs and downsamples go through the same packed GEMM.
 
 Prefill is a packed GEMM: both operands are copied into k-major panels and a
 6x16 register tile accumulates over the k-block, with the panels sized so the
@@ -153,8 +156,18 @@ curl http://localhost:8080/v1/audio/transcriptions \
      -F file=@meeting.mp3 -F response_format=verbose_json
 ```
 
-`--slots N` runs N requests concurrently against **one** copy of the weights;
-each slot costs only its own KV cache and workspace. Two 30-second files
+`--slots N` runs N requests concurrently against **one** copy of the weights,
+the speech encoders' included; each slot costs only its own KV cache,
+workspace and 1.4 MB of encoder state. Their encoder work goes through one
+worker per device that gathers what arrives within 2 ms into shared
+launches. Eight 30-second files on one 3090:
+
+| `--slots` | before | now | VRAM per slot added |
+|---|---|---|---|
+| 1 | 15.8 s | **13.2 s** | |
+| 2 | 13.9 s | **11.3 s** | |
+| 4 | 13.3 s | **10.6 s** | 3.6 GB -> **2.3 GB** |
+ Two 30-second files
 finish in 4.2 s together against 5.8 s back to back, returning identical
 transcripts either way. Not 2×, because decode
 is bandwidth-bound on the weights and interleaves — everything either side of
@@ -619,6 +632,35 @@ flowchart LR
 No mel spectrogram, no FFT. Raw 24 kHz PCM goes straight into two Conv-VAE
 tokenizers, each compressing 3200× (ratios 8·5·5·4·2·2) down to 7.5 Hz. The
 two latent streams are projected to the LLM's 3584 dims and added.
+
+### The speech front end
+
+Both encoders and both connectors are one object per device: FP16 weights
+uploaded once, an arena sized from the largest launch (30 s of audio across
+up to 16 jobs by default, `VV_ENC_BATCH_SEC` to change it), and a
+per-stream state holding every convolution's left context. An encode is
+kernel launches on the caller's stream and nothing else -- no allocation, no
+free, no sync -- so it cannot stall another slot's decode.
+
+A launch packs its jobs along time with no padding. Norms, GEMMs and GELU
+run over the concatenated axis without knowing jobs exist; only the
+convolutions look back in time, and they find each job's edge, and its left
+context in its state, in a descriptor table passed with the launch. So one
+launch can mix segments of a long file, several requests and chunks of live
+streams, and every one of them comes out bit-identical to encoding it
+alone. Streaming is exact for any chunk length: a layer that cannot finish
+an output keeps `total - out * stride` inputs for the next chunk rather than
+a fixed `k - stride`. A job with no state is a stateless window, encoded
+from zero context the way Streaming-7B encodes its 26-frame windows.
+
+The acoustic and semantic encoders run concurrently on two streams. Each
+mixer is one kernel (RMSNorm, depthwise conv, gamma residual), the FFN's
+norm is applied while its GEMM stages the operand and its bias, GELU and
+residual are the GEMMs' epilogues, the downsamples are tensor-core GEMMs over
+im2col tiles, and the stage-5/6 GEMMs -- a few hundred columns, thousands
+deep -- split along K by a rule that depends on K alone, so the split never
+depends on who shares the launch. The connectors then write the prompt's
+hidden rows in place, the semantic one accumulating onto the acoustic one.
 
 ### The acoustic latent is a distribution
 

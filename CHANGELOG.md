@@ -89,6 +89,40 @@ Write the entry for a change under Unreleased in the same pull request.
   transcript and reports success.
 - A decode step that fails now fails the request; before, the tokens so far
   were post-processed and returned as a complete transcript.
+- **Speech front end** ([#16](https://github.com/Ar4ikov/vibevoice.c/issues/16)):
+  the Conv-VAE encoders are split into weights (FP16, one copy per device,
+  shared by every slot -- each `--slots` clone used to upload its own
+  1.4 GB), per-stream state (the convolution tails, ~1.4 MB) and one arena
+  sized from (jobs, samples) per launch and counted by the placement budget
+  in place of the flat 256 MB guess. An encode is kernel launches on the
+  caller's stream and nothing else: the ~110 `cudaMalloc`/`cudaFree` pairs
+  per segment, the per-stage syncs and the host round trips are gone. One
+  launch takes any mix of jobs packed along time -- segments of a file,
+  several requests, chunks of live streams, stateless windows (from zero
+  state, as Streaming-7B's 26-frame windows need) -- and both encoders run
+  concurrently on two streams. The mixer is one fused RMSNorm + depthwise
+  conv + gamma-residual kernel, the FFN norm, bias, GELU and residual ride
+  in the GEMMs' operand load and epilogues, the downsamples are tensor-core
+  GEMMs over im2col tiles, and the deep stage-5/6 GEMMs split along K.
+  Streaming is exact for any chunk length, not only multiples of 3200
+  samples. The connectors run on the device and write the prompt's rows in
+  place. With `serve --slots N` a per-device worker gathers what arrives
+  within 2 ms into shared launches. The CPU encoder is time-tiled with
+  carried state (bounded memory), OpenMP, through the packed GEMM, and no
+  longer runs on the GPU under `--cpu`. Batched, chunked and windowed
+  encodes equal one-by-one bit for bit (`tests/test_vae_stream.c`).
+  3090: encoder 199 -> 45 ms on 11 s, 1346 -> 315 ms on 120 s (RTF 0.059
+  -> 0.050), 22.3 -> 4.8 s on the 32-minute file (RTF 0.081 -> 0.072),
+  eight 30 s files through `serve --slots 4` 13.3 -> 10.6 s, 1.3 GB less
+  VRAM per extra slot; CPU encoder on 11 s 70 -> 2.4 s. The downsample
+  GEMMs sum in tensor-core order, which moves latents against the PyTorch
+  reference from 0.149 / 0.261 % to 0.148 / 0.265 %; transcripts on jfk,
+  test30, test120 and the 32-minute file are unchanged.
+- The TensorRT stubs (`src/trt`, `trt.h`, the CMake option, the ONNX/TRT
+  export tools) are removed; they never ran, and `VV_ENABLE_TRT` defaulted
+  to ON, linking `libnvinfer` into dev builds. `--trt-acoustic` and
+  `--trt-semantic` still parse for this release and log a deprecation
+  warning.
 
 ## [0.2.0](https://github.com/Ar4ikov/vibevoice.c/releases/tag/v0.2.0) — 2026-09-18
 
