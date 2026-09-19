@@ -60,10 +60,11 @@ static int fill_device(vv_engine_t* e, const char* model_dir, int gpu_id,
 
     /*
      * Every slot on the device shares one speech front end. With more than
-     * one slot, its work goes through a worker that gathers what arrives
-     * within a couple of milliseconds into one launch: concurrent requests
-     * then share the encoder's kernel launches instead of queueing behind
-     * each other's, and the arena is sized once per device, not per slot.
+     * one slot, its work goes through a worker that plans one launch at a
+     * time from whatever has arrived: concurrent requests share the
+     * encoder's kernel launches, a short request is not stuck behind a long
+     * file's whole encode, and the arena is sized once per device, not per
+     * slot.
      */
     if (made > 1 && e->slots[base]->frontend)
         vv_frontend_service_start(e->slots[base]->frontend, gpu_id);

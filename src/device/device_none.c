@@ -75,6 +75,9 @@ vv_status_t vv_dev_stream_create(void** stream) {
     if (stream) *stream = NULL;
     return VV_OK;
 }
+vv_status_t vv_dev_stream_create_background(void** stream) {
+    return vv_dev_stream_create(stream);
+}
 vv_status_t vv_dev_stream_destroy(void* s) { (void)s; return VV_OK; }
 vv_status_t vv_dev_stream_sync(void* s) { (void)s; return VV_OK; }
 vv_status_t vv_dev_set_device(int id) { (void)id; return VV_ERR_NOT_FOUND; }

@@ -185,7 +185,9 @@ vv_status_t vv_frontend_create(const vv_conv_vae_encoder_t* acoustic,
     fe->enc[1] = semantic;
     const vv_connector_t* conn[2] = { ac_conn, sem_conn };
 
-    vv_status_t s = vv_dev_stream_create(&fe->s_main);
+    /* Background priority: a long file's encoder launches must not hold
+       up other slots' decode steps, which are latency, not throughput. */
+    vv_status_t s = vv_dev_stream_create_background(&fe->s_main);
     if (s == VV_OK) s = vv_dev_event_create(&fe->ev_in);
     if (s == VV_OK) s = vv_dev_event_create(&fe->ev_ac_rows);
 
@@ -194,7 +196,7 @@ vv_status_t vv_frontend_create(const vv_conv_vae_encoder_t* acoustic,
                                 (size_t)fe->p.max_samples * sizeof(float));
         if (s == VV_OK) s = vv_dev_event_create(&fe->ev_pin[e]);
         if (s != VV_OK || !fe->enc[e]) continue;
-        s = vv_dev_stream_create(&fe->s_enc[e]);
+        s = vv_dev_stream_create_background(&fe->s_enc[e]);
         if (s == VV_OK) s = vv_dev_event_create(&fe->ev_enc[e]);
         if (s == VV_OK) s = vv_vae_weights_upload(fe->enc[e], fe->s_main, &fe->w[e]);
         if (s == VV_OK)

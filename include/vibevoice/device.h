@@ -64,6 +64,12 @@ vv_status_t vv_dev_memset(void* ptr, int value, size_t size);
 vv_status_t vv_dev_memset_async(void* ptr, int value, size_t size,
                                 void* stream);
 vv_status_t vv_dev_stream_create(void** stream);
+/**
+ * @brief A stream whose work yields to that of every vv_dev_stream_create
+ * stream: the lowest scheduling priority, one step below the rest. For bulk
+ * work that should not hold up other requests' decode steps.
+ */
+vv_status_t vv_dev_stream_create_background(void** stream);
 vv_status_t vv_dev_stream_destroy(void* stream);
 vv_status_t vv_dev_stream_sync(void* stream);
 vv_status_t vv_dev_set_device(int device_id);

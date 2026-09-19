@@ -219,12 +219,33 @@ vv_status_t vv_dev_memset_async(void* ptr, int value, size_t size,
 }
 
 /**
- * @brief Create a CUDA stream.
+ * @brief Create a CUDA stream, one priority step above the lowest.
+ *
+ * The lowest priority is kept for vv_dev_stream_create_background, so that
+ * bulk work on those streams (the speech encoder) yields to everything
+ * else at block boundaries. On a device without priorities both are the
+ * same, which is what cudaStreamCreate gave before.
  */
-vv_status_t vv_dev_stream_create(void** stream) {
+static vv_status_t stream_create_prio(void** stream, bool background) {
     if (!stream) return VV_ERR_NULL_PTR;
-    cudaError_t err = cudaStreamCreate((cudaStream_t*)stream);
+    int least = 0, greatest = 0;
+    if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) {
+        cudaGetLastError();
+        least = greatest = 0;
+    }
+    /* Numerically lower is more urgent: greatest <= least. */
+    const int prio = background ? least : (greatest < least ? least - 1 : least);
+    cudaError_t err = cudaStreamCreateWithPriority((cudaStream_t*)stream,
+                                                   cudaStreamDefault, prio);
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
+}
+
+vv_status_t vv_dev_stream_create(void** stream) {
+    return stream_create_prio(stream, false);
+}
+
+vv_status_t vv_dev_stream_create_background(void** stream) {
+    return stream_create_prio(stream, true);
 }
 
 /**
