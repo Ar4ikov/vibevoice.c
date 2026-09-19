@@ -275,3 +275,39 @@ vv_status_t vv_swiglu_q8_dev(const void* gate, const void* up, int M, int K,
 }
 
 } /* extern "C" */
+
+/* ─── Calibration: per-column absmax ────────────────────────────────────── */
+
+#define CA_COLS 256
+#define CA_ROWS 64
+
+/*
+ * One thread per column, each block walking CA_ROWS rows, so neighbouring
+ * threads read neighbouring halves. Values are >= 0, so the float bits
+ * order like the ints and atomicMax on them is the float max.
+ */
+__global__ void col_absmax_kernel(const half* __restrict__ x, int M, int K,
+                                  float* __restrict__ acc)
+{
+    const int k = blockIdx.x * CA_COLS + threadIdx.x;
+    if (k >= K) return;
+    const int m0 = blockIdx.y * CA_ROWS;
+    const int m1 = min(M, m0 + CA_ROWS);
+    float v = 0.0f;
+    for (int m = m0; m < m1; m++)
+        v = fmaxf(v, fabsf(__half2float(x[(size_t)m * K + k])));
+    if (v == v)       /* a NaN would order above every finite value */
+        atomicMax((int*)acc + k, __float_as_int(v));
+}
+
+vv_status_t vv_col_absmax_dev(const void* x, int M, int K, float* acc,
+                              void* stream)
+{
+    if (!x || !acc) return VV_ERR_NULL_PTR;
+    if (M <= 0 || K <= 0) return VV_ERR_INVALID_ARG;
+    const dim3 grid((unsigned)((K + CA_COLS - 1) / CA_COLS),
+                    (unsigned)((M + CA_ROWS - 1) / CA_ROWS));
+    col_absmax_kernel<<<grid, CA_COLS, 0, (cudaStream_t)stream>>>(
+        (const half*)x, M, K, acc);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}

@@ -23,8 +23,10 @@
 #include "vibevoice/quant.h"
 #include "vibevoice/vibevoice.h"
 #include "vibevoice/cpu_kernels.h"
+#include "vibevoice/smooth.h"
 #include "cJSON.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,6 +85,10 @@ typedef struct {
     int                gptq_bias;
     size_t             proj_bytes;
     ct_cfg_t           ct;       /**< compressed-tensors quantization_config */
+    /** SmoothQuant statistics to fold in (NULL: none), and how. */
+    const vv_smooth_stats_t* smooth;
+    float              smooth_alpha;
+    int                smooth_maps;
 } loader_t;
 
 static int entry_cmp(const void* a, const void* b) {
@@ -785,6 +791,186 @@ vv_status_t vv_model_int4g_to_gpu_layout(vv_model_t* model, int* n_converted)
     return VV_OK;
 }
 
+/* ─── SmoothQuant folding (smooth.h) ────────────────────────────────────── */
+
+/** @brief An FP16 vector divided by a per-element factor. */
+static void div_f16(vv_tensor_t* t, const float* f) {
+    uint16_t* h = (uint16_t*)t->data;
+    const size_t n = t->size_bytes / sizeof(uint16_t);
+    for (size_t i = 0; i < n; i++)
+        h[i] = vv_float_to_half_rne(vv_half_to_float(h[i]) / f[i]);
+}
+
+/**
+ * @brief acc[k] = max(acc[k], max_r |W[r, k]|) for the dense projection
+ *        `<prefix>layers.<layer>.<which>.weight` [N, K].
+ *
+ * Read straight from the mapping, a few rows per thread; each thread keeps
+ * its own maxima and they meet at the end, so the result does not depend on
+ * the thread count.
+ */
+static vv_status_t dense_col_absmax(const loader_t* L, int layer,
+                                    const char* which, int N, int K,
+                                    float* acc) {
+    char buf[320];
+    snprintf(buf, sizeof(buf), "%slayers.%d.%s.weight", L->prefix, layer,
+             which);
+    const st_entry_t* e = find(L, buf);
+    if (!e || !is_float_dtype(e->info.dtype)) {
+        VV_LOG_E("loader: SmoothQuant folds into dense weights; '%s' is %s",
+                 buf, e ? dtype_name(e->info.dtype) : "missing");
+        return e ? VV_ERR_UNSUPPORTED : VV_ERR_WEIGHT_MISSING;
+    }
+    vv_status_t s = check_shape(e, N, K);
+    if (s != VV_OK) return s;
+    const void* src = data_of(L, e);
+    if (!src) return VV_ERR_MODEL_FORMAT;
+    const size_t es = vv_dtype_size(e->info.dtype);
+
+    enum { ROWS = 8 };
+    int nt = 1;
+#ifdef _OPENMP
+    nt = omp_get_max_threads();
+#endif
+    float* part = (float*)vv_alloc((size_t)nt * (size_t)K * sizeof(float));
+    float* tmp = (float*)vv_alloc((size_t)nt * ROWS * (size_t)K *
+                                  sizeof(float));
+    if (!part || !tmp) {
+        vv_free(part);
+        vv_free(tmp);
+        return VV_ERR_OUT_OF_MEMORY;
+    }
+    memset(part, 0, (size_t)nt * (size_t)K * sizeof(float));
+    const int n_blk = (N + ROWS - 1) / ROWS;
+    int b;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (b = 0; b < n_blk; b++) {
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        float* t = tmp + (size_t)tid * ROWS * (size_t)K;
+        float* p = part + (size_t)tid * (size_t)K;
+        const int r0 = b * ROWS;
+        const int rows = (r0 + ROWS <= N) ? ROWS : N - r0;
+        to_f32_range((const uint8_t*)src + (size_t)r0 * K * es,
+                     e->info.dtype, t, 0, (size_t)rows * K);
+        for (int r = 0; r < rows; r++)
+            for (int k = 0; k < K; k++) {
+                const float v = fabsf(t[(size_t)r * K + k]);
+                if (v > p[k]) p[k] = v;
+            }
+    }
+    for (int i = 0; i < nt; i++)
+        for (int k = 0; k < K; k++)
+            if (part[(size_t)i * K + k] > acc[k])
+                acc[k] = part[(size_t)i * K + k];
+    vv_free(part);
+    vv_free(tmp);
+    return VV_OK;
+}
+
+/** @brief Factors of one layer; NULL members are not smoothed. */
+typedef struct {
+    float* qkv;     /**< [hidden] input_layernorm -> q, k, v           */
+    float* gu;      /**< [hidden] post_attention_layernorm -> gate, up */
+    float* vo;      /**< [kv_dim] v_proj rows -> o_proj                */
+    float* o_cols;  /**< [q_dim]  vo spread over o_proj's columns      */
+    float* ud;      /**< [inter]  up_proj rows -> down_proj            */
+} smooth_fac_t;
+
+/** @brief Smallest and largest factor seen, for the load log. */
+static void smooth_range(const float* f, int n, float* lo, float* hi) {
+    for (int i = 0; f && i < n; i++) {
+        if (f[i] < *lo) *lo = f[i];
+        if (f[i] > *hi) *hi = f[i];
+    }
+}
+
+/**
+ * @brief SmoothQuant factors of layer `li` from the calibration ranges and
+ *        the dense weights' column ranges.
+ *
+ * The members of `f` point into scratch the caller owns; those of maps that
+ * are off are set to NULL. `wmax` is scratch of max(hidden, q_dim, inter)
+ * floats.
+ */
+static vv_status_t smooth_layer(const loader_t* L, int li, float* wmax,
+                                smooth_fac_t* f) {
+    const vv_llm_config_t* c = &L->m->config.llm;
+    const vv_smooth_stats_t* st = L->smooth;
+    const int hs = c->hidden_size, hd = c->head_dim;
+    const int nh = c->num_attention_heads, nkv = c->num_key_value_heads;
+    const int qd = nh * hd, kvd = nkv * hd, inter = c->intermediate_size;
+    const float a = L->smooth_alpha;
+    const float* row = st->absmax + (size_t)li * st->width;
+    vv_status_t s;
+
+    if (!(L->smooth_maps & VV_SMOOTH_QKV)) f->qkv = NULL;
+    if (!(L->smooth_maps & VV_SMOOTH_GATEUP)) f->gu = NULL;
+    if (!(L->smooth_maps & VV_SMOOTH_VO)) f->vo = f->o_cols = NULL;
+    if (!(L->smooth_maps & VV_SMOOTH_UPDOWN)) f->ud = NULL;
+
+    if (f->qkv) {
+        const float* am = row + vv_smooth_offset(st, VV_SMOOTH_ATTN_IN);
+        memset(wmax, 0, (size_t)hs * sizeof(float));
+        if ((s = dense_col_absmax(L, li, "self_attn.q_proj", qd, hs,
+                                  wmax)) != VV_OK ||
+            (s = dense_col_absmax(L, li, "self_attn.k_proj", kvd, hs,
+                                  wmax)) != VV_OK ||
+            (s = dense_col_absmax(L, li, "self_attn.v_proj", kvd, hs,
+                                  wmax)) != VV_OK)
+            return s;
+        for (int k = 0; k < hs; k++)
+            f->qkv[k] = vv_smooth_factor(am[k], wmax[k], a);
+    }
+    if (f->gu) {
+        const float* am = row + vv_smooth_offset(st, VV_SMOOTH_MLP_IN);
+        memset(wmax, 0, (size_t)hs * sizeof(float));
+        if ((s = dense_col_absmax(L, li, "mlp.gate_proj", inter, hs,
+                                  wmax)) != VV_OK ||
+            (s = dense_col_absmax(L, li, "mlp.up_proj", inter, hs,
+                                  wmax)) != VV_OK)
+            return s;
+        for (int k = 0; k < hs; k++)
+            f->gu[k] = vv_smooth_factor(am[k], wmax[k], a);
+    }
+    if (f->vo) {
+        /* KV channel ch = (h / group) * hd + d feeds o_proj column
+           h * hd + d of every query head h of its group: one factor. */
+        const float* am = row + vv_smooth_offset(st, VV_SMOOTH_ATTN_OUT);
+        const int group = nh / nkv;
+        memset(wmax, 0, (size_t)qd * sizeof(float));
+        if ((s = dense_col_absmax(L, li, "self_attn.o_proj", hs, qd,
+                                  wmax)) != VV_OK)
+            return s;
+        for (int ch = 0; ch < kvd; ch++) {
+            float ra = 0.0f, rw = 0.0f;
+            const int g = ch / hd, d = ch % hd;
+            for (int h = g * group; h < (g + 1) * group; h++) {
+                const int j = h * hd + d;
+                if (am[j] > ra) ra = am[j];
+                if (wmax[j] > rw) rw = wmax[j];
+            }
+            f->vo[ch] = vv_smooth_factor(ra, rw, a);
+        }
+        for (int j = 0; j < qd; j++)
+            f->o_cols[j] = f->vo[((j / hd) / group) * hd + j % hd];
+    }
+    if (f->ud) {
+        const float* am = row + vv_smooth_offset(st, VV_SMOOTH_MLP_MID);
+        memset(wmax, 0, (size_t)inter * sizeof(float));
+        if ((s = dense_col_absmax(L, li, "mlp.down_proj", hs, inter,
+                                  wmax)) != VV_OK)
+            return s;
+        for (int k = 0; k < inter; k++)
+            f->ud[k] = vv_smooth_factor(am[k], wmax[k], a);
+    }
+    return VV_OK;
+}
+
 /* ─── Dense projections, kept or quantized on the way in ────────────────── */
 
 /**
@@ -797,7 +983,8 @@ vv_status_t vv_model_int4g_to_gpu_layout(vv_model_t* model, int* n_converted)
  * thread count.
  */
 static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
-                                     int N, int K, vv_weight_t* w) {
+                                     int N, int K, const float* col_mul,
+                                     const float* row_div, vv_weight_t* w) {
     vv_status_t s = check_shape(e, N, K);
     if (s != VV_OK) return s;
     const void* src = data_of(L, e);
@@ -879,6 +1066,16 @@ static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
         const int rows = (r0 + ROWS <= N) ? ROWS : N - r0;
         to_f32_range((const uint8_t*)src + (size_t)r0 * K * es, dt, t, 0,
                      (size_t)rows * K);
+        /* SmoothQuant: W[r, k] * s_k (input side), / s_r (output side). */
+        if (col_mul || row_div)
+            for (int r = 0; r < rows; r++) {
+                float* tr = t + (size_t)r * K;
+                const float rd = row_div ? 1.0f / row_div[r0 + r] : 1.0f;
+                if (col_mul)
+                    for (int k = 0; k < K; k++) tr[k] *= col_mul[k] * rd;
+                else
+                    for (int k = 0; k < K; k++) tr[k] *= rd;
+            }
         vv_status_t st;
         if (kind == VV_QUANT_NF4)
             st = vv_nf4_quantize(t, rows, K, codes + (size_t)r0 * (K / 2),
@@ -1198,6 +1395,7 @@ static vv_status_t load_ct_weight(loader_t* L, const char* base,
  */
 static vv_status_t load_projection(loader_t* L, int layer, const char* which,
                                    int N, int K, bool want_bias,
+                                   const float* col_mul, const float* row_div,
                                    vv_weight_t* w) {
     char base[256], buf[320];
     snprintf(base, sizeof(base), "%slayers.%d.%s", L->prefix, layer, which);
@@ -1234,7 +1432,8 @@ static vv_status_t load_projection(loader_t* L, int layer, const char* which,
         L->n_nf4++;
         L->proj_bytes += w->tensor.size_bytes + w->quant.scales.size_bytes;
     } else if (e && is_float_dtype(e->info.dtype)) {
-        if ((s = load_dense_weight(L, e, N, K, w)) != VV_OK) return s;
+        if ((s = load_dense_weight(L, e, N, K, col_mul, row_div, w)) != VV_OK)
+            return s;
     } else if (e && e->info.dtype == VV_DTYPE_I8) {
         /* compressed-tensors int-quantized: W8A8, or 4-bit in an int8 box */
         if ((s = load_ct_weight(L, base, e, NULL, N, K, w)) != VV_OK) return s;
@@ -1280,6 +1479,7 @@ static vv_status_t load_projection(loader_t* L, int layer, const char* which,
     if (e) {
         if ((s = check_shape(e, N, 0)) != VV_OK) return s;
         if ((s = load_f16(L, e, &w->bias)) != VV_OK) return s;
+        if (row_div) div_f16(&w->bias, row_div);
     } else if (want_bias) {
         VV_LOG_E("loader: '%s' is missing (attention_bias is on)", buf);
         return VV_ERR_WEIGHT_MISSING;
@@ -1530,34 +1730,79 @@ static vv_status_t load_layers(loader_t* L) {
         return VV_ERR_SHAPE_MISMATCH;
     }
 
-    for (int i = 0; i < m->num_layers; i++) {
+    /* SmoothQuant scratch: the factors of one layer and one column range. */
+    float* sbuf = NULL;
+    float* wmax = NULL;
+    float lo = 1e30f, hi = 0.0f;
+    if (L->smooth) {
+        const size_t nf = (size_t)2 * hs + kvd + qd + inter;
+        const int wide = inter > qd ? (inter > hs ? inter : hs)
+                                    : (qd > hs ? qd : hs);
+        sbuf = (float*)vv_alloc(nf * sizeof(float));
+        wmax = (float*)vv_alloc((size_t)wide * sizeof(float));
+        if (!sbuf || !wmax) {
+            vv_free(sbuf);
+            vv_free(wmax);
+            return VV_ERR_OUT_OF_MEMORY;
+        }
+    }
+
+    s = VV_OK;
+    for (int i = 0; i < m->num_layers && s == VV_OK; i++) {
         vv_layer_weights_t* Ly = &m->layers[i];
+        smooth_fac_t f = { NULL, NULL, NULL, NULL, NULL };
+        if (sbuf) {
+            f.qkv = sbuf;
+            f.gu = f.qkv + hs;
+            f.vo = f.gu + hs;
+            f.o_cols = f.vo + kvd;
+            f.ud = f.o_cols + qd;
+            if ((s = smooth_layer(L, i, wmax, &f)) != VV_OK) break;
+            smooth_range(f.qkv, hs, &lo, &hi);
+            smooth_range(f.gu, hs, &lo, &hi);
+            smooth_range(f.vo, kvd, &lo, &hi);
+            smooth_range(f.ud, inter, &lo, &hi);
+        }
+
         snprintf(buf, sizeof(buf), "%slayers.%d.input_layernorm.weight",
                  L->prefix, i);
         if ((s = need_f16(L, buf, hs, 0, &Ly->input_layernorm)) != VV_OK)
-            return s;
+            break;
         snprintf(buf, sizeof(buf), "%slayers.%d.post_attention_layernorm.weight",
                  L->prefix, i);
         if ((s = need_f16(L, buf, hs, 0, &Ly->post_attn_layernorm)) != VV_OK)
-            return s;
+            break;
+        /* x / s out of the norms, W * s into the projections they feed. */
+        if (f.qkv) div_f16(&Ly->input_layernorm, f.qkv);
+        if (f.gu) div_f16(&Ly->post_attn_layernorm, f.gu);
 
         if ((s = load_projection(L, i, "self_attn.q_proj", qd, hs, qkv_bias,
-                                 &Ly->attn.q_proj)) != VV_OK ||
+                                 f.qkv, NULL, &Ly->attn.q_proj)) != VV_OK ||
             (s = load_projection(L, i, "self_attn.k_proj", kvd, hs, qkv_bias,
-                                 &Ly->attn.k_proj)) != VV_OK ||
+                                 f.qkv, NULL, &Ly->attn.k_proj)) != VV_OK ||
             (s = load_projection(L, i, "self_attn.v_proj", kvd, hs, qkv_bias,
-                                 &Ly->attn.v_proj)) != VV_OK ||
+                                 f.qkv, f.vo, &Ly->attn.v_proj)) != VV_OK ||
             (s = load_projection(L, i, "self_attn.o_proj", hs, qd, false,
-                                 &Ly->attn.o_proj)) != VV_OK ||
+                                 f.o_cols, NULL, &Ly->attn.o_proj)) != VV_OK ||
             (s = load_projection(L, i, "mlp.gate_proj", inter, hs, false,
-                                 &Ly->mlp.gate_proj)) != VV_OK ||
+                                 f.gu, NULL, &Ly->mlp.gate_proj)) != VV_OK ||
             (s = load_projection(L, i, "mlp.up_proj", inter, hs, false,
-                                 &Ly->mlp.up_proj)) != VV_OK ||
+                                 f.gu, f.ud, &Ly->mlp.up_proj)) != VV_OK ||
             (s = load_projection(L, i, "mlp.down_proj", hs, inter, false,
-                                 &Ly->mlp.down_proj)) != VV_OK)
-            return s;
+                                 f.ud, NULL, &Ly->mlp.down_proj)) != VV_OK)
+            break;
     }
-    return VV_OK;
+    vv_free(sbuf);
+    vv_free(wmax);
+    if (s == VV_OK && L->smooth)
+        VV_LOG_I("loader: SmoothQuant folded (alpha %.2f, maps%s%s%s%s), "
+                 "factors %.3g..%.3g", (double)L->smooth_alpha,
+                 (L->smooth_maps & VV_SMOOTH_QKV) ? " qkv" : "",
+                 (L->smooth_maps & VV_SMOOTH_GATEUP) ? " gate/up" : "",
+                 (L->smooth_maps & VV_SMOOTH_VO) ? " v->o" : "",
+                 (L->smooth_maps & VV_SMOOTH_UPDOWN) ? " up->down" : "",
+                 (double)lo, (double)hi);
+    return s;
 }
 
 static vv_status_t load_lm_globals(loader_t* L) {
@@ -1793,6 +2038,38 @@ static vv_status_t model_load_impl(const char* model_dir,
     L.m = model;
     L.quant = (vv_load_quant_t)o.quant;
     L.gptq_bias = gptq_zero_bias(model_dir);
+    if (o.smooth) {
+        /*
+         * Folding changes what the dense weights are before they are
+         * quantized; kept dense, they would compute the same thing with
+         * extra rounding. So it takes a load-time format and statistics of
+         * this model's shape.
+         */
+        const vv_llm_config_t* c = &model->config.llm;
+        const vv_smooth_stats_t* st = o.smooth;
+        if (L.quant == VV_LOAD_QUANT_AUTO || L.quant == VV_LOAD_QUANT_NONE) {
+            VV_LOG_E("loader: SmoothQuant folds into weights quantized at "
+                     "load; pick --quant w8a8, w4a8, int8, int4 or nf4");
+            vv_model_free(model);
+            return VV_ERR_INVALID_ARG;
+        }
+        if (st->n_layers != n_layers || st->hidden != c->hidden_size ||
+            st->q_dim != c->num_attention_heads * c->head_dim ||
+            st->inter != c->intermediate_size) {
+            VV_LOG_E("loader: the calibration is of a [%d layers, %d, %d, %d] "
+                     "model, this one is [%d, %d, %d, %d]", st->n_layers,
+                     st->hidden, st->q_dim, st->inter, n_layers,
+                     c->hidden_size, c->num_attention_heads * c->head_dim,
+                     c->intermediate_size);
+            vv_model_free(model);
+            return VV_ERR_SHAPE_MISMATCH;
+        }
+        L.smooth = st;
+        L.smooth_alpha = o.smooth_alpha > 0.0f ? o.smooth_alpha
+                                               : VV_SMOOTH_ALPHA_DEFAULT;
+        L.smooth_maps = o.smooth_maps > 0 ? (o.smooth_maps & VV_SMOOTH_ALL)
+                                          : VV_SMOOTH_MAPS_DEFAULT;
+    }
     ct_parse(model_dir, &L.ct);
     if (L.ct.present)
         VV_LOG_I("loader: compressed-tensors checkpoint (%s, %d-bit weights%s)",

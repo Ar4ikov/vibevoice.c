@@ -312,6 +312,17 @@ vv_status_t vv_swiglu_q8_dev(const void* gate, const void* up, int M, int K,
                              int layout, int8_t* xq, float* sx,
                              int32_t* xsum, void* stream);
 
+/**
+ * @brief Calibration statistics: acc[k] = max(acc[k], max_m |x[m,k]|).
+ *
+ * `x` is FP16 [M,K], `acc` FP32 [K] on the device, updated in place (it
+ * holds non-negative values, so the running max is exact in any order).
+ * SmoothQuant calibration (smooth.h) collects the per-channel activation
+ * range of every projection's input with it.
+ */
+vv_status_t vv_col_absmax_dev(const void* x, int M, int K, float* acc,
+                              void* stream);
+
 /** @brief Which kernel family runs an int8 linear layer. */
 typedef enum vv_i8_path {
     VV_I8_PATH_AUTO = 0,  /**< GEMV for M <= 8, tensor cores, else SIMT     */

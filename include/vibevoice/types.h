@@ -467,6 +467,15 @@ typedef struct vv_init_params {
      * plus the clones made from it). Sizes a paged pool; 1 otherwise.
      */
     int    n_slots;
+    /**
+     * SmoothQuant statistics (smooth.h) folded into a dense checkpoint as it
+     * is quantized at load (`weight_quant`), with their migration strength
+     * and maps (0: the defaults, or VV_SMOOTH_ALPHA / VV_SMOOTH_MAPS).
+     * NULL: none. Not owned; only read during vv_inference_init.
+     */
+    const struct vv_smooth_stats* smooth;
+    float  smooth_alpha;
+    int    smooth_maps;
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -483,6 +492,9 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.attn_backend = VV_ATTN_AUTO;
     p.kv_paging = VV_KV_PAGED_AUTO;
     p.n_slots = 1;
+    p.smooth = NULL;
+    p.smooth_alpha = 0.0f;
+    p.smooth_maps = 0;
     return p;
 }
 

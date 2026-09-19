@@ -14,6 +14,7 @@
 #include "vibevoice/kv_quant.h"
 #include "vibevoice/audio.h"
 #include "vibevoice/inference.h"
+#include "vibevoice/smooth.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -51,6 +52,8 @@ typedef struct {
     int         gpu_layers;
     const char* kv_cache;
     const char* quant;
+    const char* calib;
+    const char* calib_stats;
     const char* attn;
     const char* kv_paged;
     bool        cpu_only;
@@ -115,6 +118,11 @@ static void print_usage(const char* prog) {
         "                        w8a8 | w4a8: int8 / int4 weights on int8\n"
         "                        per-token activations (dense, AWQ/GPTQ for\n"
         "                        w4a8, or compressed-tensors checkpoints)\n"
+        "  --calib <audio>       SmoothQuant: run the dense checkpoint on this\n"
+        "                        clip first and fold its activation ranges\n"
+        "                        into the weights --quant quantizes\n"
+        "  --calib-stats <file>  Read those ranges from a file instead, or,\n"
+        "                        with --calib, write them there\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
         "  --kv-paged <mode>     auto (default) | on | off — take KV from a\n"
@@ -179,6 +187,10 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->kv_cache = argv[++i];
         } else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
             args->quant = argv[++i];
+        } else if (strcmp(argv[i], "--calib") == 0 && i + 1 < argc) {
+            args->calib = argv[++i];
+        } else if (strcmp(argv[i], "--calib-stats") == 0 && i + 1 < argc) {
+            args->calib_stats = argv[++i];
         } else if (strcmp(argv[i], "--vram-budget") == 0 && i + 1 < argc) {
             args->vram_budget = (float)atof(argv[++i]);
             if (args->vram_budget < 0.0f) args->vram_budget = 0.0f;
@@ -414,7 +426,17 @@ int main(int argc, char** argv) {
     init_params.gpu_layers = args.gpu_layers;
     init_params.gpus = gpus;
     init_params.split_mode = (int)split;
+    vv_smooth_stats_t* smooth = NULL;
+    s = vv_smooth_from_args(args.model_dir, args.gpu_id, &init_params,
+                            args.calib, args.calib_stats, &smooth);
+    if (s != VV_OK) {
+        VV_LOG_E("SmoothQuant calibration failed: %s", vv_status_str(s));
+        vv_free(raw_audio);
+        return 1;
+    }
+    init_params.smooth = smooth;
     s = vv_inference_init(args.model_dir, args.gpu_id, &init_params, &ctx);
+    vv_smooth_stats_free(smooth);
     if (s != VV_OK) {
         VV_LOG_E("Failed to initialize inference: %s", vv_status_str(s));
         vv_free(raw_audio);

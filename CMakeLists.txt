@@ -159,10 +159,12 @@ add_library(vibevoice_core STATIC
     src/quant/kv_format.c
     src/quant/awq_repack.c
     src/quant/load_quant.c
+    src/quant/smooth.c
     src/quant/dequant_cpu.c
     src/cpu/cpu_kernels.c
     src/cpu/cpu_int8.c
     src/inference/pipeline.c
+    src/inference/calib.c
     src/inference/frontend.c
     src/inference/decoder.c
     src/inference/kv_cache.c

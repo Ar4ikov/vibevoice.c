@@ -15,6 +15,7 @@
 #include "vibevoice/family.h"
 #include "vibevoice/cpu_kernels.h"
 #include "vibevoice/device.h"
+#include "vibevoice/smooth.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -804,6 +805,175 @@ static void test_load_quant(void) {
     vv_model_free(d);
 }
 
+/* ─── SmoothQuant folding ───────────────────────────────────────────────── */
+
+/** @brief max_r |W[r, k]| of a source projection, into acc (max-accumulate). */
+static void src_colmax(const fake_t* src, int N, int K, double* acc) {
+    for (int n = 0; n < N; n++)
+        for (int k = 0; k < K; k++) {
+            const double v = fabs(src_w(src, K, n, k));
+            if (v > acc[k]) acc[k] = v;
+        }
+}
+
+/**
+ * @brief Every INT8 weight of `w` is the source weight times col[k] / row[n]
+ *        (either may be NULL for 1), to within half a quantization step.
+ */
+static bool folded_int8(const vv_weight_t* w, const fake_t* src, int N, int K,
+                        const double* col, const double* row) {
+    if (w->quant_kind != VV_QUANT_INT8) return false;
+    const int8_t* q = (const int8_t*)w->tensor.data;
+    const float* sc = (const float*)w->quant.scales.data;
+    for (int n = 0; n < N; n++)
+        for (int k = 0; k < K; k++) {
+            const double want = src_w(src, K, n, k) * (col ? col[k] : 1.0) /
+                                (row ? row[n] : 1.0);
+            const double got = (double)q[(size_t)n * K + k] * sc[n];
+            if (fabs(got - want) > 0.5 * sc[n] * 1.0001 + 1e-7) return false;
+        }
+    return true;
+}
+
+static void test_smooth(void) {
+    printf("SmoothQuant folding:\n");
+    const char* dir = "test_model_load_dense";
+    const char* P = "model.language_model.layers.";
+    vv_smooth_stats_t* st = NULL;
+    vv_status_t s = vv_smooth_stats_alloc(LAYERS, HS, NH * HD, INTER, &st);
+    CHECK(s == VV_OK && st && st->width == 2 * HS + NH * HD + INTER,
+          "statistics allocate");
+    if (!st) return;
+    /* Ranges spanning three decades, one channel never seen (factor 1). */
+    uint32_t r = 777u;
+    for (int i = 0; i < LAYERS * st->width; i++) {
+        r = r * 1664525u + 1013904223u;
+        st->absmax[i] = powf(10.0f, (float)(r >> 8) / 16777216.0f * 3.0f - 1.0f);
+    }
+    st->absmax[(size_t)st->width + vv_smooth_offset(st, VV_SMOOTH_MLP_IN) + 3] =
+        0.0f;                                            /* layer 1 */
+    st->n_tokens = 1234;
+
+    const char* sp = "test_model_load_smooth.vvsq";
+    vv_smooth_stats_t* back = NULL;
+    s = vv_smooth_stats_save(st, sp);
+    if (s == VV_OK) s = vv_smooth_stats_load(sp, &back);
+    CHECK(s == VV_OK && back && back->n_tokens == 1234 &&
+          memcmp(back->absmax, st->absmax,
+                 (size_t)LAYERS * st->width * sizeof(float)) == 0,
+          "statistics survive a file round trip");
+    vv_smooth_stats_free(back);
+    remove(sp);
+
+    vv_model_load_opts_t o = vv_model_load_opts_default();
+    vv_model_t* m = NULL;
+    o.smooth = st;
+    o.quant = VV_LOAD_QUANT_NONE;
+    CHECK(vv_model_load_ex(dir, &o, &m) == VV_ERR_INVALID_ARG && !m,
+          "smoothing a model kept dense is refused");
+    st->inter = INTER / 2;
+    o.quant = VV_LOAD_QUANT_W8A8;
+    CHECK(vv_model_load_ex(dir, &o, &m) == VV_ERR_SHAPE_MISMATCH && !m,
+          "statistics of another shape are refused");
+    st->inter = INTER;
+
+    const float alpha = 0.6f;
+    o.smooth_alpha = alpha;
+    o.smooth_maps = VV_SMOOTH_ALL;
+    s = vv_model_load_ex(dir, &o, &m);
+    CHECK(s == VV_OK && m, "W8A8 with every map folded loads");
+    if (!m) { vv_smooth_stats_free(st); return; }
+
+    const int l = 1;
+    char nm[160];
+    const float* row = st->absmax + (size_t)l * st->width;
+    #define SRC(w) (snprintf(nm, sizeof(nm), "%s%d.%s", P, l, w), get(nm))
+    double wq[HS] = {0}, wg[HS] = {0}, wo[NH * HD] = {0}, wd[INTER] = {0};
+    src_colmax(SRC("self_attn.q_proj.weight"), NH * HD, HS, wq);
+    src_colmax(SRC("self_attn.k_proj.weight"), NKV * HD, HS, wq);
+    src_colmax(SRC("self_attn.v_proj.weight"), NKV * HD, HS, wq);
+    src_colmax(SRC("mlp.gate_proj.weight"), INTER, HS, wg);
+    src_colmax(SRC("mlp.up_proj.weight"), INTER, HS, wg);
+    src_colmax(SRC("self_attn.o_proj.weight"), HS, NH * HD, wo);
+    src_colmax(SRC("mlp.down_proj.weight"), HS, INTER, wd);
+    double f_qkv[HS], f_gu[HS], f_vo[NH * HD], f_ud[INTER];
+    for (int k = 0; k < HS; k++) {
+        f_qkv[k] = vv_smooth_factor(row[k], (float)wq[k], alpha);
+        f_gu[k] = vv_smooth_factor(row[HS + k], (float)wg[k], alpha);
+    }
+    for (int k = 0; k < NH * HD; k++)   /* one query head per KV head here */
+        f_vo[k] = vv_smooth_factor(row[2 * HS + k], (float)wo[k], alpha);
+    for (int k = 0; k < INTER; k++)
+        f_ud[k] = vv_smooth_factor(row[2 * HS + NH * HD + k], (float)wd[k],
+                                   alpha);
+    CHECK(f_gu[3] == 1.0, "a channel the calibration never saw keeps 1");
+
+    const vv_layer_weights_t* Ly = &m->layers[l];
+    bool ok = true;
+    const fake_t* g = SRC("input_layernorm.weight");
+    for (int k = 0; k < HS && ok; k++) {
+        const double want = vv_half_to_float(((const uint16_t*)g->data)[k]) /
+                            f_qkv[k];
+        const double got =
+            vv_half_to_float(((const uint16_t*)Ly->input_layernorm.data)[k]);
+        ok = fabs(got - want) <= fabs(want) * 1e-3 + 1e-7;
+    }
+    CHECK(ok, "input_layernorm divided by the q/k/v factors");
+    g = SRC("post_attention_layernorm.weight");
+    for (int k = 0; k < HS && ok; k++) {
+        const double want = vv_half_to_float(((const uint16_t*)g->data)[k]) /
+                            f_gu[k];
+        const double got =
+            vv_half_to_float(((const uint16_t*)Ly->post_attn_layernorm.data)[k]);
+        ok = fabs(got - want) <= fabs(want) * 1e-3 + 1e-7;
+    }
+    CHECK(ok, "post_attention_layernorm divided by the gate/up factors");
+    CHECK(folded_int8(&Ly->attn.q_proj, SRC("self_attn.q_proj.weight"),
+                      NH * HD, HS, f_qkv, NULL) &&
+          folded_int8(&Ly->attn.k_proj, SRC("self_attn.k_proj.weight"),
+                      NKV * HD, HS, f_qkv, NULL),
+          "q, k columns times the factors");
+    CHECK(folded_int8(&Ly->attn.v_proj, SRC("self_attn.v_proj.weight"),
+                      NKV * HD, HS, f_qkv, f_vo),
+          "v columns times the q/k/v factors, rows over the v->o ones");
+    const fake_t* vb = SRC("self_attn.v_proj.bias");
+    ok = Ly->attn.v_proj.bias.data != NULL;
+    for (int c = 0; c < NKV * HD && ok; c++) {
+        const double want = vv_bf16_to_float(((const uint16_t*)vb->data)[c]) /
+                            f_vo[c];
+        const double got =
+            vv_half_to_float(((const uint16_t*)Ly->attn.v_proj.bias.data)[c]);
+        ok = fabs(got - want) <= fabs(want) * 1e-3 + 1e-6;
+    }
+    CHECK(ok, "v bias over the v->o factors");
+    CHECK(folded_int8(&Ly->attn.o_proj, SRC("self_attn.o_proj.weight"),
+                      HS, NH * HD, f_vo, NULL),
+          "o columns times the v->o factors");
+    CHECK(folded_int8(&Ly->mlp.gate_proj, SRC("mlp.gate_proj.weight"),
+                      INTER, HS, f_gu, NULL) &&
+          folded_int8(&Ly->mlp.up_proj, SRC("mlp.up_proj.weight"),
+                      INTER, HS, f_gu, f_ud) &&
+          folded_int8(&Ly->mlp.down_proj, SRC("mlp.down_proj.weight"),
+                      HS, INTER, f_ud, NULL),
+          "gate/up columns, up rows and down columns folded");
+    CHECK(Ly->attn.q_proj.act_int8 && Ly->mlp.down_proj.act_int8,
+          "still W8A8 after the fold");
+    #undef SRC
+    vv_model_free(m);
+
+    /* Maps that are off leave their weights alone. */
+    o.smooth_maps = VV_SMOOTH_QKV;
+    m = NULL;
+    s = vv_model_load_ex(dir, &o, &m);
+    CHECK(s == VV_OK && m &&
+          folded_int8(&m->layers[l].mlp.down_proj,
+                      get("model.language_model.layers.1.mlp.down_proj.weight"),
+                      HS, INTER, NULL, NULL),
+          "with q/k/v alone, down_proj is untouched");
+    vv_model_free(m);
+    vv_smooth_stats_free(st);
+}
+
 int main(void) {
     printf("=== test_model_load ===\n");
     test_published_configs();
@@ -812,6 +982,7 @@ int main(void) {
     test_half_rne();
     test_dense_load();
     test_load_quant();
+    test_smooth();
     /* Leave nothing behind in the directory ctest runs from. */
     remove("test_model_load_dense/config.json");
     remove("test_model_load_dense/model.safetensors");

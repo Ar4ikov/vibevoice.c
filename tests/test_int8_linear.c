@@ -353,6 +353,41 @@ static void test_gpu_quantizers(void* st) {
     }
 }
 
+/** SmoothQuant calibration's per-column absmax, accumulated over calls. */
+static void test_gpu_col_absmax(void* st) {
+    printf("gpu calibration absmax (exact vs CPU)\n");
+    const int Ks[] = { 3584, 18944, 100 };
+    const int Ms[] = { 1, 70, 285 };
+    for (int ki = 0; ki < 3; ki++) for (int mi = 0; mi < 3; mi++) {
+        const int K = Ks[ki], M = Ms[mi];
+        const size_t n = (size_t)M * K;
+        uint16_t* h = (uint16_t*)malloc(n * 2);
+        float* ref = (float*)malloc((size_t)K * 4);
+        float* got = (float*)malloc((size_t)K * 4);
+        for (int k = 0; k < K; k++) ref[k] = (k % 5 == 0) ? 3.5f : 0.0f;
+        void* dacc = dup_dev(ref, (size_t)K * 4);      /* prior maxima */
+        void* dx = dup_dev(NULL, n * 2);
+        vv_status_t s = VV_OK;
+        for (int pass = 0; pass < 2 && s == VV_OK; pass++) {
+            for (size_t i = 0; i < n; i++)
+                h[i] = vv_float_to_half(frand() * (1.0f + (float)(i % K) / K) *
+                                        (pass ? 4.0f : 2.0f));
+            for (size_t i = 0; i < n; i++) {
+                const float v = fabsf(vv_half_to_float(h[i]));
+                if (v > ref[i % K]) ref[i % K] = v;
+            }
+            vv_dev_memcpy_h2d(dx, h, n * 2, st);
+            s = vv_col_absmax_dev(dx, M, K, (float*)dacc, st);
+        }
+        vv_dev_stream_sync(st);
+        vv_dev_memcpy_d2h(got, dacc, (size_t)K * 4, NULL);
+        CHECK(s == VV_OK && memcmp(got, ref, (size_t)K * 4) == 0,
+              "gpu col_absmax M=%d K=%d, two passes (status %d)", M, K, (int)s);
+        vv_dev_free(dacc); vv_dev_free(dx);
+        free(h); free(ref); free(got);
+    }
+}
+
 typedef struct {
     void *w8, *sw, *sone, *w4, *sz, *szone, *bias;
 } dev_problem_t;
@@ -724,6 +759,7 @@ int main(int argc, char** argv) {
             bench(st);
         } else {
             test_gpu_quantizers(st);
+            test_gpu_col_absmax(st);
             printf("gpu linear\n");
             for (int si = 0; si < nS; si++) {
                 problem_t p = make_problem(shapes[si].N, shapes[si].K,

@@ -575,6 +575,18 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     /* Load model — quantized now if asked, so every size below is final. */
     vv_model_load_opts_t lo = vv_model_load_opts_default();
     lo.quant = p.weight_quant;
+    lo.smooth = p.smooth;
+    lo.smooth_alpha = p.smooth_alpha;
+    lo.smooth_maps = p.smooth_maps;
+    if (p.smooth) {
+        /* Tuning knobs for the fold, read only when there is one. */
+        const char* ea = getenv("VV_SMOOTH_ALPHA");
+        const char* em = getenv("VV_SMOOTH_MAPS");
+        if (lo.smooth_alpha <= 0.0f && ea && ea[0])
+            lo.smooth_alpha = (float)atof(ea);
+        if (lo.smooth_maps <= 0 && em && em[0])
+            lo.smooth_maps = atoi(em);
+    }
     s = vv_model_load_ex(model_dir, &lo, &c->model);
     if (s != VV_OK) {
         VV_LOG_E("inference: failed to load model: %s", vv_status_str(s));

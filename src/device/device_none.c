@@ -153,6 +153,10 @@ vv_status_t vv_awq_gemm_dev(const void* a, const uint32_t* p, const uint32_t* m,
     U(a) U(p) U(m) U(s) U(o) U(t) U(M) U(N) U(K) U(g) U(st)
     return VV_ERR_UNSUPPORTED;
 }
+vv_status_t vv_col_absmax_dev(const void* x, int M, int K, float* a,
+                              void* st) {
+    U(x) U(M) U(K) U(a) U(st) return VV_ERR_UNSUPPORTED;
+}
 vv_status_t vv_act_quant_dev(const void* x, int M, int K, int l, int8_t* q,
                              float* sx, int32_t* xs, void* st) {
     U(x) U(M) U(K) U(l) U(q) U(sx) U(xs) U(st) return VV_ERR_UNSUPPORTED;

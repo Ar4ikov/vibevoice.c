@@ -19,6 +19,7 @@
 #include "vibevoice/cpu_kernels.h"
 #include "vibevoice/quant.h"
 
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -535,6 +536,37 @@ static vv_status_t a8_group(const vv_weight_t* const* ws, void* const* ys,
                                   ws[0]->group_size, M, K, stream);
 }
 
+/* ─── SmoothQuant calibration ───────────────────────────────────────────── */
+
+/*
+ * A layer with `calib_absmax` set (vv_smooth_calibrate, smooth.h) records
+ * the per-channel absmax of each projection input into its row: the two
+ * RMSNorm outputs, the attention output and the SwiGLU output. Only dense
+ * FP16 layers are calibrated, which is what the calibration pass loads.
+ */
+#define CALIB_ATTN_IN(c)  0
+#define CALIB_MLP_IN(c)   ((c)->hidden_size)
+#define CALIB_ATTN_OUT(c) (2 * (c)->hidden_size)
+#define CALIB_MLP_MID(c)  (2 * (c)->hidden_size + \
+                           (c)->num_attention_heads * (c)->head_dim)
+
+static vv_status_t calib_dev(const vv_layer_weights_t* L, int off,
+                             const void* x, int M, int K, void* stream) {
+    if (!L->calib_absmax) return VV_OK;
+    return vv_col_absmax_dev(x, M, K, L->calib_absmax + off, stream);
+}
+
+static void calib_cpu(const vv_layer_weights_t* L, int off, const float* x,
+                      int M, int K) {
+    if (!L->calib_absmax) return;
+    float* acc = L->calib_absmax + off;
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < K; k++) {
+            const float v = fabsf(x[(size_t)m * K + k]);
+            if (v > acc[k]) acc[k] = v;
+        }
+}
+
 /**
  * @brief Dump a GPU FP16 buffer as FP32 to $VV_DUMP_DIR (debug builds only).
  */
@@ -697,6 +729,10 @@ static vv_status_t decoder_layer_impl(
         if (s != VV_OK) return s;
     }
 
+    if (!a8 && (s = calib_dev(layer, CALIB_ATTN_IN(config), norm_out,
+                              seq_len, hs, stream)) != VV_OK)
+        return s;
+
     if (layer_idx == 0 && seq_len > 1 && !a8) {
         dump_gpu_fp16("c_l0_norm", norm_out, (size_t)seq_len * hs, stream);
         dump_gpu_fp16("c_l0_q_prerope", q_buf,
@@ -800,6 +836,10 @@ static vv_status_t decoder_layer_impl(
         return s;
     }
 
+    s = calib_dev(layer, CALIB_ATTN_OUT(config), attn_out, seq_len,
+                  n_heads * head_dim, stream);
+    if (s != VV_OK) return s;
+
     /* 6. O projection + bias + residual */
     s = quant_linear(&layer->attn.o_proj, attn_out, norm_out, temp_weight, temp_bytes,
                      seq_len, hs, hs, stream);
@@ -816,6 +856,8 @@ static vv_status_t decoder_layer_impl(
                          norm_out, seq_len, hs,
                          config->rms_norm_eps, stream);
     if (s != VV_OK) return s;
+    s = calib_dev(layer, CALIB_MLP_IN(config), norm_out, seq_len, hs, stream);
+    if (s != VV_OK) return s;
 
     /* 8. MLP: gate + up (+ bias if present) */
     {
@@ -831,6 +873,9 @@ static vv_status_t decoder_layer_impl(
     /* 9. SwiGLU */
     s = vv_swiglu_dev(gate_buf, up_buf, gate_buf,
                         seq_len * inter_size, stream);
+    if (s != VV_OK) return s;
+    s = calib_dev(layer, CALIB_MLP_MID(config), gate_buf, seq_len,
+                  inter_size, stream);
     if (s != VV_OK) return s;
 
     /* 10. Down projection + bias + residual */
@@ -1250,6 +1295,7 @@ static vv_status_t decoder_layer_cpu(
                        seq_len, hs, config->rms_norm_eps);
     if (s != VV_OK) return s;
 
+    calib_cpu(layer, CALIB_ATTN_IN(config), norm_out, seq_len, hs);
     CPU_Q8(norm_out, hs);
     CPU_PROJ(layer->attn.q_proj, norm_out, q_buf, seq_len, n_heads * head_dim, hs);
     CPU_PROJ(layer->attn.k_proj, norm_out, k_buf, seq_len, n_kv_heads * head_dim, hs);
@@ -1278,6 +1324,8 @@ static vv_status_t decoder_layer_cpu(
         if (s != VV_OK) return s;
     }
 
+    calib_cpu(layer, CALIB_ATTN_OUT(config), attn_out, seq_len,
+              n_heads * head_dim);
     CPU_Q8(attn_out, n_heads * head_dim);
     CPU_PROJ(layer->attn.o_proj, attn_out, norm_out, seq_len, hs,
              n_heads * head_dim);
@@ -1287,12 +1335,14 @@ static vv_status_t decoder_layer_cpu(
                        norm_out, seq_len, hs, config->rms_norm_eps);
     if (s != VV_OK) return s;
 
+    calib_cpu(layer, CALIB_MLP_IN(config), norm_out, seq_len, hs);
     CPU_Q8(norm_out, hs);
     CPU_PROJ(layer->mlp.gate_proj, norm_out, gate_buf, seq_len, inter, hs);
     CPU_PROJ(layer->mlp.up_proj,   norm_out, up_buf,   seq_len, inter, hs);
     s = vv_swiglu_cpu(gate_buf, up_buf, gate_buf, seq_len * inter);
     if (s != VV_OK) return s;
 
+    calib_cpu(layer, CALIB_MLP_MID(config), gate_buf, seq_len, inter);
     CPU_Q8(gate_buf, inter);
     CPU_PROJ(layer->mlp.down_proj, gate_buf, mlp_out, seq_len, hs, inter);
     vv_residual_add_cpu(hidden_states, mlp_out, seq_len * hs);
