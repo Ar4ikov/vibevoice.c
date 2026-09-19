@@ -572,7 +572,7 @@ the performance cores. **There is no Metal backend.** See "Not done" below.
 VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
-Twenty-two entries — the attention suites run once per backend
+Twenty-eight entries — the attention suites run once per backend
 (`VV_ATTN=fa1|fa2|flashinfer`). The ones that need weights report SKIP without
 `VV_TEST_MODEL`. `test_cpu_kernels` checks every CPU kernel against a scalar
 reference, which is what makes the SIMD paths verifiable per architecture —
