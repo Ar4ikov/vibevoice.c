@@ -35,6 +35,9 @@ struct vv_engine {
 static int fill_device(vv_engine_t* e, const char* model_dir, int gpu_id,
                        vv_init_params_t* ip, int want) {
     const int base = e->n_slots;
+    /* The first context sizes a shared KV pool for every slot it will
+     * lend it to. */
+    ip->n_slots = want;
     vv_status_t s = vv_inference_init(model_dir, gpu_id, ip, &e->slots[base]);
     if (s != VV_OK) {
         VV_LOG_W("engine: gpu %d unusable (%s)", gpu_id, vv_status_str(s));
@@ -103,6 +106,7 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
         mode = (n >= devices) ? VV_SPLIT_REPLICA : VV_SPLIT_LAYER;
     ip.split_mode = (int)mode;
     ip.attn_backend = params->attn_backend;
+    ip.kv_paging = params->kv_paging;
     if (devices > 1)
         VV_LOG_I("engine: %d devices, %s split", devices,
                  vv_split_mode_name(mode));

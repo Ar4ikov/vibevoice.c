@@ -569,12 +569,38 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         }
     }
 
-    /* The attention kernels this context runs, resolved for the device. */
+    /*
+     * Attention backend and KV paging. Paging lets the slots of one device
+     * share a pool; it needs kernels that read a page table (fa2 on FP16,
+     * flashinfer on any format) and a single device holding every layer's KV.
+     */
+    const int n_slots = p.n_slots > 0 ? p.n_slots : 1;
     const vv_attn_backend_t attn_want =
         vv_attn_backend_from_env((vv_attn_backend_t)p.attn_backend);
     const int attn_slab = vv_attn_resolve(
         (int)attn_want, p.kv_format, false, llm->num_attention_heads,
         llm->num_key_value_heads, llm->head_dim);
+    const int attn_paged = vv_attn_resolve(
+        (int)attn_want, p.kv_format, true, llm->num_attention_heads,
+        llm->num_key_value_heads, llm->head_dim);
+    /*
+     * `auto` pages only where that changes nothing but memory: several slots
+     * whose kernels read pages as they are. Forcing it on may pick other
+     * kernels for `auto`, but never overrides a backend asked for by name.
+     */
+    const bool pages_readable =
+        attn_paged == VV_ATTN_FLASHINFER ||
+        (attn_paged == VV_ATTN_FA2 && p.kv_format == VV_KV_FP16);
+    bool paged = !cpu_only && !sharding && pages_readable &&
+                 (p.kv_paging == VV_KV_PAGED_ON ||
+                  (p.kv_paging == VV_KV_PAGED_AUTO && n_slots > 1 &&
+                   attn_paged == attn_slab));
+    if (paged && attn_want != VV_ATTN_AUTO && attn_paged != (int)attn_want)
+        paged = false;
+    if (!paged && p.kv_paging == VV_KV_PAGED_ON)
+        VV_LOG_W("kv: paging needs --attn flashinfer, or fa2 on an fp16 "
+                 "cache, on one device; using one slab per slot");
+    int pool_tokens = max_seq;
 
     /* ── Decide placement strategy ── */
     if (cpu_only) {
@@ -626,7 +652,11 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
          * down to a floor below which a transcription is not worth starting.
          */
         const int kv_floor = 8192;
-        const size_t resident = ws_target + all_layers + embed_sz + lm_head_sz;
+        /* A shared pool also has to leave room for the other slots'
+         * workspaces, which clones allocate after this. */
+        const size_t clone_ws = paged ? (size_t)(n_slots - 1) * ws_target : 0;
+        const size_t resident = ws_target + all_layers + embed_sz + lm_head_sz
+                              + clone_ws;
         const int max_seq_asked = max_seq;
         if (available > resident) {
             size_t kv_room = (available - resident) / kv_per_token;
@@ -636,7 +666,21 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
             }
         }
 
-        size_t kv_total = (size_t)max_seq * kv_per_token;
+        /*
+         * A pool is sized for every slot's window when that fits, and for
+         * whatever does fit otherwise, but never below one window: a slot
+         * running alone may always use all of it.
+         */
+        pool_tokens = max_seq;
+        if (paged) {
+            size_t want = (size_t)max_seq * (size_t)n_slots;
+            const size_t room = available > resident
+                              ? (available - resident) / kv_per_token : 0;
+            if (room < want) want = room > (size_t)max_seq ? room : (size_t)max_seq;
+            pool_tokens = (int)(want / VV_KV_PAGE_SIZE * VV_KV_PAGE_SIZE);
+            if (pool_tokens < max_seq) pool_tokens = max_seq;
+        }
+        size_t kv_total = (size_t)pool_tokens * kv_per_token;
         for (;;) {
             c->placement = decide_placement(
                 available, false,
@@ -644,6 +688,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
                 per_layer, kv_total, ws_target);
             if (c->placement == VV_PLACE_ALL_GPU || max_seq <= kv_floor) break;
             max_seq = max_seq / 2 < kv_floor ? kv_floor : max_seq / 2;
+            pool_tokens = max_seq;
             kv_total = (size_t)max_seq * kv_per_token;
         }
         /* One line at the end, not one per attempt around the loop. */
@@ -766,20 +811,36 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     }
 
     /* ── KV-cache on GPU ── */
-    s = vv_kv_cache_create_range(&c->kv_cache,
-                                 llm->num_hidden_layers, 0, c->primary_layers,
-                                 llm->num_key_value_heads,
-                                 llm->head_dim,
-                                 max_seq, p.kv_format, false);
+    if (paged) {
+        vv_kv_pool_t* kv_pool = NULL;
+        s = vv_kv_pool_create(&kv_pool, llm->num_hidden_layers, 0,
+                              c->primary_layers, llm->num_key_value_heads,
+                              llm->head_dim,
+                              (pool_tokens + VV_KV_PAGE_SIZE - 1)
+                                  / VV_KV_PAGE_SIZE,
+                              p.kv_format);
+        if (s == VV_OK) {
+            s = vv_kv_cache_create_paged(&c->kv_cache, kv_pool, max_seq);
+            vv_kv_pool_release(kv_pool);        /* the cache holds it now */
+        }
+    } else {
+        s = vv_kv_cache_create_range(&c->kv_cache,
+                                     llm->num_hidden_layers, 0,
+                                     c->primary_layers,
+                                     llm->num_key_value_heads,
+                                     llm->head_dim,
+                                     max_seq, p.kv_format, false);
+    }
     if (s != VV_OK) {
         VV_LOG_E("inference: failed to create KV-cache");
         goto fail_gpu;
     }
-    c->kv_cache->attn_backend = attn_slab;
-    VV_LOG_I("inference: attention %s (asked %s), KV %s",
+    c->kv_cache->attn_backend = paged ? attn_paged : attn_slab;
+    VV_LOG_I("inference: attention %s (asked %s), KV %s%s",
              vv_attn_backend_name((vv_attn_backend_t)c->kv_cache->attn_backend),
              vv_attn_backend_name(attn_want),
-             vv_kv_format_name((vv_kv_format_t)p.kv_format));
+             vv_kv_format_name((vv_kv_format_t)p.kv_format),
+             paged ? ", paged" : "");
 
     /* ── Layer weights ── */
     if (c->n_resident_layers > 0) {
@@ -1104,10 +1165,16 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
         return s;
     }
 
-    s = vv_kv_cache_create_range(&c->kv_cache, llm->num_hidden_layers,
-                                 0, c->primary_layers,
-                                 llm->num_key_value_heads, llm->head_dim,
-                                 max_seq, p.kv_format, false);
+    if (parent->kv_cache->pool) {
+        /* Same pool, own page table: the whole point of paging. */
+        s = vv_kv_cache_create_paged(&c->kv_cache, parent->kv_cache->pool,
+                                     parent->kv_cache->max_seq_len);
+    } else {
+        s = vv_kv_cache_create_range(&c->kv_cache, llm->num_hidden_layers,
+                                     0, c->primary_layers,
+                                     llm->num_key_value_heads, llm->head_dim,
+                                     max_seq, p.kv_format, false);
+    }
     if (s != VV_OK) goto fail;
     c->kv_cache->attn_backend = parent->kv_cache->attn_backend;
 
@@ -1170,9 +1237,13 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
 
     attach_frontend(c);
 
-    VV_LOG_I("inference: cloned context (workspace=%zu MB, kv=%.0f MB)",
-             c->workspace_size / (1024 * 1024),
-             (double)c->kv_cache->bytes_total / (1024.0 * 1024.0));
+    if (c->kv_cache->pool)
+        VV_LOG_I("inference: cloned context (workspace=%zu MB, kv shared "
+                 "from the pool)", c->workspace_size / (1024 * 1024));
+    else
+        VV_LOG_I("inference: cloned context (workspace=%zu MB, kv=%.0f MB)",
+                 c->workspace_size / (1024 * 1024),
+                 (double)c->kv_cache->bytes_total / (1024.0 * 1024.0));
     *out = c;
     return VV_OK;
 
@@ -1378,6 +1449,22 @@ static vv_status_t step_slice(vv_model_t* model, void* hidden,
      * path, direct or replayed, on every shard, stops here instead.
      */
     if (kv->current_len >= kv->max_seq_len) return VV_ERR_OVERFLOW;
+
+    /*
+     * A paged cache maps its pages here, outside any capture, a whole shape
+     * bucket at a time: the step writes at the device-side position and
+     * reads the table from device memory, so replays never need the host.
+     */
+    if (kv->pool) {
+        int ahead = (kv->current_len + 1 + 1023) / 1024 * 1024;
+        if (ahead > kv->max_seq_len) ahead = kv->max_seq_len;
+        vv_status_t rs = vv_kv_cache_reserve(kv, ahead, compute);
+        /* A pool too full for the whole bucket may still have this page;
+         * the next step asks again, still outside any capture. */
+        if (rs == VV_ERR_OVERFLOW)
+            rs = vv_kv_cache_reserve(kv, kv->current_len + 1, compute);
+        if (rs != VV_OK) return rs;
+    }
 
     if (!graph_ok || g->shape == VV_GRAPH_GAVE_UP) return VV_STEP_DIRECT();
 
@@ -2403,7 +2490,18 @@ vv_status_t vv_inference_transcribe(
     if (ctx->placement == VV_PLACE_CPU_ONLY) {
         return transcribe_cpu(ctx, audio_samples, num_samples, params, result);
     } else {
-        return transcribe_gpu(ctx, audio_samples, num_samples, params, result);
+        const vv_status_t s = transcribe_gpu(ctx, audio_samples, num_samples,
+                                             params, result);
+        /*
+         * An idle slot must not sit on pages another slot could use. The
+         * request is over, but its kernels may still be queued; once the
+         * stream drains, nothing reads them.
+         */
+        if (ctx->kv_cache && ctx->kv_cache->pool) {
+            vv_dev_stream_sync(ctx->compute_stream);
+            vv_kv_cache_release(ctx->kv_cache);
+        }
+        return s;
     }
 }
 

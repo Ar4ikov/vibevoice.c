@@ -47,6 +47,8 @@ static void usage(void) {
         "                        load\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
+        "  --kv-paged <mode>     auto (default: on with several slots) | on |\n"
+        "                        off — slots share one pool of KV pages\n"
         "  --acoustic-sampling M mode (default) | fix | gaussian; a draw per\n"
         "                        request, so answers stop being reproducible\n"
         "  --vram-budget <0-1>   Fraction of free VRAM to use\n"
@@ -97,6 +99,15 @@ int vv_cmd_serve(int argc, char** argv) {
                 return 1;
             }
             ep.attn_backend = (int)b;
+        }
+        else if (strcmp(a, "--kv-paged") == 0 && next) {
+            const int m = vv_kv_paging_parse(argv[++i]);
+            if (m < 0) {
+                fprintf(stderr, "serve: --kv-paged is auto, on or off, not "
+                                "'%s'\n", argv[i]);
+                return 1;
+            }
+            ep.kv_paging = m;
         }
         else if (strcmp(a, "--kv-cache") == 0 && next) {
             vv_kv_format_t f = vv_kv_format_parse(argv[++i]);

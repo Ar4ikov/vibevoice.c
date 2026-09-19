@@ -725,6 +725,14 @@ vv_status_t vv_decoder_step(
      * on the stream, so the whole step is a function of device state and can be
      * replayed: `d_len_next` before the layers use it, `d_len` after they do.
      */
+    /* A paged cache needs a page for this position. The caller maps ahead
+     * of any capture, so inside one this finds the page already there. */
+    {
+        vv_status_t rs = vv_kv_cache_reserve(kv_cache, position + 1,
+                                             compute_stream);
+        if (rs != VV_OK) return rs;
+    }
+
     const bool dev_pos = !kv_cache->on_cpu && kv_cache->d_len;
     if (dev_pos) {
         vv_status_t ps = vv_pos_add_dev((int*)kv_cache->d_len_next,
@@ -797,6 +805,15 @@ vv_status_t vv_decoder_prefill(
 
     const vv_llm_config_t* cfg = &model->config.llm;
     const int hs = cfg->hidden_size;
+
+    {
+        vv_status_t rs = vv_kv_cache_reserve(
+            kv_cache, kv_cache->current_len + seq_len, compute_stream);
+        if (rs != VV_OK) {
+            VV_LOG_E("decoder: no KV room for %d more positions", seq_len);
+            return rs;
+        }
+    }
 
     /*
      * Chunked prefill. Activation scratch grows linearly with the number of

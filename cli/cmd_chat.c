@@ -87,6 +87,7 @@ static void usage(const char* which) {
         "  --quant <fmt>         auto (default) | none | nf4 | int4 | int8\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
+        "  --kv-paged <mode>     auto | on | off\n"
         "  --hotwords a,b,c      Hotwords\n"
         "  --cpu                 CPU-only\n"
         "  --verbose\n");
@@ -139,6 +140,15 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
                 return -1;
             }
             a->ep.attn_backend = (int)b;
+        }
+        else if (strcmp(s, "--kv-paged") == 0 && next) {
+            const int m = vv_kv_paging_parse(argv[++i]);
+            if (m < 0) {
+                fprintf(stderr, "error: --kv-paged is auto, on or off, not "
+                                "'%s'\n", argv[i]);
+                return -1;
+            }
+            a->ep.kv_paging = m;
         }
         else if (strcmp(s, "--kv-cache") == 0 && next) {
             vv_kv_format_t f = vv_kv_format_parse(argv[++i]);

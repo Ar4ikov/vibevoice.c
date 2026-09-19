@@ -423,6 +423,22 @@ const char* vv_attn_backend_name(vv_attn_backend_t b);
  */
 vv_attn_backend_t vv_attn_backend_from_env(vv_attn_backend_t requested);
 
+/**
+ * @brief Whether the KV cache is one slab per context or pages from a pool.
+ *
+ * Paged caches take 64-position pages from one pool per device, so the slots
+ * of a server share memory instead of each reserving a full window.
+ */
+typedef enum vv_kv_paging {
+    VV_KV_PAGED_AUTO = 0, /**< paged when several slots share a device and
+                               their kernels read pages as resolved          */
+    VV_KV_PAGED_OFF,      /**< one contiguous slab per context               */
+    VV_KV_PAGED_ON,       /**< pages from a pool shared by the slots          */
+} vv_kv_paging_t;
+
+/** @brief Parse "auto" | "on" | "off"; -1 on failure. */
+int vv_kv_paging_parse(const char* name);
+
 /** @brief Parameters for vv_inference_init(). Pass NULL for defaults. */
 typedef struct vv_init_params {
     float  vram_budget;   /**< 0.0-1.0 fraction of free VRAM. Default: 1.0   */
@@ -435,6 +451,12 @@ typedef struct vv_init_params {
     int    weight_quant;  /**< vv_load_quant_t (quant.h). 0 = auto: keep the
                                checkpoint's own format                      */
     int    attn_backend;  /**< vv_attn_backend_t. Default: auto              */
+    int    kv_paging;     /**< vv_kv_paging_t. Default: auto                 */
+    /**
+     * Contexts that will share this device's KV pool (the context itself
+     * plus the clones made from it). Sizes a paged pool; 1 otherwise.
+     */
+    int    n_slots;
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -449,6 +471,8 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.split_mode = VV_SPLIT_AUTO;
     p.weight_quant = 0;
     p.attn_backend = VV_ATTN_AUTO;
+    p.kv_paging = VV_KV_PAGED_AUTO;
+    p.n_slots = 1;
     return p;
 }
 

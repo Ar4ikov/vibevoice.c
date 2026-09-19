@@ -52,6 +52,7 @@ typedef struct {
     const char* kv_cache;
     const char* quant;
     const char* attn;
+    const char* kv_paged;
     bool        cpu_only;
     float       vram_budget;
     bool        verbose;
@@ -116,6 +117,8 @@ static void print_usage(const char* prog) {
         "                        load\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
+        "  --kv-paged <mode>     auto (default) | on | off — take KV from a\n"
+        "                        pool of 64-position pages\n"
         "  --vram-budget <0-1>   VRAM fraction for model (default: 1.0)\n"
         "  --gpu-layers <N>      Layers to keep on the GPU (-1 = fit to VRAM)\n"
         "  --acoustic-sampling M mode (default, deterministic) | fix |\n"
@@ -168,6 +171,8 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->trt_semantic = argv[++i];
         } else if (strcmp(argv[i], "--attn") == 0 && i + 1 < argc) {
             args->attn = argv[++i];
+        } else if (strcmp(argv[i], "--kv-paged") == 0 && i + 1 < argc) {
+            args->kv_paged = argv[++i];
         } else if (strcmp(argv[i], "--kv-cache") == 0 && i + 1 < argc) {
             args->kv_cache = argv[++i];
         } else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
@@ -343,6 +348,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         init_params.attn_backend = (int)b;
+    }
+    if (args.kv_paged) {
+        const int m = vv_kv_paging_parse(args.kv_paged);
+        if (m < 0) {
+            fprintf(stderr, "error: --kv-paged is auto, on or off, not '%s'\n",
+                    args.kv_paged);
+            return 1;
+        }
+        init_params.kv_paging = m;
     }
     init_params.vram_budget = args.vram_budget;
     init_params.cpu_only = args.cpu_only;

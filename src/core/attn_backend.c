@@ -32,6 +32,14 @@ const char* vv_attn_backend_name(vv_attn_backend_t b) {
     }
 }
 
+int vv_kv_paging_parse(const char* name) {
+    if (!name) return -1;
+    if (strcmp(name, "auto") == 0) return VV_KV_PAGED_AUTO;
+    if (strcmp(name, "on") == 0 || strcmp(name, "1") == 0)  return VV_KV_PAGED_ON;
+    if (strcmp(name, "off") == 0 || strcmp(name, "0") == 0) return VV_KV_PAGED_OFF;
+    return -1;
+}
+
 vv_attn_backend_t vv_attn_backend_from_env(vv_attn_backend_t requested) {
     if (requested != VV_ATTN_AUTO) return requested;
     const char* e = getenv("VV_ATTN");
