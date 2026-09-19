@@ -50,6 +50,9 @@ typedef struct vv_engine_params {
     int          attn_backend; /**< vv_attn_backend_t. Default: auto        */
     int          kv_paging;   /**< vv_kv_paging_t. Default: auto (paged when
                                    a device holds more than one slot)       */
+    /** SmoothQuant statistics for a load-time W8A8/W4A8 (smooth.h); NULL:
+        none. Read while the engine is created, not kept. */
+    const struct vv_smooth_stats* smooth;
 } vv_engine_params_t;
 
 static inline vv_engine_params_t vv_engine_params_default(void) {
@@ -67,6 +70,7 @@ static inline vv_engine_params_t vv_engine_params_default(void) {
     p.weight_quant = 0;
     p.attn_backend = VV_ATTN_AUTO;
     p.kv_paging = VV_KV_PAGED_AUTO;
+    p.smooth = NULL;
     return p;
 }
 

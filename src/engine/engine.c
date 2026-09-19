@@ -89,6 +89,7 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
     ip.kv_format   = params->kv_format;
     ip.gpu_layers  = params->gpu_layers;
     ip.weight_quant = params->weight_quant;
+    ip.smooth      = params->smooth;
     ip.gpus        = params->gpus;
     if (ip.gpus.n == 0) { ip.gpus.n = 1; ip.gpus.id[0] = params->gpu_id; }
 

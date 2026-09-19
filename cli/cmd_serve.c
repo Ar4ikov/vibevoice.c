@@ -8,6 +8,8 @@
 #include "vibevoice/server.h"
 #include "vibevoice/kv_quant.h"
 #include "vibevoice/tokenizer_encoder.h"
+#include "vibevoice/inference.h"
+#include "vibevoice/smooth.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +47,10 @@ static void usage(void) {
         "  --quant <fmt>         auto (default) | none | nf4 | int4 | int8 |\n"
         "                        w8a8 | w4a8 — weights quantized at load; the\n"
         "                        last two also run on int8 activations\n"
+        "  --calib <audio>       SmoothQuant for w8a8 | w4a8: calibrate the\n"
+        "                        dense checkpoint on this clip first\n"
+        "  --calib-stats <file>  Read the calibration from a file, or, with\n"
+        "                        --calib, write it there\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
         "  --kv-paged <mode>     auto (default: on with several slots) | on |\n"
@@ -74,6 +80,8 @@ int vv_cmd_serve(int argc, char** argv) {
     bool verbose = false;
     const char* gpus_arg = NULL;
     const char* mem_arg = NULL;
+    const char* calib = NULL;
+    const char* calib_stats = NULL;
 
     for (int i = 0; i < argc; i++) {
         const char* a = argv[i];
@@ -126,6 +134,10 @@ int vv_cmd_serve(int argc, char** argv) {
                 return 1;
             }
             ep.kv_format = (int)f;
+        }
+        else if (strcmp(a, "--calib") == 0 && next) { calib = argv[++i]; }
+        else if (strcmp(a, "--calib-stats") == 0 && next) {
+            calib_stats = argv[++i];
         }
         else if (strcmp(a, "--quant") == 0 && next) {
             const vv_load_quant_t q = vv_load_quant_parse(argv[++i]);
@@ -200,8 +212,21 @@ int vv_cmd_serve(int argc, char** argv) {
         VV_LOG_W("serve: %d devices but only %d slot(s); raise --slots to use "
                  "them all", ep.gpus.n, ep.n_slots);
 
+    vv_smooth_stats_t* smooth = NULL;
+    if (calib || calib_stats) {
+        vv_init_params_t ip = vv_init_params_default();
+        ip.cpu_only = ep.cpu_only;
+        ip.max_seq_len = ep.max_seq_len;
+        if (vv_smooth_from_args(ep.model_dir, ep.gpu_id, &ip, calib,
+                                calib_stats, &smooth) != VV_OK)
+            return 1;
+        ep.smooth = smooth;
+    }
+
     vv_engine_t* engine = NULL;
     vv_status_t s = vv_engine_create(&ep, &engine);
+    vv_smooth_stats_free(smooth);
+    ep.smooth = NULL;
     if (s != VV_OK) {
         VV_LOG_E("serve: cannot start engine: %s", vv_status_str(s));
         return 1;
