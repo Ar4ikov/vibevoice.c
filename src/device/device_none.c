@@ -166,6 +166,29 @@ vv_status_t vv_dequant_int8_dev(const int8_t* q, const float* s, void* o,
                                 int N, int K, void* st) {
     U(q) U(s) U(o) U(N) U(K) U(st) return VV_ERR_UNSUPPORTED;
 }
+vv_status_t vv_w4a16_gemv_dev(const void* x, const void* p, const void* sz,
+                              const void* b, void* y, int N, int K, int g,
+                              void* st) {
+    U(x) U(p) U(sz) U(b) U(y) U(N) U(K) U(g) U(st) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_w4a16_gemv_multi_dev(const void* x, const vv_w4a16_proj_t* p,
+                                    int n, int K, int g, void* st) {
+    U(x) U(p) U(n) U(K) U(g) U(st) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_w4a16_gather_dev(const void* x, const int32_t* p, void* o,
+                                int M, int K, void* st) {
+    U(x) U(p) U(o) U(M) U(K) U(st) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_w4a16_gemm_dev(const void* a, const void* p, const void* sz,
+                              const void* b, void* o, void* t, size_t tb,
+                              int M, int N, int K, int g, void* st) {
+    U(a) U(p) U(sz) U(b) U(o) U(t) U(tb) U(M) U(N) U(K) U(g) U(st)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_w4a16_dequant_dev(const void* p, const void* sz, void* o,
+                                 int N, int K, int g, void* st) {
+    U(p) U(sz) U(o) U(N) U(K) U(g) U(st) return VV_ERR_UNSUPPORTED;
+}
 vv_status_t vv_gemm_fp16_dev(const void* A, const void* B, void* C,
                              int M, int N, int K, float al, float be, void* s) {
     U(A) U(B) U(C) U(M) U(N) U(K) U(al) U(be) U(s) return VV_ERR_UNSUPPORTED;

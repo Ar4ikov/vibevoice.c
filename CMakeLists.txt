@@ -260,6 +260,7 @@ if(VV_HAS_CUDA)
         src/cuda/kv_quant.cu
         src/cuda/awq_gemv.cu
         src/cuda/int8_gemv.cu
+        src/cuda/w4a16.cu
         src/cuda/lm_head.cu
         src/cuda/conv1d.cu
         src/cuda/conv_vae.cu
@@ -351,6 +352,15 @@ if(VV_BUILD_TESTS)
     add_test(NAME test_attention_scalar COMMAND test_attention)
     set_tests_properties(test_attention_scalar PROPERTIES
                          ENVIRONMENT "VV_ATTN_MMA=0")
+    # INT4 group-affine (AWQ / GPTQ) linear layers, and the same suite
+    # through the dequant + dense GEMM fallback that Turing takes.
+    vv_add_test(test_w4a16 tests/test_w4a16.c)
+    add_test(NAME test_w4a16_fallback COMMAND test_w4a16)
+    set_tests_properties(test_w4a16_fallback PROPERTIES
+                         ENVIRONMENT "VV_W4A16_MMA=0")
+    # The same path through the loader on a real AWQ / GPTQ checkpoint
+    # (VV_TEST_MODEL; skipped without one).
+    vv_add_test(test_w4a16_model tests/test_w4a16_model.c)
     vv_add_test(test_cpu_kernels tests/test_cpu_kernels.c)
 
     # Arguments to helper programs, uploads and HTTP heads stay data (#14).

@@ -310,9 +310,46 @@ vv_status_t vv_layer_pool_pin_range(vv_model_t* model, int first, int count) {
  */
 static vv_status_t quant_linear(
     const vv_weight_t* w, const void* x, void* y,
-    void* scratch, int M, int N, int K, void* stream)
+    void* scratch, size_t scratch_bytes, int M, int N, int K, void* stream)
 {
     vv_status_t s;
+
+    /*
+     * Act-order GPTQ: the weight's input channels were sorted by group at
+     * load, so the activations go through the same order first. The
+     * gathered copy sits at the front of the scratch; the kernels get the
+     * rest. Graph-capturable: the arguments do not change between tokens.
+     */
+    if (w->perm.data) {
+        const size_t xb = ((size_t)M * K * 2 + 255) & ~(size_t)255;
+        const bool legacy_gemm = M > 1 && w->quant_kind == VV_QUANT_INT4G &&
+                                 w->int4g_layout != VV_INT4G_GPU;
+        const size_t need = xb + (legacy_gemm ? (size_t)N * K * 2 : 0);
+        if (!scratch || scratch_bytes < need) {
+            VV_LOG_E("decoder: act-order '%s' needs %zu bytes of scratch "
+                     "for %d rows, %zu available", w->name, need, M,
+                     scratch_bytes);
+            return VV_ERR_OVERFLOW;
+        }
+        s = vv_w4a16_gather_dev(x, (const int32_t*)w->perm.data, scratch,
+                                M, K, stream);
+        if (s != VV_OK) return s;
+        x = scratch;
+        scratch = (uint8_t*)scratch + xb;
+        scratch_bytes -= xb;
+    }
+
+    if (w->quant_kind == VV_QUANT_INT4G &&
+        w->int4g_layout == VV_INT4G_GPU) {
+        /* W4A16 kernels: bias fused, no dequantized copy of the weight. */
+        if (M == 1)
+            return vv_w4a16_gemv_dev(x, w->tensor.data,
+                                     w->quant.scales.data, w->bias.data,
+                                     y, N, K, w->group_size, stream);
+        return vv_w4a16_gemm_dev(x, w->tensor.data, w->quant.scales.data,
+                                 w->bias.data, y, scratch, scratch_bytes,
+                                 M, N, K, w->group_size, stream);
+    }
 
     if (w->quant_kind == VV_QUANT_INT4G) {
         if (M == 1) {
@@ -355,6 +392,43 @@ static vv_status_t quant_linear(
     if (w->bias.data)
         s = vv_bias_add_dev(y, w->bias.data, M, N, stream);
     return s;
+}
+
+/**
+ * @brief Several projections of the same x: y_i = x @ W_i^T + b_i.
+ *
+ * For one token, W4A16 weights of one group size go through a single GEMV
+ * launch (q/k/v, gate/up): the 512-row k and v projections are too short
+ * to get past the kernel's ramp-up on their own and ride along behind q
+ * instead. Everything else, and every M > 1, is one quant_linear each.
+ */
+static vv_status_t quant_linear_group(
+    const vv_weight_t* const* ws, void* const* ys, const int* Ns, int n,
+    const void* x, void* scratch, size_t scratch_bytes, int M, int K,
+    void* stream)
+{
+    bool fuse = M == 1 && n <= 3;
+    for (int i = 0; i < n && fuse; i++)
+        fuse = ws[i]->quant_kind == VV_QUANT_INT4G &&
+               ws[i]->int4g_layout == VV_INT4G_GPU && !ws[i]->perm.data &&
+               ws[i]->group_size == ws[0]->group_size;
+    if (fuse) {
+        vv_w4a16_proj_t p[3];
+        for (int i = 0; i < n; i++) {
+            p[i].packed = ws[i]->tensor.data;
+            p[i].sz     = ws[i]->quant.scales.data;
+            p[i].bias   = ws[i]->bias.data;
+            p[i].y      = ys[i];
+            p[i].N      = Ns[i];
+        }
+        return vv_w4a16_gemv_multi_dev(x, p, n, K, ws[0]->group_size, stream);
+    }
+    for (int i = 0; i < n; i++) {
+        vv_status_t s = quant_linear(ws[i], x, ys[i], scratch, scratch_bytes,
+                                     M, Ns[i], K, stream);
+        if (s != VV_OK) return s;
+    }
+    return VV_OK;
 }
 
 /**
@@ -467,6 +541,8 @@ static vv_status_t decoder_layer_impl(
     offset += (size_t)seq_len * hs * 2;
 
     void* temp_weight = wp + offset;
+    const size_t temp_bytes = workspace_size > offset
+                            ? workspace_size - offset : 0;
 
     /* 1. Input LayerNorm */
     s = vv_rmsnorm_dev(hidden_states, layer->input_layernorm.data,
@@ -475,17 +551,16 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 2. Q, K, V projections (+ bias if present) */
-    s = quant_linear(&layer->attn.q_proj, norm_out, q_buf, temp_weight,
-                     seq_len, n_heads * head_dim, hs, stream);
-    if (s != VV_OK) return s;
-
-    s = quant_linear(&layer->attn.k_proj, norm_out, k_buf, temp_weight,
-                     seq_len, n_kv_heads * head_dim, hs, stream);
-    if (s != VV_OK) return s;
-
-    s = quant_linear(&layer->attn.v_proj, norm_out, v_buf, temp_weight,
-                     seq_len, n_kv_heads * head_dim, hs, stream);
-    if (s != VV_OK) return s;
+    {
+        const vv_weight_t* ws[3] = { &layer->attn.q_proj, &layer->attn.k_proj,
+                                     &layer->attn.v_proj };
+        void* ys[3] = { q_buf, k_buf, v_buf };
+        const int ns[3] = { n_heads * head_dim, n_kv_heads * head_dim,
+                            n_kv_heads * head_dim };
+        s = quant_linear_group(ws, ys, ns, 3, norm_out, temp_weight,
+                               temp_bytes, seq_len, hs, stream);
+        if (s != VV_OK) return s;
+    }
 
     if (layer_idx == 0 && seq_len > 1) {
         dump_gpu_fp16("c_l0_norm", norm_out, (size_t)seq_len * hs, stream);
@@ -578,7 +653,7 @@ static vv_status_t decoder_layer_impl(
         dump_gpu_fp16("c_l0_attn", attn_out, (size_t)seq_len * hs, stream);
 
     /* 6. O projection + bias + residual */
-    s = quant_linear(&layer->attn.o_proj, attn_out, norm_out, temp_weight,
+    s = quant_linear(&layer->attn.o_proj, attn_out, norm_out, temp_weight, temp_bytes,
                      seq_len, hs, hs, stream);
     if (s != VV_OK) return s;
     s = vv_residual_add_dev(hidden_states, norm_out,
@@ -595,13 +670,15 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 8. MLP: gate + up (+ bias if present) */
-    s = quant_linear(&layer->mlp.gate_proj, norm_out, gate_buf, temp_weight,
-                     seq_len, inter_size, hs, stream);
-    if (s != VV_OK) return s;
-
-    s = quant_linear(&layer->mlp.up_proj, norm_out, up_buf, temp_weight,
-                     seq_len, inter_size, hs, stream);
-    if (s != VV_OK) return s;
+    {
+        const vv_weight_t* ws[2] = { &layer->mlp.gate_proj,
+                                     &layer->mlp.up_proj };
+        void* ys[2] = { gate_buf, up_buf };
+        const int ns[2] = { inter_size, inter_size };
+        s = quant_linear_group(ws, ys, ns, 2, norm_out, temp_weight,
+                               temp_bytes, seq_len, hs, stream);
+        if (s != VV_OK) return s;
+    }
 
     /* 9. SwiGLU */
     s = vv_swiglu_dev(gate_buf, up_buf, gate_buf,
@@ -609,7 +686,7 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 10. Down projection + bias + residual */
-    s = quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out, temp_weight,
+    s = quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out, temp_weight, temp_bytes,
                      seq_len, hs, inter_size, stream);
     if (s != VV_OK) return s;
     s = vv_residual_add_dev(hidden_states, mlp_out,
@@ -836,9 +913,31 @@ vv_status_t vv_decoder_prefill(
  * CPU decoder — per-layer forward (FP32 activations, quantized weights)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Run one projection in whatever format its weights are stored in. */
-static vv_status_t cpu_proj(const vv_weight_t* w, const float* in, float* out,
-                            int M, int N, int K) {
+/**
+ * @brief One CPU projection, in whatever format its weights are stored in.
+ *
+ * An act-order INT4G weight (w->perm set) had its input channels sorted by
+ * group at load; its input is gathered into `gather` first.
+ */
+static vv_status_t cpu_proj(const vv_weight_t* w, const float* in,
+                            float* out, int M, int N, int K,
+                            float* gather, size_t gather_n)
+{
+    if (w->perm.data) {
+        const int32_t* perm = (const int32_t*)w->perm.data;
+        if (!gather || gather_n < (size_t)M * K) {
+            VV_LOG_E("decoder: act-order '%s' needs %zu floats of CPU "
+                     "workspace for %d rows, %zu left", w->name,
+                     (size_t)M * K, M, gather_n);
+            return VV_ERR_OVERFLOW;
+        }
+        for (int m = 0; m < M; m++) {
+            const float* src = in + (size_t)m * K;
+            float* dst = gather + (size_t)m * K;
+            for (int j = 0; j < K; j++) dst[j] = src[perm[j]];
+        }
+        in = gather;
+    }
     switch (w->quant_kind) {
     case VV_QUANT_INT4G:
         return vv_int4g_gemm_cpu(in, (const uint8_t*)w->tensor.data,
@@ -856,6 +955,17 @@ static vv_status_t cpu_proj(const vv_weight_t* w, const float* in, float* out,
         return vv_gemm_f16w_cpu(in, w->tensor.data, w->bias.data, out,
                                 M, N, K);
     }
+}
+
+/** @brief Whether any projection carries an act-order permutation. */
+static bool model_has_act_order(vv_model_t* model) {
+    for (int i = 0; i < model->num_layers; i++) {
+        vv_weight_t* p[7];
+        const int n = vv_layer_projections(&model->layers[i], p);
+        for (int k = 0; k < n; k++)
+            if (p[k]->perm.data) return true;
+    }
+    return false;
 }
 
 /**
@@ -899,9 +1009,16 @@ static vv_status_t decoder_layer_cpu(
     float* gate_buf = wp + off; off += (size_t)seq_len * inter;
     float* up_buf   = wp + off; off += (size_t)seq_len * inter;
     float* mlp_out  = wp + off;
+    /* Whatever is left past the layer's buffers gathers act-order inputs. */
+    float* gather = wp + need;
+    const size_t gather_n = workspace_size / sizeof(float) - need;
 
     /** Run one projection in whatever format its weights are stored in. */
-    #define CPU_PROJ(w, in, out_buf, M, N, KK) do { s = cpu_proj(&(w), (in), (out_buf), (M), (N), (KK)); if (s != VV_OK) return s; } while (0)
+    #define CPU_PROJ(w, in, out_buf, M, N, KK) do {                          \
+        s = cpu_proj(&(w), (in), (out_buf), (M), (N), (KK),                 \
+                     gather, gather_n);                                     \
+        if (s != VV_OK) return s;                                           \
+    } while (0)
 
     s = vv_rmsnorm_cpu(hidden_states, layer->input_layernorm.data, norm_out,
                        seq_len, hs, config->rms_norm_eps);
@@ -975,10 +1092,15 @@ vv_status_t vv_decoder_prefill_cpu(
      * audio on the 7B. Each chunk attends to everything cached before it,
      * so chunking changes how the work is cut, not what it computes.
      */
-    const size_t per_token = sizeof(float) *
+    size_t per_token = sizeof(float) *
         (3 * (size_t)hs + (size_t)cfg->num_attention_heads * cfg->head_dim +
          2 * (size_t)cfg->num_key_value_heads * cfg->head_dim +
          2 * (size_t)cfg->intermediate_size);
+    /* Act-order INT4 weights gather their input past the layer's buffers:
+       one row of the widest K per token. */
+    if (model_has_act_order(model))
+        per_token += sizeof(float) *
+            (size_t)(cfg->intermediate_size > hs ? cfg->intermediate_size : hs);
     size_t fit = workspace_size / per_token;
     if (fit < 1) return VV_ERR_OUT_OF_MEMORY;
     if (fit > 2048) fit = 2048;

@@ -766,7 +766,10 @@ static void test_load_quant(void) {
                   w->tensor.size_bytes == (size_t)HS * INTER / 2 &&
                   w->quant.scales.size_bytes ==
                       (size_t)HS * (INTER / (q == VV_LOAD_QUANT_INT4 ? 128 : 64)) * 2 &&
-                  (q == VV_LOAD_QUANT_INT4 ? w->group_size == 128 && w->mins.data != NULL
+                  (q == VV_LOAD_QUANT_INT4 ? w->group_size == 128 && w->mins.data != NULL &&
+                                             w->zeros.data != NULL &&
+                                             w->zeros.size_bytes == (size_t)HS * (INTER / 128) &&
+                                             w->int4g_layout == VV_INT4G_ROWMAJOR
                                            : w->mins.data == NULL), msg);
 
         bool same = true;

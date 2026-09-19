@@ -15,7 +15,7 @@ Runtime работает end-to-end и **посимвольно совпадае
 
 | Метрика | Факт |
 |---|---|
-| Загрузка модели | **4.0 c** (NF4), 5.5 c (AWQ, включая репак); потоки = физические ядра |
+| Загрузка модели | **4.0 c** (NF4), 5.5 c (AWQ, включая репак; ещё 0.3–1.2 c на GPU-раскладку W4A16); потоки = физические ядра |
 | Speech encoding | **243 мс** на 11 c аудио |
 | Prefill | **3056 tok/s** (14449-токенный промпт, tensor cores) |
 | Decode | **128 tok/s** (0.2K ctx), 112 (1.5K), 76 (14K→24K) |
@@ -36,14 +36,22 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
   (совместим с бэкендом speech-to-text в GPUStack); `chat` — интерактивный
   цикл с горячей моделью; `mic` — живая транскрипция с VAD.
 * Веса: NF4 (bitsandbytes), AWQ, GPTQ. AWQ/GPTQ перепаковываются при
-  загрузке в row-major INT4G (иначе GEMV не коалесится).
+  загрузке в row-major INT4G (иначе GEMV не коалесится) с точной целой
+  нулевой точкой; GPU-путь затем переставляет нибблы внутри 16-байтных
+  отрезков строки (`vv_model_int4g_to_gpu_layout`, одна копия) под
+  `src/cuda/w4a16.cu`: GEMV с LOP3/HFMA2 (q/k/v и gate/up — одним запуском)
+  и Marlin-подобный GEMM на tensor cores для M > 1, без разворачивания
+  веса в FP16. Деквант — `(q − z)·s`, как в эталоне. GPTQ act-order
+  (`desc_act`): каналы входа сортируются по группам при загрузке
+  (`vv_weight_t.perm`), активации собираются в том же порядке
+  (`vv_w4a16_gather_dev`). `VV_INT4G_LEGACY=1` — старый путь.
 * Неквантованные чекпоинты (BF16/F16/F32, `microsoft/VibeVoice-ASR`):
   плотный FP16 или `--quant nf4|int4|int8` прямо при загрузке из mmap, до
   placement. Формат проекции определяется по dtype в файле, а не по имени
   (U8+`.absmax` → NF4, I32 `qweight` → INT4G, float → dense); каждый тензор
   сверяется с формой из config, отсутствующий/кривой — ошибка с именем.
   `tie_word_embeddings` — head и embedding один буфер. BF16 dense на 3090:
-  56 tok/s, 18.7 GB; `--quant int4` — 133 tok/s, `int8` (per-channel) —
+  56 tok/s, 18.7 GB; `--quant int4` — 149 tok/s (W4A16-ядра), `int8` (per-channel) —
   97 tok/s, 12.5 GB; те же слова, что NF4.
 * Семейства моделей (`include/vibevoice/family.h`): `asr-7b`, `asr-bitnet`,
   `asr-streaming-7b` — промпт, стоп-токены, нормализация, геометрия чанков.
@@ -631,7 +639,7 @@ VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
 `ctest` без `VV_TEST_MODEL` тоже проходит — тесты, которым нужны веса,
-рапортуют SKIP. Всего 18 наборов.
+рапортуют SKIP. Всего 21 набор.
 
 Релизная сборка (все архитектуры, статические рантаймы, без тестов):
 

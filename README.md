@@ -224,7 +224,7 @@ absurd for short clips; this pays it once.
 |---|---|
 | **NF4** (bitsandbytes, double-quantized) | loaded directly |
 | **AWQ** (AutoAWQ) | loaded directly |
-| **GPTQ** | loaded directly (its zero points are off by one; handled) |
+| **GPTQ** (AutoGPTQ / GPTQModel) | loaded directly; `gptq_v2` zero points recognised; act-order (`desc_act`) supported |
 | **BF16 / F16 / F32** (unquantized) | dense FP16, or `--quant nf4\|int4\|int8` at load |
 
 What a projection is gets decided by what the file holds — U8 with an
@@ -236,7 +236,9 @@ dense checkpoints and quantize each projection as it is read from the
 mapping, before placement, so the VRAM budget sees the final sizes and peak
 host memory is the quantized model plus a few rows per thread. NF4 here is
 bitsandbytes' layout (blocks of 64, FP16 scales, no double quantization);
-INT4 is the asymmetric group-128 layout the AWQ path uses; INT8 is
+INT4 is asymmetric group-128 with an exact integer zero point per group,
+AWQ's own form, so it takes the W4A16 GPU kernels below like an AWQ
+checkpoint does; INT8 is
 per-output-channel symmetric (one FP32 scale per row, the layout the W8A8
 work builds on) with its own GEMV. All three are deterministic whatever the
 thread count.
@@ -247,28 +249,61 @@ thread count.
 |---|---|---|---|---|---|
 | `none` (FP16) | 4.7 s | 18.7 GB | 56 tok/s | 0.108 / 0.110 / 0.109 | same words on all three |
 | `nf4` | 5.4 s | 9.8 GB | 127 tok/s | 0.066 / 0.061 / 0.059 | same words; jfk and test30 byte-identical |
-| `int4` | 2.7 s | 9.7 GB | 133 tok/s | 0.064 / 0.060 / 0.057 | same words |
+| `int4` | 2.7 s | 9.7 GB | 149 tok/s | 0.053 / 0.052 / 0.052 | same words |
 | `int8` | 3.6 s | 12.5 GB | 97 tok/s | 0.077 / 0.073 / 0.071 | same words |
 
 Load is the best of three with the page cache warm, on the 12 physical
 cores; quantizing is cheaper than uploading the 14 GB the dense model
 needs, so `int4` loads faster than `none`.
 
-Where they differ it is in timestamps (at most 0.06 s, 0.44 s once for
+Where they differ it is in timestamps (at most 0.06 s, 0.12 s for
 `int4`) and in one speaker label: on test30, whose middle clip is a
 different voice, dense BF16, `int4` and `int8` call it Speaker 1 while the NF4
 checkpoint calls everything Speaker 0.
 
-AWQ and GPTQ store weights K-major with the eight columns of a word
-interleaved, which is the wrong orientation for a GEMV — walking `k` for one
-output row would stride by `N/8` words. They are repacked once at load into
-the row-major layout the NF4 path uses, with the zero point folded into a
-per-group `min` so dequantization in the kernel is a single FMA. The repack
-is OpenMP-parallel and costs ~1.4 s for the 7B.
+AWQ packs the eight columns of a word along `N` (`qweight [K, N/8]`), GPTQ
+the eight rows along `K` (`qweight [K/8, N]`); the loader tells them apart by
+shape. Either is the wrong orientation for a GEMV, so both are repacked once
+at load into a row-major `[N][K/2]` layout with the exact integer zero point
+kept per group. The CPU kernels read that. The GPU path goes one step
+further before anything is uploaded (so there is only ever one copy): inside
+every 16-byte run of a row the nibbles are permuted so a single `LOP3` with
+the `0x6400` half-precision magic yields four `half2` weights that are at
+once the GEMV's natural `x` pairs and the tensor-core `m16n8k16` B fragment,
+and scale and zero point sit together as one `half2` per group.
+Dequantization is `(q − z)·s` in FP16 — the reference's own formula; the
+older path's `q·s + fp16(−z·s)` differed in the last bit.
 
-On the same audio, AWQ gives an identical transcript and 2% faster decode
-(102.3 vs 100.0 tok/s) for 3% more VRAM — NF4's own scales are
-double-quantized, so it is already at 4.13 bits against AWQ's 4.16.
+- **Decode GEMV**: 128-bit loads, 16–128 lanes per row (more when `N` is
+  small, so a 512-row projection still covers all 82 SMs), two rows per
+  lane group when `K` is long, HFMA2 chains of four flushed to FP32.
+  Projections that read the same input — q/k/v, gate/up — go in one launch
+  whose grid is their row blocks end to end; the 0.9 MB k and v are too
+  short to get past a kernel's ramp-up on their own. On a 3090
+  (graph-replayed, weights cycled past L2): gate+up 861 GB/s, down 822,
+  q+k+v 742, o 683 — against 727 / 669 / 597 / 208 before. What keeps
+  q+k+v and o under 85% of the 936 GB/s is a fixed ~3 µs per kernel
+  (launch, ramp-up, tail) on 8.3 and 6.4 MB of weights.
+- **M > 1**: a Marlin-style tensor-core GEMM keeps the weights 4-bit through
+  `cp.async` into shared memory and dequantizes in registers straight into
+  the B fragments, 16/32/64/128-row tiles and split-K when the grid would
+  not cover the card (the partials use the decoder's scratch; the weight
+  itself is never expanded into it any more): 9–16 rows are 14–25× faster
+  than before, 64 rows 3–9×, a 2048-token prefill chunk 1.0–1.8× (60
+  TFLOP/s on gate/up/down; q/o is 0.97× there). Turing falls back to
+  dequantize + dense GEMM (`VV_W4A16_MMA=0` forces that path).
+- **GPTQ act-order** checkpoints quantize the input channels in order of
+  importance, so each group is scattered over `K`. The loader sorts the
+  channels by group (the groups become contiguous runs the kernels already
+  handle) and keeps the order; the decoder gathers the activations through
+  it before the product, on the GPU and the CPU path alike.
+- `VV_INT4G_LEGACY=1` keeps the old layout and kernels, for comparison.
+
+On the same audio AWQ gives an identical transcript, 149.1 against NF4's
+124.0 tok/s of decode at short context (126.2 vs 109.3 at 1.5K, 82.4 vs 75 on a
+32-minute file) and 2.4× NF4's prefill rate on an 11 s clip, for 3% more
+VRAM — NF4's own scales are double-quantized, so it is already at 4.13
+bits against AWQ's 4.16.
 
 [`Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM`](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM)
 is a real activation-aware build: `llm-compressor`'s `AWQModifier` over 256
@@ -531,7 +566,7 @@ the performance cores. **There is no Metal backend.** See "Not done" below.
 VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
-Eighteen suites. The ones that need weights report SKIP without
+Twenty-one suites. The ones that need weights report SKIP without
 `VV_TEST_MODEL`. `test_cpu_kernels` checks every CPU kernel against a scalar
 reference, which is what makes the SIMD paths verifiable per architecture —
 it passes natively on AVX2 and under `qemu-aarch64` on NEON, both to 4e-7
@@ -609,6 +644,10 @@ The kernels that matter:
   The generic path (expand to FP16 scratch, then GEMM) moves 5× the bytes;
   single-token decode is purely bandwidth bound, so the weights stay 4-bit
   all the way into the multiply.
+- **`w4a16.cu`** — AWQ/GPTQ on the GPU: the decode GEMV (one launch for
+  q/k/v, one for gate/up) and a Marlin-style tensor-core GEMM over one
+  shared weight layout, int4 kept packed through shared memory and
+  dequantized in registers with `LOP3`.
 - **`attention.cu`**, **`attention_mma.cuh`** — FlashAttention-2 prefill with
   both matmuls on tensor cores, and a split-KV flash decode where each warp
   owns a slice of the cache and a second kernel merges the partial softmax

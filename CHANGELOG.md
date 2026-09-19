@@ -13,7 +13,7 @@ Write the entry for a change under Unreleased in the same pull request.
   (dense FP16 on the GPU, 56 tok/s, 18.7 GB) or quantized while it is read
   with `--quant nf4|int4|int8` (`vv_cli`, `serve`, `chat`; `auto` keeps
   whatever the checkpoint has). `int8` is per-channel symmetric with its own
-  GEMV (97 tok/s, 12.5 GB); `int4` is the fastest (133 tok/s, 9.7 GB). Projections are routed by what the file holds rather
+  GEMV (97 tok/s, 12.5 GB); `int4` is the fastest (149 tok/s, 9.7 GB). Projections are routed by what the file holds rather
   than by name, every tensor is checked against the config's shape, and a
   missing or misshaped one fails the load with its name instead of a
   "prefill layer 0 failed" later on.
@@ -34,6 +34,37 @@ Write the entry for a change under Unreleased in the same pull request.
 - Config dimensions are required: a config without, say,
   `intermediate_size` is refused instead of silently becoming the 7B.
   Non-SiLU activations, rope scaling and sliding windows are refused too.
+- **AWQ / GPTQ fast path** ([#19](https://github.com/Ar4ikov/vibevoice.c/issues/19)):
+  INT4 group-affine weights get a GPU layout at load (nibbles permuted per
+  16-byte run, scale and exact integer zero point as one `half2` per group)
+  and two kernels in `src/cuda/w4a16.cu` that share it. The decode GEMV
+  uses 128-bit loads, `LOP3`/`0x6400` conversion and HFMA2, with as many
+  lanes per row as it takes to fill the card, and takes the projections
+  that share an input in one launch: on a 3090 gate+up 861 GB/s, down 822,
+  q+k+v 742 (from 516 as three launches), o 683, against 727 / 669 / 597 /
+  208 before. Every M > 1 runs a Marlin-style tensor-core GEMM that keeps
+  the weights packed until they are in registers, instead of expanding each
+  weight into an FP16 copy first: 14–25× faster at 9–16 rows, 3–9× at 64,
+  1.0–1.8× for a 2048-token chunk (0.97× on q/o, see the PR). End to end on
+  the AWQ checkpoint: decode 133 → 149.1 tok/s at 0.2K context, 116 → 126.2
+  at 1.5K, 77 → 82.4 over 14K → 24K; prefill 1010 → 2394 tok/s on jfk,
+  2810 → 3466 on test120; the 32-minute file goes from RTF 0.078 to
+  0.074. Dequantization is now the reference's `(q − z)·s` with the
+  checkpoint's integer zero point; transcripts on jfk / test30 / test120 are
+  unchanged, and on the 32-minute file the text and speakers are too while
+  9 of 168 segment boundaries move by at most 20 ms. The loader reads
+  real AutoGPTQ tensors (`qweight [K/8, N]`, told apart from AWQ by shape),
+  honours GPTQModel's `gptq_v2` zero points, runs act-order (`desc_act`)
+  checkpoints by sorting their input channels by group at load and
+  gathering the activations through the same order, checks every tensor
+  size against the header, and fails the load on a tensor it cannot
+  repack. The GPU layout costs 0.3–1.2 s at load for the 7B (in place, no
+  second copy). `VV_INT4G_LEGACY=1` restores the old path. `--quant int4`
+  on a dense checkpoint now quantizes AWQ's way, with an exact integer zero
+  point per group (the range widened to hold 0), and so runs on the same
+  kernels: `microsoft/VibeVoice-ASR` with `--quant int4` decodes at 149
+  instead of 133 tok/s, RTF 0.053 / 0.052 / 0.052 on 11 s / 30 s / 120 s
+  instead of 0.064 / 0.060 / 0.057, same words.
 
 ## [0.2.0](https://github.com/Ar4ikov/vibevoice.c/releases/tag/v0.2.0) — 2026-09-18
 
