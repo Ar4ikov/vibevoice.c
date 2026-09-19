@@ -573,11 +573,11 @@ per launch, less when ready windows share a launch.
 
 | weights | per chunk, mean (p95) | RTF | decode | VRAM |
 |---|---|---|---|---|
-| `--quant none` (FP16) | 306 ms (379) | 0.106 | 55 tok/s | 18.6 GB |
+| `--quant none` (FP16) | 210 ms (284) | 0.072 | 57 tok/s | 18.6 GB |
 | `--quant int4` | **92 ms** (135) | **0.032** | 155 tok/s | 9.8 GB |
 | `--quant int4`, `--attn fa2` | 96 ms (137) | 0.033 | 148 tok/s | 9.8 GB |
-| `--quant int8` | 259 ms | 0.090 | – | 12.5 GB |
-| `--quant nf4` | 263 ms (313) | 0.091 | 97 tok/s | 9.8 GB |
+| `--quant int8` | 130 ms (169) | 0.045 | 99 tok/s | 12.5 GB |
+| `--quant nf4` | 110 ms (148) | 0.038 | 130 tok/s | 9.8 GB |
 | `--quant int4`, long30m (32 min, 654 chunks) | **114 ms** (191) | **0.042** | 134 tok/s | 9.8 GB |
 | `--quant int4`, long30m, `--attn fa2` | 134 ms (214) | 0.048 | 120 tok/s | 9.8 GB |
 | `--quant none`, 300 s excerpt | 342 ms (455) | 0.118 | 52 tok/s | 18.6 GB |
@@ -594,11 +594,33 @@ upstream 156/156 chunks. The batch model stays on fa2 because its
 transcripts are pinned bit for bit to the old kernels; this family has no
 such history.
 
-The int8, nf4 and FP16 rows predate encoding ready windows ahead, which
-took about 11 ms off each int4 chunk, and the flashinfer default; they
-would move by about as much. Only int4 uses kernels built for a 29-row
-prefill: the other formats run it through GEMMs sized for long prompts,
-which is most of the gap.
+Every format prefills a chunk on kernels built for a few rows: int4 on the
+W4A16 GEMM, FP16, int8 and nf4 on the small-M kernels
+(`src/cuda/gemm_skinny.cu`). Before those, the 29 rows went through the
+128-row tile GEMM -- 28 blocks for a 3584-column projection and 4 for k
+and v on an 82-SM card, most of each tile padding -- and int8 and nf4
+first wrote every weight out as FP16. Measured the same day on 0.4.0, a
+chunk took 281 ms (p95 356) in FP16, 227 (266) in int8 and 205 (244) in
+nf4, of which the prefill was about 105, 128 and 128 ms; now it is 30, 28
+and 29 ms, encode included. The small-M kernels are bit-identical to the
+path they replace (same `mma.m16n8k16` sequence and k order, same dequant
+arithmetic), so the parity table above did not move: the output JSON and
+every chunk dump of the new build equal 0.4.0's byte for byte.
+Per launch at 29 rows, against the path it replaced:
+
+| one 7B layer at 29 rows | q+k+v | o | gate+up | down | layer |
+|---|---|---|---|---|---|
+| FP16, tile GEMM | 777 us | 268 | 688 | 1418 | 3151 us |
+| FP16, small-M | 43 | 37 | 338 | 174 | **592** |
+| int8, dequant + tile | 760 | 310 | 1162 | 1662 | 3894 |
+| int8, small-M | 41 | 35 | 229 | 167 | **472** |
+| nf4, dequant + tile | 754 | 305 | 1099 | 1637 | 3795 |
+| nf4, small-M | 36 | 36 | 206 | 174 | **452** |
+
+FP16 streams its weights at 780-800 GB/s. int8 and nf4 are still about
+twice their memory or tensor bound: without split-K, whose partial sums
+would change the bits, the 3584-column down projection covers 56 of the
+82 SMs, and the dequant in registers leaves the tensor pipe waiting.
 
 CPU (`--cpu`, 12 cores, jfk, one run each): int4 2.8 s per chunk, RTF 1.09;
 int8 4.2 s, RTF 1.58; FP16 4.4 s, RTF 1.68. It works, but does not keep up
