@@ -298,18 +298,10 @@ typedef struct {
     size_t  act_elems;              /**< each of the two activation buffers */
     size_t  rinv_elems;
     size_t  hid_elems;
-    size_t  part_elems;             /**< FP32 split-K partials             */
-    size_t  off_act1, off_rinv, off_hid, off_part, bytes;
+    size_t  off_act1, off_rinv, off_hid, bytes;
 } vae_arena_layout_t;
 
 static int64_t round8(int64_t v) { return (v + 7) / 8 * 8; }
-
-static size_t max_sz(size_t a, size_t b) { return a > b ? a : b; }
-
-/** FP32 partials a GEMM split into `S` slices needs; none when unsplit. */
-static size_t split_need(int S, int M, size_t cols) {
-    return S > 1 ? (size_t)S * (size_t)M * cols : 0;
-}
 
 static void arena_layout(const vae_plan_t* p, int max_items,
                          int64_t max_samples, vae_arena_layout_t* l) {
@@ -333,42 +325,25 @@ static void arena_layout(const vae_plan_t* p, int max_items,
     for (int s = 0; s < p->n_stages; s++)
         if (p->hidden[s] > widest) widest = p->hidden[s];
     if (hid < (size_t)widest * 128) hid = (size_t)widest * 128;
-    /* The downsample GEMMs lay their im2col tiles out in the same buffer. */
+    /* The downsample and head convs lay their im2col tiles out in the
+       same buffer. */
     for (int i = 0; i < p->n_layers; i++) {
         const vae_layer_t* L = &p->L[i];
-        if (L->kind != VAE_L_DS) continue;
+        if (L->kind != VAE_L_DS && L->kind != VAE_L_HEAD) continue;
         const size_t kc = (size_t)L->in_ch * (size_t)L->k;
         if (hid < kc * 128) hid = kc * 128;
-        const int so = L->stage + 1 < p->n_stages ? L->stage + 1 : L->stage;
+        const int so = (L->kind == VAE_L_DS && L->stage + 1 < p->n_stages)
+                     ? L->stage + 1 : p->n_stages - 1;
         const size_t full = kc * (size_t)l->ld[so];
         if (full > hid_full) hid_full = full;
     }
     if (hid > hid_full) hid = hid_full;
     l->hid_elems = hid;
 
-    /* Split-K partials: slices x rows x columns of the widest GEMM that is
-       split at all (only the deep stage-4..6 ones, whose columns are few). */
-    size_t part = 0;
-    for (int s = 0; s < p->n_stages; s++) {
-        const int C = p->C[s], H = p->hidden[s];
-        const size_t cols = (size_t)l->ld[s];
-        part = max_sz(part, split_need(vv_vae_gemm_splitk(C), H, cols));
-        part = max_sz(part, split_need(vv_vae_gemm_splitk(H), C, cols));
-    }
-    for (int i = 0; i < p->n_layers; i++) {
-        const vae_layer_t* L = &p->L[i];
-        if (L->kind != VAE_L_DS) continue;
-        const int so = L->stage + 1 < p->n_stages ? L->stage + 1 : L->stage;
-        part = max_sz(part, split_need(vv_vae_gemm_splitk(L->in_ch * L->k),
-                                       L->out_ch, (size_t)l->ld[so]));
-    }
-    l->part_elems = part;
-
     l->off_act1 = align_up(act * 2, VAE_ALIGN);
     l->off_rinv = l->off_act1 + align_up(act * 2, VAE_ALIGN);
     l->off_hid  = l->off_rinv + align_up(l->rinv_elems * 4, VAE_ALIGN);
-    l->off_part = l->off_hid + align_up(l->hid_elems * 2, VAE_ALIGN);
-    l->bytes    = l->off_part + align_up(l->part_elems * 4, VAE_ALIGN);
+    l->bytes    = l->off_hid + align_up(l->hid_elems * 2, VAE_ALIGN);
 }
 
 struct vv_vae_arena {
@@ -380,7 +355,6 @@ struct vv_vae_arena {
     void*              act[2];
     float*             rinv;
     void*              hid;
-    float*             part;
     size_t             high_water;
     bool               stats;
     /* Host scratch: per item per layer, the context left after this call. */
@@ -424,7 +398,6 @@ vv_status_t vv_vae_arena_create(const vv_conv_vae_encoder_t* e, int max_items,
     a->act[1] = (char*)a->blob + a->lay.off_act1;
     a->rinv   = (float*)((char*)a->blob + a->lay.off_rinv);
     a->hid    = (char*)a->blob + a->lay.off_hid;
-    a->part   = (float*)((char*)a->blob + a->lay.off_part);
 
     const char* ev = getenv("VV_ENC_STATS");
     a->stats = ev && ev[0] && ev[0] != '0';
@@ -626,15 +599,13 @@ vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
                     s = vv_vae_gemm_nn_dev(VV_VAE_EPI_BIAS_GELU, bw->l1_w, x, ld,
                                            a->hid, ldh, bw->hidden, C, (int)pc,
                                            bw->l1_b, NULL, a->rinv + p0,
-                                           bw->ffn_norm_w, a->part,
-                                           a->lay.part_elems, stream);
+                                           bw->ffn_norm_w, 0, stream);
                     if (s == VV_OK)
                         s = vv_vae_gemm_nn_dev(VV_VAE_EPI_BIAS_RESID, bw->l2_w,
                                                a->hid, ldh, x, ld, C,
                                                bw->hidden, (int)pc, bw->l2_b,
                                                bw->ffn_gamma, NULL, NULL,
-                                               a->part, a->lay.part_elems,
-                                               stream);
+                                               0, stream);
                     if (s != VV_OK) return s;
                 }
             }
@@ -647,9 +618,10 @@ vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
             if ((size_t)L->out_ch * (size_t)ld2 > a->lay.act_elems)
                 return VV_ERR_OVERFLOW;
             if (T2 > 0) {
-                /* A tensor-core GEMM over im2col tiles in the FFN's hidden
-                   buffer; the direct kernel spent two thirds of the encoder
-                   here, one scalar load pair per multiply-add. */
+                /* A tiled GEMM over im2col columns in the FFN's hidden
+                   buffer, summing in the direct kernel's order; the direct
+                   kernel spent two thirds of the encoder here, one scalar
+                   load pair per multiply-add. */
                 const int Kc = C * L->k;
                 int64_t tile = (int64_t)(a->lay.hid_elems / (size_t)Kc);
                 tile = tile >= 128 ? tile / 128 * 128 : tile / 8 * 8;
@@ -663,13 +635,11 @@ vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
                                           L->stride, p0, (int)pc, a->hid, ldc,
                                           stream);
                     if (s == VV_OK)
-                        s = vv_vae_gemm_nn_dev(VV_VAE_EPI_BIAS, w->ds_w[st],
-                                               a->hid, ldc,
-                                               (uint16_t*)a->act[cur ^ 1] + p0,
-                                               ld2, L->out_ch, Kc, (int)pc,
-                                               w->ds_b[st], NULL, NULL, NULL,
-                                               a->part, a->lay.part_elems,
-                                               stream);
+                        s = vv_vae_conv_gemm_dev(NULL, w->ds_w[st], a->hid, ldc,
+                                                 w->ds_b[st],
+                                                 (uint16_t*)a->act[cur ^ 1] + p0,
+                                                 ld2, L->out_ch, Kc, p0,
+                                                 (int)pc, stream);
                 }
                 if (s != VV_OK) return s;
             }
@@ -699,9 +669,29 @@ vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
         d.it[i].out_ld = items[i].out_ld;
         d.it[i].skip = items[i].skip_frames;
     }
-    if (T > 0)
-        s = vv_vae_conv_dev(&d, a->act[cur], ld, w->head_w, w->head_b, NULL, 0,
-                            L->in_ch, L->out_ch, L->k, L->stride, true, stream);
+    {
+        /* The same im2col GEMM as the downsamples, writing each item's
+           frames as rows. The direct kernel ran one thread per output over
+           in_ch * k = 14336 products on a 64-128 block grid. */
+        int64_t To = 0;
+        for (int i = 0; i < n; i++) To += nxt[i];
+        const int Kc = L->in_ch * L->k;
+        int64_t tile = (int64_t)(a->lay.hid_elems / (size_t)Kc);
+        tile = tile >= 128 ? tile / 128 * 128 : tile / 8 * 8;
+        if (To > 0 && tile < 8) return VV_ERR_OVERFLOW;
+        for (int64_t p0 = 0; p0 < To && s == VV_OK; p0 += tile) {
+            const int64_t pc = (To - p0 < tile) ? To - p0 : tile;
+            const int64_t ldc = round8(pc);
+            if ((size_t)Kc * (size_t)ldc > used_hid)
+                used_hid = (size_t)Kc * (size_t)ldc;
+            s = vv_vae_im2col_dev(&d, a->act[cur], ld, L->in_ch, L->k,
+                                  L->stride, p0, (int)pc, a->hid, ldc, stream);
+            if (s == VV_OK)
+                s = vv_vae_conv_gemm_dev(&d, w->head_w, a->hid, ldc, w->head_b,
+                                         NULL, 0, L->out_ch, Kc, p0, (int)pc,
+                                         stream);
+        }
+    }
     if (s == VV_OK) s = vv_vae_tail_dev(&d, a->act[cur], ld, L->in_ch, stream);
     if (s != VV_OK) return s;
 

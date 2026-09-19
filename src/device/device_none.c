@@ -370,12 +370,18 @@ vv_status_t vv_vae_gemm_nn_dev(int ep, const void* A, const void* B,
                                int64_t ldb, void* C, int64_t ldc,
                                int M, int K, int P, const void* bias,
                                const void* gamma, const float* rinv,
-                               const void* norm_w, float* ws,
-                               size_t ws_elems, void* stream) {
+                               const void* norm_w, int tile, void* stream) {
     (void)ep; (void)A; (void)B; (void)ldb; (void)C; (void)ldc; (void)M;
     (void)K; (void)P; (void)bias; (void)gamma; (void)rinv; (void)norm_w;
-    (void)ws; (void)ws_elems; (void)stream;
+    (void)tile; (void)stream;
     return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_vae_conv_gemm_dev(const vv_vae_conv_desc_t* d, const void* w,
+                                 const void* col, int64_t ldcol, const void* b,
+                                 void* y, int64_t ld_out, int out_ch, int K,
+                                 int64_t p0, int pc, void* stream) {
+    U(d) U(w) U(col) U(ldcol) U(b) U(y) U(ld_out) U(out_ch) U(K) U(p0) U(pc)
+    U(stream) return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_vae_gemm_tn_dev(const void* A, int64_t lda, const void* B,
                                void* C, int64_t ldc, int M, int N, int K,

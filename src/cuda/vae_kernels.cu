@@ -17,12 +17,12 @@
  * fixed order, and an FP16 rounding happens at every point the old
  * multi-kernel sequence stored an intermediate. So batching, chunking and
  * fusing change no bit of the output, which is what lets the tests demand
- * bit-exact equality rather than a tolerance. The one change against the
- * kernels this replaces is the downsample: a tensor-core GEMM over im2col
- * tiles instead of a scalar loop, which sums in WMMA order. Against the
- * PyTorch reference that moves test30's latents from 0.149 / 0.261 % to
- * 0.147 / 0.265 % relative error (acoustic / semantic); transcripts are
- * unchanged.
+ * bit-exact equality rather than a tolerance -- and what keeps the latents
+ * bit-identical to the per-request encoder this replaces. The downsample and
+ * head convolutions run as a tiled GEMM over im2col columns, but in FP32
+ * with each output's products fused in the direct kernel's (channel, tap)
+ * order; the deep FFN GEMMs get more blocks from a smaller tile, not from
+ * splitting K, because a K split would re-associate the sums.
  *
  * All indexing into packed buffers is 64-bit: a packed stage-0 FFN hidden
  * buffer passes INT_MAX elements at about eleven 60 s segments.
@@ -32,6 +32,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "vibevoice/device.h"
 
@@ -158,6 +159,107 @@ __global__ void vae_im2col_kernel(vv_vae_conv_desc_t d, const half* __restrict__
     col[(size_t)kr * ldcol + q] = v;
 }
 
+/**
+ * The strided and head convolutions as a GEMM of the [out][in * k] weight
+ * against im2col columns, in FP32 on the CUDA cores: every output adds its
+ * products one at a time, fused, in (in channel, tap) order starting from
+ * zero, then the bias -- exactly what vae_conv_kernel does, so the bits are
+ * the same (a zero column past the input adds +0 to a sum that cannot be
+ * -0). What changes is reuse: a 64 x 64 tile shares each loaded weight and
+ * input across 64 outputs instead of loading a pair per multiply-add.
+ *
+ * TRANSPOSED writes packed output column p0 + q of item i as row
+ * (t - skip) of its [frame][out_ld] destination (the head).
+ */
+#define CG_BM 64
+#define CG_BN 64
+#define CG_BK 16
+
+template <bool TRANSPOSED>
+__global__ void __launch_bounds__(256) vae_conv_gemm_kernel(
+    const half* __restrict__ A, const half* __restrict__ B, int64_t ldb,
+    half* __restrict__ C, int64_t ldc, int M, int K, int P,
+    const half* __restrict__ bias, vv_vae_conv_desc_t d, int64_t p0)
+{
+    __shared__ __align__(16) float As[CG_BK][CG_BM];
+    __shared__ __align__(16) float Bs[CG_BK][CG_BN];
+
+    const int tid = threadIdx.x;
+    const int tx = tid & 15, ty = tid >> 4;
+    const int row_base = blockIdx.y * CG_BM;
+    const int col_base = blockIdx.x * CG_BN;
+    const int ar = tid >> 2, ac = (tid & 3) * 4;
+    const int br = tid >> 4, bc = (tid & 15) * 4;
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += CG_BK) {
+        {
+            const int gr = row_base + ar;
+            #pragma unroll
+            for (int t = 0; t < 4; t++) {
+                const int kk = k0 + ac + t;
+                As[ac + t][ar] = (gr < M && kk < K)
+                    ? __half2float(A[(size_t)gr * K + kk]) : 0.0f;
+            }
+            const int gk = k0 + br;
+            #pragma unroll
+            for (int t = 0; t < 4; t++) {
+                const int gc = col_base + bc + t;
+                Bs[br][bc + t] = (gk < K && gc < P)
+                    ? __half2float(B[(size_t)gk * ldb + gc]) : 0.0f;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < CG_BK; kk++) {
+            const float4 a = *(const float4*)&As[kk][ty * 4];
+            const float4 b = *(const float4*)&Bs[kk][tx * 4];
+            const float av[4] = { a.x, a.y, a.z, a.w };
+            const float bv[4] = { b.x, b.y, b.z, b.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    acc[i][j] = __fmaf_rn(av[i], bv[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int c = col_base + tx * 4 + j;
+        if (c >= P) continue;
+        half* dst = NULL;
+        int64_t step = 0;
+        if (TRANSPOSED) {
+            const int64_t p = p0 + c;
+            int it_i = 0;
+            while (it_i + 1 < d.n && p >= d.it[it_i + 1].out_off) it_i++;
+            const vv_vae_conv_item_t& it = d.it[it_i];
+            const int t = (int)(p - it.out_off);
+            if (t >= it.out_len || t < it.skip) continue;
+            dst = (half*)it.out_ptr + (size_t)(t - it.skip) * it.out_ld;
+            step = 1;
+        } else {
+            dst = C + c;
+            step = ldc;
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int r = row_base + ty * 4 + i;
+            if (r >= M) continue;
+            float v = acc[i][j];
+            if (bias) v += __half2float(bias[r]);
+            dst[(size_t)r * step] = __float2half(v);
+        }
+    }
+}
+
 /* ─── RMSNorm statistics ───────────────────────────────────────────────── */
 
 /**
@@ -282,7 +384,9 @@ __global__ void __launch_bounds__(VAE_THREADS) vae_mixer_kernel(
  * kernels in gemm.cu, so every output element sums its K products in the
  * same order and the results match bit for bit. What is new: row strides,
  * a column window, an RMSNorm applied while B is staged, and epilogues that
- * do what used to be two or three more kernels.
+ * do what used to be two or three more kernels. BM/BN/WARP_* describe the
+ * 128 x 128 tile the TN kernel uses; the NN kernel takes its tile as template
+ * parameters.
  */
 #define BM        128
 #define BN        128
@@ -295,7 +399,6 @@ __global__ void __launch_bounds__(VAE_THREADS) vae_mixer_kernel(
 #define FRAG_N    (WARP_N / 16)
 #define KSTEPS    (BK / 16)
 #define LDK       (BK + 8)
-#define LDN       (BN + 8)
 
 template <int ROWS>
 __device__ __forceinline__ void vae_load_k_major(
@@ -323,24 +426,28 @@ __device__ __forceinline__ void vae_load_k_major(
 }
 
 /**
- * B of the NN shape, [K][P] with row stride ldb. With `nw` set, each value
- * is normalised on the way in: half(x * rinv[col] * nw[row]), the value the
- * standalone RMSNorm would have stored.
+ * B of the NN shape, [K][P] with row stride ldb, TBN columns of it. With
+ * `nw` set, each value is normalised on the way in:
+ * half(x * rinv[col] * nw[row]), the value the standalone RMSNorm stored.
  */
+template <int TBN>
 __device__ __forceinline__ void vae_load_n_major(
     const half* __restrict__ src, int64_t ldb, int k0, int K,
     int col_base, int P, bool p_aligned,
     const float* __restrict__ rinv, const half* __restrict__ nw,
     half* __restrict__ dst)
 {
+    constexpr int TPR = TBN / 8;            /* threads per row           */
+    constexpr int RPP = THREADS / TPR;      /* rows per pass             */
+    constexpr int LDNT = TBN + 8;
     const int tid = threadIdx.x;
     #pragma unroll
-    for (int p = 0; p < 2; ++p) {
-        const int r  = (tid >> 4) + p * 16;
-        const int c  = (tid & 15) * 8;
+    for (int p = 0; p < BK / RPP; ++p) {
+        const int r  = tid / TPR + p * RPP;
+        const int c  = (tid % TPR) * 8;
         const int gk = k0 + r;
         const int gc = col_base + c;
-        half* dd = dst + r * LDN + c;
+        half* dd = dst + r * LDNT + c;
         if (gk < K && p_aligned && gc + 8 <= P) {
             float4 raw = *(const float4*)(src + (size_t)gk * ldb + gc);
             if (nw) {
@@ -403,71 +510,73 @@ __device__ __forceinline__ void vae_epilogue(float acc, half* __restrict__ C,
 }
 
 /*
- * With `part` set, block z sums only K slice [z * kslice, (z+1) * kslice)
- * and stores its raw FP32 accumulators to part[z][M][P]; vae_splitk_kernel
- * then adds the slices in order and applies the epilogue.
+ * TBM x TBN block tile, 8 warps in a 2 x 4 grid, BK = 32 with double
+ * buffering. Every output accumulates its K products 16 at a time, in K
+ * order, into one WMMA accumulator: the tile shape decides which block
+ * computes an element, not how. So the 128 x 128 tile (the old kernels')
+ * and the 64 x 64 one the few-column deep stages use give the same bits.
  */
-template <int EPI>
+template <int EPI, int TBM, int TBN>
 __global__ __launch_bounds__(THREADS) void vae_gemm_nn_kernel(
     const half* __restrict__ A, const half* __restrict__ B, int64_t ldb,
     half* __restrict__ C, int64_t ldc, int M, int K, int P,
     const half* __restrict__ bias, const half* __restrict__ gamma,
-    const float* __restrict__ rinv, const half* __restrict__ nw,
-    float* __restrict__ part, int kslice)
+    const float* __restrict__ rinv, const half* __restrict__ nw)
 {
+    constexpr int WM = TBM / 2, WN = TBN / 4;
+    constexpr int FM = WM / 16, FN = WN / 16;
+    constexpr int LDNT = TBN + 8;
     extern __shared__ char smem_raw[];
     half* As = (half*)smem_raw;
-    half* Bs = As + 2 * BM * LDK;
+    half* Bs = As + 2 * TBM * LDK;
 
     const int warp   = threadIdx.x >> 5;
     const int warp_m = warp >> 2;
     const int warp_n = warp & 3;
-    const int row_base = blockIdx.y * BM;
-    const int col_base = blockIdx.x * BN;
+    const int row_base = blockIdx.y * TBM;
+    const int col_base = blockIdx.x * TBN;
     const bool k_aligned = (K & 7) == 0;
     const bool p_aligned = (ldb & 7) == 0 && (((uintptr_t)B) & 15) == 0;
-    const int kbeg = blockIdx.z * kslice;
-    const int kend = kbeg + kslice < K ? kbeg + kslice : K;
 
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[FRAG_M][FRAG_N];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[FM][FN];
     #pragma unroll
-    for (int i = 0; i < FRAG_M; ++i)
+    for (int i = 0; i < FM; ++i)
         #pragma unroll
-        for (int j = 0; j < FRAG_N; ++j)
+        for (int j = 0; j < FN; ++j)
             wmma::fill_fragment(acc[i][j], 0.f);
 
-    vae_load_k_major<BM>(A, K, row_base, M, kend, kbeg, k_aligned, As);
-    vae_load_n_major(B, ldb, kbeg, kend, col_base, P, p_aligned, rinv, nw, Bs);
+    vae_load_k_major<TBM>(A, K, row_base, M, K, 0, k_aligned, As);
+    vae_load_n_major<TBN>(B, ldb, 0, K, col_base, P, p_aligned, rinv, nw, Bs);
     __syncthreads();
 
     int stage = 0;
-    for (int k0 = kbeg; k0 < kend; k0 += BK) {
-        const half* Ac = As + stage * BM * LDK;
-        const half* Bc = Bs + stage * BK * LDN;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const half* Ac = As + stage * TBM * LDK;
+        const half* Bc = Bs + stage * BK * LDNT;
         #pragma unroll
         for (int ks = 0; ks < KSTEPS; ++ks) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af[FRAG_M];
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> bf[FRAG_N];
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af[FM];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> bf[FN];
             #pragma unroll
-            for (int i = 0; i < FRAG_M; ++i)
+            for (int i = 0; i < FM; ++i)
                 wmma::load_matrix_sync(af[i],
-                    Ac + (warp_m * WARP_M + i * 16) * LDK + ks * 16, LDK);
+                    Ac + (warp_m * WM + i * 16) * LDK + ks * 16, LDK);
             #pragma unroll
-            for (int j = 0; j < FRAG_N; ++j)
+            for (int j = 0; j < FN; ++j)
                 wmma::load_matrix_sync(bf[j],
-                    Bc + (ks * 16) * LDN + warp_n * WARP_N + j * 16, LDN);
+                    Bc + (ks * 16) * LDNT + warp_n * WN + j * 16, LDNT);
             #pragma unroll
-            for (int i = 0; i < FRAG_M; ++i)
+            for (int i = 0; i < FM; ++i)
                 #pragma unroll
-                for (int j = 0; j < FRAG_N; ++j)
+                for (int j = 0; j < FN; ++j)
                     wmma::mma_sync(acc[i][j], af[i], bf[j], acc[i][j]);
         }
-        if (k0 + BK < kend) {
+        if (k0 + BK < K) {
             const int nx = stage ^ 1;
-            vae_load_k_major<BM>(A, K, row_base, M, kend, k0 + BK, k_aligned,
-                                 As + nx * BM * LDK);
-            vae_load_n_major(B, ldb, k0 + BK, kend, col_base, P, p_aligned,
-                             rinv, nw, Bs + nx * BK * LDN);
+            vae_load_k_major<TBM>(A, K, row_base, M, K, k0 + BK, k_aligned,
+                                  As + nx * TBM * LDK);
+            vae_load_n_major<TBN>(B, ldb, k0 + BK, K, col_base, P, p_aligned,
+                                  rinv, nw, Bs + nx * BK * LDNT);
             __syncthreads();
             stage = nx;
         }
@@ -477,41 +586,23 @@ __global__ __launch_bounds__(THREADS) void vae_gemm_nn_kernel(
     float* stg = (float*)smem_raw + warp * 256;
     const int lane = threadIdx.x & 31;
     #pragma unroll
-    for (int i = 0; i < FRAG_M; ++i) {
+    for (int i = 0; i < FM; ++i) {
         #pragma unroll
-        for (int j = 0; j < FRAG_N; ++j) {
+        for (int j = 0; j < FN; ++j) {
             wmma::store_matrix_sync(stg, acc[i][j], 16, wmma::mem_row_major);
             __syncwarp();
-            const int row0 = row_base + warp_m * WARP_M + i * 16;
-            const int col0 = col_base + warp_n * WARP_N + j * 16;
+            const int row0 = row_base + warp_m * WM + i * 16;
+            const int col0 = col_base + warp_n * WN + j * 16;
             for (int e = lane; e < 256; e += 32) {
                 const int r = row0 + (e >> 4);
                 const int c = col0 + (e & 15);
-                if (r < M && c < P) {
-                    if (part)
-                        part[((size_t)blockIdx.z * M + r) * (size_t)P + c] = stg[e];
-                    else
-                        vae_epilogue<EPI>(stg[e], C, (size_t)r * ldc + c, r,
-                                          bias, gamma);
-                }
+                if (r < M && c < P)
+                    vae_epilogue<EPI>(stg[e], C, (size_t)r * ldc + c, r,
+                                      bias, gamma);
             }
             __syncwarp();
         }
     }
-}
-
-template <int EPI>
-__global__ void vae_splitk_kernel(const float* __restrict__ part, int S,
-                                  int M, int P, half* __restrict__ C,
-                                  int64_t ldc, const half* __restrict__ bias,
-                                  const half* __restrict__ gamma)
-{
-    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (int64_t)M * P) return;
-    const int r = (int)(i / P), c = (int)(i - (int64_t)r * P);
-    float acc = 0.0f;
-    for (int z = 0; z < S; z++) acc += part[(size_t)z * M * P + i];
-    vae_epilogue<EPI>(acc, C, (size_t)r * ldc + c, r, bias, gamma);
 }
 
 /* ─── TN GEMM for the speech connectors ─────────────────────────────────── */
@@ -718,23 +809,37 @@ vv_status_t vv_vae_mixer_dev(const vv_vae_conv_desc_t* d, const void* xin,
 
 } /* extern "C" */
 
+template <int EPI, int TBM, int TBN>
+static void gemm_nn_tile(const half* A, const half* B, int64_t ldb, half* C,
+                         int64_t ldc, int M, int K, int P, const half* bias,
+                         const half* gamma, const float* rinv, const half* nw,
+                         cudaStream_t st) {
+    const size_t stage = (size_t)2 * (TBM * LDK + BK * (TBN + 8)) * sizeof(half);
+    const size_t stg = (size_t)WARPS * 256 * sizeof(float);
+    const size_t shmem = stage > stg ? stage : stg;
+    dim3 grid((P + TBN - 1) / TBN, (M + TBM - 1) / TBM);
+    vae_gemm_nn_kernel<EPI, TBM, TBN><<<grid, THREADS, shmem, st>>>(
+        A, B, ldb, C, ldc, M, K, P, bias, gamma, rinv, nw);
+}
+
+/** Below this many 128 x 128 blocks the card is mostly idle: use 64 x 64. */
+#define VAE_SMALL_GRID 160
+
 template <int EPI>
 static void gemm_nn_launch(const half* A, const half* B, int64_t ldb, half* C,
                            int64_t ldc, int M, int K, int P, const half* bias,
                            const half* gamma, const float* rinv, const half* nw,
-                           float* part, int S, cudaStream_t st) {
-    const size_t shmem = (size_t)2 * (BM * LDK + BK * LDN) * sizeof(half);
-    const int kslice = (K + S - 1) / S;
-    dim3 grid((P + BN - 1) / BN, (M + BM - 1) / BM, S);
-    vae_gemm_nn_kernel<EPI><<<grid, THREADS, shmem, st>>>(
-        A, B, ldb, C, ldc, M, K, P, bias, gamma, rinv, nw,
-        S > 1 ? part : NULL, kslice);
-    if (S > 1) {
-        const int64_t n = (int64_t)M * P;
-        vae_splitk_kernel<EPI><<<(unsigned)((n + VAE_THREADS - 1) / VAE_THREADS),
-                                 VAE_THREADS, 0, st>>>(part, S, M, P, C, ldc,
-                                                       bias, gamma);
+                           int tile, cudaStream_t st) {
+    if (tile == 0) {
+        const int64_t big = (int64_t)((P + 127) / 128) * ((M + 127) / 128);
+        tile = big < VAE_SMALL_GRID ? 64 : 128;
     }
+    if (tile == 64)
+        gemm_nn_tile<EPI, 64, 64>(A, B, ldb, C, ldc, M, K, P, bias, gamma,
+                                  rinv, nw, st);
+    else
+        gemm_nn_tile<EPI, 128, 128>(A, B, ldb, C, ldc, M, K, P, bias, gamma,
+                                    rinv, nw, st);
 }
 
 extern "C" {
@@ -743,16 +848,11 @@ vv_status_t vv_vae_gemm_nn_dev(int epilogue, const void* A, const void* B,
                                int64_t ldb, void* C, int64_t ldc,
                                int M, int K, int P, const void* bias,
                                const void* gamma, const float* rinv,
-                               const void* norm_w, float* ws,
-                               size_t ws_elems, void* stream) {
+                               const void* norm_w, int tile, void* stream) {
     if (!A || !B || !C) return VV_ERR_NULL_PTR;
     if (M <= 0 || K <= 0 || P <= 0) return VV_ERR_INVALID_ARG;
     if ((norm_w != NULL) != (rinv != NULL)) return VV_ERR_INVALID_ARG;
-    const int S = vv_vae_gemm_splitk(K);
-    /* The slices are BK-aligned so every slice sees whole K steps. */
-    if (S > 1 && (((K / S) % BK) != 0 || !ws ||
-                  (size_t)S * (size_t)M * (size_t)P > ws_elems))
-        return VV_ERR_OVERFLOW;
+    if (tile != 0 && tile != 64 && tile != 128) return VV_ERR_INVALID_ARG;
     const cudaStream_t st = (cudaStream_t)stream;
     const half* a = (const half*)A;
     const half* b = (const half*)B;
@@ -760,17 +860,42 @@ vv_status_t vv_vae_gemm_nn_dev(int epilogue, const void* A, const void* B,
     const half* bs = (const half*)bias;
     const half* g = (const half*)gamma;
     const half* nw = (const half*)norm_w;
-    if (epilogue == VAE_EPI_BIAS_GELU)
+    if (epilogue == VV_VAE_EPI_BIAS_GELU)
         gemm_nn_launch<VAE_EPI_BIAS_GELU>(a, b, ldb, c, ldc, M, K, P, bs, g,
-                                          rinv, nw, ws, S, st);
-    else if (epilogue == VAE_EPI_BIAS_RESID)
+                                          rinv, nw, tile, st);
+    else if (epilogue == VV_VAE_EPI_BIAS_RESID)
         gemm_nn_launch<VAE_EPI_BIAS_RESID>(a, b, ldb, c, ldc, M, K, P, bs, g,
-                                           rinv, nw, ws, S, st);
-    else if (epilogue == VAE_EPI_BIAS)
+                                           rinv, nw, tile, st);
+    else if (epilogue == VV_VAE_EPI_BIAS)
         gemm_nn_launch<VAE_EPI_BIAS>(a, b, ldb, c, ldc, M, K, P, bs, g,
-                                     rinv, nw, ws, S, st);
+                                     rinv, nw, tile, st);
     else
         return VV_ERR_INVALID_ARG;
+    return launch_status();
+}
+
+vv_status_t vv_vae_conv_gemm_dev(const vv_vae_conv_desc_t* d, const void* w,
+                                 const void* col, int64_t ldcol, const void* b,
+                                 void* y, int64_t ld_out, int out_ch, int K,
+                                 int64_t p0, int pc, void* stream) {
+    if (!w || !col) return VV_ERR_NULL_PTR;
+    if (out_ch <= 0 || K <= 0) return VV_ERR_INVALID_ARG;
+    if (!y && (!d || d->n <= 0 || d->n > VV_VAE_MAX_ITEMS))
+        return VV_ERR_INVALID_ARG;
+    if (pc <= 0) return VV_OK;
+    dim3 grid((pc + CG_BN - 1) / CG_BN, (out_ch + CG_BM - 1) / CG_BM);
+    const cudaStream_t st = (cudaStream_t)stream;
+    if (y) {
+        vv_vae_conv_desc_t none;
+        memset(&none, 0, sizeof(none));
+        vae_conv_gemm_kernel<false><<<grid, 256, 0, st>>>(
+            (const half*)w, (const half*)col, ldcol, (half*)y, ld_out, out_ch,
+            K, pc, (const half*)b, none, p0);
+    } else {
+        vae_conv_gemm_kernel<true><<<grid, 256, 0, st>>>(
+            (const half*)w, (const half*)col, ldcol, NULL, 0, out_ch, K, pc,
+            (const half*)b, *d, p0);
+    }
     return launch_status();
 }
 

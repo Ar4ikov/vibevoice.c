@@ -614,31 +614,34 @@ vv_status_t vv_vae_im2col_dev(const vv_vae_conv_desc_t* d, const void* x,
                               void* stream);
 
 /**
- * @brief K slices a Conv-VAE GEMM of depth K is split into.
+ * @brief The conv over im2col columns (vv_vae_im2col_dev): y = w @ col + b.
  *
- * A function of K alone, never of the column count: the stage-5/6 GEMMs
- * have a few hundred columns and would otherwise run on 32 blocks, but a
- * split that depended on how many items share a launch would make an
- * item's result depend on its neighbours.
+ * FP32 on the CUDA cores, each output summing its products in the direct
+ * kernel's (in channel, tap) order, so the result is bit-identical to
+ * vv_vae_conv_dev. `w` is [out_ch][K] with K = in_ch * k.
+ * @param y   Packed channel-first output (already offset to column p0),
+ *            stride ld_out; NULL writes the transposed rows of the items in
+ *            `d` instead (the head), column q being packed column p0 + q.
  */
-static inline int vv_vae_gemm_splitk(int K) {
-    return (K >= 2048 && K % 1024 == 0) ? K / 1024 : 1;
-}
+vv_status_t vv_vae_conv_gemm_dev(const vv_vae_conv_desc_t* d, const void* w,
+                                 const void* col, int64_t ldcol, const void* b,
+                                 void* y, int64_t ld_out, int out_ch, int K,
+                                 int64_t p0, int pc, void* stream);
 
 /**
  * @brief C[M, P] (stride ldc) from A[M, K] @ B[K, P] (stride ldb).
  * @param rinv, norm_w  Both or neither: B is RMS-normalised while it is
  *                      staged, B[k][p] * rinv[p] * norm_w[k].
- * @param ws, ws_elems  FP32 scratch for the split-K partials, at least
- *                      vv_vae_gemm_splitk(K) * M * P elements when that is
- *                      more than one; the slices are summed in order.
+ * @param tile          64 or 128 (block tile edge), or 0 to choose from the
+ *                      grid size. Every element sums its K products in the
+ *                      same order whatever the tile, so the bits do not
+ *                      depend on it.
  */
 vv_status_t vv_vae_gemm_nn_dev(int epilogue, const void* A, const void* B,
                                int64_t ldb, void* C, int64_t ldc,
                                int M, int K, int P, const void* bias,
                                const void* gamma, const float* rinv,
-                               const void* norm_w, float* ws,
-                               size_t ws_elems, void* stream);
+                               const void* norm_w, int tile, void* stream);
 
 /** @brief Where the rows of a TN GEMM go (speech connectors). */
 #define VV_VAE_ROWS_PLAIN        0  /**< C[r][c], stride ldc                  */
