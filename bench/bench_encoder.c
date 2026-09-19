@@ -3,13 +3,18 @@
  * @brief Speech front end throughput: one clip, then N at once.
  *
  *   vv_bench_encoder --model DIR --audio WAV [--conc 1,4,8] [--reps 5]
- *                    [--cpu-encoder]
+ *                    [--cpu-encoder] [--behind LONG_WAV [--delay-ms 300]]
  *
  * Loads the model on device 0, then times the front end alone — both
  * Conv-VAE encoders and both connectors, audio in, prompt rows out — for
  * one clip, and for N threads submitting the same clip at once, with the
  * batching service and without it. Prints milliseconds per second of audio,
  * the best of --reps runs (the box is shared; the best is the signal).
+ *
+ * --behind LONG_WAV: through the service, submit the long clip, then after
+ * --delay-ms the short one, and report how long the short one took next to
+ * how long it takes alone -- the latency of a short request that arrives
+ * while a long file is being encoded.
  */
 
 #include "vibevoice/vibevoice.h"
@@ -33,12 +38,14 @@ typedef struct {
     int                   hs;
     void*                 done;
     vv_status_t           status;
+    double                t_start;
     double                t_end;
 } worker_t;
 
 static VV_THREAD_RET worker_main(void* arg) {
     worker_t* w = (worker_t*)arg;
     vv_dev_set_device(0);
+    w->t_start = vv_time_ms();
     vv_frontend_job_t job;
     memset(&job, 0, sizeof(job));
     vv_frontend_stream_reset(w->st);
@@ -74,12 +81,17 @@ int main(int argc, char** argv) {
     const char* conc_list = "1,4,8";
     int reps = 5;
     bool cpu_enc = false;
+    const char* behind = NULL;
+    int delay_ms = 300;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--audio") && i + 1 < argc) wav = argv[++i];
         else if (!strcmp(argv[i], "--conc") && i + 1 < argc) conc_list = argv[++i];
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cpu-encoder")) cpu_enc = true;
+        else if (!strcmp(argv[i], "--behind") && i + 1 < argc) behind = argv[++i];
+        else if (!strcmp(argv[i], "--delay-ms") && i + 1 < argc)
+            delay_ms = atoi(argv[++i]);
     }
     if (!model || !wav) {
         fprintf(stderr, "usage: %s --model DIR --audio WAV [--conc 1,4,8] "
@@ -160,6 +172,56 @@ int main(int argc, char** argv) {
                    c, best, best / (sec * c), (double)(l1 - l0) / reps);
         }
         if (svc) vv_frontend_service_stop(fe);
+    }
+
+    if (behind) {
+        float* la = NULL;
+        int ln = 0;
+        if (vv_audio_preprocess(behind, &la, &ln) != VV_OK) {
+            fprintf(stderr, "cannot read %s\n", behind);
+            return 1;
+        }
+        worker_t lw;
+        memset(&lw, 0, sizeof(lw));
+        lw.fe = fe;
+        lw.audio = la;
+        lw.n = ln;
+        lw.hs = hs;
+        const int lf = vv_frontend_frames(fe, ln);
+        vv_frontend_stream_create(fe, &lw.st);
+        vv_dev_alloc(&lw.rows, (size_t)lf * hs * 2);
+        vv_dev_event_create(&lw.done);
+        vv_frontend_service_start(fe, 0);
+        double alone = 1e30, best_short = 1e30, best_long = 1e30;
+        for (int r = 0; r < reps; r++) {
+            if (run_conc(w, 1) < 0) return 1;
+            const double a = w[0].t_end - w[0].t_start;
+            if (a < alone) alone = a;
+        }
+        for (int r = 0; r < reps; r++) {
+            vv_thread_t tl, ts;
+            vv_thread_start(&tl, worker_main, &lw);
+            vv_sleep_ms(delay_ms);
+            vv_thread_start(&ts, worker_main, &w[0]);
+            vv_thread_join(ts);
+            vv_thread_join(tl);
+            if (lw.status != VV_OK || w[0].status != VV_OK) {
+                fprintf(stderr, "run failed\n");
+                return 1;
+            }
+            const double sl = w[0].t_end - w[0].t_start;
+            const double ll = lw.t_end - lw.t_start;
+            if (sl < best_short) best_short = sl;
+            if (ll < best_long) best_long = ll;
+        }
+        vv_frontend_service_stop(fe);
+        printf("behind   short alone %.1f ms; short %d ms after a %.1f s clip: "
+               "%.1f ms (the long clip: %.1f ms)\n", alone, delay_ms,
+               (double)ln / 24000.0, best_short, best_long);
+        vv_frontend_stream_free(lw.st);
+        vv_dev_free(lw.rows);
+        vv_dev_event_destroy(lw.done);
+        vv_free(la);
     }
 
     if (cpu_enc && ctx->acoustic_encoder && ctx->semantic_encoder) {

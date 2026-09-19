@@ -17,8 +17,10 @@
  * the way allocates, frees or synchronises the device.
  *
  * With the service started (serve --slots > 1), requests from all slots of
- * the device go through one worker that waits a few milliseconds for more
- * work before launching, so concurrent requests share launches.
+ * the device go through one worker. It schedules launches, not jobs: before
+ * each launch it takes in what has arrived, so concurrent requests share
+ * launches and a short request that arrives while a long file is encoding
+ * goes out in the long file's next launch rather than after all of it.
  */
 #ifndef VV_FRONTEND_H
 #define VV_FRONTEND_H
@@ -37,11 +39,10 @@ typedef struct vv_frontend_stream vv_frontend_stream_t;
 typedef struct vv_frontend_params {
     int     max_items;    /**< jobs per launch (<= VV_VAE_MAX_ITEMS)      */
     int64_t max_samples;  /**< 24 kHz samples per launch, all jobs summed */
-    int     gather_us;    /**< service: wait this long for more jobs      */
 } vv_frontend_params_t;
 
 /**
- * @brief Defaults: 16 jobs, 30 s of audio per launch, 2 ms gather window.
+ * @brief Defaults: 16 jobs, 30 s of audio per launch.
  * VV_ENC_BATCH_SEC overrides the seconds per launch.
  */
 vv_frontend_params_t vv_frontend_params_default(void);
@@ -111,13 +112,15 @@ typedef struct vv_frontend_job {
 /**
  * @brief Run jobs now on the calling thread; returns once everything is
  * enqueued (not finished — wait on each job's done_event). Jobs larger than
- * a launch are split, their state carried across the pieces.
+ * a launch are split, their state carried across the pieces. The front end
+ * is locked one launch at a time, so other callers interleave.
  */
 vv_status_t vv_frontend_run(vv_frontend_t* fe, vv_frontend_job_t* jobs, int n);
 
 /**
  * @brief Submit one job: through the service when it runs, else directly.
- * Returns once the job is enqueued on the device.
+ * Returns once the job is enqueued on the device (its last launch, not the
+ * whole batch it shared launches with).
  */
 vv_status_t vv_frontend_submit(vv_frontend_t* fe, vv_frontend_job_t* job);
 
