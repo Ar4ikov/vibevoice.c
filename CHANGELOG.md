@@ -9,6 +9,17 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- `--cpu` now wins over `--gpus` / `--gpu-memory` ([#33](https://github.com/Ar4ikov/vibevoice.c/issues/33)):
+  the device flags are no longer evaluated under it. `--gpus all --cpu`
+  on a machine with no visible GPU used to exit with `gpus: 'all' asked
+  for, but no device is visible`, which is what a CPU-only GPUStack
+  replica ran into. `serve`, `chat`, `mic` and the file command share one
+  `vv_gpu_set_from_flags()` instead of three copies.
+- `serve` no longer warns `raise --slots to use them all` when a layer
+  split already uses every device. Under `--split-mode auto` fewer slots
+  than devices means a layer split, so the warning now fires only for an
+  explicit `--split-mode replica`, where devices do sit idle.
+
 ## [0.4.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.3.0...v0.4.0) — 2026-09-19
 
 - **`microsoft/VibeVoice-ASR-Streaming-7B` runs** ([#20](https://github.com/Ar4ikov/vibevoice.c/issues/20)):
