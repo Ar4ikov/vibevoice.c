@@ -566,7 +566,7 @@ the performance cores. **There is no Metal backend.** See "Not done" below.
 VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
-Eighteen suites. The ones that need weights report SKIP without
+Twenty-one suites. The ones that need weights report SKIP without
 `VV_TEST_MODEL`. `test_cpu_kernels` checks every CPU kernel against a scalar
 reference, which is what makes the SIMD paths verifiable per architecture —
 it passes natively on AVX2 and under `qemu-aarch64` on NEON, both to 4e-7
