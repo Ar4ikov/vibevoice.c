@@ -379,9 +379,9 @@ vv_status_t vv_vae_gemm_nn_dev(int ep, const void* A, const void* B,
 vv_status_t vv_vae_conv_gemm_dev(const vv_vae_conv_desc_t* d, const void* w,
                                  const void* col, int64_t ldcol, const void* b,
                                  void* y, int64_t ld_out, int out_ch, int K,
-                                 int64_t p0, int pc, void* stream) {
+                                 int64_t p0, int pc, int tile, void* stream) {
     U(d) U(w) U(col) U(ldcol) U(b) U(y) U(ld_out) U(out_ch) U(K) U(p0) U(pc)
-    U(stream) return VV_ERR_UNSUPPORTED;
+    U(tile) U(stream) return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_vae_gemm_tn_dev(const void* A, int64_t lda, const void* B,
                                void* C, int64_t ldc, int M, int N, int K,

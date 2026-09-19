@@ -619,14 +619,16 @@ vv_status_t vv_vae_im2col_dev(const vv_vae_conv_desc_t* d, const void* x,
  * FP32 on the CUDA cores, each output summing its products in the direct
  * kernel's (in channel, tap) order, so the result is bit-identical to
  * vv_vae_conv_dev. `w` is [out_ch][K] with K = in_ch * k.
- * @param y   Packed channel-first output (already offset to column p0),
- *            stride ld_out; NULL writes the transposed rows of the items in
- *            `d` instead (the head), column q being packed column p0 + q.
+ * @param y     Packed channel-first output (already offset to column p0),
+ *              stride ld_out; NULL writes the transposed rows of the items
+ *              in `d` instead (the head), column q being packed column p0 + q.
+ * @param tile  16, 32 or 64 (block tile edge), or 0 to pick the widest that
+ *              fills the card. The bits do not depend on it.
  */
 vv_status_t vv_vae_conv_gemm_dev(const vv_vae_conv_desc_t* d, const void* w,
                                  const void* col, int64_t ldcol, const void* b,
                                  void* y, int64_t ld_out, int out_ch, int K,
-                                 int64_t p0, int pc, void* stream);
+                                 int64_t p0, int pc, int tile, void* stream);
 
 /**
  * @brief C[M, P] (stride ldc) from A[M, K] @ B[K, P] (stride ldb).

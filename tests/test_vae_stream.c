@@ -996,27 +996,8 @@ static void test_conv_gemm(void* stream) {
     }
     (void)T_in;
 
-    /* Packed: direct vs two im2col windows (41 + 22 columns). */
-    vv_status_t st = vv_vae_conv_dev(&d, dx, ld_in, dw, db, dy1, ld_out, IC, OC,
-                                     KW, SD, false, stream);
-    const int cut = 41;
-    for (int part = 0; part < 2 && st == VV_OK; part++) {
-        const int64_t p0 = part ? cut : 0;
-        const int pc = part ? T_out - cut : cut;
-        st = vv_vae_im2col_dev(&d, dx, ld_in, IC, KW, SD, p0, pc, dcol, 64,
-                               stream);
-        if (st == VV_OK)
-            st = vv_vae_conv_gemm_dev(NULL, dw, dcol, 64, db,
-                                      (uint16_t*)dy2 + p0, ld_out, OC, Kc, p0,
-                                      pc, stream);
-    }
-    TEST_ASSERT(st == VV_OK, "conv GEMM runs (packed)");
-    uint16_t* y1 = download(dy1, (size_t)OC * ld_out, stream);
-    uint16_t* y2 = download(dy2, (size_t)OC * ld_out, stream);
-    TEST_ASSERT(memcmp(y1, y2, (size_t)OC * ld_out * 2) == 0,
-                "conv GEMM == direct conv, packed, bit for bit");
-
-    /* Transposed rows with a skipped head frame: the head's layout. */
+    /* The direct kernel, packed and transposed with a skipped head frame
+       (the head's layout). */
     vv_vae_conv_desc_t d1 = d, d2 = d;
     for (int i = 0; i < 2; i++) {
         const size_t r0 = i ? (size_t)out_len[0] : 0;
@@ -1025,24 +1006,48 @@ static void test_conv_gemm(void* stream) {
         d1.it[i].out_ld = d2.it[i].out_ld = OLD;
         d1.it[i].skip = d2.it[i].skip = i == 0 ? skip0 : 0;
     }
-    st = vv_vae_conv_dev(&d1, dx, ld_in, dw, db, NULL, 0, IC, OC, KW, SD, true,
-                         stream);
-    for (int part = 0; part < 2 && st == VV_OK; part++) {
-        const int64_t p0 = part ? cut : 0;
-        const int pc = part ? T_out - cut : cut;
-        st = vv_vae_im2col_dev(&d2, dx, ld_in, IC, KW, SD, p0, pc, dcol, 64,
-                               stream);
-        if (st == VV_OK)
-            st = vv_vae_conv_gemm_dev(&d2, dw, dcol, 64, db, NULL, 0, OC, Kc,
-                                      p0, pc, stream);
-    }
-    TEST_ASSERT(st == VV_OK, "conv GEMM runs (transposed)");
+    vv_status_t st = vv_vae_conv_dev(&d, dx, ld_in, dw, db, dy1, ld_out, IC, OC,
+                                     KW, SD, false, stream);
+    if (st == VV_OK)
+        st = vv_vae_conv_dev(&d1, dx, ld_in, dw, db, NULL, 0, IC, OC, KW, SD,
+                             true, stream);
+    uint16_t* y1 = download(dy1, (size_t)OC * ld_out, stream);
     uint16_t* r1 = download(dr1, rows_elems, stream);
-    uint16_t* r2 = download(dr2, rows_elems, stream);
-    TEST_ASSERT(memcmp(r1, r2, rows_elems * 2) == 0,
-                "conv GEMM == direct conv, transposed with skip, bit for bit");
 
-    vv_free(y1); vv_free(y2); vv_free(r1); vv_free(r2);
+    /* Every tile shape, over two im2col windows (41 + 22 columns). */
+    const int tiles[4] = { 0, 16, 32, 64 };
+    const int cut = 41;
+    int ok_run = st == VV_OK, ok_packed = 1, ok_rows = 1;
+    for (int ti = 0; ti < 4; ti++) {
+        vv_dev_memset_async(dy2, 0, (size_t)OC * ld_out * 2, stream);
+        vv_dev_memset_async(dr2, 0, rows_elems * 2, stream);
+        for (int part = 0; part < 2 && st == VV_OK; part++) {
+            const int64_t p0 = part ? cut : 0;
+            const int pc = part ? T_out - cut : cut;
+            st = vv_vae_im2col_dev(&d, dx, ld_in, IC, KW, SD, p0, pc, dcol, 64,
+                                   stream);
+            if (st == VV_OK)
+                st = vv_vae_conv_gemm_dev(NULL, dw, dcol, 64, db,
+                                          (uint16_t*)dy2 + p0, ld_out, OC, Kc,
+                                          p0, pc, tiles[ti], stream);
+            if (st == VV_OK)
+                st = vv_vae_conv_gemm_dev(&d2, dw, dcol, 64, db, NULL, 0, OC,
+                                          Kc, p0, pc, tiles[ti], stream);
+        }
+        ok_run &= st == VV_OK;
+        uint16_t* y2 = download(dy2, (size_t)OC * ld_out, stream);
+        uint16_t* r2 = download(dr2, rows_elems, stream);
+        ok_packed &= memcmp(y1, y2, (size_t)OC * ld_out * 2) == 0;
+        ok_rows &= memcmp(r1, r2, rows_elems * 2) == 0;
+        vv_free(y2);
+        vv_free(r2);
+    }
+    TEST_ASSERT(ok_run, "conv GEMM runs with every tile");
+    TEST_ASSERT(ok_packed, "conv GEMM == direct conv, packed, every tile, bit for bit");
+    TEST_ASSERT(ok_rows,
+                "conv GEMM == direct conv, transposed with skip, every tile, bit for bit");
+
+    vv_free(y1); vv_free(r1);
     vv_dev_stream_sync(stream);
     vv_dev_free(dx); vv_dev_free(dw); vv_dev_free(dtl); vv_dev_free(db);
     vv_dev_free(dy1); vv_dev_free(dy2); vv_dev_free(dcol);

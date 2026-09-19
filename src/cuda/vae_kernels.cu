@@ -165,74 +165,110 @@ __global__ void vae_im2col_kernel(vv_vae_conv_desc_t d, const half* __restrict__
  * products one at a time, fused, in (in channel, tap) order starting from
  * zero, then the bias -- exactly what vae_conv_kernel does, so the bits are
  * the same (a zero column past the input adds +0 to a sum that cannot be
- * -0). What changes is reuse: a 64 x 64 tile shares each loaded weight and
- * input across 64 outputs instead of loading a pair per multiply-add.
+ * -0). What changes is reuse: a tile shares each loaded weight and input
+ * across many outputs instead of loading a pair per multiply-add.
+ *
+ * TM x TN outputs per block of 256 threads, RM x RN per thread, TBK deep
+ * per shared-memory stage; each thread loads four consecutive values of A
+ * and of B per stage in every shape. The shape only decides which thread
+ * computes an output, so every shape gives the same bits, and the launcher
+ * picks the widest that still fills the card: the deep stages and the head
+ * have a few hundred columns and would otherwise run on a handful of blocks.
  *
  * TRANSPOSED writes packed output column p0 + q of item i as row
  * (t - skip) of its [frame][out_ld] destination (the head).
  */
-#define CG_BM 64
-#define CG_BN 64
-#define CG_BK 16
-
-template <bool TRANSPOSED>
+template <bool TRANSPOSED, int TM, int TN, int RM, int RN, int TBK>
 __global__ void __launch_bounds__(256) vae_conv_gemm_kernel(
     const half* __restrict__ A, const half* __restrict__ B, int64_t ldb,
     half* __restrict__ C, int64_t ldc, int M, int K, int P,
     const half* __restrict__ bias, vv_vae_conv_desc_t d, int64_t p0)
 {
-    __shared__ __align__(16) float As[CG_BK][CG_BM];
-    __shared__ __align__(16) float Bs[CG_BK][CG_BN];
+    static_assert((TM / RM) * (TN / RN) == 256, "256 threads");
+    static_assert(TM * TBK == 1024 && TBK * TN == 1024, "4 loads per thread");
+    __shared__ __align__(16) float As[TBK][TM];
+    __shared__ __align__(16) float Bs[TBK][TN];
 
     const int tid = threadIdx.x;
-    const int tx = tid & 15, ty = tid >> 4;
-    const int row_base = blockIdx.y * CG_BM;
-    const int col_base = blockIdx.x * CG_BN;
-    const int ar = tid >> 2, ac = (tid & 3) * 4;
-    const int br = tid >> 4, bc = (tid & 15) * 4;
+    const int tx = tid % (TN / RN), ty = tid / (TN / RN);
+    const int row_base = blockIdx.y * TM;
+    const int col_base = blockIdx.x * TN;
+    const int ar = tid / (TBK / 4), ac = (tid % (TBK / 4)) * 4;
+    const int br = tid / (TN / 4), bc = (tid % (TN / 4)) * 4;
+    const bool a_vec = (K & 3) == 0 && (((uintptr_t)A) & 7) == 0;
+    const bool b_vec = (ldb & 3) == 0 && (((uintptr_t)B) & 7) == 0;
 
-    float acc[4][4];
+    float acc[RM][RN];
     #pragma unroll
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < RM; i++)
         #pragma unroll
-        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+        for (int j = 0; j < RN; j++) acc[i][j] = 0.0f;
 
-    for (int k0 = 0; k0 < K; k0 += CG_BK) {
-        {
-            const int gr = row_base + ar;
+    /* Global -> registers for the next stage while this one computes. */
+    float ra[4], rb[4];
+    auto fetch = [&](int k0) {
+        const int gr = row_base + ar;
+        const int gk = k0 + ac;
+        if (a_vec && gr < M && gk + 4 <= K) {
+            const uint2 raw = *(const uint2*)(A + (size_t)gr * K + gk);
+            const half* h = (const half*)&raw;
             #pragma unroll
-            for (int t = 0; t < 4; t++) {
-                const int kk = k0 + ac + t;
-                As[ac + t][ar] = (gr < M && kk < K)
-                    ? __half2float(A[(size_t)gr * K + kk]) : 0.0f;
-            }
-            const int gk = k0 + br;
+            for (int t = 0; t < 4; t++) ra[t] = __half2float(h[t]);
+        } else {
             #pragma unroll
-            for (int t = 0; t < 4; t++) {
-                const int gc = col_base + bc + t;
-                Bs[br][bc + t] = (gk < K && gc < P)
-                    ? __half2float(B[(size_t)gk * ldb + gc]) : 0.0f;
-            }
+            for (int t = 0; t < 4; t++)
+                ra[t] = (gr < M && gk + t < K)
+                      ? __half2float(A[(size_t)gr * K + gk + t]) : 0.0f;
         }
-        __syncthreads();
-        #pragma unroll
-        for (int kk = 0; kk < CG_BK; kk++) {
-            const float4 a = *(const float4*)&As[kk][ty * 4];
-            const float4 b = *(const float4*)&Bs[kk][tx * 4];
-            const float av[4] = { a.x, a.y, a.z, a.w };
-            const float bv[4] = { b.x, b.y, b.z, b.w };
+        const int bk = k0 + br;
+        const int gc = col_base + bc;
+        if (b_vec && bk < K && gc + 4 <= P) {
+            const uint2 raw = *(const uint2*)(B + (size_t)bk * ldb + gc);
+            const half* h = (const half*)&raw;
             #pragma unroll
-            for (int i = 0; i < 4; i++)
+            for (int t = 0; t < 4; t++) rb[t] = __half2float(h[t]);
+        } else {
+            #pragma unroll
+            for (int t = 0; t < 4; t++)
+                rb[t] = (bk < K && gc + t < P)
+                      ? __half2float(B[(size_t)bk * ldb + gc + t]) : 0.0f;
+        }
+    };
+    auto stash = [&]() {
+        #pragma unroll
+        for (int t = 0; t < 4; t++) As[ac + t][ar] = ra[t];
+        *(float4*)&Bs[br][bc] = make_float4(rb[0], rb[1], rb[2], rb[3]);
+    };
+
+    fetch(0);
+    stash();
+    __syncthreads();
+    for (int k0 = 0; k0 < K; k0 += TBK) {
+        const bool more = k0 + TBK < K;
+        if (more) fetch(k0 + TBK);
+        #pragma unroll
+        for (int kk = 0; kk < TBK; kk++) {
+            float av[RM], bv[RN];
+            #pragma unroll
+            for (int i = 0; i < RM; i++) av[i] = As[kk][ty * RM + i];
+            #pragma unroll
+            for (int j = 0; j < RN; j++) bv[j] = Bs[kk][tx * RN + j];
+            #pragma unroll
+            for (int i = 0; i < RM; i++)
                 #pragma unroll
-                for (int j = 0; j < 4; j++)
+                for (int j = 0; j < RN; j++)
                     acc[i][j] = __fmaf_rn(av[i], bv[j], acc[i][j]);
         }
         __syncthreads();
+        if (more) {
+            stash();
+            __syncthreads();
+        }
     }
 
     #pragma unroll
-    for (int j = 0; j < 4; j++) {
-        const int c = col_base + tx * 4 + j;
+    for (int j = 0; j < RN; j++) {
+        const int c = col_base + tx * RN + j;
         if (c >= P) continue;
         half* dst = NULL;
         int64_t step = 0;
@@ -250,8 +286,8 @@ __global__ void __launch_bounds__(256) vae_conv_gemm_kernel(
             step = ldc;
         }
         #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            const int r = row_base + ty * 4 + i;
+        for (int i = 0; i < RM; i++) {
+            const int r = row_base + ty * RM + i;
             if (r >= M) continue;
             float v = acc[i][j];
             if (bias) v += __half2float(bias[r]);
@@ -822,6 +858,41 @@ static void gemm_nn_tile(const half* A, const half* B, int64_t ldb, half* C,
         A, B, ldb, C, ldc, M, K, P, bias, gamma, rinv, nw);
 }
 
+/** Fewer blocks than this leave most of an 82-SM card idle. */
+#define VAE_CONV_GRID 240
+
+template <bool TR, int TM, int TN, int RM, int RN, int TBK>
+static void conv_gemm_tile(const half* A, const half* B, int64_t ldb, half* C,
+                           int64_t ldc, int M, int K, int P, const half* bias,
+                           const vv_vae_conv_desc_t& d, int64_t p0,
+                           cudaStream_t st) {
+    dim3 grid((P + TN - 1) / TN, (M + TM - 1) / TM);
+    vae_conv_gemm_kernel<TR, TM, TN, RM, RN, TBK><<<grid, 256, 0, st>>>(
+        A, B, ldb, C, ldc, M, K, P, bias, d, p0);
+}
+
+/** The widest conv GEMM tile that still gives the card enough blocks. */
+template <bool TR>
+static void conv_gemm_launch(const half* A, const half* B, int64_t ldb, half* C,
+                             int64_t ldc, int M, int K, int P, const half* bias,
+                             const vv_vae_conv_desc_t& d, int64_t p0, int tile,
+                             cudaStream_t st) {
+    if (tile == 0) {
+        const int64_t b64 = (int64_t)((P + 63) / 64) * ((M + 63) / 64);
+        const int64_t b32 = (int64_t)((P + 31) / 32) * ((M + 31) / 32);
+        tile = b64 >= VAE_CONV_GRID ? 64 : b32 >= VAE_CONV_GRID ? 32 : 16;
+    }
+    if (tile == 64)
+        conv_gemm_tile<TR, 64, 64, 4, 4, 16>(A, B, ldb, C, ldc, M, K, P, bias,
+                                             d, p0, st);
+    else if (tile == 32)
+        conv_gemm_tile<TR, 32, 32, 2, 2, 32>(A, B, ldb, C, ldc, M, K, P, bias,
+                                             d, p0, st);
+    else
+        conv_gemm_tile<TR, 16, 16, 1, 1, 64>(A, B, ldb, C, ldc, M, K, P, bias,
+                                             d, p0, st);
+}
+
 /** Below this many 128 x 128 blocks the card is mostly idle: use 64 x 64. */
 #define VAE_SMALL_GRID 160
 
@@ -877,25 +948,26 @@ vv_status_t vv_vae_gemm_nn_dev(int epilogue, const void* A, const void* B,
 vv_status_t vv_vae_conv_gemm_dev(const vv_vae_conv_desc_t* d, const void* w,
                                  const void* col, int64_t ldcol, const void* b,
                                  void* y, int64_t ld_out, int out_ch, int K,
-                                 int64_t p0, int pc, void* stream) {
+                                 int64_t p0, int pc, int tile, void* stream) {
     if (!w || !col) return VV_ERR_NULL_PTR;
     if (out_ch <= 0 || K <= 0) return VV_ERR_INVALID_ARG;
+    if (tile != 0 && tile != 16 && tile != 32 && tile != 64)
+        return VV_ERR_INVALID_ARG;
     if (!y && (!d || d->n <= 0 || d->n > VV_VAE_MAX_ITEMS))
         return VV_ERR_INVALID_ARG;
     if (pc <= 0) return VV_OK;
-    dim3 grid((pc + CG_BN - 1) / CG_BN, (out_ch + CG_BM - 1) / CG_BM);
+    vv_vae_conv_desc_t none;
+    memset(&none, 0, sizeof(none));
+    const vv_vae_conv_desc_t& dd = y ? none : *d;
     const cudaStream_t st = (cudaStream_t)stream;
-    if (y) {
-        vv_vae_conv_desc_t none;
-        memset(&none, 0, sizeof(none));
-        vae_conv_gemm_kernel<false><<<grid, 256, 0, st>>>(
-            (const half*)w, (const half*)col, ldcol, (half*)y, ld_out, out_ch,
-            K, pc, (const half*)b, none, p0);
-    } else {
-        vae_conv_gemm_kernel<true><<<grid, 256, 0, st>>>(
-            (const half*)w, (const half*)col, ldcol, NULL, 0, out_ch, K, pc,
-            (const half*)b, *d, p0);
-    }
+    if (y)
+        conv_gemm_launch<false>((const half*)w, (const half*)col, ldcol,
+                                (half*)y, ld_out, out_ch, K, pc,
+                                (const half*)b, dd, p0, tile, st);
+    else
+        conv_gemm_launch<true>((const half*)w, (const half*)col, ldcol, NULL,
+                               0, out_ch, K, pc, (const half*)b, dd, p0, tile,
+                               st);
     return launch_status();
 }
 

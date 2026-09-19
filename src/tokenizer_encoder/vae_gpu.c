@@ -639,7 +639,7 @@ vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
                                                  w->ds_b[st],
                                                  (uint16_t*)a->act[cur ^ 1] + p0,
                                                  ld2, L->out_ch, Kc, p0,
-                                                 (int)pc, stream);
+                                                 (int)pc, 0, stream);
                 }
                 if (s != VV_OK) return s;
             }
@@ -689,7 +689,7 @@ vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
             if (s == VV_OK)
                 s = vv_vae_conv_gemm_dev(&d, w->head_w, a->hid, ldc, w->head_b,
                                          NULL, 0, L->out_ch, Kc, p0, (int)pc,
-                                         stream);
+                                         0, stream);
         }
     }
     if (s == VV_OK) s = vv_vae_tail_dev(&d, a->act[cur], ld, L->in_ch, stream);
