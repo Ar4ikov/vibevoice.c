@@ -258,6 +258,20 @@ static void share_uploaded(vv_tensor_t* t, void* dev) {
     t->on_gpu = true;           /* the context frees it, not vv_tensor_free */
 }
 
+/** @brief Host bytes release_encoder_host_weights() will hand back. */
+static size_t encoder_host_bytes(const vv_model_t* m) {
+    size_t n = 0;
+    for (int i = 0; i < m->n_acoustic_weights; i++)
+        if (m->acoustic_weights[i].tensor.data &&
+            !m->acoustic_weights[i].tensor.on_gpu)
+            n += m->acoustic_weights[i].tensor.size_bytes;
+    for (int i = 0; i < m->n_semantic_weights; i++)
+        if (m->semantic_weights[i].tensor.data &&
+            !m->semantic_weights[i].tensor.on_gpu)
+            n += m->semantic_weights[i].tensor.size_bytes;
+    return n;
+}
+
 static void release_encoder_host_weights(vv_inference_ctx_t* c) {
     vv_model_t* m = c->model;
     if (c->acoustic_encoder) vv_conv_vae_forget_host_weights(c->acoustic_encoder);
@@ -747,8 +761,20 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
          * the cap is honoured by the placement decision itself rather than
          * checked once the weights are already uploaded.
          */
-        size_t available = vv_gpu_budget(&p.gpus, c->gpu_index,
-                                         p.vram_budget);
+        size_t per_layer = calc_per_layer_gpu_bytes(c->model);
+        size_t all_layers = per_layer * (size_t)c->primary_layers;
+        size_t embed_sz = c->model->embed_tokens.size_bytes;
+        size_t lm_head_sz = lm_head_own_bytes(c->model);
+        /*
+         * On unified memory those three are host bytes that placing them
+         * gives back, so they are part of what the budget can spend; on a
+         * discrete card they are a second copy across a bus, and are not.
+         */
+        const size_t reclaimable = vv_dev_host_shares_memory(c->gpu_id)
+            ? all_layers + embed_sz + lm_head_sz
+              + encoder_host_bytes(c->model) : 0;
+        size_t available = vv_gpu_budget_reclaim(&p.gpus, c->gpu_index,
+                                                 p.vram_budget, reclaimable);
         /*
          * Three things come out of the budget before anything is placed,
          * because all three are spent on the device and none of them are
@@ -767,11 +793,6 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
                  (double)vv_gpu_reserved(&p.gpus, c->gpu_index) / (1024.0*1024.0),
                  (double)frontend / (1024.0*1024.0));
         available = available > reserve ? available - reserve : 0;
-
-        size_t per_layer = calc_per_layer_gpu_bytes(c->model);
-        size_t all_layers = per_layer * (size_t)c->primary_layers;
-        size_t embed_sz = c->model->embed_tokens.size_bytes;
-        size_t lm_head_sz = lm_head_own_bytes(c->model);
 
         size_t kv_per_token = vv_kv_cache_bytes(
             c->primary_layers, llm->num_key_value_heads,

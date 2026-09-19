@@ -243,6 +243,34 @@ size_t vv_gpu_reserved(const vv_gpu_set_t* set, int index) {
     return total > freem ? total - freem : 0;
 }
 
+/**
+ * @brief The budget when `reclaimable` host bytes come back as it is spent.
+ *
+ * Where the GPU's memory is the machine's, the weights this decision is
+ * about are already in RAM, and uploading one frees the host copy it came
+ * from: placing it is a memcpy, not another gigabyte. Those bytes belong in
+ * the budget, or a Mac decides it cannot afford the memory it is already
+ * using for the very tensors it is deciding about -- and streams layers
+ * that it would have had to keep in RAM anyway.
+ *
+ * The device's own working set and the operator's cap still bound the
+ * answer, so nothing here plans past what the backend would let it
+ * allocate.
+ */
+size_t vv_gpu_budget_reclaim(const vv_gpu_set_t* set, int index,
+                             float vram_budget, size_t reclaimable) {
+    if (!set || index < 0 || index >= set->n) return 0;
+    size_t total = 0, freem = 0;
+    if (vv_dev_get_device_info(set->id[index], &total, &freem, NULL) != VV_OK)
+        return 0;
+    size_t budget = (size_t)((double)freem * (double)vram_budget);
+    const size_t ceiling = (size_t)((double)total * (double)vram_budget);
+    budget = (reclaimable > ceiling - budget) ? ceiling : budget + reclaimable;
+    const size_t cap = vv_mem_cap_bytes(&set->cap[index], total);
+    if (cap && cap < budget) budget = cap;
+    return budget;
+}
+
 size_t vv_gpu_budget(const vv_gpu_set_t* set, int index, float vram_budget) {
     if (!set || index < 0 || index >= set->n) return 0;
     size_t total = 0, freem = 0;

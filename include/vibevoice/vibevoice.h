@@ -82,6 +82,14 @@ vv_status_t vv_gpu_set_resolve(vv_gpu_set_t* set, int fallback_id,
 /** @brief Bytes the `index`th device may use: free * budget, then the cap. */
 size_t vv_gpu_budget(const vv_gpu_set_t* set, int index, float vram_budget);
 
+/**
+ * @brief The same, when placing a weight frees its host copy (unified
+ *        memory): `reclaimable` bytes are added back, within the device's
+ *        own limit and the cap.
+ */
+size_t vv_gpu_budget_reclaim(const vv_gpu_set_t* set, int index,
+                             float vram_budget, size_t reclaimable);
+
 /** @brief What that device already holds and the budget cannot place. */
 size_t vv_gpu_reserved(const vv_gpu_set_t* set, int index);
 

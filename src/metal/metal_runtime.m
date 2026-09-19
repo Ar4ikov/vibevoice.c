@@ -45,6 +45,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <IOKit/IOKitLib.h>
+#include <mach/mach.h>
 #include <os/lock.h>
 #include <sys/mman.h>
 #include <stdatomic.h>
@@ -192,6 +193,29 @@ static int query_core_count(void) {
     }
     IOObjectRelease(it);
     return cores;
+}
+
+/**
+ * @brief Memory the system could still give this process, in bytes.
+ *
+ * On unified memory the GPU's memory is the machine's, so what the device
+ * can still take is bounded by what the OS has, not only by the working-set
+ * limit: free, speculative and purgeable pages, plus the inactive ones it
+ * would evict first. A 7B model that fits Metal's limit but not the machine
+ * does not fail -- it thrashes, and the compressor turns a 3 tok/s decode
+ * into the wrong answer about what fits.
+ */
+static size_t host_available_bytes(void) {
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) page = 16384;
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &count) != KERN_SUCCESS)
+        return 0;
+    const uint64_t pages = (uint64_t)vm.free_count + vm.inactive_count +
+                           vm.purgeable_count + vm.speculative_count;
+    return (size_t)(pages * (uint64_t)page);
 }
 
 static VVMetal* mtl(void) {
@@ -1006,8 +1030,18 @@ vv_status_t vv_dev_get_device_info(int device_id, size_t* total_mem,
     /* Wrapped mappings are not in Metal's own count; ours has them all. */
     if ((size_t)m->device.currentAllocatedSize > used)
         used = (size_t)m->device.currentAllocatedSize;
+    size_t freem = total > used ? total - used : 0;
+    /*
+     * ...but never more than the machine can still give, less a margin for
+     * the system itself. What this process already holds is part of what
+     * the OS reports as taken, so it is not subtracted twice.
+     */
+    const size_t margin = (size_t)1536 * 1024 * 1024;
+    const size_t avail = host_available_bytes();
+    const size_t host_free = avail > margin ? avail - margin : 0;
+    if (host_free < freem) freem = host_free;
     if (total_mem) *total_mem = total;
-    if (free_mem) *free_mem = total > used ? total - used : 0;
+    if (free_mem) *free_mem = freem;
     if (sm_count) *sm_count = m->cores;
     return VV_OK;
 }
