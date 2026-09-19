@@ -177,6 +177,100 @@ static int make_weight(qweight_t* w, int N, int K, int G, bool sym) {
 }
 
 /**
+ * @brief A dense weight quantized the way `--quant int4` does it at load
+ *        (vv_int4g_quantize), then taken through the GPU layout.
+ *
+ * The quantizer must hand out exact integer zero points (that is what lets
+ * the W4A16 kernels take a load-time-quantized checkpoint), mins that are
+ * fp16(-z * s) like the AWQ repack's, and codes within half a step of the
+ * dense value. The logical q/z/s are read back from its output, so the
+ * kernel checks below compare against what it actually produced.
+ */
+static int make_weight_quantized(qweight_t* w, int N, int K, int G) {
+    memset(w, 0, sizeof(*w));
+    w->N = N; w->K = K; w->G = G; w->ng = K / G;
+    const int ng = w->ng;
+    float* dense = (float*)malloc((size_t)N * K * sizeof(float));
+    for (int n = 0; n < N; n++) {
+        /* Rows of different magnitude, some groups one-signed. */
+        const float amp = 0.01f + 0.05f * (float)(urand() & 255) / 256.0f;
+        for (int k = 0; k < K; k++) {
+            float v = frand() * amp;
+            if (((k / G) & 7) == 3) v = v < 0.0f ? -v : v;
+            if (((k / G) & 7) == 5) v = v > 0.0f ? -v : v;
+            dense[(size_t)n * K + k] = v;
+        }
+        if (n == 1)                         /* an all-zero group */
+            for (int k = 0; k < G; k++) dense[(size_t)n * K + k] = 0.0f;
+    }
+    w->packed = (uint8_t*)malloc((size_t)N * K / 2);
+    w->scales = (uint16_t*)malloc((size_t)N * ng * 2);
+    w->mins   = (uint16_t*)malloc((size_t)N * ng * 2);
+    w->zeros  = (uint8_t*)malloc((size_t)N * ng);
+    int bad = vv_int4g_quantize(dense, N, K, G, w->packed, w->scales,
+                                w->mins, w->zeros) != VV_OK;
+    if (bad) printf("  FAIL int4g quantize returned an error\n");
+
+    w->q = (uint8_t*)malloc((size_t)N * K);
+    w->z = (uint8_t*)malloc((size_t)N * ng);
+    w->s = (uint16_t*)malloc((size_t)N * ng * 2);
+    double worst = 0.0;
+    for (int n = 0; n < N && !bad; n++)
+        for (int g = 0; g < ng; g++) {
+            const size_t gi = (size_t)n * ng + g;
+            const int z = w->zeros[gi];
+            const float sc = vv_half_to_float(w->scales[gi]);
+            w->z[gi] = (uint8_t)z;
+            w->s[gi] = w->scales[gi];
+            if (z > 15 || w->mins[gi] != vv_float_to_half(-(float)z * sc)) {
+                printf("  FAIL int4g quantize: row %d group %d zero %d, "
+                       "min not fp16(-z*s)\n", n, g, z);
+                bad = 1;
+                break;
+            }
+            for (int k = g * G; k < (g + 1) * G; k++) {
+                const uint8_t byte = w->packed[(size_t)n * (K / 2) + k / 2];
+                const int q = (k & 1) ? (byte & 15) : (byte >> 4);
+                w->q[(size_t)n * K + k] = (uint8_t)q;
+                const double e = (double)dense[(size_t)n * K + k] -
+                                 (double)(q - z) * sc;
+                const double rel = sc > 0.0f ? (e < 0 ? -e : e) / sc
+                                             : (e != 0.0 ? 1e9 : 0.0);
+                if (rel > worst) worst = rel;
+            }
+        }
+    /* Half a step, plus the FP16 rounding of the scale: 15 steps may fall
+       short of the range by 15 * 2^-11 of a step at its ends. */
+    if (!bad && worst > 0.5 + 15.0 / 2048.0) {
+        printf("  FAIL int4g quantize: worst error %.4f of a step\n", worst);
+        bad = 1;
+    }
+    free(dense);
+
+    w->gpacked = (uint8_t*)malloc((size_t)N * K / 2);
+    w->sz = (uint16_t*)malloc((size_t)N * ng * 4);
+    memcpy(w->gpacked, w->packed, (size_t)N * K / 2);
+    if (!bad && vv_int4g_to_gpu_layout(w->gpacked, w->scales, w->zeros, N, K,
+                                       G, w->sz) != VV_OK) {
+        printf("  FAIL gpu layout of a quantized weight\n");
+        bad = 1;
+    }
+    w->wref = (float*)malloc((size_t)N * K * sizeof(float));
+    for (int n = 0; n < N && !bad; n++)
+        for (int k = 0; k < K; k++) {
+            const size_t gi = (size_t)n * ng + k / G;
+            const float v = (float)((int)w->q[(size_t)n * K + k] -
+                                    (int)w->z[gi]) *
+                            vv_half_to_float(w->s[gi]);
+            w->wref[(size_t)n * K + k] = vv_half_to_float(vv_float_to_half(v));
+        }
+    if (bad) failures++;
+    else printf("  ok   %dx%d g%d load-time int4: zeros exact, worst %.3f "
+                "of a step\n", N, K, G, worst);
+    return bad;
+}
+
+/**
  * @brief An act-order (desc_act) GPTQ weight: every group is a scattered
  *        set of exactly G input channels.
  *
@@ -459,14 +553,19 @@ static void check_m(const qweight_t* w, const dweight_t* d,
     free(hx); free(fx); free(hy);
 }
 
-static void run_shape_ex(int N, int K, int G, bool sym, bool act_order,
-                         const int* ms, int nm) {
+enum { KIND_AWQ = 0, KIND_ACT_ORDER = 1, KIND_LOAD_QUANT = 2 };
+
+static void run_shape_kind(int N, int K, int G, bool sym, int kind,
+                           const int* ms, int nm) {
     qweight_t w;
     char tag[64];
     snprintf(tag, sizeof(tag), "%dx%d g%d %s", N, K, G,
-             act_order ? "act-order" : (sym ? "sym" : "asym"));
-    const int bad = act_order ? make_weight_actorder(&w, N, K, G)
-                              : make_weight(&w, N, K, G, sym);
+             kind == KIND_ACT_ORDER ? "act-order"
+             : kind == KIND_LOAD_QUANT ? "load-time int4"
+             : (sym ? "sym" : "asym"));
+    const int bad = kind == KIND_ACT_ORDER ? make_weight_actorder(&w, N, K, G)
+                  : kind == KIND_LOAD_QUANT ? make_weight_quantized(&w, N, K, G)
+                  : make_weight(&w, N, K, G, sym);
     if (bad) { qweight_free(&w); return; }
     uint16_t* bias = (uint16_t*)malloc((size_t)N * 2);
     for (int n = 0; n < N; n++) bias[n] = vv_float_to_half(frand() * 0.5f);
@@ -480,6 +579,12 @@ static void run_shape_ex(int N, int K, int G, bool sym, bool act_order,
     free_dweight(&d);
     free(bias);
     qweight_free(&w);
+}
+
+static void run_shape_ex(int N, int K, int G, bool sym, bool act_order,
+                         const int* ms, int nm) {
+    run_shape_kind(N, K, G, sym, act_order ? KIND_ACT_ORDER : KIND_AWQ,
+                   ms, nm);
 }
 
 static void run_shape(int N, int K, int G, bool sym, const int* ms, int nm) {
@@ -788,6 +893,10 @@ int main(int argc, char** argv) {
     run_shape_ex(3584, 3584, 128, false, true, ms_few, n_few);
     run_shape_ex(3584, 18944, 128, false, true, ms_few, n_few);
     run_shape_ex(512, 3584, 32, false, true, ms_few, n_few);
+    /* --quant int4 on a dense checkpoint: quantized at load, same kernels */
+    run_shape_kind(3584, 3584, 128, false, KIND_LOAD_QUANT, ms_few, n_few);
+    run_shape_kind(512, 3584, 128, false, KIND_LOAD_QUANT, ms_few, n_few);
+    run_shape_kind(3584, 18944, 128, false, KIND_LOAD_QUANT, ms_few, n_few);
     /* fused launches: q/k/v and gate/up of the 7B and 1.5B layers */
     { const int n3[3] = { 3584, 512, 512 }; run_multi(n3, 3, 3584, 128); }
     { const int n2[2] = { 18944, 18944 }; run_multi(n2, 2, 3584, 128); }

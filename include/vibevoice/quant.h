@@ -103,12 +103,19 @@ vv_status_t vv_int4g_to_gpu_layout(uint8_t* packed, const uint16_t* scales,
                                    int group_size, uint16_t* out_sz);
 
 /**
- * @brief Quantize a dense FP32 weight into the INT4G layout (min/max per
- *        group). Used by tools that convert an existing checkpoint.
+ * @brief Quantize a dense FP32 weight into the INT4G layout, AWQ-style:
+ *        w = (q - z) * s with an exact integer zero point per group.
+ *
+ * The group's range is widened to include 0, s = fp16(range / 15) and
+ * z = round(-lo / s), so z is always a level in 0..15 and the zero point
+ * is exact -- which is what lets vv_int4g_to_gpu_layout and the W4A16
+ * kernels take the result, like an AWQ checkpoint. `out_mins` receives
+ * fp16(-z * s) for the CPU kernels; `out_zeros` (may be NULL) receives z.
+ * Codes are chosen against the FP16 scale the kernels use.
  */
 vv_status_t vv_int4g_quantize(const float* w, int N, int K, int group_size,
                               uint8_t* out_packed, uint16_t* out_scales,
-                              uint16_t* out_mins);
+                              uint16_t* out_mins, uint8_t* out_zeros);
 
 /**
  * @brief What the loader should do with the checkpoint's projections.

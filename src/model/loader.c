@@ -819,9 +819,13 @@ static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
     void* sc = vv_alloc(scale_bytes);
     uint16_t* mn = kind == VV_QUANT_INT4G ? (uint16_t*)vv_alloc(scale_bytes)
                                           : NULL;
+    /* INT4G keeps its integer zero points for the W4A16 GPU layout. */
+    const size_t zero_bytes = (size_t)N * (size_t)n_groups;
+    uint8_t* zr = kind == VV_QUANT_INT4G ? (uint8_t*)vv_alloc(zero_bytes)
+                                         : NULL;
     float* tmp = (float*)vv_alloc((size_t)nt * ROWS * (size_t)K * sizeof(float));
-    if (!codes || !sc || (kind == VV_QUANT_INT4G && !mn) || !tmp) {
-        vv_free(codes); vv_free(sc); vv_free(mn); vv_free(tmp);
+    if (!codes || !sc || (kind == VV_QUANT_INT4G && (!mn || !zr)) || !tmp) {
+        vv_free(codes); vv_free(sc); vv_free(mn); vv_free(zr); vv_free(tmp);
         return VV_ERR_OUT_OF_MEMORY;
     }
 
@@ -853,7 +857,8 @@ static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
             st = vv_int4g_quantize(t, rows, K, group,
                                    codes + (size_t)r0 * (K / 2),
                                    (uint16_t*)sc + (size_t)r0 * n_groups,
-                                   mn + (size_t)r0 * n_groups);
+                                   mn + (size_t)r0 * n_groups,
+                                   zr + (size_t)r0 * n_groups);
         if (st != VV_OK) {
 #ifdef _OPENMP
 #pragma omp critical(vv_loader_quant_err)
@@ -863,7 +868,7 @@ static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
     }
     vv_free(tmp);
     if (first_err != VV_OK) {
-        vv_free(codes); vv_free(sc); vv_free(mn);
+        vv_free(codes); vv_free(sc); vv_free(mn); vv_free(zr);
         return first_err;
     }
 
@@ -886,7 +891,9 @@ static vv_status_t load_dense_weight(loader_t* L, const st_entry_t* e,
             L->n_nf4++;
         } else {
             set_tensor(&w->mins, mn, VV_DTYPE_F16, scale_bytes, 2, gshape);
+            set_tensor(&w->zeros, zr, VV_DTYPE_U8, zero_bytes, 2, gshape);
             w->group_size = group;
+            w->int4g_layout = VV_INT4G_ROWMAJOR;
             L->n_int4g++;
         }
     }

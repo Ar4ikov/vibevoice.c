@@ -27,6 +27,7 @@
 #include "vibevoice/quant.h"
 
 #include <string.h>
+#include <math.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -98,7 +99,7 @@ vv_status_t vv_awq_repack(const uint32_t* qweight, const uint32_t* qzeros,
 
 vv_status_t vv_int4g_quantize(const float* w, int N, int K, int group_size,
                               uint8_t* out_packed, uint16_t* out_scales,
-                              uint16_t* out_mins)
+                              uint16_t* out_mins, uint8_t* out_zeros)
 {
     if (!w || !out_packed || !out_scales || !out_mins) return VV_ERR_NULL_PTR;
     if (group_size <= 0 || (K % group_size) != 0 || (K & 1) != 0)
@@ -117,30 +118,34 @@ vv_status_t vv_int4g_quantize(const float* w, int N, int K, int group_size,
         uint8_t*  prow = out_packed + (size_t)n * (K / 2);
         uint16_t* srow = out_scales + (size_t)n * n_groups;
         uint16_t* mrow = out_mins   + (size_t)n * n_groups;
+        uint8_t*  zrow = out_zeros ? out_zeros + (size_t)n * n_groups : NULL;
 
         for (int g = 0; g < n_groups; g++) {
             const int k0 = g * group_size;
-            float lo = wrow[k0], hi = wrow[k0];
-            for (int k = k0 + 1; k < k0 + group_size; k++) {
+            /* The range always holds 0, so the zero point is a level. */
+            float lo = 0.0f, hi = 0.0f;
+            for (int k = k0; k < k0 + group_size; k++) {
                 if (wrow[k] < lo) lo = wrow[k];
                 if (wrow[k] > hi) hi = wrow[k];
             }
-            /* Asymmetric range over 16 levels; a flat group gets scale 0.
-               The codes are chosen against the FP16 scale and min the
-               kernels will actually use, not the FP32 ones they came from. */
-            srow[g] = vv_float_to_half_rne((hi > lo) ? (hi - lo) / 15.0f
-                                                     : 0.0f);
-            mrow[g] = vv_float_to_half_rne(lo);
+            /* An all-zero group gets scale 0 and zero point 0. The codes
+               are chosen against the FP16 scale the kernels will use. */
+            srow[g] = vv_float_to_half_rne((hi - lo) / 15.0f);
             const float sc = vv_half_to_float(srow[g]);
-            lo = vv_half_to_float(mrow[g]);
             const float inv = (sc > 0.0f) ? 1.0f / sc : 0.0f;
+            int z = (int)(-lo * inv + 0.5f);
+            if (z < 0) z = 0; else if (z > 15) z = 15;
+            /* The same min the AWQ repack derives from its zero point. */
+            mrow[g] = vv_float_to_half(-(float)z * sc);
+            if (zrow) zrow[g] = (uint8_t)z;
 
+            const float zf = (float)z + 0.5f;
             for (int k = k0; k < k0 + group_size; k += 2) {
-                int q0 = (int)((wrow[k]     - lo) * inv + 0.5f);
-                int q1 = (int)((wrow[k + 1] - lo) * inv + 0.5f);
+                int q0 = (int)floorf(wrow[k]     * inv + zf);
+                int q1 = (int)floorf(wrow[k + 1] * inv + zf);
                 if (q0 < 0) q0 = 0; else if (q0 > 15) q0 = 15;
                 if (q1 < 0) q1 = 0; else if (q1 > 15) q1 = 15;
-                prow[(k - 0) >> 1] = (uint8_t)((q0 << 4) | q1);
+                prow[k >> 1] = (uint8_t)((q0 << 4) | q1);
             }
         }
     }

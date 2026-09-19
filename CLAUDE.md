@@ -51,7 +51,7 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
   (U8+`.absmax` → NF4, I32 `qweight` → INT4G, float → dense); каждый тензор
   сверяется с формой из config, отсутствующий/кривой — ошибка с именем.
   `tie_word_embeddings` — head и embedding один буфер. BF16 dense на 3090:
-  56 tok/s, 18.7 GB; `--quant int4` — 133 tok/s, `int8` (per-channel) —
+  56 tok/s, 18.7 GB; `--quant int4` — 149 tok/s (W4A16-ядра), `int8` (per-channel) —
   97 tok/s, 12.5 GB; те же слова, что NF4.
 * Семейства моделей (`include/vibevoice/family.h`): `asr-7b`, `asr-bitnet`,
   `asr-streaming-7b` — промпт, стоп-токены, нормализация, геометрия чанков.

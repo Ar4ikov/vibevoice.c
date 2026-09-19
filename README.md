@@ -236,7 +236,9 @@ dense checkpoints and quantize each projection as it is read from the
 mapping, before placement, so the VRAM budget sees the final sizes and peak
 host memory is the quantized model plus a few rows per thread. NF4 here is
 bitsandbytes' layout (blocks of 64, FP16 scales, no double quantization);
-INT4 is the asymmetric group-128 layout the AWQ path uses; INT8 is
+INT4 is asymmetric group-128 with an exact integer zero point per group,
+AWQ's own form, so it takes the W4A16 GPU kernels below like an AWQ
+checkpoint does; INT8 is
 per-output-channel symmetric (one FP32 scale per row, the layout the W8A8
 work builds on) with its own GEMV. All three are deterministic whatever the
 thread count.
@@ -247,14 +249,14 @@ thread count.
 |---|---|---|---|---|---|
 | `none` (FP16) | 4.7 s | 18.7 GB | 56 tok/s | 0.108 / 0.110 / 0.109 | same words on all three |
 | `nf4` | 5.4 s | 9.8 GB | 127 tok/s | 0.066 / 0.061 / 0.059 | same words; jfk and test30 byte-identical |
-| `int4` | 2.7 s | 9.7 GB | 133 tok/s | 0.064 / 0.060 / 0.057 | same words |
+| `int4` | 2.7 s | 9.7 GB | 149 tok/s | 0.053 / 0.052 / 0.052 | same words |
 | `int8` | 3.6 s | 12.5 GB | 97 tok/s | 0.077 / 0.073 / 0.071 | same words |
 
 Load is the best of three with the page cache warm, on the 12 physical
 cores; quantizing is cheaper than uploading the 14 GB the dense model
 needs, so `int4` loads faster than `none`.
 
-Where they differ it is in timestamps (at most 0.06 s, 0.44 s once for
+Where they differ it is in timestamps (at most 0.06 s, 0.12 s for
 `int4`) and in one speaker label: on test30, whose middle clip is a
 different voice, dense BF16, `int4` and `int8` call it Speaker 1 while the NF4
 checkpoint calls everything Speaker 0.
