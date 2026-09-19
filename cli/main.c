@@ -476,14 +476,9 @@ int main(int argc, char** argv) {
          * The streaming model writes text chunk by chunk; show it as it
          * comes, then the transcript and the segments as usual.
          */
-        char ctx_info[512];
-        ctx_info[0] = '\0';
-        for (int i = 0, w = 0; i < params.num_hotwords; i++) {
-            const int k = snprintf(ctx_info + w, sizeof(ctx_info) - (size_t)w,
-                                   "%s%s", w ? ", " : "", params.hotwords[i]);
-            if (k < 0 || (size_t)k >= sizeof(ctx_info) - (size_t)w) break;
-            w += k;
-        }
+        char ctx_info[VV_HOTWORDS_MAX];
+        vv_hotwords_join(params.hotwords, params.num_hotwords, ctx_info,
+                         sizeof(ctx_info));
         fprintf(stderr, "\n--- streaming (%d+%d frames per chunk) ---\n",
                 ctx->family.chunk_frames, ctx->family.lookahead_frames);
         s = vv_stream_transcribe(ctx, audio, n_samples,

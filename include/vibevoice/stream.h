@@ -352,6 +352,24 @@ typedef struct {
      * append_tokens.
      */
     bool               fold_chunk_end;
+    /**
+     * Admission against a KV page pool shared by several slots. The
+     * session maps pages for about this many seconds of audio when it
+     * opens, and vv_stream_open() fails with VV_ERR_KV_POOL_EXHAUSTED when
+     * the pool cannot cover them -- so a server refuses a new session up
+     * front rather than letting it squeeze the ones already running.
+     * Capped at the KV window. 0: map as the session grows. No effect on a
+     * cache of its own (one slot) or on the CPU.
+     */
+    double             kv_reserve_sec;
+    /**
+     * Never wait for pages. Past the reservation a session takes pages as
+     * it goes; with this set, a pool that has none free ends the session
+     * with VV_ERR_KV_POOL_EXHAUSTED (an ERROR event) instead of blocking
+     * it until another slot finishes -- which for a live stream may be
+     * never, and meanwhile nobody reads its socket.
+     */
+    bool               kv_no_wait;
     vv_stream_event_fn on_event;
     void*              user;
 } vv_stream_params_t;
@@ -403,8 +421,9 @@ vv_status_t vv_stream_params_for(const struct vv_inference_ctx* ctx,
                                  vv_stream_params_t* p);
 
 /**
- * @brief Ask a session to stop. Safe from another thread or from inside the
- *        event callback (e.g. when a write to a disconnected client fails).
+ * @brief Ask a session to stop. Safe from another thread (the flag is an
+ *        atomic) or from inside the event callback (e.g. when a write to a
+ *        disconnected client fails).
  *
  * The session checks between tokens and between chunks; the call in
  * progress returns VV_ERR_CANCELLED and so does every later one. No ERROR

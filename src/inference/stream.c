@@ -10,6 +10,8 @@
 #include "vibevoice/stream.h"
 #include "vibevoice/vibevoice.h"
 
+#include "vv_thread.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -393,8 +395,13 @@ vv_status_t vv_stream_text_flush(vv_stream_text_t* t, const char** out,
 vv_status_t vv_stream_token_bytes(const vv_tokenizer_t* tok, int32_t id,
                                   char* buf, size_t cap, size_t* n) {
     if (!tok || !n || (cap && !buf)) return VV_ERR_NULL_PTR;
+    /* Once per generated token: straight into the caller's buffer. */
+    vv_status_t st = vv_tokenizer_decode_into(tok, &id, 1, true, buf, cap, n);
+    if (st != VV_ERR_OVERFLOW) return st;
+    /* The bound is the encoded length, which can be up to twice the text;
+     * a long token near the cap takes the exact route. */
     char* s = NULL;
-    vv_status_t st = vv_tokenizer_decode_ex(tok, &id, 1, true, &s);
+    st = vv_tokenizer_decode_ex(tok, &id, 1, true, &s);
     if (st != VV_OK) return st;
     const size_t len = strlen(s);
     if (len > cap) { vv_free(s); return VV_ERR_OVERFLOW; }
@@ -423,12 +430,16 @@ struct vv_stream {
     int32_t             pending_lead;  /* folded <|text_chunk_end|>, or -1 */
     vv_status_t         failed;
     bool                done;
-    volatile int        cancel;        /* vv_stream_cancel(), any thread */
+    vv_atomic_int_t     cancel;        /* vv_stream_cancel(), any thread */
     vv_stream_stats_t   stats;
 };
 
+static bool cancelled(vv_stream_t* s) {
+    return vv_atomic_load(&s->cancel) != 0;
+}
+
 void vv_stream_cancel(vv_stream_t* s) {
-    if (s) s->cancel = 1;
+    if (s) vv_atomic_store(&s->cancel, 1);
 }
 
 void vv_stream_params_default(vv_stream_params_t* p) {
@@ -516,7 +527,7 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
                                               n_frames, s->rows, s->rows_cap,
                                               &feat_off);
     if (n_rows < 0) return fail(s, VV_ERR_INVALID_ARG, idx);
-    if (s->cancel) return fail(s, VV_ERR_CANCELLED, idx);
+    if (cancelled(s)) return fail(s, VV_ERR_CANCELLED, idx);
     /* The rows, plus the trailing <|text_chunk_end|> that has to follow. */
     if (!kv_fits(s, n_rows + 1)) {
         vv_log(VV_LOG_ERROR, "stream: chunk %lld does not fit the KV window "
@@ -583,7 +594,7 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
 
         /* The token is fed even when it is the last one the cap allows,
          * exactly as upstream does; one slot stays for the chunk end. */
-        if (s->cancel) { st = VV_ERR_CANCELLED; break; }
+        if (cancelled(s)) { st = VV_ERR_CANCELLED; break; }
         if (!kv_fits(s, 2)) {
             vv_log(VV_LOG_ERROR, "stream: the KV window (%lld positions) is "
                    "full in chunk %lld; the session ends here -- raise "
@@ -647,7 +658,7 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
     ev.decode_ms = t2 - t1;
     ev.kv_len = kv_len(s);
     emit(s, &ev);
-    return s->cancel ? fail(s, VV_ERR_CANCELLED, idx) : VV_OK;
+    return cancelled(s) ? fail(s, VV_ERR_CANCELLED, idx) : VV_OK;
 }
 
 /*
@@ -662,7 +673,7 @@ static vv_status_t drain(vv_stream_t* s) {
     for (;;) {
         const int64_t ready = vv_stream_chunker_ready(s->chunker);
         if (ready <= 0) return VV_OK;
-        if (s->cancel) return fail(s, VV_ERR_CANCELLED, -1);
+        if (cancelled(s)) return fail(s, VV_ERR_CANCELLED, -1);
 
         if (ready >= 2 && s->be.encode_ahead) {
             if (!s->ahead) {
@@ -778,7 +789,7 @@ fail:
 vv_status_t vv_stream_push(vv_stream_t* s, const float* pcm, size_t n) {
     if (!s) return VV_ERR_NULL_PTR;
     if (s->failed != VV_OK) return s->failed;
-    if (s->cancel) return fail(s, VV_ERR_CANCELLED, -1);
+    if (cancelled(s)) return fail(s, VV_ERR_CANCELLED, -1);
     if (s->done) return VV_ERR_INVALID_ARG;
     vv_status_t st = vv_stream_chunker_push(s->chunker, pcm, n);
     if (st != VV_OK) return fail(s, st, -1);
@@ -789,7 +800,7 @@ vv_status_t vv_stream_finish(vv_stream_t* s) {
     if (!s) return VV_ERR_NULL_PTR;
     if (s->failed != VV_OK) return s->failed;
     if (s->done) return VV_OK;
-    if (s->cancel) return fail(s, VV_ERR_CANCELLED, -1);
+    if (cancelled(s)) return fail(s, VV_ERR_CANCELLED, -1);
     vv_stream_chunker_finish(s->chunker);
     vv_status_t st = drain(s);
     if (st != VV_OK) return st;

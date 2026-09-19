@@ -1338,7 +1338,7 @@ fail:
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 
-#define VV_ARGMAX_PARTIALS 256
+/* VV_ARGMAX_PARTIALS: pipeline_internal.h, shared with the streaming loop. */
 
 static const char* s_dump_dir = NULL;
 static vv_once_t s_dump_once = VV_ONCE_INIT;
@@ -1432,18 +1432,47 @@ static void sample_acoustic(vv_inference_ctx_t* ctx,
                        mode, seed, NULL);
 }
 
+size_t vv_hotwords_join(const char* const* words, int n, char* buf,
+                        size_t cap) {
+    if (!buf || cap == 0) return 0;
+    buf[0] = '\0';
+    size_t w = 0;
+    for (int i = 0; words && i < n; i++) {
+        const char* hw = words[i];
+        if (!hw || !hw[0]) continue;
+        /* A whole word or none: a cut one would be a different hotword. */
+        const int k = snprintf(buf + w, cap - w, "%s%s", w ? ", " : "", hw);
+        if (k < 0 || (size_t)k >= cap - w) { buf[w] = '\0'; break; }
+        w += (size_t)k;
+    }
+    return w;
+}
+
+size_t vv_hotwords_join_csv(const char* csv, char* buf, size_t cap) {
+    if (!buf || cap == 0) return 0;
+    buf[0] = '\0';
+    if (!csv) return 0;
+    char tmp[VV_HOTWORDS_MAX];
+    const char* words[VV_HOTWORDS_MAX / 2];
+    snprintf(tmp, sizeof(tmp), "%s", csv);
+    int n = 0;
+    for (char* t = tmp; t && n < (int)(sizeof(words) / sizeof(words[0])); ) {
+        char* next = strchr(t, ',');
+        if (next) *next++ = '\0';
+        while (*t == ' ') t++;
+        size_t len = strlen(t);
+        while (len > 0 && t[len - 1] == ' ') t[--len] = '\0';
+        if (*t) words[n++] = t;
+        t = next;
+    }
+    return vv_hotwords_join(words, n, buf, cap);
+}
+
 static void build_context_info(const vv_inference_params_t* params,
                                char* buf, size_t buf_size) {
     buf[0] = '\0';
     if (!params || !params->hotwords || params->num_hotwords <= 0) return;
-    size_t w = 0;
-    for (int i = 0; i < params->num_hotwords; i++) {
-        const char* hw = params->hotwords[i];
-        if (!hw || !hw[0]) continue;
-        int n = snprintf(buf + w, buf_size - w, "%s%s", w ? ", " : "", hw);
-        if (n < 0 || (size_t)n >= buf_size - w) break;
-        w += (size_t)n;
-    }
+    vv_hotwords_join(params->hotwords, params->num_hotwords, buf, buf_size);
 }
 
 /**
@@ -1638,6 +1667,32 @@ static vv_status_t cpu_head_argmax(vv_inference_ctx_t* ctx,
     for (int d = 0; d < hs; d++) f[d] = vv_half_to_float(h[d]);
     return vv_lm_head_argmax_cpu(f, ctx->model->lm_head.data,
                                  llm->vocab_size, hs, token, NULL);
+}
+
+vv_status_t vv_pipeline_head_argmax(vv_inference_ctx_t* ctx, const void* row,
+                                    void* normed, void* logits, void* am_v,
+                                    void* am_i, void* tok_dev,
+                                    int32_t* tok_host, uint16_t* h, float* f,
+                                    int32_t* token) {
+    const vv_llm_config_t* llm = &ctx->model->config.llm;
+    vv_status_t s = vv_rmsnorm_dev(row, ctx->final_norm_gpu, normed, 1,
+                                   llm->hidden_size, llm->rms_norm_eps,
+                                   ctx->compute_stream);
+    if (s != VV_OK) return s;
+    if (!ctx->lm_head_gpu) return cpu_head_argmax(ctx, normed, h, f, token);
+    s = vv_lm_head_gemv_dev(normed, ctx->lm_head_gpu, logits, llm->vocab_size,
+                            llm->hidden_size, ctx->compute_stream);
+    if (s == VV_OK)
+        s = vv_argmax_dev(logits, llm->vocab_size, am_v, am_i, tok_dev, NULL,
+                          ctx->compute_stream);
+    /* Into pinned memory the copy is asynchronous: wait for it, not just
+     * for the argmax before it. */
+    if (s == VV_OK)
+        s = vv_dev_memcpy_d2h(tok_host, tok_dev, sizeof(int32_t),
+                              ctx->compute_stream);
+    if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
+    if (s == VV_OK) *token = *tok_host;
+    return s;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1893,7 +1948,7 @@ static vv_status_t transcribe_gpu(
     int seq_len = 0;
     int audio_offset = 0;  /* index where box_start tokens (= audio frames) begin */
 
-    char ctx_info[512];
+    char ctx_info[VV_HOTWORDS_MAX];
     build_context_info(params, ctx_info, sizeof(ctx_info));
 
     {
@@ -2276,27 +2331,14 @@ static vv_status_t transcribe_gpu(
         }
 
         /* RMSNorm + LM head + sample */
-        s = vv_rmsnorm_dev(hidden_one_gpu, ctx->final_norm_gpu,
-                             normed_gpu, 1, hs, llm->rms_norm_eps,
-                             ctx->compute_stream);
-        if (s != VV_OK) break;
-
-        if (lm_head_on_cpu) {
-            s = cpu_head_argmax(ctx, normed_gpu, host_normed_h, host_normed_f,
-                                &token_id);
+        {
+            int32_t tok_host = 0;
+            s = vv_pipeline_head_argmax(ctx, hidden_one_gpu, normed_gpu,
+                                        logits_f32_gpu, argmax_v_gpu,
+                                        argmax_i_gpu, token_out_gpu, &tok_host,
+                                        host_normed_h, host_normed_f,
+                                        &token_id);
             if (s != VV_OK) break;
-        } else {
-            s = vv_lm_head_gemv_dev(normed_gpu, ctx->lm_head_gpu,
-                                      logits_f32_gpu, vocab_size, hs,
-                                      ctx->compute_stream);
-            if (s != VV_OK) break;
-            s = vv_argmax_dev(logits_f32_gpu, vocab_size, argmax_v_gpu,
-                                argmax_i_gpu, token_out_gpu, NULL,
-                                ctx->compute_stream);
-            if (s != VV_OK) break;
-            vv_dev_stream_sync(ctx->compute_stream);
-            vv_dev_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t),
-                              ctx->compute_stream);
         }
 
         if (prof) t_head_ms += vv_time_ms() - t_tok;
@@ -2495,7 +2537,7 @@ static vv_status_t transcribe_cpu(
     int seq_len = 0;
     int audio_offset = 0;
 
-    char ctx_info[512];
+    char ctx_info[VV_HOTWORDS_MAX];
     build_context_info(params, ctx_info, sizeof(ctx_info));
 
     {
@@ -2686,7 +2728,7 @@ vv_status_t vv_inference_transcribe(
          * chunk on one KV cache, so a whole clip goes through a session:
          * every window, then the tail, text joined at the end.
          */
-        char ctx_info[512];
+        char ctx_info[VV_HOTWORDS_MAX];
         build_context_info(params, ctx_info, sizeof(ctx_info));
         return vv_stream_transcribe(ctx, audio_samples, num_samples,
                                     ctx_info[0] ? ctx_info : NULL, NULL,
@@ -2723,6 +2765,7 @@ const vv_perf_metrics_t* vv_inference_get_perf(
 vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
     if (!ctx) return VV_ERR_NULL_PTR;
 
+    vv_stream_ctx_drop_cache(ctx);
     if (ctx->use_gpu) {
         if (ctx->workspace) vv_dev_free(ctx->workspace);
         if (!ctx->is_clone) {

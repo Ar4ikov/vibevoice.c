@@ -18,9 +18,17 @@
  *    survive every prefill in between: a session re-captures a couple of
  *    dozen times over half an hour of audio, not once per chunk.
  *
- * All device buffers are allocated at open (the prompt may grow the row
- * buffer once); nothing on the per-chunk path allocates on the device. The
+ * All device buffers are allocated at open, sized for the prompt as well as
+ * a chunk; nothing on the per-chunk path allocates on the device. A closed
+ * session parks them on its context for the next one (ctx->stream_bufs), so
+ * in `serve` opening and closing sessions does not cudaMalloc or cudaFree --
+ * either of which would stall every other live session on the card. The
  * CPU backend is the same sequence over the host kernels.
+ *
+ * A shared KV pool: the session maps pages for `kv_reserve_sec` of audio
+ * when it opens (admission -- a pool that cannot cover them refuses the
+ * session), then a page at a time; with `kv_no_wait` a pool that has run
+ * dry ends the session instead of blocking it behind other live ones.
  */
 
 #include "vibevoice/stream.h"
@@ -39,7 +47,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ARGMAX_PARTIALS 256   /* matches VV_ARGMAX_PARTIALS in pipeline.c */
+/*
+ * Text a chunk decodes to, in cache positions, for sizing a reservation:
+ * test120 averages 10 tokens per 2.93 s chunk, dense speech 12-14; the
+ * rest of a chunk is its 29 prefill rows.
+ */
+#define KV_TEXT_PER_CHUNK 16
 
 typedef struct {
     vv_inference_ctx_t* ctx;
@@ -49,6 +62,8 @@ typedef struct {
     int      rows_cap;       /* rows the hidden buffer holds */
     int32_t  pad_id;         /* id embedded under a feature row */
     bool     profile;        /* VV_STREAM_PROFILE: split encode from prefill */
+    int      kv_reserve;     /* positions mapped at open (admission) */
+    bool     kv_no_wait;     /* a dry pool ends the session, never blocks it */
 
     /* GPU */
     void*    hidden;         /* [rows_cap][hs] FP16 */
@@ -195,33 +210,19 @@ static vv_status_t gpu_embed_rows(sbe_t* b, const int32_t* ids, int n) {
 /* Final norm + head + argmax of one hidden row; the token lands in tok_dev
  * (device head) and in *tok. */
 static vv_status_t gpu_head(sbe_t* b, const void* row, int32_t* tok) {
-    vv_inference_ctx_t* ctx = b->ctx;
-    const vv_llm_config_t* llm = &ctx->model->config.llm;
-    vv_status_t s = vv_rmsnorm_dev(row, ctx->final_norm_gpu, b->normed, 1,
-                                   b->hs, llm->rms_norm_eps,
-                                   ctx->compute_stream);
-    if (s != VV_OK) return s;
-    if (b->head_on_cpu) {
-        s = vv_pipeline_cpu_head_argmax(ctx, b->normed, b->host_h, b->host_f,
-                                        tok);
-        b->tok_dev_id = -1;
-        return s;
-    }
-    s = vv_lm_head_gemv_dev(b->normed, ctx->lm_head_gpu, b->logits, b->vocab,
-                            b->hs, ctx->compute_stream);
-    if (s == VV_OK)
-        s = vv_argmax_dev(b->logits, b->vocab, b->am_v, b->am_i, b->tok_dev,
-                          NULL, ctx->compute_stream);
-    /* Into pinned memory the copy is asynchronous: wait for it, not just
-     * for the argmax before it. */
-    if (s == VV_OK)
-        s = vv_dev_memcpy_d2h(b->tok_pin, b->tok_dev, sizeof(int32_t),
-                              ctx->compute_stream);
-    if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
-    if (s != VV_OK) return s;
-    *tok = *b->tok_pin;
-    b->tok_dev_id = *tok;
-    return VV_OK;
+    const vv_status_t s = vv_pipeline_head_argmax(
+        b->ctx, row, b->normed, b->logits, b->am_v, b->am_i, b->tok_dev,
+        b->tok_pin, b->host_h, b->host_f, tok);
+    /* A device head leaves the token on the device for the next embed. */
+    b->tok_dev_id = (s == VV_OK && !b->head_on_cpu) ? *tok : -1;
+    return s;
+}
+
+/* Every cache of the context (primary and shards) waits for pages or not. */
+static void set_kv_no_wait(vv_inference_ctx_t* ctx, bool on) {
+    if (ctx->kv_cache) ctx->kv_cache->no_wait = on;
+    for (int i = 0; i < ctx->n_shards; i++)
+        if (ctx->shards[i].kv_cache) ctx->shards[i].kv_cache->no_wait = on;
 }
 
 static vv_status_t gpu_prefill_prompt(void* self, const int32_t* ids, int n) {
@@ -230,8 +231,16 @@ static vv_status_t gpu_prefill_prompt(void* self, const int32_t* ids, int n) {
     vv_status_t s = bind(b);
     if (s != VV_OK) return s;
     vv_pipeline_kv_reset(ctx);
+    set_kv_no_wait(ctx, b->kv_no_wait);
     s = gpu_rows(b, n);
-    if (s == VV_OK) s = vv_pipeline_kv_reserve(ctx, n);
+    if (s == VV_OK) {
+        /* Admission: the reservation now, all of it, or no session. */
+        const int want = n > b->kv_reserve ? n : b->kv_reserve;
+        s = vv_pipeline_kv_reserve(ctx, want);
+        if (s == VV_ERR_KV_POOL_EXHAUSTED && want > n)
+            VV_LOG_W("stream: the shared KV pool cannot reserve %d positions "
+                     "for another session; refusing it", want);
+    }
     if (s == VV_OK) s = gpu_embed_rows(b, ids, n);
     if (s == VV_OK) s = vv_pipeline_prefill(ctx, b->hidden, n);
     if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
@@ -250,6 +259,11 @@ static vv_status_t gpu_prefill_chunk(void* self, const vv_stream_chunk_t* ch,
     /* Pages for the rows plus the chunk end that will follow them; decode
      * steps take theirs one at a time (step_slice). */
     s = vv_pipeline_kv_reserve(ctx, ctx->kv_cache->current_len + n + 1);
+    if (s == VV_ERR_KV_POOL_EXHAUSTED && b->kv_no_wait)
+        VV_LOG_W("stream: the shared KV pool has no page left for this "
+                 "session at %d positions; ending it rather than stalling "
+                 "it behind the other live sessions",
+                 ctx->kv_cache->current_len);
     if (s != VV_OK) return s;
 
     int32_t ids[64];
@@ -335,12 +349,7 @@ static vv_status_t gpu_encode_ahead(void* self, int64_t first, int n,
     vv_status_t s = bind(b);
     if (s != VV_OK) return s;
     const size_t feat_bytes = (size_t)frames * (size_t)b->hs * 2;
-    if (!b->ahead) {
-        s = vv_dev_alloc(&b->ahead, feat_bytes * VV_STREAM_AHEAD_MAX);
-        for (int i = 0; s == VV_OK && i < VV_STREAM_AHEAD_MAX; i++)
-            s = vv_dev_event_create(&b->ahead_ev[i]);
-        if (s != VV_OK) return s;
-    }
+    if (!b->ahead) return VV_ERR_NULL_PTR;   /* allocated at open */
     /* The previous batch's rows were copied out by chunks that have
      * finished (each ends in a sync), so the buffer is free. */
     vv_frontend_job_t jobs[VV_STREAM_AHEAD_MAX];
@@ -405,15 +414,35 @@ static vv_status_t gpu_decode_step(void* self, int32_t token, int32_t* next) {
     return gpu_head(b, b->hidden_one, next);
 }
 
-static void gpu_destroy(void* self) {
-    sbe_t* b = (sbe_t*)self;
-    if (!b) return;
-    vv_inference_ctx_t* ctx = b->ctx;
-    bind(b);
-    vv_dev_stream_sync(ctx->compute_stream);
-    vv_pipeline_graphs_free(ctx, b->graphs);
-    /* An idle slot must not sit on pages another slot could use. */
-    vv_pipeline_kv_release(ctx);
+/* The device buffers a session leaves on its context for the next one. */
+typedef struct {
+    void*    hidden;
+    int32_t* ids_dev;
+    int32_t* ids_pin;
+    int      rows_cap;
+    int32_t* tok_pin;
+    void*    normed;
+    void*    hidden_one;
+    void*    logits;
+    void*    am_v;
+    void*    am_i;
+    void*    tok_dev;
+    void*    ahead;
+    void*    ahead_ev[VV_STREAM_AHEAD_MAX];
+} parked_t;
+
+static void park_move(parked_t* p, sbe_t* b, bool to_park) {
+#define MV(f) do { if (to_park) { p->f = b->f; b->f = NULL; } \
+                   else { b->f = p->f; p->f = NULL; } } while (0)
+    MV(hidden); MV(ids_dev); MV(ids_pin); MV(tok_pin); MV(normed);
+    MV(hidden_one); MV(logits); MV(am_v); MV(am_i); MV(tok_dev); MV(ahead);
+    for (int i = 0; i < VV_STREAM_AHEAD_MAX; i++) MV(ahead_ev[i]);
+#undef MV
+    if (to_park) { p->rows_cap = b->rows_cap; b->rows_cap = 0; }
+    else         { b->rows_cap = p->rows_cap; p->rows_cap = 0; }
+}
+
+static void gpu_free_bufs(sbe_t* b) {
     gpu_free_rows(b);
     if (b->ahead) vv_dev_free(b->ahead);
     for (int i = 0; i < VV_STREAM_AHEAD_MAX; i++)
@@ -425,12 +454,50 @@ static void gpu_destroy(void* self) {
     if (b->am_i) vv_dev_free(b->am_i);
     if (b->tok_dev) vv_dev_free(b->tok_dev);
     if (b->tok_pin) vv_dev_free_pinned(b->tok_pin);
+    memset(b->ahead_ev, 0, sizeof(b->ahead_ev));
+    b->ahead = b->normed = b->hidden_one = b->logits = NULL;
+    b->am_v = b->am_i = b->tok_dev = NULL;
+    b->tok_pin = NULL;
+}
+
+void vv_stream_ctx_drop_cache(vv_inference_ctx_t* ctx) {
+    if (!ctx || !ctx->stream_bufs) return;
+    parked_t* p = (parked_t*)ctx->stream_bufs;
+    ctx->stream_bufs = NULL;
+    sbe_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    park_move(p, &tmp, false);
+    vv_free(p);
+    if (ctx->use_gpu) vv_dev_set_device(ctx->gpu_id);
+    gpu_free_bufs(&tmp);
+}
+
+static void gpu_destroy(void* self) {
+    sbe_t* b = (sbe_t*)self;
+    if (!b) return;
+    vv_inference_ctx_t* ctx = b->ctx;
+    bind(b);
+    vv_dev_stream_sync(ctx->compute_stream);
+    vv_pipeline_graphs_free(ctx, b->graphs);
+    /* An idle slot must not sit on pages another slot could use. */
+    vv_pipeline_kv_release(ctx);
+    set_kv_no_wait(ctx, false);
+    /* Keep the buffers for the next session on this slot: a cudaFree here
+     * would synchronize the device under every other live session. */
+    parked_t* p = ctx->stream_bufs
+                  ? NULL : (parked_t*)vv_alloc(sizeof(parked_t));
+    if (p) {
+        memset(p, 0, sizeof(*p));
+        park_move(p, b, true);
+        ctx->stream_bufs = p;
+    }
+    gpu_free_bufs(b);
     vv_free(b->host_h);
     vv_free(b->host_f);
     vv_free(b);
 }
 
-static vv_status_t gpu_open(sbe_t* b, int rows) {
+static vv_status_t gpu_open(sbe_t* b, int rows, bool ahead) {
     vv_inference_ctx_t* ctx = b->ctx;
     if (!ctx->frontend || !ctx->final_norm_gpu) {
         VV_LOG_E("stream: no speech front end or final norm on the device");
@@ -445,11 +512,21 @@ static vv_status_t gpu_open(sbe_t* b, int rows) {
     b->graph_ok = vv_pipeline_graph_ok(ctx);
     b->tok_dev_id = -1;
     const size_t row = (size_t)b->hs * 2;
+
+    /* What the previous session on this slot left: the same model, so the
+     * same set of buffers, only the row count can differ. */
+    if (ctx->stream_bufs) {
+        parked_t* p = (parked_t*)ctx->stream_bufs;
+        ctx->stream_bufs = NULL;
+        park_move(p, b, false);
+        vv_free(p);
+    }
     vv_status_t s = gpu_rows(b, rows);
-    if (s == VV_OK) s = vv_dev_alloc(&b->normed, row);
-    if (s == VV_OK) s = vv_dev_alloc(&b->hidden_one, row);
-    if (s == VV_OK) s = vv_dev_alloc(&b->tok_dev, sizeof(int32_t));
-    if (s == VV_OK)
+    if (s == VV_OK && !b->normed) s = vv_dev_alloc(&b->normed, row);
+    if (s == VV_OK && !b->hidden_one) s = vv_dev_alloc(&b->hidden_one, row);
+    if (s == VV_OK && !b->tok_dev)
+        s = vv_dev_alloc(&b->tok_dev, sizeof(int32_t));
+    if (s == VV_OK && !b->tok_pin)
         s = vv_dev_alloc_pinned((void**)&b->tok_pin, sizeof(int32_t));
     if (s != VV_OK) return s;
     if (b->head_on_cpu) {
@@ -458,11 +535,23 @@ static vv_status_t gpu_open(sbe_t* b, int rows) {
         if (!b->host_h || !b->host_f) return VV_ERR_OUT_OF_MEMORY;
         if (!ctx->model->lm_head.data) return VV_ERR_WEIGHT_MISSING;
     } else {
-        s = vv_dev_alloc(&b->logits, (size_t)b->vocab * sizeof(float));
-        if (s == VV_OK)
-            s = vv_dev_alloc(&b->am_v, ARGMAX_PARTIALS * sizeof(float));
-        if (s == VV_OK)
-            s = vv_dev_alloc(&b->am_i, ARGMAX_PARTIALS * sizeof(int32_t));
+        if (!b->logits)
+            s = vv_dev_alloc(&b->logits, (size_t)b->vocab * sizeof(float));
+        if (s == VV_OK && !b->am_v)
+            s = vv_dev_alloc(&b->am_v, VV_ARGMAX_PARTIALS * sizeof(float));
+        if (s == VV_OK && !b->am_i)
+            s = vv_dev_alloc(&b->am_i, VV_ARGMAX_PARTIALS * sizeof(int32_t));
+    }
+    if (s == VV_OK && ahead && !b->ahead) {
+        /* Up front, not when a live session first falls behind: that is
+         * the moment it can least afford a cudaMalloc. */
+        const vv_family_t* f = &ctx->family;
+        const size_t feat_bytes = (size_t)(f->chunk_frames +
+                                           f->lookahead_frames) *
+                                  (size_t)b->hs * 2;
+        s = vv_dev_alloc(&b->ahead, feat_bytes * VV_STREAM_AHEAD_MAX);
+        for (int i = 0; s == VV_OK && i < VV_STREAM_AHEAD_MAX; i++)
+            if (!b->ahead_ev[i]) s = vv_dev_event_create(&b->ahead_ev[i]);
     }
     return s;
 }
@@ -659,20 +748,39 @@ vv_status_t vv_stream_open(vv_inference_ctx_t* ctx,
     be.kv_capacity = be_kv_capacity;
     be.append_tokens = NULL;   /* the chunk end is folded into the next prefill */
 
+    /* The prompt is ~31 tokens plus the hotwords, and a BPE token is at
+     * least a byte: rows for both, so the buffer never grows mid-session. */
+    int rows = 96 + (p.context_info ? (int)strlen(p.context_info) : 0);
+    if (rows < chunk_rows) rows = chunk_rows;
+
+    /* Admission: positions for kv_reserve_sec of audio, capped at the
+     * window (the prompt comes on top when the prefill reserves). */
+    b->kv_no_wait = p.kv_no_wait;
+    if (p.kv_reserve_sec > 0.0 && ctx->kv_cache) {
+        const double chunk_sec = (double)vv_stream_chunk_samples(&p.geom) /
+                                 (double)p.geom.sample_rate;
+        const double chunks = p.kv_reserve_sec / chunk_sec + 1.0;
+        double pos = rows + chunks * (double)(chunk_rows + KV_TEXT_PER_CHUNK);
+        if (pos > (double)ctx->kv_cache->max_seq_len)
+            pos = (double)ctx->kv_cache->max_seq_len;
+        b->kv_reserve = (int)pos;
+    }
+
     if (b->gpu) {
+        /* VV_STREAM_AHEAD=0: every window on its own, for comparison. */
+        const char* ah = getenv("VV_STREAM_AHEAD");
+        const bool ahead = !(ah && ah[0] == '0');
         s = vv_dev_set_device(ctx->gpu_id);
-        if (s == VV_OK) s = gpu_open(b, chunk_rows);
+        if (s == VV_OK) s = gpu_open(b, rows, ahead);
         be.prefill_prompt = gpu_prefill_prompt;
         be.prefill_chunk = gpu_prefill_chunk;
         be.decode_step = gpu_decode_step;
         be.destroy = gpu_destroy;
-        /* VV_STREAM_AHEAD=0: every window on its own, for comparison. */
-        const char* ah = getenv("VV_STREAM_AHEAD");
-        if (!(ah && ah[0] == '0')) be.encode_ahead = gpu_encode_ahead;
+        if (ahead) be.encode_ahead = gpu_encode_ahead;
     } else {
         if (!ctx->model->lm_head.data || !ctx->model->final_norm.data)
             s = VV_ERR_WEIGHT_MISSING;
-        if (s == VV_OK) s = cpu_rows(b, chunk_rows);
+        if (s == VV_OK) s = cpu_rows(b, rows);
         if (s == VV_OK) {
             b->one32 = (float*)vv_alloc((size_t)b->hs * sizeof(float));
             b->norm32 = (float*)vv_alloc((size_t)b->hs * sizeof(float));

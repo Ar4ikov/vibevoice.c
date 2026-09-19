@@ -55,6 +55,29 @@ vv_status_t vv_pipeline_kv_reserve(vv_inference_ctx_t* ctx, int n_positions);
 /** @brief Give every page back (after the stream is drained). */
 void vv_pipeline_kv_release(vv_inference_ctx_t* ctx);
 
+/** @brief Free the device buffers a closed streaming session parked on
+ *         `ctx` (stream_ctx.c). Called by vv_inference_free(). */
+void vv_stream_ctx_drop_cache(vv_inference_ctx_t* ctx);
+
+/** @brief Partials the device argmax reduces through, per call. */
+#define VV_ARGMAX_PARTIALS 256
+
+/**
+ * @brief Final norm, LM head and greedy argmax of one FP16 hidden row on
+ *        the device -- the tail of every decode step, batch or streaming.
+ *
+ * With the head on the device the token is left in `tok_dev` (so the next
+ * step can embed it without a round trip) and copied to `tok_host`; with it
+ * in host memory `logits`, `am_v`, `am_i` and `tok_dev` are unused and `h`,
+ * `f` (one row each) stage the host GEMV. Ends in a sync of the compute
+ * stream either way.
+ */
+vv_status_t vv_pipeline_head_argmax(vv_inference_ctx_t* ctx, const void* row,
+                                    void* normed, void* logits, void* am_v,
+                                    void* am_i, void* tok_dev,
+                                    int32_t* tok_host, uint16_t* h, float* f,
+                                    int32_t* token);
+
 /** @brief Greedy token from an LM head that stayed in host memory; `h`
  *         and `f` are one hidden row each. */
 vv_status_t vv_pipeline_cpu_head_argmax(vv_inference_ctx_t* ctx,

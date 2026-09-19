@@ -380,22 +380,9 @@ static void mic_stream_event(void* user, const vv_stream_event_t* ev) {
  */
 static int mic_stream(vv_engine_t* engine, vv_mic_t* mic, const chat_args_t* a,
                       float gain) {
-    char ctx_info[512];
-    ctx_info[0] = '\0';
-    if (a->hotwords && a->hotwords[0]) {
-        /* "A,B" -> "A, B", the way the batch prompt joins hotwords. */
-        size_t w = 0;
-        for (const char* q = a->hotwords; *q && w + 3 < sizeof(ctx_info); q++) {
-            if (*q == ',') {
-                ctx_info[w++] = ',';
-                ctx_info[w++] = ' ';
-                while (q[1] == ' ') q++;
-            } else {
-                ctx_info[w++] = *q;
-            }
-        }
-        ctx_info[w] = '\0';
-    }
+    /* "A,B" -> "A, B", the way every prompt joins hotwords. */
+    char ctx_info[VV_HOTWORDS_MAX];
+    vv_hotwords_join_csv(a->hotwords, ctx_info, sizeof(ctx_info));
 
     mic_live_t live;
     live.timestamps = a->timestamps;
