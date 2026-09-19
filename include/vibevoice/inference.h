@@ -181,10 +181,29 @@ vv_status_t vv_kv_cache_create_paged(vv_kv_cache_t** cache,
  * Takes pages from the pool and writes their ids into the device table on
  * `stream`. A no-op for a slab or when they are already mapped. Must not be
  * called inside a graph capture unless it is known to be a no-op.
- * @return VV_ERR_OVERFLOW past max_seq_len or when the pool is exhausted.
+ * @return VV_ERR_OVERFLOW past max_seq_len (the window is full),
+ *         VV_ERR_KV_POOL_EXHAUSTED when the pool has too few free pages.
  */
 vv_status_t vv_kv_cache_reserve(vv_kv_cache_t* cache, int n_positions,
                                 void* stream);
+
+/**
+ * @brief vv_kv_cache_reserve that waits for pages instead of failing.
+ *
+ * A pool shared by several slots can run short while another slot still
+ * holds pages it will return. This blocks until they come back, and returns
+ * VV_ERR_KV_POOL_EXHAUSTED only when that cannot happen: the pool is smaller
+ * than the request, or every other cache holding pages is itself waiting
+ * (then exactly one of the waiters fails, and its pages free the others).
+ * Never call it inside a graph capture.
+ */
+vv_status_t vv_kv_cache_reserve_wait(vv_kv_cache_t* cache, int n_positions,
+                                     void* stream);
+
+/** @brief Free pages, caches holding pages, and how many of those are
+ *         blocked in vv_kv_cache_reserve_wait. Any pointer may be NULL. */
+void vv_kv_pool_stats(const vv_kv_pool_t* pool, int* n_free, int* n_holders,
+                      int* n_stalled);
 
 /**
  * @brief Give every page back to the pool. The caller guarantees no kernel

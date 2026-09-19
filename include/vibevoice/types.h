@@ -28,6 +28,9 @@ typedef enum vv_status {
     VV_ERR_UNSUPPORTED    = -7,
     VV_ERR_OVERFLOW       = -8,
     VV_ERR_SHAPE_MISMATCH = -9,
+    /** A shared KV page pool had no pages left for a request that still fit
+     *  its own window. Retryable: the pages come back as other requests end. */
+    VV_ERR_KV_POOL_EXHAUSTED = -10,
 
     /* CUDA errors */
     VV_ERR_CUDA           = -100,

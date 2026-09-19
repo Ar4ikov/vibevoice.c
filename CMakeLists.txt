@@ -347,6 +347,7 @@ if(VV_BUILD_TESTS)
     vv_add_test(test_kv_quant tests/test_kv_quant.c)
     vv_add_test(test_kv_shard tests/test_kv_shard.c)
     vv_add_test(test_concurrent_decode tests/test_concurrent_decode.c)
+    vv_add_test(test_kv_pool tests/test_kv_pool.c)
     vv_add_test(test_attention tests/test_attention.c)
     vv_add_test(test_decode_position tests/test_decode_position.c)
     # The same suite again with the tensor-core prefill kernel switched off:

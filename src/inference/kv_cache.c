@@ -20,6 +20,18 @@
  * each holding n_pages * VV_KV_PAGE_SIZE rows. Pages are handed out from a
  * stack under a lock, because the slots that share a pool run on their own
  * threads.
+ *
+ * A pool may be smaller than every slot's window put together, so a slot can
+ * find it empty. vv_kv_cache_reserve_wait then waits for another slot to give
+ * pages back -- which is only worth doing while some other holder is still
+ * running. `n_holders` counts caches that hold pages, `n_stalled` those of
+ * them waiting for more; when every other holder is stalled too, nobody will
+ * ever free anything, and the slot that notices gives up with
+ * VV_ERR_KV_POOL_EXHAUSTED (its pages then unblock the rest). Pages coming
+ * back make every stalled holder worth another look, so a return clears
+ * `n_stalled` and bumps `stall_gen`; waiters that still come up short count
+ * themselves again. Without that, a holder woken by the return but not yet
+ * scheduled would still look stuck, and another slot could fail for it.
  */
 struct vv_kv_pool {
     void**     k;              /* [num_layers] */
@@ -32,8 +44,12 @@ struct vv_kv_pool {
     int*       free_stack;     /* [n_pages] */
     int        n_free;
     int        refs;
+    int        n_holders;      /* caches with n_pages > 0               */
+    int        n_stalled;      /* holders blocked in reserve_wait       */
+    unsigned   stall_gen;      /* bumped when pages return               */
     size_t     bytes;
     vv_mutex_t lock;
+    vv_cond_t  freed;          /* broadcast whenever pages come back    */
 };
 
 /** @brief One layer's store bytes, for `max_seq_len` positions. */
@@ -199,7 +215,7 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
         /* Pages were reserved outside any capture; a decode step writes at
          * the device position, which the host length bounds from below. */
         if (cache->current_len + seq_len > cache->n_pages * VV_KV_PAGE_SIZE)
-            return VV_ERR_OVERFLOW;
+            return VV_ERR_KV_POOL_EXHAUSTED;   /* not reserved */
         const bool build_ref = cache->ref_ready && !cache->ref_ready[layer];
         s = vv_kv_store_dev(
             k, v, cache->k_cache[layer], cache->v_cache[layer],
@@ -360,6 +376,7 @@ vv_status_t vv_kv_pool_create(vv_kv_pool_t** out, int num_layers,
     p->n_pages = n_pages;
     p->refs = 1;
     vv_mutex_init(&p->lock);
+    vv_cond_init(&p->freed);
 
     const bool has_meta = vv_kv_has_meta((vv_kv_format_t)format);
     const int rows = n_pages * VV_KV_PAGE_SIZE;
@@ -429,6 +446,7 @@ void vv_kv_pool_release(vv_kv_pool_t* p) {
     if (p->k_meta) vv_free(p->k_meta);
     if (p->v_meta) vv_free(p->v_meta);
     if (p->free_stack) vv_free(p->free_stack);
+    vv_cond_destroy(&p->freed);
     vv_mutex_destroy(&p->lock);
     vv_free(p);
 }
@@ -442,6 +460,19 @@ int vv_kv_pool_pages(const vv_kv_pool_t* p, int* n_free) {
 }
 
 size_t vv_kv_pool_bytes(const vv_kv_pool_t* p) { return p ? p->bytes : 0; }
+
+void vv_kv_pool_stats(const vv_kv_pool_t* p, int* n_free, int* n_holders,
+                      int* n_stalled) {
+    int f = 0, h = 0, st = 0;
+    if (p) {
+        vv_mutex_lock((vv_mutex_t*)&p->lock);
+        f = p->n_free; h = p->n_holders; st = p->n_stalled;
+        vv_mutex_unlock((vv_mutex_t*)&p->lock);
+    }
+    if (n_free) *n_free = f;
+    if (n_holders) *n_holders = h;
+    if (n_stalled) *n_stalled = st;
+}
 
 vv_status_t vv_kv_cache_create_paged(vv_kv_cache_t** cache,
                                      vv_kv_pool_t* pool, int max_seq_len) {
@@ -524,8 +555,15 @@ vv_status_t vv_kv_cache_create_paged(vv_kv_cache_t** cache,
     return VV_OK;
 }
 
-vv_status_t vv_kv_cache_reserve(vv_kv_cache_t* c, int n_positions,
-                                void* stream) {
+/*
+ * Pages for [0, n_positions). With `wait`, a short pool is waited on for as
+ * long as another holder is still running (see the pool comment); without
+ * it, or once nobody could free anything, the answer is
+ * VV_ERR_KV_POOL_EXHAUSTED -- never VV_ERR_OVERFLOW, which callers read as
+ * "this request's window is full" and end the transcript on.
+ */
+static vv_status_t reserve_pages(vv_kv_cache_t* c, int n_positions,
+                                 void* stream, bool wait) {
     if (!c) return VV_ERR_NULL_PTR;
     if (n_positions > c->max_seq_len) return VV_ERR_OVERFLOW;
     if (!c->pool) return VV_OK;
@@ -536,13 +574,52 @@ vv_status_t vv_kv_cache_reserve(vv_kv_cache_t* c, int n_positions,
 
     vv_kv_pool_t* p = c->pool;
     vv_mutex_lock(&p->lock);
-    if (p->n_free < need) {
-        const int free_now = p->n_free;
-        vv_mutex_unlock(&p->lock);
-        VV_LOG_E("kv_pool: out of pages (%d wanted, %d free of %d)",
-                 need, free_now, p->n_pages);
-        return VV_ERR_OVERFLOW;
+    bool counted = false;       /* in n_stalled (as of stall_gen my_gen) */
+    unsigned my_gen = 0;
+    bool waited = false;
+    while (p->n_free < need) {
+        if (counted && p->stall_gen != my_gen) counted = false;
+        const bool holds = c->n_pages > 0;
+        /* Other holders that are not waiting themselves: only they can
+         * give pages back. A cache that holds nothing blocks nobody, so it
+         * may wait for as long as it takes; it gives up only when the pool
+         * could never hold the request at all. */
+        const int running = (p->n_holders - (holds ? 1 : 0)) -
+                            (p->n_stalled - (counted ? 1 : 0));
+        const bool hopeless = need > p->n_pages ||
+                              (holds && running <= 0) ||
+                              (!holds && p->n_holders == 0);
+        if (!wait || hopeless) {
+            const int free_now = p->n_free, holders = p->n_holders;
+            if (counted) p->n_stalled--;
+            vv_mutex_unlock(&p->lock);
+            if (wait && need > p->n_pages)
+                VV_LOG_E("kv_pool: %d pages wanted, the pool has %d",
+                         need, p->n_pages);
+            else if (wait)
+                VV_LOG_E("kv_pool: out of pages -- %d more wanted at %d "
+                         "positions, %d of %d free, and the %d other "
+                         "request(s) holding the rest are waiting too; "
+                         "failing this one. The pool is sized by "
+                         "--gpu-memory and --slots, not --max-seq-len",
+                         need, n_positions, free_now, p->n_pages,
+                         holders - (holds ? 1 : 0));
+            return VV_ERR_KV_POOL_EXHAUSTED;
+        }
+        if (holds && !counted) {
+            p->n_stalled++;
+            counted = true;
+            my_gen = p->stall_gen;
+        }
+        if (!waited) {
+            VV_LOG_I("kv_pool: waiting for %d page(s) (%d of %d free)",
+                     need, p->n_free, p->n_pages);
+            waited = true;
+        }
+        vv_cond_wait(&p->freed, &p->lock);
     }
+    if (counted && p->stall_gen == my_gen) p->n_stalled--;
+    if (c->n_pages == 0) p->n_holders++;
     for (int i = 0; i < need; i++)
         c->pages[c->n_pages + i] = p->free_stack[--p->n_free];
     vv_mutex_unlock(&p->lock);
@@ -553,11 +630,25 @@ vv_status_t vv_kv_cache_reserve(vv_kv_cache_t* c, int n_positions,
         vv_mutex_lock(&p->lock);
         for (int i = need - 1; i >= 0; i--)
             p->free_stack[p->n_free++] = c->pages[c->n_pages + i];
+        if (c->n_pages == 0) p->n_holders--;
+        p->n_stalled = 0;
+        p->stall_gen++;
+        vv_cond_broadcast(&p->freed);
         vv_mutex_unlock(&p->lock);
         return s;
     }
     c->n_pages = want;
     return VV_OK;
+}
+
+vv_status_t vv_kv_cache_reserve(vv_kv_cache_t* c, int n_positions,
+                                void* stream) {
+    return reserve_pages(c, n_positions, stream, false);
+}
+
+vv_status_t vv_kv_cache_reserve_wait(vv_kv_cache_t* c, int n_positions,
+                                     void* stream) {
+    return reserve_pages(c, n_positions, stream, true);
 }
 
 void vv_kv_cache_release(vv_kv_cache_t* c) {
@@ -566,6 +657,10 @@ void vv_kv_cache_release(vv_kv_cache_t* c) {
     vv_mutex_lock(&p->lock);
     for (int i = c->n_pages - 1; i >= 0; i--)
         p->free_stack[p->n_free++] = c->pages[i];
+    p->n_holders--;
+    p->n_stalled = 0;
+    p->stall_gen++;
+    vv_cond_broadcast(&p->freed);
     vv_mutex_unlock(&p->lock);
     c->n_pages = 0;
 }

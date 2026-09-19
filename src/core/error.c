@@ -17,6 +17,7 @@ const char* vv_status_str(vv_status_t status) {
         case VV_ERR_UNSUPPORTED:  return "Unsupported";
         case VV_ERR_OVERFLOW:     return "Overflow";
         case VV_ERR_SHAPE_MISMATCH: return "Shape mismatch";
+        case VV_ERR_KV_POOL_EXHAUSTED: return "KV page pool exhausted";
 
         case VV_ERR_CUDA:         return "CUDA error";
         case VV_ERR_CUDA_OOM:     return "CUDA out of memory";

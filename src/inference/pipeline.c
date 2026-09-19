@@ -1451,18 +1451,17 @@ static vv_status_t step_slice(vv_model_t* model, void* hidden,
     if (kv->current_len >= kv->max_seq_len) return VV_ERR_OVERFLOW;
 
     /*
-     * A paged cache maps its pages here, outside any capture, a whole shape
-     * bucket at a time: the step writes at the device-side position and
-     * reads the table from device memory, so replays never need the host.
+     * A paged cache maps its pages here, outside any capture: the step
+     * writes at the device-side position and reads the table from device
+     * memory, so a replay needs only this token's page to be mapped. Admission
+     * reserved the request's expected length up front; past that, pages come
+     * one at a time (never a look-ahead, which would sit on pages another
+     * slot needs), and a pool that is short waits for another slot to finish
+     * rather than ending this transcript early.
      */
     if (kv->pool) {
-        int ahead = (kv->current_len + 1 + 1023) / 1024 * 1024;
-        if (ahead > kv->max_seq_len) ahead = kv->max_seq_len;
-        vv_status_t rs = vv_kv_cache_reserve(kv, ahead, compute);
-        /* A pool too full for the whole bucket may still have this page;
-         * the next step asks again, still outside any capture. */
-        if (rs == VV_ERR_OVERFLOW)
-            rs = vv_kv_cache_reserve(kv, kv->current_len + 1, compute);
+        const vv_status_t rs = vv_kv_cache_reserve_wait(
+            kv, kv->current_len + 1, compute);
         if (rs != VV_OK) return rs;
     }
 
@@ -1578,6 +1577,26 @@ static vv_status_t cpu_head_argmax(vv_inference_ctx_t* ctx,
 /* ═══════════════════════════════════════════════════════════════════════════
  * Transcribe — GPU path
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Positions a request reserves before it starts: the prompt plus the decode
+ * it is expected to run. Transcripts come to about 5 tokens per second of
+ * audio (jfk 4.5, test120 5.0, the 32-minute file 5.0); 8 a second plus a
+ * little for the JSON framing leaves room for dense speech. A request that
+ * outruns it takes further pages one at a time.
+ */
+#define VV_KV_ADMIT_TOKENS_PER_SEC 8
+#define VV_KV_ADMIT_BASE           256
+
+static int kv_admit_positions(const vv_kv_cache_t* kv, int prompt_len,
+                              float audio_sec, int max_new_tokens) {
+    double decode = (double)audio_sec * VV_KV_ADMIT_TOKENS_PER_SEC
+                  + VV_KV_ADMIT_BASE;
+    if (decode > (double)max_new_tokens) decode = (double)max_new_tokens;
+    double want = (double)prompt_len + decode;
+    if (want > (double)kv->max_seq_len) want = (double)kv->max_seq_len;
+    return (int)want;
+}
 
 static vv_status_t transcribe_gpu(
     vv_inference_ctx_t* ctx,
@@ -1758,6 +1777,34 @@ static vv_status_t transcribe_gpu(
         input_ids = pr.ids;
         seq_len = pr.n;
         audio_offset = pr.audio_offset;
+    }
+
+    /*
+     * Admission. A paged cache shares its pool with the other slots on this
+     * device, and the pool may be smaller than all their windows together.
+     * Take the pages this request is expected to need before any work is
+     * done on the device, waiting here while other requests hold them, so
+     * that a request rarely has to wait halfway through its decode (and
+     * never gets cut short: see step_slice).
+     */
+    if (ctx->kv_cache && ctx->kv_cache->pool) {
+        const int admit = kv_admit_positions(ctx->kv_cache, seq_len,
+                                             perf->audio_duration_sec,
+                                             max_new_tokens);
+        const double t_admit = vv_time_ms();
+        s = vv_kv_cache_reserve_wait(ctx->kv_cache, admit,
+                                     ctx->compute_stream);
+        const double waited = vv_time_ms() - t_admit;
+        if (waited > 50.0)
+            VV_LOG_I("inference: waited %.0f ms for %d KV positions",
+                     waited, admit);
+        if (s != VV_OK) {
+            VV_LOG_E("inference: no KV pages for this request: %s",
+                     vv_status_str(s));
+            vv_free(input_ids);
+            vv_free(combined_fp16);
+            return s;
+        }
     }
 
     perf->prefill_tokens = seq_len;
@@ -1970,6 +2017,7 @@ static vv_status_t transcribe_gpu(
     int32_t* output_tokens = (int32_t*)vv_alloc((size_t)out_cap * sizeof(int32_t));
     if (!output_tokens) { s = VV_ERR_OUT_OF_MEMORY; goto cleanup_decode; }
     int n_generated = 0;
+    s = VV_OK;          /* the loop below leaves it set only on failure */
 
     /* Split the decode cost so the next optimisation targets the real hot
      * spot: 28 transformer layers vs the 152k-row LM head + sampling. */
@@ -2066,12 +2114,19 @@ static vv_status_t transcribe_gpu(
         /* Decoder step */
         s = decoder_step_graphed(ctx, hidden_one_gpu, graph_ok, graphs);
         if (s == VV_ERR_OVERFLOW) {
+            /* This request's own window, and only that: a shared pool that
+             * runs dry reports VV_ERR_KV_POOL_EXHAUSTED and fails below. */
             VV_LOG_W("inference: the KV window is full (%d positions); the "
                      "transcript stops here -- raise --max-seq-len",
                      ctx->kv_cache->max_seq_len);
+            s = VV_OK;
             break;
         }
-        if (s != VV_OK) { VV_LOG_E("inference: decode step %d failed", n_generated); break; }
+        if (s != VV_OK) {
+            VV_LOG_E("inference: decode step %d failed: %s", n_generated,
+                     vv_status_str(s));
+            break;
+        }
 
         if (prof) {
             vv_dev_stream_sync(ctx->compute_stream);
@@ -2144,6 +2199,15 @@ static vv_status_t transcribe_gpu(
 
     for (int i = 0; i <= ctx->n_shards; i++)
         if (graphs[i].exec) vv_dev_graph_destroy(graphs[i].exec);
+
+    /*
+     * A step that failed fails the request. Post-processing what came out
+     * so far would hand back a truncated transcript as a success.
+     */
+    if (s != VV_OK) {
+        vv_free(output_tokens);
+        goto cleanup_decode;
+    }
 
     /* Zero unless VV_PROFILE_DECODE asked for the extra stalls. */
     perf->decode_layers_ms = t_layers_ms;
