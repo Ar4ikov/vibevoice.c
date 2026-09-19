@@ -47,6 +47,19 @@ Two consequences the rest of the runtime is built around:
   uploaded its FP16 ones (2.6 GB). Without that, the first end-to-end run
   peaked at 14.9 GB on a 16 GB Mac and swapped: a 1 GB upload took 20 s and
   prefill fell to 3 tok/s.
+- **What Metal allows is not what the machine has.**
+  `recommendedMaxWorkingSetSize` is 11.8 GiB on a 16 GB Mac that is also
+  running macOS, and placement that believes it takes a 32K KV window and
+  gets the compressor: 66 MB of free pages, 3.4 GB of swap, and a 16-minute
+  file decoding at 3.1 tok/s. `vv_dev_get_device_info` reports the smaller of
+  what Metal allows and what the OS can still give (free, inactive, purgeable
+  and speculative pages, less a margin).
+  That on its own makes placement worse, because the weights it is deciding
+  about are already in RAM: a Mac that has just loaded 8 GB of model sees
+  nothing free and streams layers it would have to hold anyway. So
+  `vv_gpu_budget_reclaim` adds back what placing them frees — uploading a
+  weight here is a memcpy, and the host copy goes. A discrete card reclaims
+  nothing and decides as before.
 - **Untouched pages cost nothing.** Allocations of 64 KB and up are
   anonymous mappings wrapped with `newBufferWithBytesNoCopy`, so their pages
   are zero and are committed on first use; a zero fill of a buffer nothing
@@ -69,17 +82,26 @@ that needs the host mid-capture (a sync, an event, a pageable copy) breaks
 the capture, and the caller falls back to launching each kernel, exactly as
 it does on CUDA.
 
-**Two limits the CUDA path never meets:**
+**Two limits the CUDA path never meets**, both because of the system's GPU
+watchdog, which counts from submission and not from when a buffer starts
+running. The speech encoder on a 16-minute file queued a minute of work in a
+few seconds and every buffer behind it was killed with
+`kIOGPUCommandBufferCallbackErrorTimeout`.
 
 - A command buffer is committed every 128 launches **or every 64K
   threadgroups**, whichever comes first.
-- A stream keeps at most **two** command buffers queued; committing a third
-  waits for the first.
+- A stream may have **192K threadgroups submitted and not yet finished**;
+  committing past that waits for its oldest buffer. Finished buffers are
+  retired by reading their status, which never blocks.
 
-Both exist because of the system's GPU watchdog, which counts from
-submission, not from when a buffer starts running. The speech encoder on a
-16-minute file queued a minute of work in a few seconds and every buffer
-behind it was killed with `kIOGPUCommandBufferCallbackErrorTimeout`.
+The second bound is on work, not on buffers, and the difference is the whole
+decode loop: a step is ~450 tiny launches across four buffers, so a cap of
+two *buffers* made it wait for the GPU four times a token — 6.5 tok/s against
+14.9, RTF 1.29 against 0.61 on a 30-second file.
+
+`VV_METAL_TRACE=<ms>` logs every command buffer that runs longer than that,
+with its launches, its threadgroups and the last kernel in it; it is how both
+numbers were chosen.
 
 ### Numerics
 

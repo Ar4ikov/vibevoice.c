@@ -241,9 +241,10 @@ static size_t host_available_bytes(void) {
     if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) page = 16384;
     vm_statistics64_data_t vm;
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    /* Unanswerable means "do not narrow the answer", not "nothing is free". */
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
                           (host_info64_t)&vm, &count) != KERN_SUCCESS)
-        return 0;
+        return SIZE_MAX;
     const uint64_t pages = (uint64_t)vm.free_count + vm.inactive_count +
                            vm.purgeable_count + vm.speculative_count;
     return (size_t)(pages * (uint64_t)page);
@@ -1140,8 +1141,10 @@ vv_status_t vv_dev_get_device_info(int device_id, size_t* total_mem,
      */
     const size_t margin = (size_t)1536 * 1024 * 1024;
     const size_t avail = host_available_bytes();
-    const size_t host_free = avail > margin ? avail - margin : 0;
-    if (host_free < freem) freem = host_free;
+    if (avail != SIZE_MAX) {
+        const size_t host_free = avail > margin ? avail - margin : 0;
+        if (host_free < freem) freem = host_free;
+    }
     if (total_mem) *total_mem = total;
     if (free_mem) *free_mem = freem;
     if (sm_count) *sm_count = m->cores;
