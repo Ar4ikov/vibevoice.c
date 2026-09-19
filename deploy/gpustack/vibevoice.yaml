@@ -1,9 +1,12 @@
 backend_name: vibevoice-custom
-description: VibeVoice ASR in C with CUDA, diarization and bounded FIFO admission
+description: VibeVoice ASR in C with CUDA, diarization, multi-GPU and bounded FIFO admission
 default_version: latest
 health_check_path: /health
 parameter_format: space
-default_run_command: 'serve --model "{{model_path}}" --host 0.0.0.0 --port {{port}} --model-name "{{model_name}}"'
+# --gpus all is every GPU GPUStack assigned to the replica and no other: the
+# worker exposes them through CUDA_VISIBLE_DEVICES, renumbered from 0 inside
+# the container. Not {{gpu_ids}}, which are host indexes.
+default_run_command: 'serve --model "{{model_path}}" --host 0.0.0.0 --port {{port}} --model-name "{{model_name}}" --gpus all'
 default_backend_param:
   - --slots 1
   - --queue-size 16
@@ -15,8 +18,12 @@ common_parameters:
   - --max-conns
   - --kv-cache
   - --max-seq-len
+  - --split-mode
+  - --gpu-memory
+  - --gpus
   - --gpu-layers
   - --vram-budget
+  - --acoustic-sampling
 default_env:
   OMP_NUM_THREADS: '8'
 # One entry per image tag the deployment can be pinned to. GET /health on the
