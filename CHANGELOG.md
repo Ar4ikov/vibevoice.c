@@ -9,6 +9,15 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- GPUStack backend ([#25](https://github.com/Ar4ikov/vibevoice.c/issues/25)):
+  the run command passes `--gpus all`, so a replica uses every GPU GPUStack
+  assigned to it instead of only the first. GPUStack spreads a replica
+  over several GPUs on its own when no single card has room for its 8.3 GiB
+  estimate. `--split-mode`, `--gpu-memory`, `--gpus` and
+  `--acoustic-sampling` are offered in the UI. The deployment guide covers
+  replicas vs layer split per GPU, why `{{gpu_ids}}` must not be used (it
+  holds host indexes), what `--gpu-memory` counts, and CPU-only replicas.
+
 ## [0.4.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.3.0...v0.4.0) — 2026-09-19
 
 - **`microsoft/VibeVoice-ASR-Streaming-7B` runs** ([#20](https://github.com/Ar4ikov/vibevoice.c/issues/20)):
