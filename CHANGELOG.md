@@ -116,11 +116,13 @@ Write the entry for a change under Unreleased in the same pull request.
   CPU encoder is time-tiled with carried state (bounded memory), OpenMP,
   through the packed GEMM, and no longer runs on the GPU under `--cpu`.
   Batched, chunked and windowed encodes equal one-by-one bit for bit
-  (`tests/test_vae_stream.c`). 3090: encoder 195 -> 50 ms on 11 s, 1352 ->
-  352 ms on 120 s (RTF 0.064 -> 0.055), 21.1 -> 5.4 s on the 32-minute file
-  (RTF 0.084 -> 0.071); eight 30 s files through `serve --slots 4` 18.2 ->
-  14.8 s with 1.3 GB less VRAM per extra slot; jfk sent 0.3 s into a
-  32-minute request 2.4 -> 2.3 s; CPU encoder on 11 s 70 -> 2.4 s.
+  (`tests/test_vae_stream.c`). 3090, against master with the attention
+  backends and the W4A16 path: encoder 197 -> 52 ms on 11 s, 1347 -> 350 ms
+  on 120 s (RTF 0.054 -> 0.046), 21.9 -> 5.4 s on the 32-minute file (RTF
+  0.067 -> 0.058; AWQ 0.060 -> 0.051); eight 30 s files through
+  `serve --slots 4` 13.1 -> 10.5 s and 20.5 -> 16.9 GB of VRAM; jfk sent
+  0.3 s into a 32-minute request 2.4 -> 2.3 s; CPU encoder on 11 s 71 ->
+  2.5 s.
 - The TensorRT stubs (`src/trt`, `trt.h`, the CMake option, the ONNX/TRT
   export tools) are removed; they never ran, and `VV_ENABLE_TRT` defaulted
   to ON, linking `libnvinfer` into dev builds. `--trt-acoustic` and

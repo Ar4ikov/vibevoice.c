@@ -30,7 +30,7 @@ $ vv_cli --model ./model_hf --audio meeting.wav --output transcript.json
                              your country.
 [ 11.73 -  22.29] Speaker 1  He hoped there would be stew for dinner, turnips
                              and carrots and bruised potatoes...
-RTF 0.055  (120 s of audio in 6.5 s)
+RTF 0.046  (120 s of audio in 5.5 s)
 ```
 
 ---
@@ -70,12 +70,12 @@ RTX 3090, CUDA 12.4, Ryzen 9 5900X. Defaults unless noted.
 | Speech encoding | **50 ms** per 11 s of audio, 352 ms per 120 s, 5.4 s per 32 min |
 | Prefill | **3056 tok/s** on a 14449-token prompt |
 | Decode | **131 tok/s** at 0.2K context, 123 at 1.5K, 93 averaged over a 14K-to-24K window; 132 / 129 / 107 with `--attn flashinfer` |
-| RTF | **0.055** on a 120 s file, **0.067** on 32 minutes (0.060 with `--attn flashinfer`) |
+| RTF | **0.046** on a 120 s file, **0.058** on 32 minutes (0.051 with `--attn flashinfer`) |
 | VRAM | 9.8 GB (3.2 GB weights + 1.8 GB KV at a 32K window) |
 
 `transformers` + `bitsandbytes` on the same GPU and checkpoint: 27.6 tok/s.
 
-A 32-minute recording transcribes in 128 s (115 s with `--attn flashinfer`):
+A 32-minute recording transcribes in 112 s (98 s with `--attn flashinfer`):
 14449 prompt tokens, 9522 generated, 168 segments, flat memory throughout.
 
 ### CPU only
@@ -591,7 +591,7 @@ the performance cores. **There is no Metal backend.** See "Not done" below.
 VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
-Twenty-eight entries — the attention suites run once per backend
+Twenty-nine entries — the attention suites run once per backend
 (`VV_ATTN=fa1|fa2|flashinfer`). The ones that need weights report SKIP without
 `VV_TEST_MODEL`. `test_cpu_kernels` checks every CPU kernel against a scalar
 reference, which is what makes the SIMD paths verifiable per architecture —

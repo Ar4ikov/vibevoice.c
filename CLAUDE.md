@@ -19,7 +19,7 @@ Runtime работает end-to-end и **посимвольно совпадае
 | Speech encoding | **50 мс** на 11 c аудио, 352 мс на 120 c, 5.4 c на 32 мин |
 | Prefill | **3056 tok/s** (14449-токенный промпт, tensor cores) |
 | Decode | **131 tok/s** (0.2K ctx), 123 (1.5K), 93 (14K→24K); flashinfer 132 / 129 / 107 |
-| RTF | **0.055** (120 c), **0.067** (32 мин), 0.060 с `--attn flashinfer` |
+| RTF | **0.046** (120 c), **0.058** (32 мин), 0.051 с `--attn flashinfer` |
 | VRAM | 9.8 GB (3.2 веса + 1.8 KV на 32K) |
 | CPU-only | prefill 77 tok/s (991 GFLOP/s), decode 7.9 tok/s, RTF 0.81 |
 
@@ -655,7 +655,7 @@ VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
 `ctest` без `VV_TEST_MODEL` тоже проходит — тесты, которым нужны веса,
-рапортуют SKIP. Всего 28 записей (attention-наборы идут по разу на бэкенд).
+рапортуют SKIP. Всего 29 записей (attention-наборы идут по разу на бэкенд).
 
 Релизная сборка (все архитектуры, статические рантаймы, без тестов):
 
