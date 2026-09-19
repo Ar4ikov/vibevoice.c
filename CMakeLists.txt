@@ -358,6 +358,9 @@ if(VV_BUILD_TESTS)
     add_test(NAME test_w4a16_fallback COMMAND test_w4a16)
     set_tests_properties(test_w4a16_fallback PROPERTIES
                          ENVIRONMENT "VV_W4A16_MMA=0")
+    # The same path through the loader on a real AWQ / GPTQ checkpoint
+    # (VV_TEST_MODEL; skipped without one).
+    vv_add_test(test_w4a16_model tests/test_w4a16_model.c)
     vv_add_test(test_cpu_kernels tests/test_cpu_kernels.c)
 
     # Arguments to helper programs, uploads and HTTP heads stay data (#14).
