@@ -24,8 +24,9 @@
 extern "C" {
 #endif
 
-/** @brief Buffers one launch binds, at [[buffer(1)]] onwards. */
-#define VV_MTL_MAX_BUFS 16
+/** @brief Buffers one launch binds, at [[buffer(1)]] onwards (Metal
+ *         allows 31 per stage). */
+#define VV_MTL_MAX_BUFS 24
 
 /** @brief Buffers a launch reaches only through addresses in its params
  *         (a VAE descriptor table: four per item, 32 items). */

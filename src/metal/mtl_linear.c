@@ -73,6 +73,15 @@ vv_status_t vv_gemm_fp16_dev(const void* A, const void* B, void* C,
         l.block[0] = 256;
         return vv_mtl_run(stream, &l);
     }
+    return vv_gemm_fp16_tile_dev(A, B, C, M, N, K, alpha, beta, stream);
+}
+
+vv_status_t vv_gemm_fp16_tile_dev(const void* A, const void* B, void* C,
+                                  int M, int N, int K, float alpha, float beta,
+                                  void* stream) {
+    if (!A || !B || !C) return VV_ERR_NULL_PTR;
+    if (M <= 0 || N <= 0 || K <= 0) return VV_ERR_INVALID_ARG;
+    gemm_p p = { M, N, K, alpha, beta };
     vv_mtl_launch_t l = launch("vv_gemm_tn", &p, sizeof(p));
     l.bufs[0] = A; l.bufs[1] = B; l.bufs[2] = C; l.nbufs = 3;
     l.grid[0] = (uint32_t)((N + 63) / 64);
