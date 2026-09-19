@@ -272,12 +272,22 @@ static void bind_worker(int slot) {
 #endif
 }
 
-/** @brief Pin every worker of the current team. Call inside a parallel region. */
+/**
+ * @brief Pin every worker of the current team except the calling thread.
+ *        Call inside a parallel region.
+ *
+ * The caller stays unpinned: every thread it creates later inherits its
+ * affinity, and `serve` creates its connection threads from here. With the
+ * caller on core 0, each request's OpenMP team -- created by a connection
+ * thread, so not this pool -- ran all its workers on that one core: jfk.wav
+ * took RTF 13.7 through `serve --cpu` instead of 0.23.
+ */
 static void bind_team(void) {
 #ifdef _OPENMP
-    bind_worker(omp_get_thread_num());
+    const int id = omp_get_thread_num();
+    if (id > 0) bind_worker(id);
 #else
-    bind_worker(0);
+    (void)bind_worker;
 #endif
 }
 
