@@ -850,6 +850,31 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
              placement_str(c->placement), c->n_resident_layers,
              c->primary_layers);
 
+    /*
+     * BitNet loads differently per backend: the GPU preparation above turned
+     * the norms into F16, and the encoder and head defaults were picked for
+     * the GPU. When the budget sends the model to the CPU anyway, load it
+     * again the way --cpu does, so the result is the --cpu transcript.
+     */
+    if (c->placement == VV_PLACE_CPU_ONLY && !lo.cpu &&
+        c->model->config.family == VV_FAMILY_ASR_BITNET) {
+        VV_LOG_W("inference: nothing fits on the GPU; reloading BitNet "
+                 "for the CPU");
+        free_frontend_host(c);
+        vv_model_free(c->model);
+        c->model = NULL;
+        lo.cpu = 1;
+        s = vv_model_load_ex(model_dir, &lo, &c->model);
+        if (s != VV_OK) {
+            VV_LOG_E("inference: failed to reload model: %s",
+                     vv_status_str(s));
+            vv_free(c);
+            return s;
+        }
+        llm = &c->model->config.llm;
+        build_frontend_host(c);
+    }
+
     /* ── CPU-only path: skip all CUDA ── */
     if (c->placement == VV_PLACE_CPU_ONLY) {
         c->use_gpu = false;

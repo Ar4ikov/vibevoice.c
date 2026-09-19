@@ -607,6 +607,13 @@ vv_status_t vv_bitnet_layer_cpu(const vv_layer_weights_t* L,
     float* ascr = f;             f += (size_t)nt * per;
     int8_t* q8 = (int8_t*)f;
     vv_status_t s;
+    /* The GPU preparation turns the norms into F16; this path reads FP32. */
+    if (L->input_layernorm.dtype != VV_DTYPE_F32 ||
+        L->post_attn_layernorm.dtype != VV_DTYPE_F32) {
+        VV_LOG_E("bitnet: layer %d norms are not FP32 (prepared for the GPU?)",
+                 layer);
+        return VV_ERR_INVALID_ARG;
+    }
 
     /* attention */
     lm_dump(layer, pos0, "inp", h, (size_t)T * hs);
