@@ -514,6 +514,28 @@ static vv_status_t a8_linear(const vv_weight_t* w, const a8_act_t* a,
 }
 
 /**
+ * @brief Projections that read the same int8 input (q/k/v, gate/up): one
+ *        GEMV launch for decode-sized M, one GEMM each otherwise.
+ */
+static vv_status_t a8_group(const vv_weight_t* const* ws, void* const* ys,
+                            const int* Ns, int n, const a8_act_t* a,
+                            int M, int K, void* stream)
+{
+    vv_i8_proj_t p[3];
+    for (int i = 0; i < n; i++) {
+        p[i].w    = ws[i]->tensor.data;
+        p[i].sw   = ws[i]->quant.scales.data;
+        p[i].sz   = ws[i]->quant.scales.data;
+        p[i].bias = ws[i]->bias.data;
+        p[i].y    = ys[i];
+        p[i].N    = Ns[i];
+    }
+    return vv_i8_linear_multi_dev(a->xq, a->layout, a->sx, a->xsum,
+                                  ws[0]->quant_kind == VV_QUANT_INT4G, p, n,
+                                  ws[0]->group_size, M, K, stream);
+}
+
+/**
  * @brief Dump a GPU FP16 buffer as FP32 to $VV_DUMP_DIR (debug builds only).
  */
 static void dump_gpu_fp16(const char* name, const void* gpu, size_t n,
@@ -657,14 +679,12 @@ static vv_status_t decoder_layer_impl(
 
     /* 2. Q, K, V projections (+ bias if present) */
     if (a8) {
-        s = a8_linear(&layer->attn.q_proj, &act, q_buf, NULL,
-                      seq_len, n_heads * head_dim, hs, stream);
-        if (s == VV_OK)
-            s = a8_linear(&layer->attn.k_proj, &act, k_buf, NULL,
-                          seq_len, n_kv_heads * head_dim, hs, stream);
-        if (s == VV_OK)
-            s = a8_linear(&layer->attn.v_proj, &act, v_buf, NULL,
-                          seq_len, n_kv_heads * head_dim, hs, stream);
+        const vv_weight_t* ws[3] = { &layer->attn.q_proj, &layer->attn.k_proj,
+                                     &layer->attn.v_proj };
+        void* ys[3] = { q_buf, k_buf, v_buf };
+        const int ns[3] = { n_heads * head_dim, n_kv_heads * head_dim,
+                            n_kv_heads * head_dim };
+        s = a8_group(ws, ys, ns, 3, &act, seq_len, hs, stream);
         if (s != VV_OK) return s;
     } else {
         const vv_weight_t* ws[3] = { &layer->attn.q_proj, &layer->attn.k_proj,
@@ -762,12 +782,13 @@ static vv_status_t decoder_layer_impl(
                                   layer->post_attn_layernorm.data, seq_len,
                                   hs, config->rms_norm_eps, act.layout,
                                   act.xq, act.sx, act.xsum, stream);
-        if (s == VV_OK)
-            s = a8_linear(&layer->mlp.gate_proj, &act, gate_buf, NULL,
-                          seq_len, inter_size, hs, stream);
-        if (s == VV_OK)
-            s = a8_linear(&layer->mlp.up_proj, &act, up_buf, NULL,
-                          seq_len, inter_size, hs, stream);
+        if (s == VV_OK) {
+            const vv_weight_t* ws[2] = { &layer->mlp.gate_proj,
+                                         &layer->mlp.up_proj };
+            void* ys[2] = { gate_buf, up_buf };
+            const int ns[2] = { inter_size, inter_size };
+            s = a8_group(ws, ys, ns, 2, &act, seq_len, hs, stream);
+        }
         if (s == VV_OK)
             s = vv_swiglu_q8_dev(gate_buf, up_buf, seq_len, inter_size,
                                  act.layout, act.xq, act.sx, act.xsum,

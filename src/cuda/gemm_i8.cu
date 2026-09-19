@@ -36,9 +36,8 @@
 #include "vibevoice/device.h"
 
 #include <stdlib.h>
+#include <string.h>
 
-extern "C" vv_status_t vv_i8_gemv_launch(const vv_i8_args* ap, int w4,
-                                         void* stream);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Tensor-core kernel
@@ -612,6 +611,37 @@ vv_status_t vv_w4a8_linear_dev(
     p.y = y; p.y_f32 = y_f32; p.M = M; p.N = N; p.K = K; p.G = group_size;
     p.x_layout = x_layout;
     return i8_dispatch(p, true, path, stream);
+}
+
+vv_status_t vv_i8_linear_multi_dev(
+    const int8_t* xq, int x_layout, const float* sx, const int32_t* xsum,
+    int w4, const vv_i8_proj_t* projs, int n, int group_size,
+    int M, int K, void* stream)
+{
+    if (!xq || !sx || !projs) return VV_ERR_NULL_PTR;
+    if (n < 1) return VV_ERR_INVALID_ARG;
+    vv_i8_args p;
+    memset(&p, 0, sizeof(p));
+    p.xq = xq; p.sx = sx; p.xsum = xsum;
+    p.M = M; p.K = K; p.G = w4 ? group_size : K; p.x_layout = x_layout;
+    /* One launch for all of them when the GEMV takes the shape. */
+    const bool gemv = w4 ? x_layout == VV_Q8_W4_GEMV : M <= 8;
+    if (gemv && n <= 3) {
+        vv_status_t s = vv_i8_gemv_launch_multi(&p, w4, projs, n, stream);
+        if (s != VV_ERR_UNSUPPORTED) return s;
+    }
+    for (int i = 0; i < n; i++) {
+        const vv_i8_proj_t* q = &projs[i];
+        vv_status_t s = w4
+            ? vv_w4a8_linear_dev(xq, x_layout, sx, xsum, q->w, q->sz,
+                                 group_size, q->bias, NULL, q->y, 0, M, q->N,
+                                 K, VV_I8_PATH_AUTO, stream)
+            : vv_w8a8_linear_dev(xq, sx, (const int8_t*)q->w,
+                                 (const float*)q->sw, q->bias, NULL, q->y, 0,
+                                 M, q->N, K, VV_I8_PATH_AUTO, stream);
+        if (s != VV_OK) return s;
+    }
+    return VV_OK;
 }
 
 } /* extern "C" */

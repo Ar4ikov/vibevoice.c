@@ -476,6 +476,46 @@ static void test_gpu_linear(const problem_t* p, const dev_problem_t* d, int M,
                   pn[path], M, N, K, bad, cnt, worst);
         }
     }
+    /* Shared-input launches (q/k/v, gate/up): three projections of the
+       same input in one GEMV grid, each checked like a single one. */
+    if (M <= 8) {
+        void* dy2 = dup_dev(NULL, mn * 2 * 3);
+        for (int w4 = 0; w4 < 2; w4++) {
+            vv_i8_proj_t pr[3];
+            for (int i = 0; i < 3; i++) {
+                pr[i].w = w4 ? d->w4 : d->w8;
+                pr[i].sw = d->sw;
+                pr[i].sz = d->sz;
+                pr[i].bias = i == 1 ? NULL : d->bias;
+                pr[i].y = (uint8_t*)dy2 + (size_t)i * mn * 2;
+                pr[i].N = i == 2 ? (N + 1) / 2 : N;   /* a shorter third */
+            }
+            vv_status_t s = vv_i8_linear_multi_dev(
+                w4 ? dxqn : dxq, w4 ? VV_Q8_W4_GEMV : VV_Q8_NATURAL, dsx, dxs,
+                w4, pr, 3, p->G, M, K, st);
+            vv_dev_stream_sync(st);
+            int bad = 0;
+            for (int i = 0; i < 3 && s == VV_OK; i++) {
+                const int Ni = pr[i].N;
+                vv_dev_memcpy_d2h(yh, pr[i].y, (size_t)M * Ni * 2, NULL);
+                for (int e = 0; e < cnt; e++) {
+                    const int m = ms[e], n = ns[e];
+                    if (n >= Ni) continue;
+                    const double core = w4
+                        ? ref_w4(p, xq + (size_t)m * K, n, 0) * sx[m]
+                        : (double)ref_w8_dot(p, xq + (size_t)m * K, n) * sx[m] * p->sw[n];
+                    const double r = core +
+                        (pr[i].bias ? vv_half_to_float(p->bias[n]) : 0.0);
+                    const double o = vv_half_to_float(yh[(size_t)m * Ni + n]);
+                    if (fabs(o - r) > fabs(r) * (1.0 / 1024.0) + 1e-3) bad++;
+                }
+            }
+            CHECK(s == VV_OK && bad == 0, "gpu %s multi M=%d N=%d K=%d: %d "
+                  "(status %d)", w4 ? "w4a8" : "w8a8", M, N, K, bad, (int)s);
+        }
+        vv_dev_free(dy2);
+    }
+
     vv_dev_free(dxq); vv_dev_free(dxqn); vv_dev_free(dxqm); vv_dev_free(dsx);
     vv_dev_free(done);
     vv_dev_free(dxs); vv_dev_free(dres); vv_dev_free(dy);

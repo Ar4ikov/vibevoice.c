@@ -13,6 +13,8 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+#include "vibevoice/device.h"
+
 /** @brief Everything a W8A8 or W4A8 launch needs; passed by value. */
 struct vv_i8_args {
     const int8_t*  xq;       /* [M][K] int8 activations                     */
@@ -28,6 +30,12 @@ struct vv_i8_args {
     int x_layout;            /* vv_q8_layout_t of xq                        */
     int M, N, K, G;
 };
+
+extern "C" vv_status_t vv_i8_gemv_launch(const vv_i8_args* ap, int w4,
+                                         void* stream);
+extern "C" vv_status_t vv_i8_gemv_launch_multi(const vv_i8_args* ap, int w4,
+                                               const vv_i8_proj_t* projs,
+                                               int n, void* stream);
 
 /** @brief Write one output: v + bias[n] + res[m,n], FP16 or FP32. */
 __device__ __forceinline__ void i8_store(const vv_i8_args& p, int m, int n,

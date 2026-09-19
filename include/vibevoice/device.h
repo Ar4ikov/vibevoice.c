@@ -356,6 +356,31 @@ vv_status_t vv_w4a8_linear_dev(
     const void* bias, const void* residual, void* y,
     int y_f32, int M, int N, int K, int path, void* stream);
 
+/** @brief One projection of a shared-input int8 launch. */
+typedef struct vv_i8_proj {
+    const void* w;        /**< W8: int8 [N][K]; W4: GPU-layout [N][K/2]    */
+    const void* sw;       /**< W8: FP32 [N] scales                         */
+    const void* sz;       /**< W4: half2 {scale, zero} [N][K/G]            */
+    const void* bias;     /**< FP16 [N] or NULL                            */
+    void*       y;        /**< FP16 [M][N] output                          */
+    int         N;        /**< output rows                                 */
+} vv_i8_proj_t;
+
+/**
+ * @brief Up to three projections of the same int8 input (q/k/v, gate/up).
+ *
+ * For M <= 8 (W8A8) or VV_Q8_W4_GEMV activations (W4A8) they run as one
+ * GEMV launch whose grid is the concatenation of their rows, each row
+ * computed exactly as vv_w8a8_linear_dev / vv_w4a8_linear_dev would; other
+ * shapes run one GEMM each. Graph-capturable.
+ *
+ * @param w4 0: W8A8 (projs[].w, .sw); 1: W4A8 (projs[].w, .sz, group_size)
+ */
+vv_status_t vv_i8_linear_multi_dev(
+    const int8_t* xq, int x_layout, const float* sx, const int32_t* xsum,
+    int w4, const vv_i8_proj_t* projs, int n, int group_size,
+    int M, int K, void* stream);
+
 /* ─── Dense linear ───────────────────────────────────────────────────────── */
 
 /** @brief C[M,N] = alpha * A[M,K] @ B[N,K]^T + beta * C. */
