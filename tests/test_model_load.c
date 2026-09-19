@@ -6,7 +6,9 @@
  * live in tests/data, and the loader is exercised on a tiny synthetic
  * checkpoint this test writes itself — BF16 projections, an F32 embedding,
  * F16 norms — so every conversion and routing decision is checked against
- * values computed here.
+ * values computed here. The same checkpoint is also written the way
+ * llm-compressor stores W8A8 / W4A8 / W4A16 (compressed-tensors
+ * `int-quantized` and `pack-quantized`) and loaded back integer for integer.
  */
 
 #include "vibevoice/vibevoice.h"
@@ -251,7 +253,7 @@ static void test_half_rne(void) {
 }
 
 typedef struct {
-    char        name[128];
+    char        name[160];
     const char* dtype;     /* "BF16" | "F16" | "F32" */
     int64_t     shape[2];
     int         ndim;
@@ -362,13 +364,28 @@ static void build_tensors(bool with_head) {
     add("model.semantic_tokenizer.encoder.probe.weight", "BF16", 16, 0, 1.0f);
 }
 
+/*
+ * A compressed-tensors variant of the checkpoint (test_compressed_tensors):
+ * while g_nct > 0, write_model() writes the tensors in g_ct in place of the
+ * dense projection weights, and g_qcfg (",\"quantization_config\":{...}")
+ * into config.json.
+ */
+static fake_t g_ct[96];
+static int g_nct;
+static char g_qcfg[1024];
+
+static bool is_proj_weight(const char* name) {
+    const size_t n = strlen(name), s = strlen("_proj.weight");
+    return n > s && strcmp(name + n - s, "_proj.weight") == 0;
+}
+
 /** @brief Write `dir` with config.json and model.safetensors. `skip`/`bad`
  *  name one tensor to leave out or to write with the wrong shape. */
 static int write_model(const char* dir, bool tie, const char* skip,
                        const char* bad) {
     MKDIR(dir);
     char path[512];
-    char cfg[1024];
+    char cfg[2048];
     snprintf(cfg, sizeof(cfg),
         "{\"architectures\":[\"VibeVoiceForASRTraining\"],"
         "\"acoustic_tokenizer_config\":{\"vae_dim\":%d},"
@@ -377,8 +394,9 @@ static int write_model(const char* dir, bool tie, const char* skip,
         "\"num_attention_heads\":%d,\"num_key_value_heads\":%d,"
         "\"intermediate_size\":%d,\"vocab_size\":%d,\"hidden_act\":\"silu\","
         "\"rope_theta\":1000000.0,\"rms_norm_eps\":1e-6,"
-        "\"tie_word_embeddings\":%s}}",
-        VAE_A, VAE_S, HS, LAYERS, NH, NKV, INTER, VOCAB, tie ? "true" : "false");
+        "\"tie_word_embeddings\":%s}%s}",
+        VAE_A, VAE_S, HS, LAYERS, NH, NKV, INTER, VOCAB, tie ? "true" : "false",
+        g_nct > 0 ? g_qcfg : "");
     snprintf(path, sizeof(path), "%s/config.json", dir);
     if (write_text(path, cfg)) return 1;
 
@@ -388,9 +406,10 @@ static int write_model(const char* dir, bool tie, const char* skip,
     if (!hdr) return 1;
     int trunc = appendf(hdr, cap, &len, "{");
     bool first = true;
-    for (int i = 0; i < g_n; i++) {
-        const fake_t* t = &g_t[i];
+    for (int i = 0; i < g_n + g_nct; i++) {
+        const fake_t* t = i < g_n ? &g_t[i] : &g_ct[i - g_n];
         if (skip && strcmp(t->name, skip) == 0) continue;
+        if (i < g_n && g_nct > 0 && is_proj_weight(t->name)) continue;
         int64_t d0 = t->shape[0];
         if (bad && strcmp(t->name, bad) == 0) d0 /= 2;   /* bytes stay */
         if (t->ndim == 2)
@@ -417,9 +436,11 @@ static int write_model(const char* dir, bool tie, const char* skip,
     uint64_t hl = len;
     fwrite(&hl, 8, 1, f);
     fwrite(hdr, 1, len, f);
-    for (int i = 0; i < g_n; i++) {
-        if (skip && strcmp(g_t[i].name, skip) == 0) continue;
-        fwrite(g_t[i].data, 1, g_t[i].bytes, f);
+    for (int i = 0; i < g_n + g_nct; i++) {
+        const fake_t* t = i < g_n ? &g_t[i] : &g_ct[i - g_n];
+        if (skip && strcmp(t->name, skip) == 0) continue;
+        if (i < g_n && g_nct > 0 && is_proj_weight(t->name)) continue;
+        fwrite(t->data, 1, t->bytes, f);
     }
     fclose(f);
     free(hdr);
@@ -974,6 +995,320 @@ static void test_smooth(void) {
     vv_smooth_stats_free(st);
 }
 
+/* ─── compressed-tensors checkpoints ────────────────────────────────────── */
+
+/** @brief How the synthetic llm-compressor checkpoint stores its Linears. */
+typedef struct {
+    const char* what;
+    int  bits;        /**< 8: channel-wise; 4: group-wise                    */
+    int  group;       /**< 4-bit only                                         */
+    bool asym;        /**< weight_zero_point present (4-bit only)             */
+    bool packed;      /**< pack-quantized: weight_packed + weight_shape       */
+    bool bf16_scale;  /**< BF16 weight_scale (else F32)                       */
+    bool act8;        /**< input_activations: int8 dynamic per token          */
+} ct_fmt_t;
+
+/** @brief What the writer quantized one projection to, kept to check the
+ *         loader against without going through any packing. */
+typedef struct {
+    char    base[128];
+    int     N, K, ng;
+    int8_t* q;        /**< [N][K], signed                                     */
+    float*  s;        /**< [N][ng], as stored (BF16 values when bf16_scale)   */
+    int*    z;        /**< [N][ng], signed; zeros when symmetric              */
+} ct_ref_t;
+
+static ct_ref_t g_ref[LAYERS * 7];
+static int g_nref;
+
+/** @brief Positive normal `f` cut to the 8 significant bits of a BF16, as a
+ *         float: exactly what f2bf() then stores. */
+static float bf16_trunc(float f) {
+    int e;
+    const float m = frexpf(f, &e);                  /* [0.5, 1) */
+    return ldexpf(floorf(ldexpf(m, 8)), e - 8);
+}
+
+/** @brief Scale of a group spanning [mn, mx] (mn <= 0 <= mx), as stored. */
+static float ct_scale(const ct_fmt_t* f, double mn, double mx, int hi) {
+    const double s = f->asym ? (mx - mn) / 15.0
+                             : (-mn > mx ? -mn : mx) / (double)hi;
+    return f->bf16_scale ? bf16_trunc((float)s) : (float)s;
+}
+
+static void* ct_add(const char* name, const char* dtype, int64_t d0,
+                    int64_t d1, size_t es) {
+    fake_t* t = &g_ct[g_nct++];
+    snprintf(t->name, sizeof(t->name), "%s", name);
+    t->dtype = dtype;
+    t->shape[0] = d0; t->shape[1] = d1;
+    t->ndim = d1 > 0 ? 2 : 1;
+    t->bytes = (size_t)d0 * (size_t)(d1 > 0 ? d1 : 1) * es;
+    t->data = calloc(1, t->bytes);
+    return t->data;
+}
+
+static fake_t* ct_find(const char* name) {
+    for (int i = 0; i < g_nct; i++)
+        if (strcmp(g_ct[i].name, name) == 0) return &g_ct[i];
+    return NULL;
+}
+
+static void ct_clear(void) {
+    for (int i = 0; i < g_nct; i++) free(g_ct[i].data);
+    g_nct = 0;
+    for (int i = 0; i < g_nref; i++) {
+        free(g_ref[i].q); free(g_ref[i].s); free(g_ref[i].z);
+    }
+    g_nref = 0;
+}
+
+/**
+ * @brief Quantize every dense projection of g_t the way llm-compressor
+ *        writes it, into g_ct, and the matching quantization_config.
+ *
+ * w = (q - z) * s, q and z signed; 8-bit symmetric in [-127, 127], 4-bit in
+ * [-8, 7]. Packed: element k of a row at bits 4 * (k % 8) of int32 word
+ * k / 8, stored + 8; zero points packed the same way along N.
+ */
+static void build_ct(const ct_fmt_t* f) {
+    ct_clear();
+    snprintf(g_qcfg, sizeof(g_qcfg),
+        ",\"quantization_config\":{\"quant_method\":\"compressed-tensors\","
+        "\"format\":\"%s\",\"ignore\":[\"lm_head\"],\"config_groups\":{"
+        "\"group_0\":{\"targets\":[\"Linear\"],\"weights\":{\"num_bits\":%d,"
+        "\"type\":\"int\",\"symmetric\":%s,\"strategy\":\"%s\","
+        "\"group_size\":%d,\"dynamic\":false},\"input_activations\":%s}}}",
+        f->packed ? "pack-quantized" : "int-quantized", f->bits,
+        f->asym ? "false" : "true", f->bits == 8 ? "channel" : "group",
+        f->bits == 8 ? 0 : f->group,
+        f->act8 ? "{\"num_bits\":8,\"type\":\"int\",\"symmetric\":true,"
+                  "\"strategy\":\"token\",\"dynamic\":true}" : "null");
+    for (int i = 0; i < g_n; i++) {
+        const fake_t* src = &g_t[i];
+        if (!is_proj_weight(src->name)) continue;
+        const int N = (int)src->shape[0], K = (int)src->shape[1];
+        const int G = f->bits == 8 ? K : f->group, ng = K / G;
+        const int lo = f->bits == 8 ? -127 : -8, hi = f->bits == 8 ? 127 : 7;
+        ct_ref_t* r = &g_ref[g_nref++];
+        snprintf(r->base, sizeof(r->base), "%.*s", (int)(strlen(src->name) - 7),
+                 src->name);
+        r->N = N; r->K = K; r->ng = ng;
+        r->q = (int8_t*)malloc((size_t)N * K);
+        r->s = (float*)malloc((size_t)N * ng * sizeof(float));
+        r->z = (int*)calloc((size_t)N * ng, sizeof(int));
+        for (int n = 0; n < N; n++)
+            for (int g = 0; g < ng; g++) {
+                double mn = 0.0, mx = 0.0;
+                for (int k = g * G; k < (g + 1) * G; k++) {
+                    const double v = src_w(src, K, n, k);
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                const float s = ct_scale(f, mn, mx, hi);
+                int z = 0;
+                if (f->asym) {
+                    z = (int)floor(-mn / s + 0.5) - 8;
+                    z = z < -8 ? -8 : (z > 7 ? 7 : z);
+                }
+                r->s[(size_t)n * ng + g] = s;
+                r->z[(size_t)n * ng + g] = z;
+                for (int k = g * G; k < (g + 1) * G; k++) {
+                    int q = (int)floor(src_w(src, K, n, k) / s + 0.5) + z;
+                    r->q[(size_t)n * K + k] =
+                        (int8_t)(q < lo ? lo : (q > hi ? hi : q));
+                }
+            }
+
+        char nm[160];
+        if (f->packed) {
+            snprintf(nm, sizeof(nm), "%s.weight_packed", r->base);
+            uint32_t* w = (uint32_t*)ct_add(nm, "I32", N, K / 8, 4);
+            for (int n = 0; n < N; n++)
+                for (int k = 0; k < K; k++)
+                    w[(size_t)n * (K / 8) + k / 8] |=
+                        (uint32_t)(r->q[(size_t)n * K + k] + 8) << (4 * (k % 8));
+            snprintf(nm, sizeof(nm), "%s.weight_shape", r->base);
+            int64_t* sh = (int64_t*)ct_add(nm, "I64", 2, 0, 8);
+            sh[0] = N; sh[1] = K;
+        } else {
+            snprintf(nm, sizeof(nm), "%s.weight", r->base);
+            memcpy(ct_add(nm, "I8", N, K, 1), r->q, (size_t)N * K);
+        }
+        snprintf(nm, sizeof(nm), "%s.weight_scale", r->base);
+        void* sd = ct_add(nm, f->bf16_scale ? "BF16" : "F32", N, ng,
+                          f->bf16_scale ? 2 : 4);
+        for (int j = 0; j < N * ng; j++) {
+            if (f->bf16_scale) ((uint16_t*)sd)[j] = f2bf(r->s[j]);
+            else ((float*)sd)[j] = r->s[j];
+        }
+        if (f->asym) {
+            snprintf(nm, sizeof(nm), "%s.weight_zero_point", r->base);
+            if (f->packed) {
+                uint32_t* zw = (uint32_t*)ct_add(nm, "I32", N / 8, ng, 4);
+                for (int n = 0; n < N; n++)
+                    for (int g = 0; g < ng; g++)
+                        zw[(size_t)(n / 8) * ng + g] |=
+                            (uint32_t)(r->z[(size_t)n * ng + g] + 8)
+                            << (4 * (n % 8));
+            } else {
+                int8_t* zb = (int8_t*)ct_add(nm, "I8", N, ng, 1);
+                for (int j = 0; j < N * ng; j++) zb[j] = (int8_t)r->z[j];
+            }
+        }
+    }
+}
+
+/** @brief The loaded weight holds exactly the integers and scales written. */
+static bool ct_exact(const vv_weight_t* w, const ct_ref_t* r, int bits) {
+    const int N = r->N, K = r->K, ng = r->ng;
+    if (bits == 8) {
+        if (w->quant_kind != VV_QUANT_INT8 || w->tensor.dtype != VV_DTYPE_I8 ||
+            w->tensor.size_bytes != (size_t)N * K ||
+            memcmp(w->tensor.data, r->q, (size_t)N * K) != 0)
+            return false;
+        for (int n = 0; n < N; n++)
+            if (((const float*)w->quant.scales.data)[n] != r->s[n]) return false;
+        return true;
+    }
+    if (w->quant_kind != VV_QUANT_INT4G || w->group_size != K / ng ||
+        w->int4g_layout != VV_INT4G_ROWMAJOR ||
+        w->tensor.size_bytes != (size_t)N * K / 2 || !w->zeros.data)
+        return false;
+    const uint8_t* b = (const uint8_t*)w->tensor.data;
+    for (int n = 0; n < N; n++)
+        for (int k = 0; k < K; k++) {
+            const uint8_t v = b[((size_t)n * K + k) / 2];
+            const int code = (k & 1) ? (v & 15) : (v >> 4);   /* high = even */
+            if (code != r->q[(size_t)n * K + k] + 8) return false;
+        }
+    for (int j = 0; j < N * ng; j++) {
+        const uint16_t sh = vv_float_to_half_rne(r->s[j]);
+        const int z = r->z[j] + 8;
+        if (((const uint8_t*)w->zeros.data)[j] != z ||
+            ((const uint16_t*)w->quant.scales.data)[j] != sh ||
+            ((const uint16_t*)w->mins.data)[j] !=
+                vv_float_to_half_rne(-(float)z * vv_half_to_float(sh)))
+            return false;
+    }
+    return true;
+}
+
+static void test_compressed_tensors(void) {
+    printf("compressed-tensors checkpoints:\n");
+    const char* dir = "test_model_load_ct";
+    static const ct_fmt_t F[] = {
+        { "W8A8 int-quantized",            8,  0, false, false, false, true  },
+        { "W4A8 int-quantized (int8 box)", 4, 32, false, false, true,  true  },
+        { "W4A16 pack-quantized, asym",    4, 64, true,  true,  true,  false },
+        { "W4A8 pack-quantized, sym",      4, 32, false, true,  false, true  },
+    };
+    char msg[192];
+    build_tensors(false);
+    for (size_t fi = 0; fi < sizeof(F) / sizeof(F[0]); fi++) {
+        const ct_fmt_t* f = &F[fi];
+        build_ct(f);
+        if (write_model(dir, true, NULL, NULL)) {
+            printf("  SKIP: cannot write %s\n", dir);
+            break;
+        }
+        vv_model_t* m = NULL;
+        vv_status_t s = load(dir, VV_LOAD_QUANT_AUTO, &m);
+        snprintf(msg, sizeof(msg), "%s loads", f->what);
+        CHECK(s == VV_OK && m, msg);
+        if (!m) continue;
+
+        bool exact = true, a8 = true;
+        for (int l = 0; l < LAYERS; l++) {
+            vv_weight_t* p[7];
+            vv_layer_projections(&m->layers[l], p);
+            for (int k = 0; k < 7; k++) {
+                const ct_ref_t* r = &g_ref[l * 7 + k];
+                exact = exact && ct_exact(p[k], r, f->bits);
+                a8 = a8 && p[k]->act_int8 == f->act8;
+            }
+        }
+        /* g_ref follows g_t's order, which is vv_layer_projections' order. */
+        snprintf(msg, sizeof(msg), "%s: every integer, zero point and scale "
+                 "as written", f->what);
+        CHECK(exact, msg);
+        snprintf(msg, sizeof(msg), "%s: int8 activations %s, from the config",
+                 f->what, f->act8 ? "on" : "off");
+        CHECK(a8, msg);
+        CHECK(m->layers[0].attn.q_proj.bias.data != NULL &&
+              m->final_norm.data != NULL, "biases and norms still load");
+
+        const vv_weight_t* w = &m->layers[1].mlp.down_proj;
+        const fake_t* src = get("model.language_model.layers.1.mlp.down_proj.weight");
+        test_kernels(f->what, w, src, HS, INTER);
+        vv_model_free(m);
+
+        /* The other activation mode on the same bytes, and a refusal. */
+        const int other = f->bits == 8
+            ? (f->act8 ? VV_LOAD_QUANT_INT8 : VV_LOAD_QUANT_W8A8)
+            : (f->act8 ? VV_LOAD_QUANT_INT4 : VV_LOAD_QUANT_W4A8);
+        m = NULL;
+        s = load(dir, other, &m);
+        snprintf(msg, sizeof(msg), "%s: --quant %s runs the same weights on "
+                 "%s activations", f->what,
+                 vv_load_quant_name((vv_load_quant_t)other),
+                 f->act8 ? "FP16" : "int8");
+        CHECK(s == VV_OK && m &&
+              ct_exact(&m->layers[1].mlp.gate_proj, &g_ref[7 + 4], f->bits) &&
+              m->layers[1].mlp.gate_proj.act_int8 == !f->act8, msg);
+        vv_model_free(m);
+        m = NULL;
+        const int wrong = f->bits == 8 ? VV_LOAD_QUANT_W4A8 : VV_LOAD_QUANT_W8A8;
+        snprintf(msg, sizeof(msg), "%s: --quant %s refused", f->what,
+                 vv_load_quant_name((vv_load_quant_t)wrong));
+        CHECK(load(dir, wrong, &m) == VV_ERR_UNSUPPORTED && !m, msg);
+    }
+
+    /* Damaged checkpoints are refused by name, not loaded as garbage. */
+    const char* q0 = "model.language_model.layers.0.self_attn.q_proj";
+    char nm[160];
+    vv_model_t* m = NULL;
+    build_ct(&F[2]);
+    snprintf(nm, sizeof(nm), "%s.weight_shape", q0);
+    ((int64_t*)ct_find(nm)->data)[1] = HS * 2;
+    write_model(dir, true, NULL, NULL);
+    CHECK(load(dir, VV_LOAD_QUANT_AUTO, &m) == VV_ERR_SHAPE_MISMATCH && !m,
+          "pack-quantized: a weight_shape that disagrees is refused");
+
+    build_ct(&F[1]);
+    snprintf(nm, sizeof(nm), "%s.weight", q0);
+    ((int8_t*)ct_find(nm)->data)[3] = 9;
+    write_model(dir, true, NULL, NULL);
+    CHECK(load(dir, VV_LOAD_QUANT_AUTO, &m) == VV_ERR_MODEL_FORMAT && !m,
+          "int-quantized 4-bit: a value outside [-8, 7] is refused");
+
+    build_ct(&F[0]);
+    snprintf(nm, sizeof(nm), "%s.weight_zero_point", q0);
+    ct_add(nm, "I8", NH * HD, 1, 1);
+    ((int8_t*)g_ct[g_nct - 1].data)[5] = 3;
+    write_model(dir, true, NULL, NULL);
+    CHECK(load(dir, VV_LOAD_QUANT_AUTO, &m) == VV_ERR_UNSUPPORTED && !m,
+          "asymmetric int8 is refused (INT8 has no zero point)");
+
+    build_ct(&F[1]);
+    snprintf(nm, sizeof(nm), "%s.weight_g_idx", q0);
+    int32_t* gi = (int32_t*)ct_add(nm, "I32", HS, 0, 4);
+    for (int k = 0; k < HS; k++) gi[k] = (k * 7 % HS) / 32;   /* shuffled */
+    write_model(dir, true, NULL, NULL);
+    CHECK(load(dir, VV_LOAD_QUANT_AUTO, &m) == VV_ERR_UNSUPPORTED && !m,
+          "an act-order g_idx is refused");
+    for (int k = 0; k < HS; k++) gi[k] = k / 32;              /* plain */
+    write_model(dir, true, NULL, NULL);
+    CHECK(load(dir, VV_LOAD_QUANT_AUTO, &m) == VV_OK && m,
+          "a plain g_idx (k / group) loads");
+    vv_model_free(m);
+
+    ct_clear();
+    remove("test_model_load_ct/config.json");
+    remove("test_model_load_ct/model.safetensors");
+    RMDIR("test_model_load_ct");
+}
+
 int main(void) {
     printf("=== test_model_load ===\n");
     test_published_configs();
@@ -983,6 +1318,7 @@ int main(void) {
     test_dense_load();
     test_load_quant();
     test_smooth();
+    test_compressed_tensors();
     /* Leave nothing behind in the directory ctest runs from. */
     remove("test_model_load_dense/config.json");
     remove("test_model_load_dense/model.safetensors");
