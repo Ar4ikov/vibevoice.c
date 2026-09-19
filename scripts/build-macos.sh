@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #
-# Build on macOS. There is no accelerator backend here yet, so this produces
-# the CPU build: NEON kernels on Apple Silicon, AVX2 on Intel Macs, threads
-# defaulted to the performance cores.
+# Build on macOS. On Apple Silicon this includes the Metal backend, which
+# needs only the Command Line Tools -- the shaders are compiled from source
+# at runtime, so no Xcode and no offline `metal` compiler. On an Intel Mac,
+# and with -DVV_ENABLE_METAL=OFF, it is the CPU build: AVX2 there, NEON on
+# Apple Silicon, threads defaulted to the performance cores.
 #
 #   scripts/build-macos.sh [build-dir]
 #
-# OpenMP is optional but worth having -- without it the kernels run on one
-# core. Apple's clang does not ship it:
+# OpenMP is optional but worth having -- without it the CPU kernels run on
+# one core. Apple's clang does not ship it:
 #
 #   brew install libomp
 #
