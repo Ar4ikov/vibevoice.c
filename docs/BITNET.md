@@ -318,7 +318,7 @@ VAE** (5.3 s), 8 % prefill, 25 % decode (24 ms per token, of which the F16
 head alone is an estimated ~9 ms at 50 GB/s). Decode stops scaling at 3 threads — it is
 memory-bound on 467 MB (head) + 328 MB (ternary layers) per token.
 
-## This runtime's kernels (phase 1)
+## This runtime's kernels
 
 All exact in int32 and bit-identical across ISAs and to the GPU
 (`tests/test_bitnet.c`, run natively, with `VV_BITNET_MMA=0`, and under
@@ -379,14 +379,135 @@ the small shapes; graphs and fusion (phase 2) are the lever there.
   for tensor-by-tensor comparison, and the encoder in F32 / int8+ReLU /
   int8+GELU.
 
-## Phase 2 (integration) notes
+## End to end (phase 2)
 
-* Loader: family `asr-bitnet` (issue #15 adds families and F32 → FP16 for
-  the dense tensors). GGUF pair via `vv_gguf_open`; I2_S tensors map
-  zero-copy onto the ternary layout; `blk.N.attn_q ↔
-  model.language_model.layers.N.self_attn.q_proj` etc.
-* Quantize each input once and feed q/k/v (and gate/up) from the same int8
-  buffer. The quantizer here (`vv_act_quant_i8_{cpu,dev}`) and the one of
+`vv_cli --model <dir>` runs the model when `<dir>` holds the GGUF pair (the
+default source) or the F32 safetensors (`--source safetensors`: ternarized
+and I8_S-quantized at load, 7.2 s instead of 2.8 s). `serve`, `chat` and
+`--cpu` work as for the other families. Flags specific to this family:
+`--vae auto|float|int8`, `--source auto|gguf|safetensors`, `--head
+auto|f16|int8`.
+
+### The head
+
+The reference scores all 151,936 rows of the F16 head for every token. On
+the CPU this runtime first scores an int8 copy of the rows against the int8
+activation (the ternary kernels' GEMM), and with it an upper bound on how
+far each int8 logit can be from the F16 one: the weight's rounding error
+and the activation's, both as norms taken at load / per token, rounded up.
+Only rows whose upper bound reaches the best lower bound are rescored in
+F16, so the argmax is the full F16 scan's, ties included, at the cost of an
+int8 pass (233 MB instead of 467 MB). The GPU computes the F16 head
+directly, with the same FP16 head GEMV as the other families.
+
+### Which encoder
+
+`--vae int8` is VibeASR.cpp's int8 encoder, bit for bit (above).
+`--vae float` runs the same I8_S weights dequantized to FP32 (CPU) / FP16
+(GPU) with the exact GELU through the shared front end — the encoder the
+model was trained with, streamable and batched. Measured on gpubox
+(test30.wav unless noted, best of 3):
+
+| | CPU 12 threads | GPU (3090) |
+|---|---|---|
+| int8 encoder | 2.68 s | 2.41–2.52 s (runs on the host) |
+| float encoder | 6.49 s | **99 ms** |
+| RTF int8 / float | **0.160** / 0.289 | 0.089 / **0.012** |
+
+WER against the 7B model's transcripts (jfk against the known text), the
+same words for both on the CPU and the GPU:
+
+| file | words | reference | int8 | float |
+|---|---|---|---|---|
+| jfk | 22 | 4.5 % | 4.5 % | 0.0 % |
+| test30 | 64 | 6.2 % | 6.2 % | 6.2 % |
+| test55 | 122 | 9.0 % | 9.0 % | 8.2 % |
+| test120 | 259 | 78.4 % | 78.4 % | 79.2 % |
+
+(test120's WER is the model stopping after ~40 s of content, as the
+reference does; see above.) The two encoders are equally accurate on these
+files — float is a word better on jfk and test55, int8 one on test120. The
+default is therefore the faster one per backend: **int8 on the CPU** (2.4×
+faster than FP32 there, and the reference's transcripts to the token),
+**float on the GPU** (25× faster than the host-side int8 encoder, and it
+keeps the batched, streaming front end).
+
+### Transcripts against VibeASR.cpp (`--greedy`)
+
+| file | CPU, int8 (default) | GPU, int8 | GPU, float (default) | CPU, float |
+|---|---|---|---|---|
+| jfk | identical | identical | "And so**,** my fellow american**s**" | same as GPU float |
+| test30 | identical | identical | "fellow america" ×2 | same as GPU float |
+| test120 | identical | identical | "fellow america", second segment "And so my fellow america." | same as GPU float |
+
+Also identical to the reference on the CPU default: test55, a, b,
+win_speech11 and syn_long (s1 is FLAC, which the reference's `dr_wav`
+cannot open). The loader route does not matter: the F32 safetensors
+(`--source safetensors`) give the same transcripts as the GGUF: all three
+files with the int8 encoder, jfk and test30 with the float one.
+
+Every difference is the encoder: with `--vae int8` the GPU reproduces the
+reference's words exactly even though its LM runs different kernels
+(tensor-core GEMM prefill, dp4a GEMV decode, contiguous RoPE positions),
+because the ternary/int8 products are exact integers and the float epilogue
+follows ggml's order. The float encoder produces different features (GELU,
+no activation requantization — the reference's int8 encoder is at latent
+cosine 0.88 / 0.95 from the F32 one, see "I8_S"), and the greedy decode picks a different token at "fellow
+american(s)". The attention backend moves one comma: `--attn fa1` writes
+"And so my fellow americans" on jfk; `fa2` (default) and `flashinfer` agree
+with each other on all three files.
+
+### Speed and memory
+
+GPU (RTX 3090, `gpu-run 1`, best of 3; default = float encoder, fa2):
+
+| file | RTF | encoder | prefill | decode | VRAM |
+|---|---|---|---|---|---|
+| jfk (11 s) | 0.014 | 52 ms | 10.3 ms (12.6K tok/s) | 336 tok/s | 4.2 GB |
+| test30 | 0.012 | 99 ms | 13.0 ms (21K tok/s) | 335 tok/s | 4.2 GB |
+| test120 | 0.005 | 347 ms | 28 ms (34K tok/s) | 290 tok/s | 4.2 GB |
+| long30m (32 min) | 0.007 | 5.29 s | 678 ms (21K tok/s) | 268 tok/s | 4.2 GB |
+| test30, `--vae int8` | 0.089 | 2.41 s | 12.7 ms | 329 tok/s | 2.6 GB |
+| test120, `--attn flashinfer` | 0.005 | 346 ms | 28 ms | 347 tok/s | 4.2 GB |
+
+VRAM is the whole process on the card (weights, a 32K-position FP16 KV
+cache, the encoder's arena, the CUDA context); `--vae int8` keeps the
+encoder on the host and saves 1.6 GB. The host RSS of a GPU run is
+5.4 GB (4.1 GB with `--vae int8`). The reference has no GPU path.
+
+CPU (Ryzen 9 5900X, `vv_cli --cpu`, default int8 encoder, test30.wav,
+`cpu-bench`, best of 3 by RTF; the box was shared and noisy — load average
+13–25 — so single runs vary by up to 2×). The reference's row is the
+table under "Ground truth" (taken on a quieter box); at 4 and 12 threads it
+was re-run next to this runtime, and came out 0.366 and 0.277:
+
+| threads | 1 | 2 | 3 | 4 | 6 | 8 | 12 |
+|---|---|---|---|---|---|---|---|
+| **this runtime, RTF** | **0.744** | **0.411** | **0.290** | **0.230** | **0.185** | **0.163** | **0.145** |
+| VibeASR.cpp, RTF | 1.144 | 0.624 | 0.448 | 0.369 | 0.307 | 0.389* | 0.264 |
+| encoder, s (this / ref) | 13.5 / 27.2 | 7.9 / 14.6 | 5.5 / 10.2 | 4.2 / 8.1 | 3.2 / 6.5 | 2.8 / 7.5* | 2.4 / 5.3 |
+| prefill 272 tok, s | 4.80 / 3.46 | 2.33 / 1.82 | 1.60 / 1.24 | 1.24 / 0.97 | 0.85 / 0.69 | 0.67 / 0.61 | 0.52 / 0.62 |
+| decode 82 tok, s | 4.04 / 3.72 | 2.09 / 2.30 | 1.63 / 2.00 | 1.48 / 1.86 | 1.49 / 1.96 | 1.40 / 1.98 | 1.43 / 1.99 |
+
+test120.wav at 12 threads, both runtimes side by side: **RTF 0.111** against
+0.211 (encoder 8.8 s / 21.7 s, prefill 948 tokens 3.0 s / 1.6 s, decode 75
+tokens 1.55 s / 1.89 s).
+
+The encoder — two thirds of the reference's time — is 2.0–2.7× faster
+with the same integer results. Decode is 18–29 % faster from 3 threads on
+(the int8 head filter reads half the bytes of the F16 head); like the
+reference it stops scaling at ~4 threads, memory-bound. Prefill is where
+the reference is still ahead, below 12 threads and on long prompts
+(test120: 3.0 s against 1.6 s); it is the next thing to optimize and does
+not change the ranking here.
+
+Peak RSS (`/usr/bin/time`): this runtime 4.97 GB on test30 and 5.45 GB on
+test120 (the F16 head, its int8 filter, a 32K-position KV cache and a 512 MB
+workspace); the reference 8.1 GB and 25.9 GB.
+
+## Notes for other work
+
+* The quantizer here (`vv_act_quant_i8_{cpu,dev}`) and the one of
   #18 (`vv_quant_act_q8_cpu`, `vv_act_quant_dev`, branch `w8a8-w4a8`) should
   be unified. They agree on per-token absmax and round half to even, and
   differ in details that change bits: #18 multiplies by `127.0f/amax`
@@ -397,9 +518,7 @@ the small shapes; graphs and fusion (phase 2) are the lever there.
   #18 additionally emits per-32 sums and a nibble-interleaved layout. A
   shared quantizer needs a mode flag for the scale formula; the BitNet mode
   must keep ggml's to match VibeASR.cpp. The symbol names do not collide.
-* The encoder: decide between reproducing the int8+ReLU pipeline (matches
-  the reference, not streamable) and running the I8_S weights dequantized
-  with GELU (matches the model, streamable); `bitnet_ref.py vae` measures
-  both against F32.
-* The prompt is the text format, not JSON; the postprocessor must accept
-  plain text.
+* Not done: the GPU runs the int8 encoder on the host (`--vae int8`, 2.4 s
+  on 30 s); a device port would make the reference's exact transcripts cheap
+  on the GPU too. CPU prefill on long prompts (above) is the other open
+  item. Multi-GPU was not measured: only one card of gpubox was available.

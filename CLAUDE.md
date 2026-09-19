@@ -85,6 +85,14 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
   считается по аудио, а не по пингам, слот ждётся не дольше
   `--stream-slot-wait`.
   Нормализация громкости для этой модели выключена.
+* VibeVoice-ASR-BitNet (`asr-bitnet`, 1.5B): GGUF-пара VibeASR.cpp
+  (`src/model/gguf.c`, `loader_gguf.c`) или F32 safetensors с
+  тернаризацией при загрузке; тернарные×int8 ядра точны в int32 и повторяют
+  порядок операций ggml (`bitnet_cpu.c`, `bitnet.cu`, слой — `bitnet_lm.c`).
+  `--vae int8` — int8-энкодер эталона бит в бит (`vae_i8.c`, дефолт на CPU,
+  транскрипты = VibeASR.cpp `--greedy`), `--vae float` — те же веса с GELU
+  через общий фронтенд (дефолт на GPU). CPU RTF 0.16 (12 потоков, эталон
+  0.26), 3090 RTF 0.005–0.014, 4.2 GB. Подробности — `docs/BITNET.md`.
 * KV-кэш: `--kv-cache fp16|fp8|fp8-e5m2|tq4|tq3|tq2|tq1.5`. На 32K позиций
   1792 → 896 / 462 / 350 / 238 / 182 MB. fp8, fp8-e5m2 и tq4 дают
   идентичный транскрипт.

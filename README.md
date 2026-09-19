@@ -708,10 +708,19 @@ Any of them works; point `--model` at the directory. The NF4 and BF16 repos
 do not ship tokenizer files, so drop `tokenizer.json` next to the
 safetensors. The AWQ repo already carries its own.
 
-The loader also recognises `microsoft/VibeVoice-ASR-BitNet` (1.5B, tied head)
-and `microsoft/VibeVoice-ASR-Streaming-7B` by their configs. The streaming
-model ships its own `tokenizer.json` and generates chunk by chunk on a
-persistent KV cache; see
+[`microsoft/VibeVoice-ASR-BitNet`](https://huggingface.co/microsoft/VibeVoice-ASR-BitNet)
+(1.5B, ternary LM, int8 speech encoder) runs on the CPU and the GPU from
+the GGUF pair VibeASR.cpp ships (`vibeasr-lm-i2_s-embed-q6_k.gguf`,
+`vibeasr-vae-encoder-i8_s.gguf`, plus `config.json` and `tokenizer.json`)
+or from its F32 safetensors (`--source safetensors`). On the CPU its
+transcripts are VibeASR.cpp's to the token at RTF 0.16 on 12 threads (the
+reference: 0.26); on a 3090 it runs at RTF 0.005-0.014 in 4.2 GB. See
+[docs/BITNET.md](docs/BITNET.md) for the numerics and the `--vae`,
+`--source` and `--head` flags.
+
+The loader also recognises `microsoft/VibeVoice-ASR-Streaming-7B` by its
+config. The streaming model ships its own `tokenizer.json` and generates
+chunk by chunk on a persistent KV cache; see
 [Streaming transcription](#streaming-transcription-vibevoice-asr-streaming-7b).
 
 ---
