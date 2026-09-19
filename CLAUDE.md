@@ -693,7 +693,7 @@ VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
 `ctest` без `VV_TEST_MODEL` тоже проходит — тесты, которым нужны веса,
-рапортуют SKIP. Всего 32 записи (attention-наборы идут по разу на бэкенд).
+рапортуют SKIP. Всего 39 записей (attention-наборы идут по разу на бэкенд).
 
 Streaming-7B: `VV_TEST_STREAM_MODEL=<каталог модели>` включает проверки
 токенизатора, `VV_TEST_STREAM_REF=<dump-stream>[:<dump>...]` — сверку
