@@ -236,13 +236,19 @@ int vv_cmd_serve(int argc, char** argv) {
     }
     vv_log_set_level(verbose ? VV_LOG_DEBUG : VV_LOG_INFO);
 
-    if (gpus_arg && vv_gpu_set_parse(gpus_arg, &ep.gpus) != VV_OK) return 1;
-    if (mem_arg && vv_gpu_set_caps(mem_arg, &ep.gpus) != VV_OK) return 1;
-    if (ep.gpus.n > 0) ep.gpu_id = ep.gpus.id[0];
-    if (vv_gpu_set_resolve(&ep.gpus, ep.gpu_id, ep.cpu_only) != VV_OK) return 1;
-    if (ep.gpus.n > ep.n_slots && !ep.cpu_only)
-        VV_LOG_W("serve: %d devices but only %d slot(s); raise --slots to use "
-                 "them all", ep.gpus.n, ep.n_slots);
+    if (vv_gpu_set_from_flags(gpus_arg, mem_arg, ep.cpu_only, &ep.gpu_id,
+                              &ep.gpus) != VV_OK)
+        return 1;
+    /*
+     * Fewer slots than devices idles a device only when replicas were asked
+     * for by name: `auto` then splits the layers, which uses every device
+     * (engine.c), and `layer` always does.
+     */
+    if (ep.gpus.n > ep.n_slots && !ep.cpu_only &&
+        ep.split_mode == VV_SPLIT_REPLICA)
+        VV_LOG_W("serve: --split-mode replica with %d devices but %d slot(s) "
+                 "leaves %d of them idle; raise --slots, or use --split-mode "
+                 "layer", ep.gpus.n, ep.n_slots, ep.gpus.n - ep.n_slots);
 
     {
         const char* sv = getenv("VV_SAVE_TOKENS");
