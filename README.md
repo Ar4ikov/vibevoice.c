@@ -225,31 +225,38 @@ absurd for short clips; this pays it once.
 | **NF4** (bitsandbytes, double-quantized) | loaded directly |
 | **AWQ** (AutoAWQ) | loaded directly |
 | **GPTQ** | loaded directly (its zero points are off by one; handled) |
-| **BF16 / F16 / F32** (unquantized) | dense FP16, or `--quant nf4\|int4` at load |
+| **BF16 / F16 / F32** (unquantized) | dense FP16, or `--quant nf4\|int4\|int8` at load |
 
 What a projection is gets decided by what the file holds — U8 with an
 `.absmax` next to it is NF4, an I32 `qweight` is AWQ/GPTQ, anything float is
 dense — and every tensor is checked against the config's shape; a missing or
 misshaped one fails the load with its name. `--quant auto` (the default)
-keeps the checkpoint as it is; `none`, `nf4` and `int4` apply to dense
-checkpoints and quantize each projection as it is read from the mapping,
-before placement, so the VRAM budget sees the final sizes and peak host
-memory is the quantized model plus a 32 MB slab. NF4 here is bitsandbytes'
-layout (blocks of 64, FP16 scales, no double quantization); INT4 is the
-asymmetric group-128 layout the AWQ path uses. Both are deterministic
-whatever the thread count.
+keeps the checkpoint as it is; `none`, `nf4`, `int4` and `int8` apply to
+dense checkpoints and quantize each projection as it is read from the
+mapping, before placement, so the VRAM budget sees the final sizes and peak
+host memory is the quantized model plus a few rows per thread. NF4 here is
+bitsandbytes' layout (blocks of 64, FP16 scales, no double quantization);
+INT4 is the asymmetric group-128 layout the AWQ path uses; INT8 is
+per-output-channel symmetric (one FP32 scale per row, the layout the W8A8
+work builds on) with its own GEMV. All three are deterministic whatever the
+thread count.
 
 `microsoft/VibeVoice-ASR` (BF16, 17.3 GB) on a 3090:
 
 | `--quant` | load (warm) | VRAM | decode | RTF 11 s / 30 s / 120 s | transcript vs the NF4 checkpoint |
 |---|---|---|---|---|---|
-| `none` (FP16) | 5.3–6.9 s | 18.7 GB | 56 tok/s | 0.108 / 0.110 / 0.109 | same words on all three |
-| `nf4` | 15–24 s | 9.8 GB | 126 tok/s | 0.067 / 0.060 / 0.059 | same words; jfk and test30 byte-identical |
-| `int4` | 10–15 s | 9.7 GB | 133 tok/s | 0.064 / 0.059 / 0.058 | same words |
+| `none` (FP16) | 4.7 s | 18.7 GB | 56 tok/s | 0.108 / 0.110 / 0.109 | same words on all three |
+| `nf4` | 5.4 s | 9.8 GB | 127 tok/s | 0.066 / 0.061 / 0.059 | same words; jfk and test30 byte-identical |
+| `int4` | 2.7 s | 9.7 GB | 133 tok/s | 0.064 / 0.060 / 0.057 | same words |
+| `int8` | 3.6 s | 12.5 GB | 97 tok/s | 0.077 / 0.073 / 0.071 | same words |
+
+Load is the best of three with the page cache warm, on the 12 physical
+cores; quantizing is cheaper than uploading the 14 GB the dense model
+needs, so `int4` loads faster than `none`.
 
 Where they differ it is in timestamps (at most 0.06 s, 0.44 s once for
 `int4`) and in one speaker label: on test30, whose middle clip is a
-different voice, dense BF16 and `int4` call it Speaker 1 while the NF4
+different voice, dense BF16, `int4` and `int8` call it Speaker 1 while the NF4
 checkpoint calls everything Speaker 0.
 
 AWQ and GPTQ store weights K-major with the eight columns of a word

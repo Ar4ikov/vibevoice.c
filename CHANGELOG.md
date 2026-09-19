@@ -11,11 +11,15 @@ Write the entry for a change under Unreleased in the same pull request.
 
 - Unquantized checkpoints load: `microsoft/VibeVoice-ASR` in BF16 runs as-is
   (dense FP16 on the GPU, 56 tok/s, 18.7 GB) or quantized while it is read
-  with `--quant nf4|int4` (`vv_cli`, `serve`, `chat`; `auto` keeps whatever
-  the checkpoint has). Projections are routed by what the file holds rather
+  with `--quant nf4|int4|int8` (`vv_cli`, `serve`, `chat`; `auto` keeps
+  whatever the checkpoint has). `int8` is per-channel symmetric with its own
+  GEMV (97 tok/s, 12.5 GB); `int4` is the fastest (133 tok/s, 9.7 GB). Projections are routed by what the file holds rather
   than by name, every tensor is checked against the config's shape, and a
   missing or misshaped one fails the load with its name instead of a
   "prefill layer 0 failed" later on.
+- Model load runs on the physical cores (unless `OMP_NUM_THREADS` is set)
+  instead of one thread per SMT sibling: the NF4 checkpoint loads in 4.0 s
+  instead of 8.7 s, AWQ in 5.5 s instead of 10.2 s (3090 + 5900X, best of 3).
 - `tie_word_embeddings` is honoured (at the root or in `decoder_config`): the
   head is the embedding buffer, uploaded and budgeted once.
 - Model families: `asr-7b`, `asr-bitnet` and `asr-streaming-7b` are told
