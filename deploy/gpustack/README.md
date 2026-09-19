@@ -121,9 +121,10 @@ is set by `--split-mode`:
 
 If GPUStack spread the replica because the model did not fit on one card, a
 copy per card will not fit either. Keep `--slots` below the number of GPUs or
-set `--split-mode layer`. With several GPUs and fewer slots, 0.2.0 still logs
-`raise --slots to use them all`. The warning is wrong under `auto` and
-`layer`: the layer split already uses every card.
+set `--split-mode layer`. With several GPUs and fewer slots, releases up to
+0.4.0 log `raise --slots to use them all`. The warning is wrong under `auto`
+and `layer`, because the layer split already uses every card; it is fixed in
+[#34](https://github.com/Ar4ikov/vibevoice.c/pull/34).
 
 One two-GPU replica with `--slots 2` holds the same per card as two one-GPU
 replicas. The difference is the queue: the two-GPU replica has one, and the
@@ -131,13 +132,16 @@ next request goes to whichever slot frees up first. Two replicas each have
 their own, so a request can wait behind one replica while the other is idle.
 
 **CPU only.** GPUStack starts a replica without a GPU only when
-**Advanced → Allow CPU Offloading** is on and no card fits. That replica must
-not keep `--gpus all`. If no device is visible, it exits with
-`gpus: 'all' asked for, but no device is visible`, and `--cpu` does not help.
-On a Docker host whose default runtime is `nvidia`, the image's
-`NVIDIA_VISIBLE_DEVICES=all` shows the replica every card on the host
-instead. Set the deployment's run command to the default without
-`--gpus all`, and add `--cpu` to the backend parameters.
+**Advanced → Allow CPU Offloading** is on and no card fits. Add `--cpu` to its
+backend parameters. Without it, one of two things happens. If no device is
+visible, the replica exits with
+`gpus: 'all' asked for, but no device is visible`. On a Docker host whose
+default runtime is `nvidia`, the image's `NVIDIA_VISIBLE_DEVICES=all` shows
+the replica every card on the host instead, and it uses them. On images up
+to 0.4.0, `--cpu` alone is not enough when no device is visible: also set
+the run command to the default without `--gpus all`. From
+[#34](https://github.com/Ar4ikov/vibevoice.c/pull/34) on, `--cpu` wins over
+`--gpus`.
 
 ## Memory
 
