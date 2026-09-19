@@ -4,6 +4,7 @@
 #ifndef VV_QUEUE_H
 #define VV_QUEUE_H
 #include "vv_thread.h"
+#include "vibevoice/vibevoice.h"   /* vv_time_ms */
 #include <stdint.h>
 
 typedef struct {
@@ -32,6 +33,31 @@ static inline bool vv_queue_enter(vv_queue_t* q) {
     q->waiting--; q->active++; q->serving++;
     vv_cond_broadcast(&q->changed);
     vv_mutex_unlock(&q->lock); return true;
+}
+/*
+ * Enter only when a slot is free and nobody is queued ahead, waiting at
+ * most `wait_ms` for that; false (counted as rejected) otherwise. For a
+ * live session, which would hold the slot for as long as its audio lasts:
+ * it must not sit in the FIFO behind other long holders with its client
+ * left hanging, and it must not jump ahead of the requests already waiting.
+ */
+static inline bool vv_queue_try_enter(vv_queue_t* q, int wait_ms) {
+    const double deadline = vv_time_ms() + (wait_ms > 0 ? wait_ms : 0);
+    vv_mutex_lock(&q->lock);
+    for (;;) {
+        if (q->waiting == 0 && q->active < q->slots) {
+            q->active++;
+            vv_mutex_unlock(&q->lock);
+            return true;
+        }
+        const double left = deadline - vv_time_ms();
+        if (left <= 0.0) {
+            q->rejected++;
+            vv_mutex_unlock(&q->lock);
+            return false;
+        }
+        vv_cond_timedwait(&q->changed, &q->lock, (int)left + 1);
+    }
 }
 static inline void vv_queue_leave(vv_queue_t* q) {
     vv_mutex_lock(&q->lock); q->active--;

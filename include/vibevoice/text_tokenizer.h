@@ -63,6 +63,18 @@ vv_status_t vv_tokenizer_decode_ex(const vv_tokenizer_t* tok,
                                     bool skip_special, char** text);
 
 /**
+ * @brief vv_tokenizer_decode_ex() into a caller's buffer, no allocation and
+ *        no terminator -- for decoding one token at a time.
+ *
+ * @param out_len  bytes written
+ * @return VV_ERR_OVERFLOW when the text might not fit in `cap` bytes.
+ */
+vv_status_t vv_tokenizer_decode_into(const vv_tokenizer_t* tok,
+                                     const int32_t* ids, int n_tokens,
+                                     bool skip_special, char* buf,
+                                     size_t cap, size_t* out_len);
+
+/**
  * @brief Raw vocabulary string for a token id (NULL when unknown).
  *
  * The result is the byte-level-encoded form, not human-readable text; use

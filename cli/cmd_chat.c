@@ -346,6 +346,90 @@ int vv_cmd_devices(int argc, char** argv) {
     return print_devices();
 }
 
+/* ─── mic, streaming model ──────────────────────────────────────────────── */
+
+typedef struct {
+    bool timestamps;
+    bool at_line_start;
+} mic_live_t;
+
+static void mic_stream_event(void* user, const vv_stream_event_t* ev) {
+    mic_live_t* m = (mic_live_t*)user;
+    if (ev->type == VV_STREAM_EVENT_DELTA && !m->timestamps) {
+        fwrite(ev->text, 1, ev->text_len, stdout);
+        fflush(stdout);
+    } else if (ev->type == VV_STREAM_EVENT_CHUNK && m->timestamps &&
+               ev->text_len > 0) {
+        /* One line per chunk; the model's inline turn breaks stay visible. */
+        printf("[%7.2f - %7.2f] ", ev->audio_start, ev->audio_end);
+        for (size_t i = 0; i < ev->text_len; i++)
+            fputc(ev->text[i] == '\n' ? '|' : ev->text[i], stdout);
+        fputc('\n', stdout);
+        fflush(stdout);
+    } else if (ev->type == VV_STREAM_EVENT_ERROR) {
+        fprintf(stderr, "\nmic: stream failed in chunk %lld: %s\n",
+                (long long)ev->chunk_index, vv_status_str(ev->status));
+    }
+}
+
+/**
+ * @brief Live transcription with a streaming model: capture blocks go
+ * straight into one session, and text appears chunk by chunk (2.93 s of
+ * audio plus 0.53 s of lookahead each). No VAD: the model is trained on the
+ * continuous stream, silence included.
+ */
+static int mic_stream(vv_engine_t* engine, vv_mic_t* mic, const chat_args_t* a,
+                      float gain) {
+    /* "A,B" -> "A, B", the way every prompt joins hotwords. */
+    char ctx_info[VV_HOTWORDS_MAX];
+    vv_hotwords_join_csv(a->hotwords, ctx_info, sizeof(ctx_info));
+
+    mic_live_t live;
+    live.timestamps = a->timestamps;
+    live.at_line_start = true;
+    vv_stream_params_t sp;
+    vv_stream_params_default(&sp);
+    sp.context_info = ctx_info[0] ? ctx_info : NULL;
+    sp.on_event = mic_stream_event;
+    sp.user = &live;
+
+    vv_engine_stream_t* es = NULL;
+    vv_status_t s = vv_engine_stream_open(engine, &sp, 24000, &es);
+    if (s != VV_OK) {
+        fprintf(stderr, "mic: cannot open a streaming session: %s\n",
+                vv_status_str(s));
+        return 1;
+    }
+
+    float buf[4096];
+    while (!g_stop && s == VV_OK) {
+        const int got = vv_mic_read(mic, buf, (int)(sizeof(buf) / sizeof(buf[0])));
+        if (got == 0) {
+            if (vv_mic_eof(mic)) break;
+            vv_msleep(5);
+            continue;
+        }
+        if (gain != 1.0f)
+            for (int i = 0; i < got; i++) buf[i] *= gain;
+        s = vv_engine_stream_push(es, buf, (size_t)got);
+    }
+    /* Whatever arrived before the stop is still worth transcribing. */
+    if (s == VV_OK) s = vv_engine_stream_finish(es);
+    if (!a->timestamps) printf("\n");
+
+    vv_stream_stats_t st;
+    vv_stream_get_stats(vv_engine_stream_session(es), &st);
+    if (st.chunks > 0)
+        fprintf(stderr, "mic: %lld chunk(s), %lld tokens, %.0f ms per chunk "
+                "(slowest %.0f), KV %lld/%lld\n", (long long)st.chunks,
+                (long long)st.tokens,
+                (st.prefill_ms + st.decode_ms) / (double)st.chunks,
+                st.max_chunk_ms, (long long)st.kv_len,
+                (long long)st.kv_capacity);
+    vv_engine_stream_close(es);
+    return s == VV_OK ? 0 : 1;
+}
+
 /* ─── mic ────────────────────────────────────────────────────────────────── */
 
 int vv_cmd_mic(int argc, char** argv) {
@@ -377,6 +461,22 @@ int vv_cmd_mic(int argc, char** argv) {
                         "then pass one to --device\n");
         vv_engine_free(engine);
         return 1;
+    }
+
+    if (vv_engine_is_streaming(engine)) {
+        signal(SIGINT, on_signal);
+        const char* label = vv_mic_device_label(mic);
+        fprintf(stderr, "listening to %s via %s, streaming (Ctrl-C to stop)\n",
+                label && label[0] ? label : "the default device",
+                vv_mic_backend(mic));
+        const float g = (a.gain_db != 0.0f) ? powf(10.0f, a.gain_db / 20.0f)
+                                            : 1.0f;
+        const int rc = mic_stream(engine, mic, &a, g);
+        if (vv_mic_captured(mic) == 0)
+            fprintf(stderr, "mic: no audio arrived from the capture device.\n");
+        vv_mic_close(mic);
+        vv_engine_free(engine);
+        return rc;
     }
 
     vv_vad_params_t vp = vv_vad_params_default();

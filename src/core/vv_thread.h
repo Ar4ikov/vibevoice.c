@@ -52,6 +52,20 @@ static inline void vv_cond_broadcast(vv_cond_t* c) { WakeAllConditionVariable(c)
 static inline void vv_cond_wait(vv_cond_t* c, vv_mutex_t* m) {
     SleepConditionVariableCS(c, m, INFINITE);
 }
+/** Wait at most `ms`; false when the time ran out (spurious wakes return
+ *  true, so callers loop on their condition either way). */
+static inline bool vv_cond_timedwait(vv_cond_t* c, vv_mutex_t* m, int ms) {
+    return SleepConditionVariableCS(c, m, (DWORD)(ms > 0 ? ms : 0)) != 0;
+}
+
+/* A flag one thread sets and another polls (a cancel request). */
+typedef volatile LONG vv_atomic_int_t;
+static inline void vv_atomic_store(vv_atomic_int_t* a, int v) {
+    InterlockedExchange(a, (LONG)v);
+}
+static inline int vv_atomic_load(vv_atomic_int_t* a) {
+    return (int)InterlockedCompareExchange(a, 0, 0);
+}
 
 typedef unsigned (__stdcall *vv_thread_fn)(void*);
 
@@ -84,6 +98,8 @@ static inline void vv_once(vv_once_t* o, void (*fn)(void)) {
 #else /* POSIX */
 
 #include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef pthread_mutex_t vv_mutex_t;
@@ -101,6 +117,23 @@ static inline void vv_cond_signal(vv_cond_t* c)    { pthread_cond_signal(c); }
 static inline void vv_cond_broadcast(vv_cond_t* c) { pthread_cond_broadcast(c); }
 static inline void vv_cond_wait(vv_cond_t* c, vv_mutex_t* m) {
     pthread_cond_wait(c, m);
+}
+static inline bool vv_cond_timedwait(vv_cond_t* c, vv_mutex_t* m, int ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    if (ms < 0) ms = 0;
+    ts.tv_sec += ms / 1000;
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    return pthread_cond_timedwait(c, m, &ts) == 0;
+}
+
+typedef atomic_int vv_atomic_int_t;
+static inline void vv_atomic_store(vv_atomic_int_t* a, int v) {
+    atomic_store(a, v);
+}
+static inline int vv_atomic_load(vv_atomic_int_t* a) {
+    return atomic_load(a);
 }
 
 typedef void* (*vv_thread_fn)(void*);

@@ -204,7 +204,10 @@ void vv_engine_stats(const vv_engine_t* e, uint64_t* completed, int* busy) {
     vv_mutex_unlock((vv_mutex_t*)&e->lock);
 }
 
-static int acquire_slot(vv_engine_t* e) {
+/* A free slot, waiting for one for at most `wait_ms` (< 0: for as long as it
+ * takes). -1 when none freed up in time. */
+static int acquire_slot_wait(vv_engine_t* e, int wait_ms) {
+    const double deadline = wait_ms >= 0 ? vv_time_ms() + wait_ms : 0.0;
     vv_mutex_lock(&e->lock);
     for (;;) {
         for (int i = 0; i < e->n_slots; i++) {
@@ -215,9 +218,20 @@ static int acquire_slot(vv_engine_t* e) {
                 return i;
             }
         }
-        vv_cond_wait(&e->slot_free, &e->lock);
+        if (wait_ms < 0) {
+            vv_cond_wait(&e->slot_free, &e->lock);
+            continue;
+        }
+        const double left = deadline - vv_time_ms();
+        if (left <= 0.0) {
+            vv_mutex_unlock(&e->lock);
+            return -1;
+        }
+        vv_cond_timedwait(&e->slot_free, &e->lock, (int)left + 1);
     }
 }
+
+static int acquire_slot(vv_engine_t* e) { return acquire_slot_wait(e, -1); }
 
 static void release_slot(vv_engine_t* e, int idx, bool ok) {
     vv_mutex_lock(&e->lock);
@@ -254,4 +268,99 @@ vv_status_t vv_engine_transcribe(vv_engine_t* e,
 
     vv_free(audio);
     return s;
+}
+
+/* ─── Streaming sessions ────────────────────────────────────────────────── */
+
+struct vv_engine_stream {
+    vv_engine_t*    e;
+    int             slot;
+    vv_stream_t*    st;
+    vv_resampler_t* rs;
+    bool            ok;
+};
+
+bool vv_engine_is_streaming(const vv_engine_t* e) {
+    return e && e->n_slots > 0 && e->slots[0]->family_ok &&
+           e->slots[0]->family.mode == VV_GEN_CHUNKED;
+}
+
+vv_status_t vv_engine_stream_open(vv_engine_t* e,
+                                  const vv_stream_params_t* params,
+                                  int sample_rate, vv_engine_stream_t** out) {
+    return vv_engine_stream_open_ex(e, params, sample_rate, -1, out);
+}
+
+vv_status_t vv_engine_stream_open_ex(vv_engine_t* e,
+                                     const vv_stream_params_t* params,
+                                     int sample_rate, int wait_ms,
+                                     vv_engine_stream_t** out) {
+    if (!e || !params || !out) return VV_ERR_NULL_PTR;
+    *out = NULL;
+    if (!vv_engine_is_streaming(e)) return VV_ERR_UNSUPPORTED;
+    if (sample_rate <= 0) return VV_ERR_INVALID_ARG;
+
+    vv_engine_stream_t* s = (vv_engine_stream_t*)vv_alloc(sizeof(*s));
+    if (!s) return VV_ERR_OUT_OF_MEMORY;
+    memset(s, 0, sizeof(*s));
+    s->e = e;
+    s->slot = -1;
+
+    const int target = e->slots[0]->family.sample_rate > 0
+                       ? e->slots[0]->family.sample_rate : 24000;
+    vv_status_t st = vv_resampler_create(sample_rate, target, &s->rs);
+    if (st != VV_OK) { vv_free(s); return st; }
+
+    s->slot = acquire_slot_wait(e, wait_ms);
+    if (s->slot < 0) {
+        vv_engine_stream_close(s);
+        return VV_ERR_BUSY;
+    }
+    vv_inference_ctx_t* ctx = e->slots[s->slot];
+    memset(&ctx->last_perf, 0, sizeof(ctx->last_perf));
+    if (ctx->use_gpu) st = vv_dev_set_device(ctx->gpu_id);
+    if (st == VV_OK) st = vv_stream_open(ctx, params, &s->st);
+    if (st != VV_OK) {
+        vv_engine_stream_close(s);
+        return st;
+    }
+    *out = s;
+    return VV_OK;
+}
+
+vv_status_t vv_engine_stream_push(vv_engine_stream_t* s, const float* pcm,
+                                  size_t n) {
+    if (!s) return VV_ERR_NULL_PTR;
+    const float* o = NULL;
+    size_t no = 0;
+    vv_status_t st = vv_resampler_push(s->rs, pcm, n, &o, &no);
+    if (st != VV_OK) return st;
+    return vv_stream_push(s->st, o, no);
+}
+
+vv_status_t vv_engine_stream_finish(vv_engine_stream_t* s) {
+    if (!s) return VV_ERR_NULL_PTR;
+    const float* o = NULL;
+    size_t no = 0;
+    vv_status_t st = vv_resampler_finish(s->rs, &o, &no);
+    if (st == VV_OK && no) st = vv_stream_push(s->st, o, no);
+    if (st == VV_OK) st = vv_stream_finish(s->st);
+    if (st == VV_OK) s->ok = true;
+    return st;
+}
+
+void vv_engine_stream_cancel(vv_engine_stream_t* s) {
+    if (s) vv_stream_cancel(s->st);
+}
+
+vv_stream_t* vv_engine_stream_session(vv_engine_stream_t* s) {
+    return s ? s->st : NULL;
+}
+
+void vv_engine_stream_close(vv_engine_stream_t* s) {
+    if (!s) return;
+    vv_stream_close(s->st);
+    vv_resampler_free(s->rs);
+    if (s->slot >= 0) release_slot(s->e, s->slot, s->ok);
+    vv_free(s);
 }

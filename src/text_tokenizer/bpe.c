@@ -680,23 +680,24 @@ vv_status_t vv_tokenizer_encode(const vv_tokenizer_t* t, const char* text,
     return VV_OK;
 }
 
-vv_status_t vv_tokenizer_decode_ex(const vv_tokenizer_t* t,
-                                   const int32_t* ids, int n_tokens,
-                                   bool skip_special, char** out_text) {
-    if (!t || !ids || !out_text) return VV_ERR_NULL_PTR;
-    bytelevel_init();
-
-    size_t total = 1;
+/* Bytes the decode of `ids` can take at most: each byte-level character
+ * becomes one byte or stays the same UTF-8 sequence, never longer. */
+static size_t decode_bound(const vv_tokenizer_t* t, const int32_t* ids,
+                           int n_tokens) {
+    size_t total = 0;
     for (int i = 0; i < n_tokens; i++) {
         int32_t id = ids[i];
         if (id >= 0 && id < t->id_capacity && t->id_to_token[id])
             total += t->id_to_len[id];
     }
+    return total;
+}
 
-    char* res = (char*)vv_alloc(total + 1);
-    if (!res) return VV_ERR_OUT_OF_MEMORY;
+/* Decode into `res`, which holds at least decode_bound() bytes; returns the
+ * length written (no terminator). */
+static size_t decode_write(const vv_tokenizer_t* t, const int32_t* ids,
+                           int n_tokens, bool skip_special, char* res) {
     size_t w = 0;
-
     for (int i = 0; i < n_tokens; i++) {
         int32_t id = ids[i];
         if (id < 0 || id >= t->id_capacity || !t->id_to_token[id]) continue;
@@ -728,8 +729,32 @@ vv_status_t vv_tokenizer_decode_ex(const vv_tokenizer_t* t,
             p += (size_t)a;
         }
     }
+    return w;
+}
+
+vv_status_t vv_tokenizer_decode_ex(const vv_tokenizer_t* t,
+                                   const int32_t* ids, int n_tokens,
+                                   bool skip_special, char** out_text) {
+    if (!t || !ids || !out_text) return VV_ERR_NULL_PTR;
+    bytelevel_init();
+
+    const size_t total = decode_bound(t, ids, n_tokens) + 1;
+    char* res = (char*)vv_alloc(total + 1);
+    if (!res) return VV_ERR_OUT_OF_MEMORY;
+    const size_t w = decode_write(t, ids, n_tokens, skip_special, res);
     res[w] = '\0';
     *out_text = res;
+    return VV_OK;
+}
+
+vv_status_t vv_tokenizer_decode_into(const vv_tokenizer_t* t,
+                                     const int32_t* ids, int n_tokens,
+                                     bool skip_special, char* buf,
+                                     size_t cap, size_t* out_len) {
+    if (!t || !ids || !out_len || (cap && !buf)) return VV_ERR_NULL_PTR;
+    bytelevel_init();
+    if (decode_bound(t, ids, n_tokens) > cap) return VV_ERR_OVERFLOW;
+    *out_len = decode_write(t, ids, n_tokens, skip_special, buf);
     return VV_OK;
 }
 

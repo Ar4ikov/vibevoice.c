@@ -567,6 +567,7 @@ static vv_status_t reserve_pages(vv_kv_cache_t* c, int n_positions,
     if (!c) return VV_ERR_NULL_PTR;
     if (n_positions > c->max_seq_len) return VV_ERR_OVERFLOW;
     if (!c->pool) return VV_OK;
+    if (c->no_wait) wait = false;
 
     const int want = (n_positions + VV_KV_PAGE_SIZE - 1) / VV_KV_PAGE_SIZE;
     if (want <= c->n_pages) return VV_OK;

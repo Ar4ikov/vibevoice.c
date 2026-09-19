@@ -80,6 +80,9 @@ typedef struct vv_kv_cache {
     int*     pages;           /**< host [max_pages]                          */
     int      n_pages;         /**< pages mapped so far                       */
     int      max_pages;
+    /** vv_kv_cache_reserve_wait() does not wait: a short pool is
+     *  VV_ERR_KV_POOL_EXHAUSTED at once (a live stream sets it). */
+    bool     no_wait;
 } vv_kv_cache_t;
 
 /**
@@ -501,6 +504,10 @@ typedef struct vv_inference_ctx {
         longest clip seen and kept, so those modes do not allocate per request. */
     void*                      fe_lat_buf;
     size_t                     fe_lat_bytes;
+    /** Device buffers a closed streaming session left for the next one on
+        this context (stream_ctx.c), so opening and closing a live session
+        allocates and frees nothing on the device. */
+    void*                      stream_bufs;
 
     /* Model directory path (for loading tokenizer) */
     char           model_dir[512];
@@ -522,6 +529,25 @@ typedef struct vv_inference_ctx {
      */
     bool           quiet;
 } vv_inference_ctx_t;
+
+/** Bytes of joined hotwords a prompt takes, on every entry point. */
+#define VV_HOTWORDS_MAX 1024
+
+/**
+ * @brief Hotwords joined into the prompt's context ("A, B, C"), the one way
+ *        every path (file, SSE, WebSocket, CLI) does it.
+ *
+ * Whole words only: one that does not fit `cap` (at most VV_HOTWORDS_MAX)
+ * is dropped with everything after it. Empty entries are skipped.
+ *
+ * @return bytes written, without the terminator
+ */
+size_t vv_hotwords_join(const char* const* words, int n, char* buf,
+                        size_t cap);
+
+/** @brief vv_hotwords_join() over a comma-separated list ("A,B, C"),
+ *         entries trimmed of surrounding spaces. */
+size_t vv_hotwords_join_csv(const char* csv, char* buf, size_t cap);
 
 vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
                                const vv_init_params_t* params,

@@ -30,6 +30,8 @@
 #include "vibevoice/cpu_kernels.h"
 
 #include "vv_thread.h"
+#include "pipeline_internal.h"
+#include "vibevoice/stream.h"
 
 /* Forward declarations — CUDA helpers */
 
@@ -631,8 +633,21 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
      * flashinfer on any format) and a single device holding every layer's KV.
      */
     const int n_slots = p.n_slots > 0 ? p.n_slots : 1;
-    const vv_attn_backend_t attn_want =
+    vv_attn_backend_t attn_want =
         vv_attn_backend_from_env((vv_attn_backend_t)p.attn_backend);
+    /*
+     * The streaming model prefills 29 rows at a time on top of a cache that
+     * keeps growing. fa2 runs those as one row kernel -- 16 blocks on an
+     * 82-SM card, each walking the whole cache -- while flashinfer splits
+     * the cache across the idle SMs. `auto` is fa2 for the batch model to
+     * keep its transcripts bit-identical to the old kernels; this family
+     * has no such history, and with flashinfer it still matches upstream
+     * chunk for chunk (jfk, test30, test120), so `auto` takes the faster
+     * one here. `--attn fa2` still gets fa2.
+     */
+    if (attn_want == VV_ATTN_AUTO &&
+        c->model->config.family == VV_FAMILY_ASR_STREAMING_7B)
+        attn_want = VV_ATTN_FLASHINFER;
     const int attn_slab = vv_attn_resolve(
         (int)attn_want, p.kv_format, false, llm->num_attention_heads,
         llm->num_key_value_heads, llm->head_dim);
@@ -697,7 +712,14 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         size_t kv_per_token = vv_kv_cache_bytes(
             c->primary_layers, llm->num_key_value_heads,
             llm->head_dim, 1, p.kv_format);
-        size_t ws_target = (size_t)512 * 1024 * 1024;
+        /*
+         * A streaming model's context starts at the 256 MB workspace (see
+         * the allocation below), and so does every clone of it; budgeting
+         * 512 MB per slot there would starve the KV pool the sessions share.
+         */
+        size_t ws_target =
+            c->model->config.family == VV_FAMILY_ASR_STREAMING_7B
+            ? (size_t)256 * 1024 * 1024 : (size_t)512 * 1024 * 1024;
 
         /*
          * The context is the first thing to give up. A shorter window costs
@@ -924,7 +946,14 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
             (size_t)256 * 1024 * 1024,
         };
         s = VV_ERR_CUDA_OOM;
-        for (int wi = 0; wi < 3; wi++) {
+        /*
+         * A streaming model never prefills more than one chunk (29 rows) or
+         * its prompt at a time: the weight scratch plus a few MB of
+         * activations. The smallest size leaves room for more slots.
+         */
+        const int ws_first =
+            c->model->config.family == VV_FAMILY_ASR_STREAMING_7B ? 2 : 0;
+        for (int wi = ws_first; wi < 3; wi++) {
             c->workspace_size = ws_sizes[wi];
             s = vv_dev_alloc(&c->workspace, c->workspace_size);
             if (s == VV_OK) break;
@@ -1309,7 +1338,7 @@ fail:
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 
-#define VV_ARGMAX_PARTIALS 256
+/* VV_ARGMAX_PARTIALS: pipeline_internal.h, shared with the streaming loop. */
 
 static const char* s_dump_dir = NULL;
 static vv_once_t s_dump_once = VV_ONCE_INIT;
@@ -1403,18 +1432,47 @@ static void sample_acoustic(vv_inference_ctx_t* ctx,
                        mode, seed, NULL);
 }
 
+size_t vv_hotwords_join(const char* const* words, int n, char* buf,
+                        size_t cap) {
+    if (!buf || cap == 0) return 0;
+    buf[0] = '\0';
+    size_t w = 0;
+    for (int i = 0; words && i < n; i++) {
+        const char* hw = words[i];
+        if (!hw || !hw[0]) continue;
+        /* A whole word or none: a cut one would be a different hotword. */
+        const int k = snprintf(buf + w, cap - w, "%s%s", w ? ", " : "", hw);
+        if (k < 0 || (size_t)k >= cap - w) { buf[w] = '\0'; break; }
+        w += (size_t)k;
+    }
+    return w;
+}
+
+size_t vv_hotwords_join_csv(const char* csv, char* buf, size_t cap) {
+    if (!buf || cap == 0) return 0;
+    buf[0] = '\0';
+    if (!csv) return 0;
+    char tmp[VV_HOTWORDS_MAX];
+    const char* words[VV_HOTWORDS_MAX / 2];
+    snprintf(tmp, sizeof(tmp), "%s", csv);
+    int n = 0;
+    for (char* t = tmp; t && n < (int)(sizeof(words) / sizeof(words[0])); ) {
+        char* next = strchr(t, ',');
+        if (next) *next++ = '\0';
+        while (*t == ' ') t++;
+        size_t len = strlen(t);
+        while (len > 0 && t[len - 1] == ' ') t[--len] = '\0';
+        if (*t) words[n++] = t;
+        t = next;
+    }
+    return vv_hotwords_join(words, n, buf, cap);
+}
+
 static void build_context_info(const vv_inference_params_t* params,
                                char* buf, size_t buf_size) {
     buf[0] = '\0';
     if (!params || !params->hotwords || params->num_hotwords <= 0) return;
-    size_t w = 0;
-    for (int i = 0; i < params->num_hotwords; i++) {
-        const char* hw = params->hotwords[i];
-        if (!hw || !hw[0]) continue;
-        int n = snprintf(buf + w, buf_size - w, "%s%s", w ? ", " : "", hw);
-        if (n < 0 || (size_t)n >= buf_size - w) break;
-        w += (size_t)n;
-    }
+    vv_hotwords_join(params->hotwords, params->num_hotwords, buf, buf_size);
 }
 
 /**
@@ -1459,7 +1517,7 @@ static bool decode_graph_enabled(void) {
 #define VV_GRAPH_GAVE_UP (-2)
 
 /** @brief One captured step, and the launch shape it was captured for. */
-typedef struct { void* exec; int shape; } graph_slot_t;
+typedef vv_graph_slot_t graph_slot_t;
 
 /**
  * @brief One shard's slice of a decode step, replayed when it can be.
@@ -1609,6 +1667,32 @@ static vv_status_t cpu_head_argmax(vv_inference_ctx_t* ctx,
     for (int d = 0; d < hs; d++) f[d] = vv_half_to_float(h[d]);
     return vv_lm_head_argmax_cpu(f, ctx->model->lm_head.data,
                                  llm->vocab_size, hs, token, NULL);
+}
+
+vv_status_t vv_pipeline_head_argmax(vv_inference_ctx_t* ctx, const void* row,
+                                    void* normed, void* logits, void* am_v,
+                                    void* am_i, void* tok_dev,
+                                    int32_t* tok_host, uint16_t* h, float* f,
+                                    int32_t* token) {
+    const vv_llm_config_t* llm = &ctx->model->config.llm;
+    vv_status_t s = vv_rmsnorm_dev(row, ctx->final_norm_gpu, normed, 1,
+                                   llm->hidden_size, llm->rms_norm_eps,
+                                   ctx->compute_stream);
+    if (s != VV_OK) return s;
+    if (!ctx->lm_head_gpu) return cpu_head_argmax(ctx, normed, h, f, token);
+    s = vv_lm_head_gemv_dev(normed, ctx->lm_head_gpu, logits, llm->vocab_size,
+                            llm->hidden_size, ctx->compute_stream);
+    if (s == VV_OK)
+        s = vv_argmax_dev(logits, llm->vocab_size, am_v, am_i, tok_dev, NULL,
+                          ctx->compute_stream);
+    /* Into pinned memory the copy is asynchronous: wait for it, not just
+     * for the argmax before it. */
+    if (s == VV_OK)
+        s = vv_dev_memcpy_d2h(tok_host, tok_dev, sizeof(int32_t),
+                              ctx->compute_stream);
+    if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
+    if (s == VV_OK) *token = *tok_host;
+    return s;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1864,7 +1948,7 @@ static vv_status_t transcribe_gpu(
     int seq_len = 0;
     int audio_offset = 0;  /* index where box_start tokens (= audio frames) begin */
 
-    char ctx_info[512];
+    char ctx_info[VV_HOTWORDS_MAX];
     build_context_info(params, ctx_info, sizeof(ctx_info));
 
     {
@@ -2247,27 +2331,14 @@ static vv_status_t transcribe_gpu(
         }
 
         /* RMSNorm + LM head + sample */
-        s = vv_rmsnorm_dev(hidden_one_gpu, ctx->final_norm_gpu,
-                             normed_gpu, 1, hs, llm->rms_norm_eps,
-                             ctx->compute_stream);
-        if (s != VV_OK) break;
-
-        if (lm_head_on_cpu) {
-            s = cpu_head_argmax(ctx, normed_gpu, host_normed_h, host_normed_f,
-                                &token_id);
+        {
+            int32_t tok_host = 0;
+            s = vv_pipeline_head_argmax(ctx, hidden_one_gpu, normed_gpu,
+                                        logits_f32_gpu, argmax_v_gpu,
+                                        argmax_i_gpu, token_out_gpu, &tok_host,
+                                        host_normed_h, host_normed_f,
+                                        &token_id);
             if (s != VV_OK) break;
-        } else {
-            s = vv_lm_head_gemv_dev(normed_gpu, ctx->lm_head_gpu,
-                                      logits_f32_gpu, vocab_size, hs,
-                                      ctx->compute_stream);
-            if (s != VV_OK) break;
-            s = vv_argmax_dev(logits_f32_gpu, vocab_size, argmax_v_gpu,
-                                argmax_i_gpu, token_out_gpu, NULL,
-                                ctx->compute_stream);
-            if (s != VV_OK) break;
-            vv_dev_stream_sync(ctx->compute_stream);
-            vv_dev_memcpy_d2h(&token_id, token_out_gpu, sizeof(int32_t),
-                              ctx->compute_stream);
         }
 
         if (prof) t_head_ms += vv_time_ms() - t_tok;
@@ -2466,7 +2537,7 @@ static vv_status_t transcribe_cpu(
     int seq_len = 0;
     int audio_offset = 0;
 
-    char ctx_info[512];
+    char ctx_info[VV_HOTWORDS_MAX];
     build_context_info(params, ctx_info, sizeof(ctx_info));
 
     {
@@ -2634,16 +2705,6 @@ vv_status_t vv_inference_transcribe(
         VV_LOG_E("inference: no usable tokenizer for this model");
         return VV_ERR_MODEL_FORMAT;
     }
-    if (ctx->family.mode != VV_GEN_ONE_SHOT) {
-        /*
-         * The streaming model is prompted without audio and fed chunk by
-         * chunk on one KV cache; a one-shot pass over the whole clip is not
-         * something it was trained for, so it is not attempted here.
-         */
-        VV_LOG_E("inference: %s generates chunk by chunk, which this entry "
-                 "point does not do", vv_model_family_name(ctx->family.id));
-        return VV_ERR_UNSUPPORTED;
-    }
 
     /*
      * CUDA's current device is per-thread and this context was created on
@@ -2659,6 +2720,19 @@ vv_status_t vv_inference_transcribe(
                      ctx->gpu_id, vv_status_str(bind));
             return bind;
         }
+    }
+
+    if (ctx->family.mode != VV_GEN_ONE_SHOT) {
+        /*
+         * The streaming model is prompted without audio and fed chunk by
+         * chunk on one KV cache, so a whole clip goes through a session:
+         * every window, then the tail, text joined at the end.
+         */
+        char ctx_info[VV_HOTWORDS_MAX];
+        build_context_info(params, ctx_info, sizeof(ctx_info));
+        return vv_stream_transcribe(ctx, audio_samples, num_samples,
+                                    ctx_info[0] ? ctx_info : NULL, NULL,
+                                    NULL, result);
     }
 
     if (ctx->placement == VV_PLACE_CPU_ONLY) {
@@ -2691,6 +2765,7 @@ const vv_perf_metrics_t* vv_inference_get_perf(
 vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
     if (!ctx) return VV_ERR_NULL_PTR;
 
+    vv_stream_ctx_drop_cache(ctx);
     if (ctx->use_gpu) {
         if (ctx->workspace) vv_dev_free(ctx->workspace);
         if (!ctx->is_clone) {
@@ -2743,4 +2818,91 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
 
     VV_LOG_I("inference: context freed");
     return VV_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Exports for the streaming backend (pipeline_internal.h)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+vv_status_t vv_pipeline_prefill(vv_inference_ctx_t* ctx, void* hidden,
+                                int seq_len) {
+    return prefill_all_shards(ctx, hidden, seq_len);
+}
+
+vv_status_t vv_pipeline_step(vv_inference_ctx_t* ctx, void* hidden,
+                             bool graph_ok, vv_graph_slot_t* graphs) {
+    return decoder_step_graphed(ctx, hidden, graph_ok, graphs);
+}
+
+bool vv_pipeline_graph_ok(const vv_inference_ctx_t* ctx) {
+    return decode_graph_enabled() && ctx->layer_pool &&
+           ctx->layer_pool->all_resident && ctx->kv_cache &&
+           ctx->kv_cache->d_len && !profile_decode();
+}
+
+void vv_pipeline_graphs_free(const vv_inference_ctx_t* ctx,
+                             vv_graph_slot_t* graphs) {
+    for (int i = 0; i <= ctx->n_shards; i++) {
+        if (graphs[i].exec) vv_dev_graph_destroy(graphs[i].exec);
+        graphs[i].exec = NULL;
+        graphs[i].shape = -1;
+    }
+}
+
+void vv_pipeline_kv_reset(vv_inference_ctx_t* ctx) {
+    vv_kv_cache_reset(ctx->kv_cache, ctx->compute_stream);
+    for (int i = 0; i < ctx->n_shards; i++) {
+        vv_dev_set_device(ctx->shards[i].gpu_id);
+        vv_kv_cache_reset(ctx->shards[i].kv_cache,
+                          ctx->shards[i].compute_stream);
+    }
+    if (ctx->use_gpu) vv_dev_set_device(ctx->gpu_id);
+}
+
+void vv_pipeline_kv_publish(vv_inference_ctx_t* ctx) {
+    vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+    for (int i = 0; i < ctx->n_shards; i++) {
+        vv_dev_set_device(ctx->shards[i].gpu_id);
+        vv_kv_cache_publish_len(ctx->shards[i].kv_cache,
+                                ctx->shards[i].compute_stream);
+    }
+    if (ctx->use_gpu) vv_dev_set_device(ctx->gpu_id);
+}
+
+vv_status_t vv_pipeline_kv_reserve(vv_inference_ctx_t* ctx, int n_positions) {
+    vv_status_t s = VV_OK;
+    if (ctx->kv_cache && ctx->kv_cache->pool)
+        s = vv_kv_cache_reserve_wait(ctx->kv_cache, n_positions,
+                                     ctx->compute_stream);
+    for (int i = 0; s == VV_OK && i < ctx->n_shards; i++) {
+        vv_shard_t* sh = &ctx->shards[i];
+        if (!sh->kv_cache || !sh->kv_cache->pool) continue;
+        vv_dev_set_device(sh->gpu_id);
+        s = vv_kv_cache_reserve_wait(sh->kv_cache, n_positions,
+                                     sh->compute_stream);
+    }
+    if (ctx->use_gpu) vv_dev_set_device(ctx->gpu_id);
+    return s;
+}
+
+void vv_pipeline_kv_release(vv_inference_ctx_t* ctx) {
+    if (ctx->kv_cache && ctx->kv_cache->pool) {
+        vv_dev_stream_sync(ctx->compute_stream);
+        vv_kv_cache_release(ctx->kv_cache);
+    }
+    for (int i = 0; i < ctx->n_shards; i++) {
+        vv_shard_t* sh = &ctx->shards[i];
+        if (!sh->kv_cache || !sh->kv_cache->pool) continue;
+        vv_dev_set_device(sh->gpu_id);
+        vv_dev_stream_sync(sh->compute_stream);
+        vv_kv_cache_release(sh->kv_cache);
+    }
+    if (ctx->use_gpu) vv_dev_set_device(ctx->gpu_id);
+}
+
+vv_status_t vv_pipeline_cpu_head_argmax(vv_inference_ctx_t* ctx,
+                                        const void* normed_gpu,
+                                        uint16_t* h, float* f,
+                                        int32_t* token) {
+    return cpu_head_argmax(ctx, normed_gpu, h, f, token);
 }

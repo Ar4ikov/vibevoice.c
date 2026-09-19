@@ -31,6 +31,11 @@ typedef enum vv_status {
     /** A shared KV page pool had no pages left for a request that still fit
      *  its own window. Retryable: the pages come back as other requests end. */
     VV_ERR_KV_POOL_EXHAUSTED = -10,
+    /** The caller asked for the work to stop (a streaming client left). */
+    VV_ERR_CANCELLED      = -11,
+    /** Every slot stayed taken for as long as the caller was willing to
+     *  wait (a live session asking for one). Retryable. */
+    VV_ERR_BUSY           = -12,
 
     /* CUDA errors */
     VV_ERR_CUDA           = -100,

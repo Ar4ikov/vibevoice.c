@@ -57,6 +57,26 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
   `asr-streaming-7b` — промпт, стоп-токены, нормализация, геометрия чанков.
   Один проход по слоям — `vv_layer_tensors()`; prefill дописывает с
   `kv->current_len` (GPU и CPU), CPU prefill идёт чанками.
+* **VibeVoice-ASR-Streaming-7B** (`docs/STREAMING.md`, `include/vibevoice/stream.h`,
+  `src/inference/stream_ctx.c`): сессия на контексте — промпт в сброшенный
+  KV, каждое окно 26 кадров (22 + 4 lookahead) — stateless-задача фронтенда,
+  коннекторы пишут прямо в строки чанка, prefill `[<|text_chunk_end|>]
+  <|object_ref_start|> 26 фич <|object_ref_end|>` с `kv->current_len`,
+  greedy decode на захваченном графе (графы живут в сессии и переживают
+  prefill'ы). Несколько готовых окон кодируются одним заходом
+  (`encode_ahead`). `vv_inference_transcribe` для этой модели идёт через
+  сессию; `vv_cli --audio` печатает чанки по мере готовности, `mic` —
+  живой поток без VAD, `serve` — SSE `stream=true` и WebSocket
+  `/v1/audio/stream` (слот на сессию, отключение клиента отменяет сессию).
+  `--quant none` посимвольно совпадает с upstream `streaming_generate` на
+  jfk/test30/test120 (156/156 чанков); int4 на 3090 — 92 мс на чанк,
+  RTF 0.032 (32 мин — 114 мс, 0.042); `serve` держит ~24 живых
+  int4-потока на 3090 (p95 < 300 мс) — предел time-slicing: каждый слот
+  декодирует сам, батча между слотами нет. Живая сессия резервирует KV на
+  `--stream-reserve` секунд при открытии (иначе 503 / close 1013), idle
+  считается по аудио, а не по пингам, слот ждётся не дольше
+  `--stream-slot-wait`.
+  Нормализация громкости для этой модели выключена.
 * KV-кэш: `--kv-cache fp16|fp8|fp8-e5m2|tq4|tq3|tq2|tq1.5`. На 32K позиций
   1792 → 896 / 462 / 350 / 238 / 182 MB. fp8, fp8-e5m2 и tq4 дают
   идентичный транскрипт.
@@ -69,7 +89,9 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
 * `--attn auto|fa1|fa2|flashinfer` (`VV_ATTN=`): бэкенды внимания за одной
   точкой диспетчеризации (`vv_attn_prefill/decode`). `auto` = fa2 —
   побитово совпадает со старыми ядрами (тесты сравнивают декод fa2 и fa1
-  бит в бит), поэтому транскрипты не двигаются. flashinfer быстрее
+  бит в бит), поэтому транскрипты не двигаются (у Streaming-7B `auto` =
+  flashinfer: split-KV для 29-строчного prefill на растущем кэше, JSON тот
+  же, на 32 мин быстрее на 15%). flashinfer быстрее
   (tensor cores и в декоде, fp8/tq через те же ядра), но округляет P и
   суммирует в своём порядке: слова те же, таймстемпы сдвигаются на 10–20 мс.
 * `--gpus 0,1|all` выбирает устройства, `--gpu-memory 80%|18GiB|8192M|байты`
@@ -655,7 +677,15 @@ VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
 `ctest` без `VV_TEST_MODEL` тоже проходит — тесты, которым нужны веса,
-рапортуют SKIP. Всего 29 записей (attention-наборы идут по разу на бэкенд).
+рапортуют SKIP. Всего 32 записи (attention-наборы идут по разу на бэкенд).
+
+Streaming-7B: `VV_TEST_STREAM_MODEL=<каталог модели>` включает проверки
+токенизатора, `VV_TEST_STREAM_REF=<dump-stream>[:<dump>...]` — сверку
+текстов чанков с дампами `tools/compare_ref.py dump-stream`, а
+`VV_TEST_STREAM_E2E=1` поверх — загрузку модели: живая сессия в
+`test_stream` (`VV_TEST_STREAM_QUANT`, по умолчанию none) и сессии
+WebSocket-сервера по loopback в `test_stream_server` (int4; idle, trickle,
+503 при занятом слоте, обрыв клиента). Без этих переменных — SKIP.
 
 Релизная сборка (все архитектуры, статические рантаймы, без тестов):
 

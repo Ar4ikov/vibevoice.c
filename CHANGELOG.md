@@ -9,6 +9,36 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- **`microsoft/VibeVoice-ASR-Streaming-7B` runs** ([#20](https://github.com/Ar4ikov/vibevoice.c/issues/20)):
+  text chunk by chunk while audio arrives, on GPU and CPU, from BF16 as-is or
+  `--quant int4|int8|nf4`. `vv_cli --audio` prints each chunk as it is
+  produced and then the transcript with speaker-turn segments; `mic` pushes
+  capture blocks into one live session (no VAD); `serve` answers
+  `stream=true` with SSE `transcript.text.delta` / `transcript.text.done`
+  and takes live PCM of any rate over a WebSocket at `/v1/audio/stream`.
+  A session holds one slot, and a client that leaves releases it at the
+  next token. The session (`include/vibevoice/stream.h`, backend in
+  `src/inference/stream_ctx.c`) prefills the prompt into a reset cache,
+  encodes each 26-frame window through the device front end as a stateless
+  job with the connectors writing straight into the chunk's rows, prefills
+  the chunk at `kv->current_len` with the previous `<|text_chunk_end|>`
+  folded in, and decodes on the captured step, whose graphs stay alive
+  across chunks; several ready windows are encoded in shared launches. With
+  `--quant none` every chunk's token ids equal upstream `streaming_generate`
+  on jfk, test30 and test120 (156/156); on a 300 s excerpt 101/103 chunks,
+  one word moving across a chunk boundary, same transcript. int4 and int8
+  give the same transcripts, nf4 the same words with different punctuation.
+  3090, test120: 92 ms per chunk and RTF 0.032 with int4 (9.8 GB), 306 ms
+  and 0.106 in FP16 (18.6 GB). `serve` carries about 24 live int4 streams per 3090 under 300 ms p95
+  chunk latency; streaming slots are budgeted at their real 256 MB
+  workspace so the shared KV pool gets the rest of the card. A session refuses a chunk that
+  would outgrow its KV window instead of writing past it. Also: a streaming
+  resampler equal to the whole-file one sample for sample,
+  `VV_ERR_CANCELLED`, `tools/stream_client.py` (live WebSocket client and
+  sessions-per-GPU bench), and `cmp-stream` reports the joined transcript's
+  word edits. The protocol, reference tooling and numbers are in
+  `docs/STREAMING.md`.
+
 ## [0.3.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.2.0...v0.3.0) — 2026-09-19
 
 - Unquantized checkpoints load: `microsoft/VibeVoice-ASR` in BF16 runs as-is

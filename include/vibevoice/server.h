@@ -42,6 +42,22 @@ typedef struct vv_server_params {
      * the same audio can come back worded differently.
      */
     int         acoustic_sampling;
+    /*
+     * Live sessions (streaming models). A WebSocket session holds a slot
+     * from session.start until it ends, so the server bounds what a client
+     * can hold without sending audio, how long a new session waits for a
+     * slot, and how much of the shared KV pool it must be able to get.
+     */
+    int         stream_idle_ms;      /**< No audio or JSON message for this
+                                          long ends a WebSocket; pings do not
+                                          count. Default 60000.            */
+    int         stream_slot_wait_ms; /**< session.start / stream=true wait
+                                          this long for a slot, then answer
+                                          server_overloaded. Default 5000. */
+    double      stream_reserve_sec;  /**< KV reserved per live session at
+                                          open, in seconds of audio (see
+                                          vv_stream_params_t). Default 180;
+                                          0 = none.                        */
 } vv_server_params_t;
 
 static inline vv_server_params_t vv_server_params_default(void) {
@@ -54,6 +70,9 @@ static inline vv_server_params_t vv_server_params_default(void) {
     p.api_key = NULL;
     p.max_body = (size_t)512 * 1024 * 1024;
     p.acoustic_sampling = 0;
+    p.stream_idle_ms = 60000;
+    p.stream_slot_wait_ms = 5000;
+    p.stream_reserve_sec = 180.0;
     return p;
 }
 
