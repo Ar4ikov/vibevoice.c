@@ -90,6 +90,9 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
     ip.gpu_layers  = params->gpu_layers;
     ip.weight_quant = params->weight_quant;
     ip.smooth      = params->smooth;
+    ip.weights_source = params->weights_source;
+    ip.vae_numerics = params->vae_numerics;
+    ip.head_format = params->head_format;
     ip.gpus        = params->gpus;
     if (ip.gpus.n == 0) { ip.gpus.n = 1; ip.gpus.id[0] = params->gpu_id; }
 
@@ -258,8 +261,13 @@ vv_status_t vv_engine_transcribe(vv_engine_t* e,
     /* Every slot runs the same model, so any of them knows its family. */
     const bool normalize = e->slots[0]->family_ok
                            ? e->slots[0]->family.normalize_audio : true;
-    vv_status_t s = vv_audio_prepare_ex(pcm, n_samples, sample_rate,
-                                        normalize, &audio, &n_out);
+    const bool vibeasr = e->slots[0]->family_ok &&
+                         e->slots[0]->family.vibeasr_audio;
+    vv_status_t s = vibeasr
+        ? vv_audio_prepare_vibeasr(pcm, n_samples, sample_rate, normalize,
+                                   &audio, &n_out)
+        : vv_audio_prepare_ex(pcm, n_samples, sample_rate, normalize,
+                              &audio, &n_out);
     if (s != VV_OK) return s;
 
     const int slot = acquire_slot(e);

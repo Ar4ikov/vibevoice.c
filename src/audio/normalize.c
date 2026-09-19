@@ -120,3 +120,50 @@ vv_status_t vv_audio_prepare_ex(const float* pcm, int n_samples,
     *out_len = len;
     return VV_OK;
 }
+
+vv_status_t vv_audio_prepare_vibeasr(const float* pcm, int n_samples,
+                                     int sample_rate, bool normalize,
+                                     float** out, int* out_len) {
+    if (!pcm || !out || !out_len) return VV_ERR_NULL_PTR;
+    if (n_samples <= 0 || sample_rate <= 0) return VV_ERR_INVALID_ARG;
+
+    /* resample_linear(): the expressions of audio_io.h, in double. */
+    const double ratio = (double)sample_rate / 24000.0;
+    const size_t len = sample_rate == 24000
+                     ? (size_t)n_samples
+                     : (size_t)((double)n_samples / ratio);
+    if (len == 0 || len > (size_t)0x7fffffff) return VV_ERR_INVALID_ARG;
+    float* buf = (float*)vv_alloc(len * sizeof(float));
+    if (!buf) return VV_ERR_OUT_OF_MEMORY;
+    if (sample_rate == 24000) {
+        memcpy(buf, pcm, len * sizeof(float));
+    } else {
+        for (size_t i = 0; i < len; i++) {
+            const double src_pos = (double)i * ratio;
+            const size_t idx = (size_t)src_pos;
+            const double frac = src_pos - (double)idx;
+            if (idx + 1 < (size_t)n_samples)
+                buf[i] = (float)((1.0 - frac) * pcm[idx] + frac * pcm[idx + 1]);
+            else if (idx < (size_t)n_samples)
+                buf[i] = pcm[idx];
+            else
+                buf[i] = 0.0f;
+        }
+    }
+
+    if (normalize) {
+        /* normalize_audio(): RMS as a float, then one float gain. */
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < len; i++)
+            sum_sq += (double)buf[i] * (double)buf[i];
+        const float rms = sqrtf((float)(sum_sq / (double)len));
+        if (rms >= 1e-6f) {
+            const float scalar = powf(10.0f, -25.0f / 20.0f) / (rms + 1e-6f);
+            for (size_t i = 0; i < len; i++) buf[i] *= scalar;
+        }
+    }
+
+    *out = buf;
+    *out_len = (int)len;
+    return VV_OK;
+}

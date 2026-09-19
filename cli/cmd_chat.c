@@ -86,6 +86,9 @@ static void usage(const char* which) {
         "  --kv-cache <fmt>      fp16 | fp8 | tq4 | ...\n"
         "  --quant <fmt>         auto (default) | none | nf4 | int4 | int8 |\n"
         "                        w8a8 | w4a8\n"
+        "  --vae <numerics>      auto (default) | float | int8 (BitNet)\n"
+        "  --source <from>       BitNet weights: auto | gguf | safetensors\n"
+        "  --head <fmt>          BitNet CPU head: auto | f16 | int8\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
         "  --kv-paged <mode>     auto | on | off\n"
@@ -167,6 +170,33 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
                 return -1;
             }
             a->ep.weight_quant = (int)q;
+        }
+        else if (strcmp(s, "--vae") == 0 && next) {
+            const vv_vae_numerics_t v = vv_vae_numerics_parse(argv[++i]);
+            if (v >= VV_VAE_COUNT) {
+                fprintf(stderr, "error: --vae is auto, float or int8, not '%s'\n",
+                        argv[i]);
+                return -1;
+            }
+            a->ep.vae_numerics = (int)v;
+        }
+        else if (strcmp(s, "--source") == 0 && next) {
+            const vv_weights_source_t v = vv_weights_source_parse(argv[++i]);
+            if (v >= VV_SOURCE_COUNT) {
+                fprintf(stderr, "error: --source is auto, gguf or safetensors, "
+                                "not '%s'\n", argv[i]);
+                return -1;
+            }
+            a->ep.weights_source = (int)v;
+        }
+        else if (strcmp(s, "--head") == 0 && next) {
+            const vv_head_format_t v = vv_head_format_parse(argv[++i]);
+            if (v >= VV_HEAD_COUNT) {
+                fprintf(stderr, "error: --head is auto, f16 or int8, not '%s'\n",
+                        argv[i]);
+                return -1;
+            }
+            a->ep.head_format = (int)v;
         }
         else if (strcmp(s, "--device") == 0 && next) a->device = argv[++i];
         else if (strcmp(s, "--from-file") == 0 && next) a->mic_file = argv[++i];

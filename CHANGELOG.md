@@ -51,6 +51,31 @@ Write the entry for a change under Unreleased in the same pull request.
   words are the same as dense BF16 on jfk, test30, test120 and the
   32-minute file. `VV_SAVE_TOKENS` / `VV_TEACHER_TOKENS` measure
   teacher-forced top-1 agreement. Default behaviour is unchanged.
+- VibeVoice-ASR-BitNet runs end to end on the CPU and the GPU (`vv_cli`,
+  `serve`, `chat`), from VibeASR.cpp's GGUF pair or the F32 safetensors
+  (ternarized and int8-quantized at load). The LM uses exact ternary x
+  int8 kernels (AVX2 / AVX-VNNI / AVX512-VNNI / NEON on the CPU, dp4a GEMV
+  and an int8 tensor-core GEMM on the GPU) in the reference's operation
+  order; the CPU picks the F16 head's argmax through an exact int8 filter.
+  `--vae int8` is VibeASR.cpp's fully int8 speech encoder bit for bit (the
+  CPU default), `--vae float` the same weights with GELU through the shared
+  GPU front end (the GPU default). With the int8 encoder the transcripts of
+  jfk, test30 and test120 equal VibeASR.cpp's `--greedy` output on both
+  backends. 5900X, test30: RTF 0.16 at 12 threads against the reference's
+  0.26; RTX 3090: RTF 0.012 (test30), 0.005 (120 s), 0.007 (32 min), 335
+  tok/s decode, 4.2 GB VRAM. `docs/BITNET.md` has the formats, numerics and
+  measurements; `tools/bitnet_ref.py` is a numpy fake-quant reference.
+- `serve --cpu` ran every request's OpenMP team on one core (RTF 13.7 on
+  jfk.wav, now 0.23): the connection threads inherited the accepting
+  thread's core-0 pin and now drop it (`vv_cpu_thread_unbind`). The main
+  thread stays pinned: leaving it unpinned cost the 7B CPU path a third
+  (prefill 73 -> 47 tok/s, decode 8.0 -> 5.3).
+- An asr-bitnet run that placement sends to the CPU (a small
+  `--gpu-memory`, a busy card) is loaded again the way `--cpu` loads it;
+  before, it read the GPU's F16 norms as FP32 and decoded garbage until the
+  KV window was full.
+- The front end's counters (`vv_frontend_stats`) have their own lock; a
+  reader no longer waits behind the service thread for a whole long file.
 
 ## [0.3.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.2.0...v0.3.0) — 2026-09-19
 

@@ -53,6 +53,9 @@ typedef struct vv_engine_params {
     /** SmoothQuant statistics for a load-time W8A8/W4A8 (smooth.h); NULL:
         none. Read while the engine is created, not kept. */
     const struct vv_smooth_stats* smooth;
+    int          weights_source; /**< vv_weights_source_t (asr-bitnet)       */
+    int          vae_numerics;   /**< vv_vae_numerics_t. Default: auto       */
+    int          head_format;    /**< vv_head_format_t (asr-bitnet)          */
 } vv_engine_params_t;
 
 static inline vv_engine_params_t vv_engine_params_default(void) {
@@ -71,6 +74,9 @@ static inline vv_engine_params_t vv_engine_params_default(void) {
     p.attn_backend = VV_ATTN_AUTO;
     p.kv_paging = VV_KV_PAGED_AUTO;
     p.smooth = NULL;
+    p.weights_source = VV_SOURCE_AUTO;
+    p.vae_numerics = VV_VAE_AUTO;
+    p.head_format = VV_HEAD_AUTO;
     return p;
 }
 

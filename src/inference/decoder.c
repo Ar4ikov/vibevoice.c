@@ -18,6 +18,7 @@
 #include "vibevoice/vibevoice.h"
 #include "vibevoice/cpu_kernels.h"
 #include "vibevoice/quant.h"
+#include "vibevoice/bitnet.h"
 
 #include <math.h>
 #include <string.h>
@@ -309,11 +310,42 @@ vv_status_t vv_layer_pool_pin_range(vv_model_t* model, int first, int count) {
  * straight into the MAC instead of materialising an FP16 copy first — the
  * scratch round-trip costs ~5x the memory traffic and dominates decode.
  */
+/**
+ * @brief Carve the per-token int8 activation of a ternary projection out of
+ *        the scratch: q [M][K], then the FP32 multipliers and int32 row sums.
+ */
+static vv_status_t ternary_act(const void* x, int M, int K, void* scratch,
+                               size_t scratch_bytes, int8_t** q, float** sc,
+                               int32_t** sum, void* stream) {
+    const size_t qb = ((size_t)M * K + 255) & ~(size_t)255;
+    const size_t mb = ((size_t)M * 4 + 255) & ~(size_t)255;
+    if (!scratch || scratch_bytes < qb + 2 * mb) return VV_ERR_OVERFLOW;
+    *q = (int8_t*)scratch;
+    *sc = (float*)((uint8_t*)scratch + qb);
+    *sum = (int32_t*)((uint8_t*)scratch + qb + mb);
+    return vv_act_quant_i8_dev(x, 1, M, K, *q, *sc, *sum, stream);
+}
+
+static vv_status_t ternary_linear(const vv_weight_t* w, const int8_t* q,
+                                  const float* sc, const int32_t* sum, void* y,
+                                  int M, int N, int K, void* stream) {
+    return vv_ternary_gemm_dev(q, sum, sc, (const uint8_t*)w->tensor.data,
+                               w->tscale, (const float*)w->bias.data, NULL, y,
+                               1, M, N, K, stream);
+}
+
 static vv_status_t quant_linear(
     const vv_weight_t* w, const void* x, void* y,
     void* scratch, size_t scratch_bytes, int M, int N, int K, void* stream)
 {
     vv_status_t s;
+
+    if (w->quant_kind == VV_QUANT_TERNARY) {
+        /* W1.58A8: quantize the rows, then the ternary product (bias fused). */
+        int8_t* q; float* sc; int32_t* sum;
+        s = ternary_act(x, M, K, scratch, scratch_bytes, &q, &sc, &sum, stream);
+        return s == VV_OK ? ternary_linear(w, q, sc, sum, y, M, N, K, stream) : s;
+    }
 
     /*
      * Act-order GPTQ: the weight's input channels were sorted by group at
@@ -408,6 +440,17 @@ static vv_status_t quant_linear_group(
     const void* x, void* scratch, size_t scratch_bytes, int M, int K,
     void* stream)
 {
+    bool tern = true;
+    for (int i = 0; i < n; i++) tern = tern && ws[i]->quant_kind == VV_QUANT_TERNARY;
+    if (tern) {
+        /* One quantization of x feeds q/k/v (gate/up), as in the reference. */
+        int8_t* q; float* sc; int32_t* sum;
+        vv_status_t s = ternary_act(x, M, K, scratch, scratch_bytes, &q, &sc,
+                                    &sum, stream);
+        for (int i = 0; i < n && s == VV_OK; i++)
+            s = ternary_linear(ws[i], q, sc, sum, ys[i], M, Ns[i], K, stream);
+        return s;
+    }
     bool fuse = M == 1 && n <= 3;
     for (int i = 0; i < n && fuse; i++)
         fuse = ws[i]->quant_kind == VV_QUANT_INT4G &&
@@ -1187,6 +1230,28 @@ static vv_status_t cpu_proj(const vv_weight_t* w, const float* in,
         return vv_int8_gemm_cpu(in, (const int8_t*)w->tensor.data,
                                 (const float*)w->quant.scales.data,
                                 w->bias.data, out, M, N, K);
+    case VV_QUANT_TERNARY: {
+        /*
+         * W1.58A8: per-token int8 rows, then the exact ternary product with
+         * ggml's epilogue and the FP32 bias. asr-bitnet layers normally run
+         * whole through vv_bitnet_layer_cpu; this is for any other caller.
+         * The int8 rows and their multipliers live in the gather space.
+         */
+        const size_t need = ((size_t)M * K + 3) / 4 + (size_t)M;
+        if (w->perm.data || !gather || gather_n < need) {
+            VV_LOG_E("decoder: ternary '%s' needs %zu floats of CPU "
+                     "workspace for %d rows, %zu left", w->name, need, M,
+                     gather_n);
+            return VV_ERR_OVERFLOW;
+        }
+        float* sc = gather;
+        int8_t* q = (int8_t*)(gather + M);
+        vv_status_t s = vv_act_quant_i8_cpu(in, M, K, q, sc, NULL);
+        if (s != VV_OK) return s;
+        return vv_ternary_linear_cpu(q, sc, (const uint8_t*)w->tensor.data,
+                                     w->tscale, (const float*)w->bias.data,
+                                     out, M, N, K);
+    }
     default:
         return vv_gemm_f16w_cpu(in, w->tensor.data, w->bias.data, out,
                                 M, N, K);
@@ -1235,6 +1300,12 @@ static vv_status_t decoder_layer_cpu(
     const size_t kmax = (size_t)a8_kmax(config);
     const size_t a8_floats = a8
         ? (size_t)seq_len * (kmax / 4 + 1 + kmax / 32) + 64 : 0;
+    /* BitNet: its own layer, with the reference's numerics (bitnet_lm.c). */
+    if (layer->attn.q_proj.quant_kind == VV_QUANT_TERNARY)
+        return vv_bitnet_layer_cpu(layer, config, hidden_states, kv_cache,
+                                   layer_idx, position_offset, seq_len,
+                                   workspace, workspace_size);
+
     const size_t need = (size_t)seq_len *
         (3 * (size_t)hs + (size_t)n_heads * head_dim +
          2 * (size_t)n_kv_heads * head_dim + 2 * (size_t)inter) + a8_floats;
@@ -1399,6 +1470,14 @@ vv_status_t vv_decoder_prefill_cpu(
         per_token += sizeof(float) * ((size_t)a8_kmax(cfg) / 4 + 1 +
                                       (size_t)a8_kmax(cfg) / 32) + 64;
     size_t fit = workspace_size / per_token;
+    if (model->num_layers > 0 &&
+        model->layers[0].attn.q_proj.quant_kind == VV_QUANT_TERNARY) {
+        /* The BitNet layer's workspace grows with the cache it attends to. */
+        const int kv_end = kv_cache->current_len + seq_len;
+        const size_t fixed = vv_bitnet_layer_cpu_bytes(cfg, 0, kv_end);
+        const size_t per = vv_bitnet_layer_cpu_bytes(cfg, 1, kv_end) - fixed;
+        fit = workspace_size > fixed ? (workspace_size - fixed) / per : 0;
+    }
     if (fit < 1) return VV_ERR_OUT_OF_MEMORY;
     if (fit > 2048) fit = 2048;
     const int chunk = (int)fit < seq_len ? (int)fit : seq_len;

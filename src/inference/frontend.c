@@ -54,6 +54,10 @@ struct vv_frontend {
     size_t  bytes;
 
     vv_mutex_t lock;
+    /* Counters under their own lock: fe->lock is held for a whole launch,
+       event waits included, and glibc mutexes are not fair -- a reader
+       queued behind the service thread could wait out a long file. */
+    vv_mutex_t stat_lock;
     uint64_t   launches;
     uint64_t   n_jobs;
 
@@ -156,6 +160,7 @@ void vv_frontend_free(vv_frontend_t* fe) {
     if (fe->ev_ac_rows) vv_dev_event_destroy(fe->ev_ac_rows);
     if (fe->s_main) vv_dev_stream_destroy(fe->s_main);
     vv_mutex_destroy(&fe->lock);
+    vv_mutex_destroy(&fe->stat_lock);
     vv_mutex_destroy(&fe->q_lock);
     vv_cond_destroy(&fe->q_cond);
     vv_cond_destroy(&fe->q_done);
@@ -176,6 +181,7 @@ vv_status_t vv_frontend_create(const vv_conv_vae_encoder_t* acoustic,
     if (!fe) return VV_ERR_OUT_OF_MEMORY;
     memset(fe, 0, sizeof(*fe));
     vv_mutex_init(&fe->lock);
+    vv_mutex_init(&fe->stat_lock);
     vv_mutex_init(&fe->q_lock);
     vv_cond_init(&fe->q_cond);
     vv_cond_init(&fe->q_done);
@@ -265,10 +271,10 @@ int vv_frontend_frames(const vv_frontend_t* fe, int64_t n_samples) {
 void vv_frontend_stats(const vv_frontend_t* fe, uint64_t* launches,
                        uint64_t* jobs) {
     if (!fe) return;
-    vv_mutex_lock((vv_mutex_t*)&fe->lock);
+    vv_mutex_lock((vv_mutex_t*)&fe->stat_lock);
     if (launches) *launches = fe->launches;
     if (jobs) *jobs = fe->n_jobs;
-    vv_mutex_unlock((vv_mutex_t*)&fe->lock);
+    vv_mutex_unlock((vv_mutex_t*)&fe->stat_lock);
 }
 
 vv_status_t vv_frontend_stream_create(vv_frontend_t* fe,
@@ -467,7 +473,9 @@ static vv_status_t launch(vv_frontend_t* fe, fe_piece_t* pc, int np) {
        kernel of this launch can still write. */
     const vv_status_t sj = join(fe);
     if (s == VV_OK) s = sj;
+    vv_mutex_lock(&fe->stat_lock);
     fe->launches++;
+    vv_mutex_unlock(&fe->stat_lock);
     return s;
 }
 
@@ -513,7 +521,9 @@ static void admit_job(vv_frontend_t* fe, fe_act_t* a) {
     vv_frontend_job_t* j = a->job;
     j->status = VV_OK;
     j->n_frames = 0;
+    vv_mutex_lock(&fe->stat_lock);
     fe->n_jobs++;
+    vv_mutex_unlock(&fe->stat_lock);
     if (!j->audio && j->n_samples > 0) {
         finish_job(fe, a, VV_ERR_NULL_PTR);
     } else if (j->n_samples < 0 || (j->stream && j->stream->fe != fe)) {

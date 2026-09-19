@@ -32,6 +32,59 @@ const char* vv_attn_backend_name(vv_attn_backend_t b) {
     }
 }
 
+/* ─── asr-bitnet knobs ──────────────────────────────────────────────────── */
+
+vv_weights_source_t vv_weights_source_parse(const char* name) {
+    if (!name || !*name || strcmp(name, "auto") == 0) return VV_SOURCE_AUTO;
+    if (strcmp(name, "gguf") == 0)        return VV_SOURCE_GGUF;
+    if (strcmp(name, "safetensors") == 0) return VV_SOURCE_SAFETENSORS;
+    return VV_SOURCE_COUNT;
+}
+
+const char* vv_weights_source_name(vv_weights_source_t s) {
+    switch (s) {
+        case VV_SOURCE_AUTO:        return "auto";
+        case VV_SOURCE_GGUF:        return "gguf";
+        case VV_SOURCE_SAFETENSORS: return "safetensors";
+        default:                    return "?";
+    }
+}
+
+vv_vae_numerics_t vv_vae_numerics_parse(const char* name) {
+    if (!name || !*name || strcmp(name, "auto") == 0) return VV_VAE_AUTO;
+    if (strcmp(name, "float") == 0 || strcmp(name, "fp16") == 0 ||
+        strcmp(name, "fp32") == 0)
+        return VV_VAE_FLOAT;
+    if (strcmp(name, "int8") == 0 || strcmp(name, "i8") == 0)
+        return VV_VAE_INT8;
+    return VV_VAE_COUNT;
+}
+
+const char* vv_vae_numerics_name(vv_vae_numerics_t v) {
+    switch (v) {
+        case VV_VAE_AUTO:  return "auto";
+        case VV_VAE_FLOAT: return "float";
+        case VV_VAE_INT8:  return "int8";
+        default:           return "?";
+    }
+}
+
+vv_head_format_t vv_head_format_parse(const char* name) {
+    if (!name || !*name || strcmp(name, "auto") == 0) return VV_HEAD_AUTO;
+    if (strcmp(name, "f16") == 0 || strcmp(name, "fp16") == 0) return VV_HEAD_F16;
+    if (strcmp(name, "int8") == 0 || strcmp(name, "i8") == 0)  return VV_HEAD_INT8;
+    return VV_HEAD_COUNT;
+}
+
+const char* vv_head_format_name(vv_head_format_t h) {
+    switch (h) {
+        case VV_HEAD_AUTO: return "auto";
+        case VV_HEAD_F16:  return "f16";
+        case VV_HEAD_INT8: return "int8";
+        default:           return "?";
+    }
+}
+
 int vv_kv_paging_parse(const char* name) {
     if (!name) return -1;
     if (strcmp(name, "auto") == 0) return VV_KV_PAGED_AUTO;

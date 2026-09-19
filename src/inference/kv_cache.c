@@ -298,6 +298,7 @@ vv_status_t vv_kv_cache_publish_len(vv_kv_cache_t* cache, void* stream) {
 vv_status_t vv_kv_cache_reset(vv_kv_cache_t* cache, void* stream) {
     if (!cache) return VV_ERR_NULL_PTR;
     cache->current_len = 0;
+    cache->rope_gap = 0;
     if (cache->d_len) {
         vv_dev_memset_async(cache->d_len, 0, sizeof(int), stream);
         vv_dev_memset_async(cache->d_len_next, 0, sizeof(int), stream);

@@ -36,6 +36,16 @@ int vv_cpu_threads(void);
  */
 int vv_cpu_physical_cores(void);
 
+/**
+ * @brief Let the calling thread run on every CPU the process may use.
+ *
+ * The first thread to set up the CPU kernels is pinned to core 0, and on
+ * Linux the threads it creates inherit that pin. A thread that runs CPU
+ * inference of its own calls this first. No-op where threads do not inherit
+ * affinity (Windows) or cannot be pinned (macOS), and under VV_CPU_BIND=0.
+ */
+void vv_cpu_thread_unbind(void);
+
 /* ─── Quantized linear ──────────────────────────────────────────────────── */
 
 /**
