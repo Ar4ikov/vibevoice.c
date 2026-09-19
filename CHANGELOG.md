@@ -9,6 +9,8 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+## [0.4.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.3.0...v0.4.0) — 2026-09-19
+
 - **`microsoft/VibeVoice-ASR-Streaming-7B` runs** ([#20](https://github.com/Ar4ikov/vibevoice.c/issues/20)):
   text chunk by chunk while audio arrives, on GPU and CPU, from BF16 as-is or
   `--quant int4|int8|nf4`. `vv_cli --audio` prints each chunk as it is

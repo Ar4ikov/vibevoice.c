@@ -21,9 +21,9 @@ extern "C" {
  * to configure if they disagree. See docs/RELEASING.md.
  */
 #define VV_VERSION_MAJOR 0
-#define VV_VERSION_MINOR 3
+#define VV_VERSION_MINOR 4
 #define VV_VERSION_PATCH 0
-#define VV_VERSION_STRING "0.3.0"
+#define VV_VERSION_STRING "0.4.0"
 
 /**
  * @brief Full SemVer 2.0 version of this build.
