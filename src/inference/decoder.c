@@ -441,10 +441,18 @@ static vv_status_t quant_linear_group(
  * kind, so that one quantized input serves q/k/v and one serves gate/up.
  * The GPU reads INT4 in the W4A16 layout, the CPU in the row-major one with
  * its integer zeros; act-order weights gather FP16 inputs and stay on the
- * FP16 path. A layer that does not qualify runs its (identical) weights on
- * FP16 activations instead, so this never refuses a model.
+ * FP16 path. On the GPU the fused quantizers also bound the row width
+ * (VV_ACT_QUANT_MIN_K..VV_ACT_QUANT_MAX_K). A layer that does not qualify
+ * runs its (identical) weights on FP16 activations instead, so this never
+ * refuses a model.
  */
-static bool layer_a8(const vv_layer_weights_t* L, bool gpu) {
+static int a8_kmax(const vv_llm_config_t* c);
+
+static bool layer_a8(const vv_layer_weights_t* L, const vv_llm_config_t* c,
+                     bool gpu) {
+    if (gpu && (a8_kmax(c) > VV_ACT_QUANT_MAX_K ||
+                c->hidden_size < VV_ACT_QUANT_MIN_K))
+        return false;
     vv_weight_t* p[7];
     vv_layer_projections((vv_layer_weights_t*)L, p);
     for (int i = 0; i < 7; i++) {
@@ -685,7 +693,7 @@ static vv_status_t decoder_layer_impl(
      * holds the quantized activations instead. INT4 weights want them in
      * the order the GEMV or the GEMM reads (q8.h), INT8 in column order.
      */
-    const bool a8 = layer_a8(layer, true);
+    const bool a8 = layer_a8(layer, config, true);
     a8_act_t act = { NULL, NULL, NULL, VV_Q8_NATURAL };
     if (a8) {
         if (layer->attn.q_proj.quant_kind == VV_QUANT_INT4G)
@@ -1054,7 +1062,7 @@ vv_status_t vv_decoder_prefill(
     {
         bool any_a8 = false, all_a8 = true;
         for (int i = first_layer; i < last_layer; i++) {
-            const bool a = layer_a8(&model->layers[i], true);
+            const bool a = layer_a8(&model->layers[i], cfg, true);
             any_a8 |= a;
             all_a8 &= a;
         }
@@ -1223,7 +1231,7 @@ static vv_status_t decoder_layer_cpu(
     vv_status_t s;
 
     /* Int8 activations, scales and per-32 sums, counted in floats. */
-    const bool a8 = layer_a8(layer, false);
+    const bool a8 = layer_a8(layer, config, false);
     const size_t kmax = (size_t)a8_kmax(config);
     const size_t a8_floats = a8
         ? (size_t)seq_len * (kmax / 4 + 1 + kmax / 32) + 64 : 0;
@@ -1384,7 +1392,10 @@ vv_status_t vv_decoder_prefill_cpu(
         per_token += sizeof(float) *
             (size_t)(cfg->intermediate_size > hs ? cfg->intermediate_size : hs);
     /* Int8 activations: a byte per column plus a scale and the sums. */
-    if (model->num_layers > 0 && layer_a8(&model->layers[0], false))
+    bool any_a8 = false;
+    for (int i = 0; i < model->num_layers; i++)
+        any_a8 |= layer_a8(&model->layers[i], cfg, false);
+    if (any_a8)
         per_token += sizeof(float) * ((size_t)a8_kmax(cfg) / 4 + 1 +
                                       (size_t)a8_kmax(cfg) / 32) + 64;
     size_t fit = workspace_size / per_token;

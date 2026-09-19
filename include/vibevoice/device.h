@@ -296,6 +296,13 @@ vv_status_t vv_w4a16_dequant_dev(
  * vv_q8_layout_t (q8.h).
  */
 
+/** @brief Widest row the fused GPU activation quantizers take (the FP16 row
+ *         sits in shared memory). A layer reading more stays on FP16
+ *         activations. */
+#define VV_ACT_QUANT_MAX_K 22528
+/** @brief Narrowest row the fused RMSNorm + quantize kernel takes. */
+#define VV_ACT_QUANT_MIN_K 256
+
 /** @brief FP16 [M,K] -> int8 [M,K] + FP32 scale [M] (+ xsum [M,K/32]). */
 vv_status_t vv_act_quant_dev(const void* x, int M, int K, int layout,
                              int8_t* xq, float* sx, int32_t* xsum,

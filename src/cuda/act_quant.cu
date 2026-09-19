@@ -31,7 +31,7 @@
 #include "vibevoice/device.h"
 
 #define AQ_THREADS 256
-#define AQ_MAX_K   22528          /* the FP16 row in shared memory, < 48 KB */
+#define AQ_MAX_K   VV_ACT_QUANT_MAX_K  /* the FP16 row in shared memory, < 48 KB */
 
 __device__ __forceinline__ float aq_block_max(float v, float* red) {
     for (int off = 16; off > 0; off >>= 1)
@@ -253,7 +253,7 @@ vv_status_t vv_rmsnorm_q8_dev(const void* x, const void* weight,
     if (!weight) return VV_ERR_NULL_PTR;
     if (!aq_layout_ok(layout)) return VV_ERR_INVALID_ARG;
     /* vv_rmsnorm_dev narrows its block below 256 columns; match it or bail. */
-    if (K < AQ_THREADS) return VV_ERR_UNSUPPORTED;
+    if (K < VV_ACT_QUANT_MIN_K) return VV_ERR_UNSUPPORTED;
     rmsnorm_q8_kernel<<<M, AQ_THREADS, (size_t)K * 2, (cudaStream_t)stream>>>(
         (const half*)x, (const half*)weight, K, eps, layout,
         xq, sx, xsum);
