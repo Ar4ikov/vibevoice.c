@@ -239,7 +239,13 @@ ggml's convolutions have no right padding, so each strided conv yields
 frames, not 83. The prompt still reserves `ceil(n/3200)` = 83 `speech_pad`
 tokens; `prefill_segmented` feeds only the 82 frames it has and continues the
 positions from there, so the last pad token is never fed (the prompt is 129
-positions, reported as "130 tokens").
+positions, reported as "130 tokens"). Decoding then starts at
+`cur_pos = n_prompt_tokens` = 130, not at 129: every generated token is
+rotated one position further than the cache row it lands in (llama.cpp
+finds the first free cell, so rows stay contiguous and only RoPE sees the
+gap). This runtime builds the prompt with the 82 pads it feeds and carries
+the gap in `vv_kv_cache_t.rope_gap` on the CPU, so its decode positions are
+the reference's (the GPU path keeps positions contiguous).
 
 ## Prompt and decoding
 
