@@ -26,11 +26,12 @@
  *  - ::vv_stream_t is the session, driving a ::vv_stream_backend_t that owns
  *    the model work (encode a window, prefill at an offset, decode a step).
  *
- * The backend over a real ::vv_inference_ctx_t is phase 2 of issue #20: it
- * needs BF16 loading and the model family from #15, the stateless-window
- * encoder from #16 and prefill at `kv->current_len`. Until then
- * vv_stream_open() returns VV_ERR_UNSUPPORTED and tests drive the session
- * through vv_stream_open_backend() with a scripted backend.
+ * vv_stream_open() puts a session on a real ::vv_inference_ctx_t (GPU or
+ * CPU): the prompt into a reset cache, each window through the device's
+ * speech front end as a stateless job, the chunk prefilled at the cache's
+ * current length and greedy decode on the captured step (src/inference/
+ * stream_ctx.c). Tests drive the same session through
+ * vv_stream_open_backend() with a scripted backend.
  */
 #ifndef VV_STREAM_H
 #define VV_STREAM_H
@@ -259,6 +260,12 @@ typedef struct {
     double           audio_start;  /**< seconds: the chunk covers */
     double           audio_end;    /**< [start, start + chunk) of new audio */
     vv_status_t      status;       /**< ERROR */
+    /* CHUNK: where the chunk's time went, wall clock on the calling thread. */
+    double           prefill_ms;   /**< window ready -> first token: encode,
+                                        prefill, head */
+    double           encode_ms;    /**< of which the encode, when measured */
+    double           decode_ms;    /**< the greedy steps after it */
+    int64_t          kv_len;       /**< cache positions after the chunk */
 } vv_stream_event_t;
 
 typedef void (*vv_stream_event_fn)(void* user, const vv_stream_event_t* ev);
@@ -272,6 +279,9 @@ typedef struct {
     const int32_t* rows;        /**< vv_stream_chunk_layout() output */
     int            n_rows;
     int            feat_offset; /**< first feature row */
+    /** Where the backend may report how long the window's encode took, in
+        ms (0 when it does not measure it separately). Never NULL. */
+    double*        encode_ms;
 } vv_stream_chunk_t;
 
 /**
@@ -342,6 +352,12 @@ typedef struct {
     int64_t kv_capacity;
     int64_t samples;        /**< PCM pushed */
     int64_t prompt_tokens;
+    int64_t prefill_rows;   /**< chunk rows prefilled, all chunks */
+    double  prompt_ms;      /**< prompt prefill */
+    double  prefill_ms;     /**< sum of the chunks' prefill_ms */
+    double  encode_ms;      /**< sum of the chunks' encode_ms */
+    double  decode_ms;      /**< sum of the chunks' decode_ms */
+    double  max_chunk_ms;   /**< slowest chunk, prefill + decode */
 } vv_stream_stats_t;
 
 typedef struct vv_stream vv_stream_t;
@@ -349,13 +365,52 @@ typedef struct vv_stream vv_stream_t;
 /**
  * @brief Open a session over an inference context.
  *
- * TODO(phase 2, #20): build the backend over `ctx` once #15 (BF16 load,
- * family `asr-streaming-7b`), #16 (stateless-window encoder) and chunk
- * prefill at `kv->current_len` are in. Returns VV_ERR_UNSUPPORTED today.
+ * The context must hold a chunked model (family `asr-streaming-7b`); the
+ * geometry and the special ids come from the model, overriding those in
+ * `params`, and everything else (hotwords, token cap, callbacks) from
+ * `params`. The context is the session's until vv_stream_close(): the KV
+ * cache is reset here and grows with every chunk, and nothing else may
+ * transcribe on it meanwhile. All calls must come from one thread at a
+ * time; on a GPU context each call binds the context's device first.
+ *
+ * @return VV_ERR_UNSUPPORTED for a one-shot model, VV_ERR_OVERFLOW when the
+ *         prompt alone does not fit the KV window.
  */
 vv_status_t vv_stream_open(struct vv_inference_ctx* ctx,
                            const vv_stream_params_t* params,
                            vv_stream_t** out);
+
+/**
+ * @brief Fill `p` with the defaults for `ctx`'s model: its chunk geometry
+ *        and special ids, 256 tokens per chunk.
+ */
+vv_status_t vv_stream_params_for(const struct vv_inference_ctx* ctx,
+                                 vv_stream_params_t* p);
+
+/**
+ * @brief Ask a session to stop. Safe from another thread or from inside the
+ *        event callback (e.g. when a write to a disconnected client fails).
+ *
+ * The session checks between tokens and between chunks; the call in
+ * progress returns VV_ERR_CANCELLED and so does every later one. No ERROR
+ * event is emitted for a cancel.
+ */
+void vv_stream_cancel(vv_stream_t* s);
+
+/**
+ * @brief Transcribe a whole clip through a session on `ctx`.
+ *
+ * What vv_inference_transcribe() does for a chunked model: every window,
+ * then the tail. Segments are the speaker turns the model writes inline
+ * (" 
+ Speaker N:"), timed to the chunks they came from. `on_event` may be
+ * NULL; with it the chunks can be shown as they are produced.
+ */
+vv_status_t vv_stream_transcribe(struct vv_inference_ctx* ctx,
+                                 const float* pcm24k, int n_samples,
+                                 const char* context_info,
+                                 vv_stream_event_fn on_event, void* user,
+                                 struct vv_transcription** result);
 
 /**
  * @brief Open a session over any backend (copied; destroyed on close).
@@ -376,6 +431,19 @@ vv_status_t vv_stream_push(vv_stream_t* s, const float* pcm, size_t n);
 
 /** @brief End of audio: run the zero-padded tail windows, emit DONE. */
 vv_status_t vv_stream_finish(vv_stream_t* s);
+
+/**
+ * @brief Build a transcription (speaker-turn segments) from chunk texts.
+ *
+ * `texts[i]` is chunk i's text; chunk i covers [i * chunk_sec,
+ * (i + 1) * chunk_sec) clamped to `duration`. A turn starts at a newline
+ * followed by "Speaker N:"; text before the first marker goes to
+ * "Speaker 0".
+ */
+vv_status_t vv_stream_build_transcription(const char* const* texts,
+                                          int n_chunks, double chunk_sec,
+                                          double duration,
+                                          struct vv_transcription** out);
 
 /** @brief Full transcript so far (concatenated chunk texts). */
 const char* vv_stream_transcript(const vv_stream_t* s);

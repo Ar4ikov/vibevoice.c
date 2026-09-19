@@ -9,6 +9,7 @@
  */
 
 #include "vibevoice/vibevoice.h"
+#include "vibevoice/stream.h"
 #include "vibevoice/tokenizer_encoder.h"
 #include "vibevoice/kv_quant.h"
 #include "vibevoice/audio.h"
@@ -211,6 +212,50 @@ int vv_cmd_serve(int argc, char** argv);
 int vv_cmd_chat(int argc, char** argv);
 int vv_cmd_mic(int argc, char** argv);
 int vv_cmd_devices(int argc, char** argv);
+
+/* ─── Live output for the streaming model ─────────────────────────────── */
+
+typedef struct {
+    double* ms;       /* per chunk: prefill + decode */
+    double* enc_ms;   /* per chunk: encode (VV_STREAM_PROFILE=1) */
+    int     n, cap;
+} cli_stream_t;
+
+static void cli_stream_event(void* user, const vv_stream_event_t* ev) {
+    cli_stream_t* c = (cli_stream_t*)user;
+    if (ev->type == VV_STREAM_EVENT_DELTA) {
+        fwrite(ev->text, 1, ev->text_len, stdout);
+        fflush(stdout);
+    } else if (ev->type == VV_STREAM_EVENT_CHUNK) {
+        if (c->n == c->cap) {
+            const int nc = c->cap ? c->cap * 2 : 64;
+            double* a = (double*)vv_realloc(c->ms, sizeof(double) * (size_t)nc);
+            if (!a) return;
+            c->ms = a;
+            double* b = (double*)vv_realloc(c->enc_ms,
+                                            sizeof(double) * (size_t)nc);
+            if (!b) return;
+            c->enc_ms = b;
+            c->cap = nc;
+        }
+        c->ms[c->n] = ev->prefill_ms + ev->decode_ms;
+        c->enc_ms[c->n] = ev->encode_ms;
+        c->n++;
+        VV_LOG_D("chunk %lld [%.2f-%.2f s]: %d tokens, prefill %.1f ms "
+                 "(encode %.1f), decode %.1f ms, KV %lld",
+                 (long long)ev->chunk_index, ev->audio_start, ev->audio_end,
+                 ev->n_tokens, ev->prefill_ms, ev->encode_ms, ev->decode_ms,
+                 (long long)ev->kv_len);
+    } else if (ev->type == VV_STREAM_EVENT_ERROR) {
+        VV_LOG_E("stream: chunk %lld failed: %s", (long long)ev->chunk_index,
+                 vv_status_str(ev->status));
+    }
+}
+
+static int cmp_double(const void* a, const void* b) {
+    const double x = *(const double*)a, y = *(const double*)b;
+    return (x > y) - (x < y);
+}
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
@@ -422,7 +467,32 @@ int main(int argc, char** argv) {
         VV_LOG_I("Hotwords: %d term(s)", params.num_hotwords);
 
     vv_transcription_t* result = NULL;
-    s = vv_inference_transcribe(ctx, audio, n_samples, &params, &result);
+    const bool chunked = ctx->family_ok &&
+                         ctx->family.mode == VV_GEN_CHUNKED;
+    cli_stream_t live;
+    memset(&live, 0, sizeof(live));
+    if (chunked) {
+        /*
+         * The streaming model writes text chunk by chunk; show it as it
+         * comes, then the transcript and the segments as usual.
+         */
+        char ctx_info[512];
+        ctx_info[0] = '\0';
+        for (int i = 0, w = 0; i < params.num_hotwords; i++) {
+            const int k = snprintf(ctx_info + w, sizeof(ctx_info) - (size_t)w,
+                                   "%s%s", w ? ", " : "", params.hotwords[i]);
+            if (k < 0 || (size_t)k >= sizeof(ctx_info) - (size_t)w) break;
+            w += k;
+        }
+        fprintf(stderr, "\n--- streaming (%d+%d frames per chunk) ---\n",
+                ctx->family.chunk_frames, ctx->family.lookahead_frames);
+        s = vv_stream_transcribe(ctx, audio, n_samples,
+                                 ctx_info[0] ? ctx_info : NULL,
+                                 cli_stream_event, &live, &result);
+        fprintf(stderr, "\n--- end stream (%d chunks) ---\n", live.n);
+    } else {
+        s = vv_inference_transcribe(ctx, audio, n_samples, &params, &result);
+    }
     if (s != VV_OK) {
         VV_LOG_E("Transcription failed: %s", vv_status_str(s));
         vv_inference_free(ctx);
@@ -521,6 +591,26 @@ int main(int argc, char** argv) {
                perf->total_ms / 1000.0);
 
         /* Tokens */
+        if (chunked && live.n > 0) {
+            /* Per-chunk latency: what a live caller waits after a window's
+             * last sample arrives before its text is complete. */
+            double sum = 0.0, enc = 0.0;
+            for (int i = 0; i < live.n; i++) sum += live.ms[i];
+            for (int i = 0; i < live.n; i++) enc += live.enc_ms[i];
+            qsort(live.ms, (size_t)live.n, sizeof(double), cmp_double);
+            printf("\n  Streaming (%d chunks of %.2f s):\n", live.n,
+                   (double)ctx->family.chunk_frames *
+                   ctx->family.frame_samples / ctx->family.sample_rate);
+            printf("    Chunk latency        %8.1f ms mean, p50 %.1f, p95 %.1f, "
+                   "max %.1f\n", sum / live.n, live.ms[live.n / 2],
+                   live.ms[(live.n * 95) / 100 < live.n
+                           ? (live.n * 95) / 100 : live.n - 1],
+                   live.ms[live.n - 1]);
+            if (enc > 0.0)
+                printf("      of which encode    %8.1f ms mean\n", enc / live.n);
+            printf("    Prompt prefill       %8.1f ms\n", perf->ttft_ms);
+        }
+
         printf("\n  Token counts:\n");
         printf("    Prefill tokens       %8d\n", perf->prefill_tokens);
         printf("    Audio frames         %8d\n", perf->audio_frames);
@@ -566,6 +656,8 @@ int main(int argc, char** argv) {
     }
 
     /* Cleanup */
+    vv_free(live.ms);
+    vv_free(live.enc_ms);
     vv_transcription_free(result);
     vv_inference_free(ctx);
     vv_free(audio);

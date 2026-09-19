@@ -53,6 +53,31 @@ vv_status_t vv_audio_resample(const float* in, int in_sr, int in_len,
                                float** out, int target_sr, int* out_len);
 
 /**
+ * @brief Fixed-ratio resampler fed piece by piece (live PCM).
+ *
+ * Pushing a signal in any split and then finishing yields exactly what
+ * vv_audio_resample() gives for the whole signal, sample for sample: an
+ * output is released as soon as every input tap it reads has arrived
+ * (16 input samples of delay), and finish() emits the tail with the same
+ * edge handling. Equal rates pass samples through.
+ */
+typedef struct vv_resampler vv_resampler_t;
+
+vv_status_t vv_resampler_create(int in_sr, int out_sr, vv_resampler_t** out);
+void vv_resampler_free(vv_resampler_t* r);
+
+/**
+ * @brief Add input; `*out` points at the outputs that became final (owned by
+ *        the resampler, valid until the next call), `*n_out` counts them.
+ */
+vv_status_t vv_resampler_push(vv_resampler_t* r, const float* in, size_t n,
+                              const float** out, size_t* n_out);
+
+/** @brief End of input: the remaining outputs. */
+vv_status_t vv_resampler_finish(vv_resampler_t* r, const float** out,
+                                size_t* n_out);
+
+/**
  * @brief Normalize audio to target dBFS level.
  *
  * Computes RMS, then applies gain to reach target_db_fs.

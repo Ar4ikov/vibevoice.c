@@ -169,6 +169,7 @@ add_library(vibevoice_core STATIC
     src/inference/postprocess.c
     src/inference/family.c
     src/inference/stream.c
+    src/inference/stream_ctx.c
 )
 # With no accelerator backend the device op set still has to link. The stub
 # implements memory and streams on the host and refuses every compute op,

@@ -3,8 +3,8 @@
  * @brief Streaming-7B session: chunk scheduler, chunk layout, text deltas.
  *
  * Everything here is model-free. The model work goes through
- * vv_stream_backend_t; the backend over a real inference context is phase 2
- * of issue #20 (see the TODO(phase 2) markers and docs/STREAMING.md).
+ * vv_stream_backend_t; the backend over a real inference context is in
+ * stream_ctx.c (docs/STREAMING.md has the protocol).
  */
 
 #include "vibevoice/stream.h"
@@ -422,8 +422,13 @@ struct vv_stream {
     int32_t             pending_lead;  /* folded <|text_chunk_end|>, or -1 */
     vv_status_t         failed;
     bool                done;
+    volatile int        cancel;        /* vv_stream_cancel(), any thread */
     vv_stream_stats_t   stats;
 };
+
+void vv_stream_cancel(vv_stream_t* s) {
+    if (s) s->cancel = 1;
+}
 
 void vv_stream_params_default(vv_stream_params_t* p) {
     if (!p) return;
@@ -441,6 +446,7 @@ static void emit(vv_stream_t* s, vv_stream_event_t* ev) {
 static vv_status_t fail(vv_stream_t* s, vv_status_t st, int64_t chunk) {
     if (s->failed == VV_OK) {
         s->failed = st;
+        if (st == VV_ERR_CANCELLED) return st;
         vv_stream_event_t ev;
         memset(&ev, 0, sizeof(ev));
         ev.type = VV_STREAM_EVENT_ERROR;
@@ -508,8 +514,16 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
                                               n_frames, s->rows, s->rows_cap,
                                               &feat_off);
     if (n_rows < 0) return fail(s, VV_ERR_INVALID_ARG, idx);
+    if (s->cancel) return fail(s, VV_ERR_CANCELLED, idx);
     /* The rows, plus the trailing <|text_chunk_end|> that has to follow. */
-    if (!kv_fits(s, n_rows + 1)) return fail(s, VV_ERR_OVERFLOW, idx);
+    if (!kv_fits(s, n_rows + 1)) {
+        vv_log(VV_LOG_ERROR, "stream: chunk %lld does not fit the KV window "
+               "(%lld + %d of %lld positions); the session ends here -- "
+               "raise --max-seq-len", (long long)idx, (long long)kv_len(s),
+               n_rows + 1, (long long)kv_cap(s));
+        return fail(s, VV_ERR_OVERFLOW, idx);
+    }
+    double encode_ms = 0.0;
 
     vv_stream_chunk_t ch;
     ch.index = idx;
@@ -519,11 +533,15 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
     ch.rows = s->rows;
     ch.n_rows = n_rows;
     ch.feat_offset = feat_off;
+    ch.encode_ms = &encode_ms;
 
     int32_t tok = -1;
+    const double t0 = vv_time_ms();
     vv_status_t st = s->be.prefill_chunk(s->be.self, &ch, s->window, &tok);
     if (st != VV_OK) return fail(s, st, idx);
+    const double t1 = vv_time_ms();
     s->pending_lead = -1;
+    s->stats.prefill_rows += n_rows;
 
     s->chunk_text.len = 0;
     if (s->chunk_text.p) s->chunk_text.p[0] = '\0';
@@ -561,7 +579,14 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
 
         /* The token is fed even when it is the last one the cap allows,
          * exactly as upstream does; one slot stays for the chunk end. */
-        if (!kv_fits(s, 2)) { st = VV_ERR_OVERFLOW; break; }
+        if (s->cancel) { st = VV_ERR_CANCELLED; break; }
+        if (!kv_fits(s, 2)) {
+            vv_log(VV_LOG_ERROR, "stream: the KV window (%lld positions) is "
+                   "full in chunk %lld; the session ends here -- raise "
+                   "--max-seq-len", (long long)kv_cap(s), (long long)idx);
+            st = VV_ERR_OVERFLOW;
+            break;
+        }
         st = s->be.decode_step(s->be.self, tok, &tok);
         if (st != VV_OK) break;
     }
@@ -570,6 +595,7 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
         return fail(s, st, idx);
     }
 
+    const double t2 = vv_time_ms();
     const char* d = NULL;
     size_t dn = 0;
     st = vv_stream_text_flush(s->text, &d, &dn);
@@ -595,6 +621,10 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
                 s->chunk_text.len))
         return fail(s, VV_ERR_OUT_OF_MEMORY, idx);
     s->stats.chunks++;
+    s->stats.prefill_ms += t1 - t0;
+    s->stats.encode_ms += encode_ms;
+    s->stats.decode_ms += t2 - t1;
+    if (t2 - t0 > s->stats.max_chunk_ms) s->stats.max_chunk_ms = t2 - t0;
 
     vv_stream_event_t ev;
     memset(&ev, 0, sizeof(ev));
@@ -607,8 +637,12 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w) {
     ev.audio_start = (double)w->start / s->p.geom.sample_rate;
     ev.audio_end = (double)(w->start + vv_stream_chunk_samples(&s->p.geom)) /
                    s->p.geom.sample_rate;
+    ev.prefill_ms = t1 - t0;
+    ev.encode_ms = encode_ms;
+    ev.decode_ms = t2 - t1;
+    ev.kv_len = kv_len(s);
     emit(s, &ev);
-    return VV_OK;
+    return s->cancel ? fail(s, VV_ERR_CANCELLED, idx) : VV_OK;
 }
 
 static vv_status_t drain(vv_stream_t* s) {
@@ -618,31 +652,6 @@ static vv_status_t drain(vv_stream_t* s) {
         if (st != VV_OK) return st;
     }
     return VV_OK;
-}
-
-vv_status_t vv_stream_open(struct vv_inference_ctx* ctx,
-                           const vv_stream_params_t* params,
-                           vv_stream_t** out) {
-    (void)params;
-    if (!ctx || !out) return VV_ERR_NULL_PTR;
-    *out = NULL;
-    /* TODO(phase 2, #20): a vv_stream_backend_t over ctx:
-     *  - encode_text / token_bytes: ctx->tokenizer (vv_tokenizer_encode,
-     *    vv_stream_token_bytes);
-     *  - prefill_prompt: embed + vv_decoder_prefill into a reset cache;
-     *  - prefill_chunk: the stateless-window encoder (#16) for both
-     *    tokenizers + connectors straight into the chunk's hidden rows at
-     *    feat_offset, token rows through the embedding, prefill at
-     *    kv->current_len (#15 / #17 split-KV small-q path), then final norm,
-     *    LM head and argmax of the last row; vv_kv_cache_publish_len after;
-     *  - decode_step: the graphed decode step with graphs kept in the
-     *    session (position-invariant captures survive across chunks);
-     *  - kv_len / kv_capacity: kv->current_len / kv->max_seq_len (every
-     *    shard);
-     *  - the per-chunk dumps stream_cNNNN_feats / _logits for cmp-stream. */
-    vv_log(VV_LOG_ERROR, "stream: Streaming-7B sessions need the phase-2 "
-                         "backend (issue #20)");
-    return VV_ERR_UNSUPPORTED;
 }
 
 vv_status_t vv_stream_open_backend(const vv_stream_backend_t* backend,
@@ -709,9 +718,11 @@ vv_status_t vv_stream_open_backend(const vv_stream_backend_t* backend,
             st = VV_ERR_OVERFLOW;
             goto fail;
         }
+        const double t0 = vv_time_ms();
         st = s->be.prefill_prompt(s->be.self, ids, n);
         vv_free(ids);
         if (st != VV_OK) goto fail;
+        s->stats.prompt_ms = vv_time_ms() - t0;
         s->stats.prompt_tokens = n;
     }
     *out = s;
@@ -727,6 +738,7 @@ fail:
 vv_status_t vv_stream_push(vv_stream_t* s, const float* pcm, size_t n) {
     if (!s) return VV_ERR_NULL_PTR;
     if (s->failed != VV_OK) return s->failed;
+    if (s->cancel) return fail(s, VV_ERR_CANCELLED, -1);
     if (s->done) return VV_ERR_INVALID_ARG;
     vv_status_t st = vv_stream_chunker_push(s->chunker, pcm, n);
     if (st != VV_OK) return fail(s, st, -1);
@@ -737,6 +749,7 @@ vv_status_t vv_stream_finish(vv_stream_t* s) {
     if (!s) return VV_ERR_NULL_PTR;
     if (s->failed != VV_OK) return s->failed;
     if (s->done) return VV_OK;
+    if (s->cancel) return fail(s, VV_ERR_CANCELLED, -1);
     vv_stream_chunker_finish(s->chunker);
     vv_status_t st = drain(s);
     if (st != VV_OK) return st;
@@ -779,4 +792,168 @@ void vv_stream_close(vv_stream_t* s) {
     vv_free(s->transcript.p);
     vv_free(s->context_info);
     vv_free(s);
+}
+
+/* ─── Transcript -> segments ────────────────────────────────────────────── */
+
+/* A turn marker: '\n', blanks, "Speaker", blanks, digits, ':'. Returns its
+ * length and writes the speaker's name, or 0 when `p` is not one. */
+static size_t turn_marker(const char* p, const char* end, char* name,
+                          size_t name_cap) {
+    const char* q = p;
+    if (q >= end || *q != '\n') return 0;
+    q++;
+    while (q < end && (*q == ' ' || *q == '\t')) q++;
+    static const char kw[] = "Speaker";
+    const size_t kn = sizeof(kw) - 1;
+    if ((size_t)(end - q) < kn || memcmp(q, kw, kn) != 0) return 0;
+    q += kn;
+    while (q < end && *q == ' ') q++;
+    const char* d0 = q;
+    while (q < end && *q >= '0' && *q <= '9' && q - d0 < 6) q++;
+    if (q == d0 || q >= end || *q != ':') return 0;
+    snprintf(name, name_cap, "Speaker %.*s", (int)(q - d0), d0);
+    return (size_t)(q + 1 - p);
+}
+
+static bool is_blank(char c) {
+    return c == ' ' || c == '\n' || c == '\t' || c == '\r';
+}
+
+static char* dup_trimmed(const char* s, size_t n) {
+    while (n && is_blank(*s)) { s++; n--; }
+    while (n && is_blank(s[n - 1])) n--;
+    char* o = (char*)vv_alloc(n + 1);
+    if (!o) return NULL;
+    if (n) memcpy(o, s, n);
+    o[n] = '\0';
+    return o;
+}
+
+/* The chunk whose text holds byte `b`: off[] ascends, off[n] = total. */
+static int chunk_of(const size_t* off, int n_chunks, size_t b) {
+    int lo = 0, hi = n_chunks - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        if (off[mid] <= b) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+vv_status_t vv_stream_build_transcription(const char* const* texts,
+                                          int n_chunks, double chunk_sec,
+                                          double duration,
+                                          vv_transcription_t** out) {
+    if (!out || (n_chunks > 0 && !texts)) return VV_ERR_NULL_PTR;
+    *out = NULL;
+    if (n_chunks < 0 || chunk_sec <= 0.0) return VV_ERR_INVALID_ARG;
+
+    /* One string, with where each chunk starts in it: a marker may be split
+     * across two chunks' texts. */
+    sbuf_t all = { NULL, 0, 0 };
+    size_t* off = (size_t*)vv_alloc(sizeof(size_t) * (size_t)(n_chunks + 1));
+    if (!off || !sb_reserve(&all, 0)) {
+        vv_free(off); vv_free(all.p);
+        return VV_ERR_OUT_OF_MEMORY;
+    }
+    all.p[0] = '\0';
+    for (int i = 0; i < n_chunks; i++) {
+        off[i] = all.len;
+        const char* t = texts[i] ? texts[i] : "";
+        if (!sb_put(&all, t, strlen(t))) {
+            vv_free(off); vv_free(all.p);
+            return VV_ERR_OUT_OF_MEMORY;
+        }
+    }
+    off[n_chunks] = all.len;
+
+    vv_transcription_t* tr = (vv_transcription_t*)vv_alloc(sizeof(*tr));
+    int seg_cap = 8;
+    vv_segment_t* segs = (vv_segment_t*)vv_alloc(sizeof(vv_segment_t) *
+                                                 (size_t)seg_cap);
+    if (!tr || !segs) {
+        vv_free(tr); vv_free(segs); vv_free(off); vv_free(all.p);
+        return VV_ERR_OUT_OF_MEMORY;
+    }
+    memset(tr, 0, sizeof(*tr));
+    tr->segments = segs;
+    tr->duration = (float)duration;
+    vv_status_t st = VV_OK;
+
+    char name[32];
+    snprintf(name, sizeof(name), "Speaker 0");
+    size_t seg_begin = 0;      /* first byte of the current turn's text */
+    size_t seg_mark = 0;       /* where its marker was (chunk of the start) */
+    const char* end = all.p + all.len;
+    size_t i = 0;
+    for (;;) {
+        char nn[32];
+        size_t ml = 0;
+        const bool at_end = i >= all.len;
+        if (!at_end) ml = turn_marker(all.p + i, end, nn, sizeof(nn));
+        if (!at_end && ml == 0) { i++; continue; }
+
+        /* Close the turn [seg_begin, i). */
+        char* body = dup_trimmed(all.p + seg_begin, i - seg_begin);
+        if (!body) { st = VV_ERR_OUT_OF_MEMORY; break; }
+        if (body[0]) {
+            if (tr->num_segments == seg_cap) {
+                seg_cap *= 2;
+                vv_segment_t* ns = (vv_segment_t*)vv_realloc(
+                    tr->segments, sizeof(vv_segment_t) * (size_t)seg_cap);
+                if (!ns) { vv_free(body); st = VV_ERR_OUT_OF_MEMORY; break; }
+                tr->segments = ns;
+            }
+            /* It ends in the chunk of its last non-blank byte. */
+            size_t last = i;
+            while (last > seg_begin && is_blank(all.p[last - 1])) last--;
+            const int c0 = n_chunks ? chunk_of(off, n_chunks, seg_mark) : 0;
+            const int c1 = n_chunks ? chunk_of(off, n_chunks, last - 1) : 0;
+            double t0 = c0 * chunk_sec;
+            double t1 = (c1 + 1) * chunk_sec;
+            if (duration > 0.0) {
+                if (t1 > duration) t1 = duration;
+                if (t0 > t1) t0 = t1;
+            }
+            vv_segment_t* sg = &tr->segments[tr->num_segments];
+            sg->speaker = dup_trimmed(name, strlen(name));
+            sg->text = body;
+            sg->start_time = (float)t0;
+            sg->end_time = (float)t1;
+            if (!sg->speaker) { vv_free(body); st = VV_ERR_OUT_OF_MEMORY; break; }
+            tr->num_segments++;
+        } else {
+            vv_free(body);
+        }
+        if (at_end) break;
+        snprintf(name, sizeof(name), "%s", nn);
+        seg_mark = i;
+        i += ml;
+        seg_begin = i;
+    }
+
+    if (st == VV_OK) {
+        size_t cap = 1;
+        for (int k = 0; k < tr->num_segments; k++)
+            cap += strlen(tr->segments[k].text) + 1;
+        char* full = (char*)vv_alloc(cap);
+        if (!full) {
+            st = VV_ERR_OUT_OF_MEMORY;
+        } else {
+            size_t n = 0;
+            for (int k = 0; k < tr->num_segments; k++) {
+                const size_t l = strlen(tr->segments[k].text);
+                if (n) full[n++] = ' ';
+                memcpy(full + n, tr->segments[k].text, l);
+                n += l;
+            }
+            full[n] = '\0';
+            tr->full_text = full;
+        }
+    }
+    vv_free(off);
+    vv_free(all.p);
+    if (st != VV_OK) { vv_transcription_free(tr); return st; }
+    *out = tr;
+    return VV_OK;
 }

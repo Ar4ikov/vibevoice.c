@@ -23,6 +23,7 @@
 
 #include "vibevoice/types.h"
 #include "vibevoice/inference.h"
+#include "vibevoice/stream.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,6 +90,47 @@ vv_status_t vv_engine_transcribe(vv_engine_t* e,
                                  const vv_inference_params_t* params,
                                  vv_transcription_t** out,
                                  vv_perf_metrics_t* perf);
+
+/* ─── Streaming sessions (chunked models) ───────────────────────────────── */
+
+/** @brief Whether the loaded model transcribes chunk by chunk (Streaming-7B),
+ *         so vv_engine_stream_open() applies. */
+bool vv_engine_is_streaming(const vv_engine_t* e);
+
+/**
+ * @brief A streaming session holding one slot for its whole life.
+ *
+ * Counts against the slots like a request does: it blocks in open while
+ * all are busy, and the slot is back when it closes. PCM arrives at
+ * `sample_rate` and is resampled on the fly (sample for sample what a
+ * whole-file resample gives); the streaming model is never
+ * loudness-normalized.
+ */
+typedef struct vv_engine_stream vv_engine_stream_t;
+
+/**
+ * @param params  hotwords, token cap, callbacks; the geometry and ids come
+ *                from the model
+ */
+vv_status_t vv_engine_stream_open(vv_engine_t* e,
+                                  const vv_stream_params_t* params,
+                                  int sample_rate, vv_engine_stream_t** out);
+
+/** @brief Push mono PCM at the session's rate; runs every ready chunk. */
+vv_status_t vv_engine_stream_push(vv_engine_stream_t* s, const float* pcm,
+                                  size_t n);
+
+/** @brief End of audio: the resampler's tail, the padded windows, DONE. */
+vv_status_t vv_engine_stream_finish(vv_engine_stream_t* s);
+
+/** @brief Stop at the next token (any thread); see vv_stream_cancel(). */
+void vv_engine_stream_cancel(vv_engine_stream_t* s);
+
+/** @brief The underlying session (transcript, stats). */
+vv_stream_t* vv_engine_stream_session(vv_engine_stream_t* s);
+
+/** @brief Close the session and give the slot back. NULL is fine. */
+void vv_engine_stream_close(vv_engine_stream_t* s);
 
 /** @brief Slot count, for logging and for sizing a server's thread pool. */
 int vv_engine_slots(const vv_engine_t* e);
