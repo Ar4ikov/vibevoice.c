@@ -50,6 +50,9 @@ typedef struct vv_family {
     vv_model_family_t  id;
     vv_gen_mode_t      mode;
     bool               normalize_audio;  /**< -25 dBFS before encoding    */
+    /** Prepare audio as VibeASR.cpp does (linear resampling, its gain
+     *  formula): asr-bitnet, whose reference runtime that is. */
+    bool               vibeasr_audio;
     int                sample_rate;      /**< 24000                       */
     int                frame_samples;    /**< samples per frame, 3200     */
     int                chunk_frames;     /**< chunked only, else 0        */
@@ -84,7 +87,9 @@ void vv_prompt_free(vv_prompt_t* p);
  *
  * One-shot families: the whole ChatML turn with `n_audio_frames` pads,
  * exactly as vibevoice_asr_processor.py builds it — no generation prompt,
- * the model writes `<|im_start|>assistant\n` itself.
+ * the model writes `<|im_start|>assistant\n` itself. asr-bitnet asks for
+ * plain text ("please transcribe it."), as VibeASR.cpp's default prompt
+ * format does, and gets no JSON keys.
  *
  * Chunked families: the plain-text instruction `streaming_generate` prefills
  * before any audio; `n_audio_frames` and `duration_sec` are ignored and the

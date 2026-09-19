@@ -24,6 +24,9 @@
 #include "vibevoice/vibevoice.h"
 #include "vibevoice/cpu_kernels.h"
 #include "vibevoice/smooth.h"
+#include "vibevoice/bitnet.h"
+#include "vibevoice/vae_i8.h"
+#include "bitnet_load.h"
 #include "cJSON.h"
 
 #include <math.h>
@@ -83,6 +86,11 @@ typedef struct {
     char               prefix[128];  /**< "model." / "model.language_model." */
     /* What the projections turned out to be, for the summary line. */
     int                n_nf4, n_int4g, n_int8, n_dense, n_converted;
+    int                n_ternary;
+    /** asr-bitnet from F32 safetensors: ternarize, FP32 norms and biases */
+    bool               bitnet;
+    int                vae;       /**< vv_vae_numerics_t for bitnet      */
+    int                head;      /**< vv_head_format_t for bitnet       */
     /** 1 when GPTQ zeros are stored minus one (all but "gptq_v2") */
     int                gptq_bias;
     size_t             proj_bytes;
@@ -334,6 +342,19 @@ static vv_status_t need_f16(const loader_t* L, const char* name,
     }
     vv_status_t s = check_shape(e, d0, d1);
     return s != VV_OK ? s : load_f16(L, e, t);
+}
+
+/** @brief An LM norm: FP32 for BitNet (the reference keeps them), else FP16. */
+static vv_status_t need_norm(const loader_t* L, const char* name, int64_t d0,
+                             vv_tensor_t* t) {
+    if (!L->bitnet) return need_f16(L, name, d0, 0, t);
+    const st_entry_t* e = find(L, name);
+    if (!e) {
+        VV_LOG_E("loader: '%s' is missing from the checkpoint", name);
+        return VV_ERR_WEIGHT_MISSING;
+    }
+    vv_status_t s = check_shape(e, d0, 0);
+    return s != VV_OK ? s : load_f32(L, e, t);
 }
 
 /* ─── NF4 (bitsandbytes) ────────────────────────────────────────────────── */
@@ -1410,6 +1431,51 @@ static vv_status_t load_projection(loader_t* L, int layer, const char* which,
     char pbuf[320];
     snprintf(pbuf, sizeof(pbuf), "%s.weight_packed", base);
     const st_entry_t* ep = e ? NULL : find(L, pbuf);
+    if (L->bitnet) {
+        /*
+         * BitNet's safetensors hold the latent F32 weights; the model runs
+         * their ternarization (one scale per tensor, VibeASR.cpp's converter
+         * formula), never the latent values themselves.
+         */
+        if (!e) {
+            VV_LOG_E("loader: '%s' is missing", buf);
+            return VV_ERR_WEIGHT_MISSING;
+        }
+        if (e->info.dtype != VV_DTYPE_F32) {
+            VV_LOG_E("loader: '%s' is %s; BitNet's latent weights are F32",
+                     buf, dtype_name(e->info.dtype));
+            return VV_ERR_MODEL_FORMAT;
+        }
+        if ((s = check_shape(e, N, K)) != VV_OK) return s;
+        if (K % VV_TERNARY_BLOCK) return VV_ERR_UNSUPPORTED;
+        const float* src = (const float*)data_of(L, e);
+        if (!src) return VV_ERR_MODEL_FORMAT;
+        const size_t nb = (size_t)N * K / 4;
+        uint8_t* codes = (uint8_t*)vv_alloc(nb);
+        if (!codes) return VV_ERR_OUT_OF_MEMORY;
+        float sc = 0.0f;
+        s = vv_ternarize_f32(src, N, K, codes, &sc);
+        if (s != VV_OK) { vv_free(codes); return s; }
+        const int64_t shp[2] = { N, K / 4 };
+        set_tensor(&w->tensor, codes, VV_DTYPE_U8, nb, 2, shp);
+        w->tscale = sc;
+        w->quant_kind = VV_QUANT_TERNARY;
+        w->is_quantized = true;
+        L->n_ternary++;
+        L->n_converted++;
+        L->proj_bytes += nb;
+        snprintf(buf, sizeof(buf), "%s.bias", base);
+        e = find(L, buf);
+        if (e) {
+            if ((s = check_shape(e, N, 0)) != VV_OK) return s;
+            return load_f32(L, e, &w->bias);
+        }
+        if (want_bias) {
+            VV_LOG_E("loader: '%s' is missing (attention_bias is on)", buf);
+            return VV_ERR_WEIGHT_MISSING;
+        }
+        return VV_OK;
+    }
     if (e && e->info.dtype == VV_DTYPE_U8) {
         /* bitsandbytes NF4: the codes of [N,K], two to a byte. */
         if (L->quant != VV_LOAD_QUANT_AUTO && L->quant != VV_LOAD_QUANT_NF4) {
@@ -1781,11 +1847,13 @@ static vv_status_t load_layers(loader_t* L) {
 
         snprintf(buf, sizeof(buf), "%slayers.%d.input_layernorm.weight",
                  L->prefix, i);
-        if ((s = need_f16(L, buf, hs, 0, &Ly->input_layernorm)) != VV_OK)
+        /* F16 norms, except BitNet's F32 ones (SmoothQuant is refused there:
+         * it needs --quant, which BitNet refuses). */
+        if ((s = need_norm(L, buf, hs, &Ly->input_layernorm)) != VV_OK)
             break;
         snprintf(buf, sizeof(buf), "%slayers.%d.post_attention_layernorm.weight",
                  L->prefix, i);
-        if ((s = need_f16(L, buf, hs, 0, &Ly->post_attn_layernorm)) != VV_OK)
+        if ((s = need_norm(L, buf, hs, &Ly->post_attn_layernorm)) != VV_OK)
             break;
         /* x / s out of the norms, W * s into the projections they feed. */
         if (f.qkv) div_f16(&Ly->input_layernorm, f.qkv);
@@ -1831,7 +1899,7 @@ static vv_status_t load_lm_globals(loader_t* L) {
                       &m->embed_tokens)) != VV_OK)
         return s;
     snprintf(buf, sizeof(buf), "%snorm.weight", L->prefix);
-    if ((s = need_f16(L, buf, c->hidden_size, 0, &m->final_norm)) != VV_OK)
+    if ((s = need_norm(L, buf, c->hidden_size, &m->final_norm)) != VV_OK)
         return s;
 
     const st_entry_t* head = find(L, "lm_head.weight");
@@ -1847,6 +1915,14 @@ static vv_status_t load_lm_globals(loader_t* L) {
         if (head)
             VV_LOG_I("loader: tie_word_embeddings — '%s' ignored, the head "
                      "shares embed_tokens", head->info.name);
+        if (L->bitnet && L->head == VV_HEAD_INT8) {
+            /* int8 rows of the F32 table itself, not of its FP16 copy */
+            snprintf(buf, sizeof(buf), "%sembed_tokens.weight", L->prefix);
+            const st_entry_t* e = find(L, buf);
+            const void* src = e ? data_of(L, e) : NULL;
+            if (!src || e->info.dtype != VV_DTYPE_F32) return VV_ERR_MODEL_FORMAT;
+            return vv_bitnet_head_i8(m, src, 0, c->vocab_size, c->hidden_size);
+        }
         return VV_OK;
     }
     if (!head) {
@@ -1915,6 +1991,138 @@ static vv_status_t load_encoder(loader_t* L, const char* which,
     }
     *n_out = k;
     return VV_OK;
+}
+
+/* ─── BitNet's int8 encoder, quantized from the F32 safetensors ─────────── */
+
+/* One layer: I8_S-quantize the whole F32 tensor (vv_i8s_quantize_f32, which
+ * reproduces the shipped GGUF bit for bit), then lay it out as the int8
+ * encoder reads it. */
+static vv_status_t i8_layer_st(loader_t* L, vv_i8vae_t* v, const char* wname,
+                               const char* bname, int stride, int depthwise,
+                               vv_i8_layer_t* out) {
+    const st_entry_t* ew = find(L, wname);
+    const st_entry_t* eb = find(L, bname);
+    if (!ew || !eb || ew->info.dtype != VV_DTYPE_F32 ||
+        eb->info.dtype != VV_DTYPE_F32) {
+        VV_LOG_E("loader: '%s' / '%s' missing or not F32", wname, bname);
+        return VV_ERR_WEIGHT_MISSING;
+    }
+    vv_status_t s = check_bytes(ew);
+    if (s == VV_OK) s = check_bytes(eb);
+    if (s != VV_OK) return s;
+    int o, in, k;
+    if (ew->info.ndim == 3) {
+        o = (int)ew->info.shape[0]; in = (int)ew->info.shape[1];
+        k = (int)ew->info.shape[2];
+    } else if (ew->info.ndim == 2) {
+        o = (int)ew->info.shape[0]; in = (int)ew->info.shape[1]; k = 1;
+    } else {
+        return VV_ERR_MODEL_FORMAT;
+    }
+    if (numel_of(&eb->info) != o) return VV_ERR_SHAPE_MISMATCH;
+    const int64_t n = (int64_t)o * in * k;
+    int8_t* q = (int8_t*)vv_alloc((size_t)n);
+    if (!q) return VV_ERR_OUT_OF_MEMORY;
+    float sc = 0.0f;
+    s = vv_i8s_quantize_f32((const float*)data_of(L, ew), 1, n, q, &sc);
+    if (s == VV_OK)
+        s = vv_i8vae_layer_from_q(v, q, sc, o, depthwise ? 1 : in, k, k,
+                                  stride, depthwise,
+                                  (const float*)data_of(L, eb), out);
+    vv_free(q);
+    return s;
+}
+
+static const float* f32_st(loader_t* L, const char* name, int64_t n) {
+    const st_entry_t* e = find(L, name);
+    if (!e || e->info.dtype != VV_DTYPE_F32 || numel_of(&e->info) != n ||
+        check_bytes(e) != VV_OK) {
+        VV_LOG_E("loader: '%s' missing, not F32 or not %lld long", name,
+                 (long long)n);
+        return NULL;
+    }
+    return (const float*)data_of(L, e);
+}
+
+static vv_status_t load_i8vae_st(loader_t* L) {
+    vv_model_t* m = L->m;
+    vv_i8vae_t* v = NULL;
+    vv_status_t s = vv_i8vae_create(&v);
+    for (int t = 0; t < 2 && s == VV_OK; t++) {
+        const bool ac = t == 0;
+        const char* p = ac ? "acoustic" : "semantic";
+        const int* depth = ac ? m->config.acoustic.encoder_depths
+                              : m->config.semantic.encoder_depths;
+        const int ns = ac ? m->config.acoustic.n_depths : m->config.semantic.n_depths;
+        vv_i8_tower_t* tw = &v->tower[t];
+        s = vv_i8vae_tower_alloc(v, tw, ns, depth);
+        char wn[256], bn[256];
+        for (int i = 0; i < ns && s == VV_OK; i++) {
+            snprintf(wn, sizeof(wn), "model.%s_tokenizer.encoder.downsample_layers.%d.0.conv.conv.weight", p, i);
+            snprintf(bn, sizeof(bn), "model.%s_tokenizer.encoder.downsample_layers.%d.0.conv.conv.bias", p, i);
+            s = i8_layer_st(L, v, wn, bn, vv_bitnet_vae_stride(&m->config, ac, i),
+                            0, &tw->ds[i]);
+            const int C = tw->ds[i].out_ch;
+            for (int b = 0; b < depth[i] && s == VV_OK; b++) {
+                vv_i8_block_t* B = &tw->blocks[i][b];
+                char pre[160];
+                snprintf(pre, sizeof(pre), "model.%s_tokenizer.encoder.stages.%d.%d.", p, i, b);
+                snprintf(wn, sizeof(wn), "%smixer.conv.conv.conv.weight", pre);
+                snprintf(bn, sizeof(bn), "%smixer.conv.conv.conv.bias", pre);
+                s = i8_layer_st(L, v, wn, bn, 1, 1, &B->mixer);
+                snprintf(wn, sizeof(wn), "%sffn.linear1.weight", pre);
+                snprintf(bn, sizeof(bn), "%sffn.linear1.bias", pre);
+                if (s == VV_OK) s = i8_layer_st(L, v, wn, bn, 1, 0, &B->fc1);
+                snprintf(wn, sizeof(wn), "%sffn.linear2.weight", pre);
+                snprintf(bn, sizeof(bn), "%sffn.linear2.bias", pre);
+                if (s == VV_OK) s = i8_layer_st(L, v, wn, bn, 1, 0, &B->fc2);
+                if (s != VV_OK) break;
+                const char* part[4] = { "norm.weight", "gamma", "ffn_norm.weight", "ffn_gamma" };
+                float** dst[4] = { &B->norm, &B->gamma, &B->ffn_norm, &B->ffn_gamma };
+                for (int q = 0; q < 4 && s == VV_OK; q++) {
+                    snprintf(wn, sizeof(wn), "%s%s", pre, part[q]);
+                    const float* f = f32_st(L, wn, C);
+                    if (!f) { s = VV_ERR_WEIGHT_MISSING; break; }
+                    *dst[q] = vv_i8vae_copy_f32(v, f, (size_t)C);
+                    if (!*dst[q]) s = VV_ERR_OUT_OF_MEMORY;
+                }
+            }
+        }
+        if (s != VV_OK) break;
+        snprintf(wn, sizeof(wn), "model.%s_tokenizer.encoder.head.conv.conv.weight", p);
+        snprintf(bn, sizeof(bn), "model.%s_tokenizer.encoder.head.conv.conv.bias", p);
+        s = i8_layer_st(L, v, wn, bn, 1, 0, &tw->head);
+        snprintf(wn, sizeof(wn), "model.%s_connector.fc1.weight", p);
+        snprintf(bn, sizeof(bn), "model.%s_connector.fc1.bias", p);
+        if (s == VV_OK) s = i8_layer_st(L, v, wn, bn, 1, 0, &tw->cfc1);
+        snprintf(wn, sizeof(wn), "model.%s_connector.fc2.weight", p);
+        snprintf(bn, sizeof(bn), "model.%s_connector.fc2.bias", p);
+        if (s == VV_OK) s = i8_layer_st(L, v, wn, bn, 1, 0, &tw->cfc2);
+        if (s == VV_OK) {
+            snprintf(wn, sizeof(wn), "model.%s_connector.norm.weight", p);
+            const float* f = f32_st(L, wn, tw->cfc1.out_ch);
+            tw->cnorm = f ? vv_i8vae_copy_f32(v, f, (size_t)tw->cfc1.out_ch) : NULL;
+            if (!tw->cnorm) s = VV_ERR_WEIGHT_MISSING;
+        }
+    }
+    if (s == VV_OK) s = vv_i8vae_prepare(v);
+    if (s == VV_OK) m->i8vae = v;
+    else vv_i8vae_free(v);
+    return s;
+}
+
+int vv_bitnet_default_vae(int cpu) {
+    /*
+     * CPU: the reference's int8 encoder. Its transcripts are VibeASR.cpp's
+     * to the token, and it is also the faster one there (int8 GEMMs; the
+     * FP32 encoder on the same weights takes about twice as long).
+     * GPU: the float encoder on the dequantized I8_S weights, with GELU --
+     * the model as trained, streamable and batched by the shared front end
+     * in tens of milliseconds, where the int8 one would run on the host.
+     * docs/BITNET.md has the measurements behind both.
+     */
+    return cpu ? VV_VAE_INT8 : VV_VAE_FLOAT;
 }
 
 /* ─── Walking a layer ───────────────────────────────────────────────────── */
@@ -2015,6 +2223,74 @@ static vv_status_t model_load_impl(const char* model_dir,
         return s;
     }
 
+    /*
+     * BitNet's own choices: where the weights come from, which encoder, which
+     * head. Other families have one answer to each and refuse the others.
+     */
+    const bool bitnet = model->config.family == VV_FAMILY_ASR_BITNET;
+    vv_model_load_opts_t bo = o;
+    if (!bitnet) {
+        if (o.source != VV_SOURCE_AUTO || o.vae == VV_VAE_INT8 ||
+            o.head == VV_HEAD_INT8) {
+            VV_LOG_E("loader: a weights source, the int8 encoder and the int8 "
+                     "head exist for VibeVoice-ASR-BitNet only");
+            vv_free(model);
+            return VV_ERR_UNSUPPORTED;
+        }
+    } else {
+        if (o.quant != VV_LOAD_QUANT_AUTO) {
+            VV_LOG_E("loader: BitNet's projections are ternary; --quant %s "
+                     "does not apply to them",
+                     vv_load_quant_name((vv_load_quant_t)o.quant));
+            vv_free(model);
+            return VV_ERR_UNSUPPORTED;
+        }
+        if (o.head == VV_HEAD_INT8 && !o.cpu) {
+            /* The GPU reads the F16 head at ~900 GB/s; the int8 rows only
+             * pay off where decode is bound by host memory. */
+            VV_LOG_E("loader: --head int8 is for the CPU path (--cpu)");
+            vv_free(model);
+            return VV_ERR_UNSUPPORTED;
+        }
+        if (bo.vae == VV_VAE_AUTO) bo.vae = vv_bitnet_default_vae(o.cpu);
+        if (bo.source == VV_SOURCE_AUTO)
+            bo.source = vv_model_has_bitnet_gguf(model_dir)
+                      ? VV_SOURCE_GGUF : VV_SOURCE_SAFETENSORS;
+        model->vae_numerics = bo.vae;
+        model->weights_source = bo.source;
+    }
+
+    if (bitnet && bo.source == VV_SOURCE_GGUF) {
+        const int nl = model->config.llm.num_hidden_layers;
+        model->num_layers = nl;
+        model->layers = (vv_layer_weights_t*)vv_alloc(
+            (size_t)nl * sizeof(vv_layer_weights_t));
+        if (!model->layers) { vv_free(model); return VV_ERR_OUT_OF_MEMORY; }
+        memset(model->layers, 0, (size_t)nl * sizeof(vv_layer_weights_t));
+        s = vv_model_load_bitnet_gguf(model, model_dir, &bo);
+        if (s != VV_OK) {
+            VV_LOG_E("loader: '%s' cannot be loaded from its GGUF pair: %s",
+                     model_dir, vv_status_str(s));
+            vv_model_free(model);
+            return s;
+        }
+        if (o.cpu && bo.head == VV_HEAD_AUTO &&
+            (s = vv_bitnet_head_filter_prepare(model)) != VV_OK) {
+            vv_model_free(model);
+            return s;
+        }
+        size_t pb = 0;
+        for (int li = 0; li < nl; li++) pb += vv_layer_bytes(&model->layers[li]);
+        VV_LOG_I("loader: asr-bitnet loaded from GGUF in %.0f ms (%d ternary "
+                 "layers, %.1f MB; embedding Q6_K, head %s; encoder %s)",
+                 vv_time_ms() - t0, nl, (double)pb / (1024.0 * 1024.0),
+                 model->head_bound.data ? "F16 behind an exact int8 filter"
+                 : model->head_i8.data ? "int8" : "F16",
+                 vv_vae_numerics_name((vv_vae_numerics_t)bo.vae));
+        *out = model;
+        return VV_OK;
+    }
+
     /* Find and open safetensors files */
     char** st_names = NULL;
     int n_st = 0;
@@ -2097,11 +2373,17 @@ static vv_status_t model_load_impl(const char* model_dir,
         VV_LOG_I("loader: compressed-tensors checkpoint (%s, %d-bit weights%s)",
                  L.ct.format[0] ? L.ct.format : "?", L.ct.w_bits,
                  L.ct.act_int8 ? ", int8 activations" : "");
+    L.bitnet = bitnet;
+    L.vae = bo.vae;
+    L.head = bo.head;
 
     s = build_index(&L);
     if (s == VV_OK) s = find_prefix(&L);
     if (s == VV_OK) s = load_lm_globals(&L);
     if (s == VV_OK) s = load_layers(&L);
+    if (s == VV_OK && bitnet && bo.vae == VV_VAE_INT8) {
+        s = load_i8vae_st(&L);
+    } else {
     if (s == VV_OK)
         s = load_connector(&L, "acoustic_connector",
                            model->config.acoustic_vae_dim,
@@ -2120,7 +2402,10 @@ static vv_status_t model_load_impl(const char* model_dir,
     if (s == VV_OK)
         s = load_encoder(&L, "semantic_tokenizer.encoder.",
                          &model->semantic_weights, &model->n_semantic_weights);
+    }
     vv_free(L.ent);
+    if (s == VV_OK && bitnet && o.cpu && bo.head == VV_HEAD_AUTO)
+        s = vv_bitnet_head_filter_prepare(model);
 
     if (s != VV_OK) {
         VV_LOG_E("loader: '%s' cannot be loaded: %s", model_dir,
@@ -2140,12 +2425,12 @@ static vv_status_t model_load_impl(const char* model_dir,
     }
 
     VV_LOG_I("loader: %s model loaded in %.0f ms (%d layers under prefix "
-             "'%s'; projections %d nf4 / %d int4g / %d int8 / %d fp16, %d "
-             "quantized at load, %d on int8 activations, %.1f MB; head %s; "
-             "encoders %d+%d tensors; %d biases)",
+             "'%s'; projections %d nf4 / %d int4g / %d int8 / %d ternary / "
+             "%d fp16, %d quantized at load, %d on int8 activations, %.1f MB; "
+             "head %s; encoders %d+%d tensors; %d biases)",
              vv_model_family_name(model->config.family),
              vv_time_ms() - t0, n_layers, L.prefix, L.n_nf4, L.n_int4g,
-             L.n_int8, L.n_dense, L.n_converted, n_a8,
+             L.n_int8, L.n_ternary, L.n_dense, L.n_converted, n_a8,
              (double)L.proj_bytes / (1024.0 * 1024.0),
              model->lm_head_tied ? "tied to embed_tokens" : "separate",
              model->n_acoustic_weights, model->n_semantic_weights, n_bias);
@@ -2174,6 +2459,12 @@ vv_status_t vv_model_free(vv_model_t* model) {
 
     /* A tied head is the embedding table: freed once, as embed_tokens. */
     if (model->lm_head_tied) memset(&model->lm_head, 0, sizeof(model->lm_head));
+    vv_tensor_free(&model->embed_q6k);
+    vv_tensor_free(&model->head_i8);
+    vv_tensor_free(&model->head_i8_scale);
+    vv_tensor_free(&model->head_bound);
+    vv_i8vae_free(model->i8vae);
+    model->i8vae = NULL;
     vv_tensor_free(&model->embed_tokens);
     vv_tensor_free(&model->final_norm);
     vv_tensor_free(&model->lm_head);

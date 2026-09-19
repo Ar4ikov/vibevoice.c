@@ -27,6 +27,15 @@ typedef enum vv_quant_kind {
      * bytes either way.
      */
     VV_QUANT_INT8  = 3,
+    /**
+     * Ternary (BitNet b1.58), the I2_S layout of bitnet.h. Slots of
+     * vv_weight_t:
+     *   tensor   uint8 [N][K/4] 2-bit codes (VV_DTYPE_U8)
+     *   tscale   the one FP32 scale of the tensor, on the host
+     *   bias     FP32 [N] when present (the ternary kernels add it in FP32)
+     * Run as W1.58A8: every input row is quantized to int8 per token first.
+     */
+    VV_QUANT_TERNARY = 4,
 } vv_quant_kind_t;
 
 /** @brief How an INT4G weight's packed codes and group data are arranged. */

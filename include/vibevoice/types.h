@@ -449,6 +449,52 @@ typedef enum vv_kv_paging {
 /** @brief Parse "auto" | "on" | "off"; -1 on failure. */
 int vv_kv_paging_parse(const char* name);
 
+/**
+ * @brief Where an asr-bitnet model is read from. Only BitNet has a choice:
+ *        the GGUF pair VibeASR.cpp ships, or the F32 latent safetensors,
+ *        ternarized and int8-quantized at load exactly as its converter does.
+ */
+typedef enum vv_weights_source {
+    VV_SOURCE_AUTO = 0,     /**< the GGUF pair when present, else safetensors */
+    VV_SOURCE_GGUF,
+    VV_SOURCE_SAFETENSORS,
+    VV_SOURCE_COUNT
+} vv_weights_source_t;
+
+/**
+ * @brief How the speech encoder computes.
+ *
+ * FLOAT is the model as trained (FP32 on the CPU, FP16 on the GPU, exact
+ * GELU). INT8 is VibeASR.cpp's encoder for BitNet: int8 weights and int8
+ * activations with one scale per tensor, ReLU in the FFN (vae_i8.h), which
+ * is what its transcripts come from. Only asr-bitnet has int8 weights.
+ */
+typedef enum vv_vae_numerics {
+    VV_VAE_AUTO = 0,        /**< per family and backend, see pipeline.c     */
+    VV_VAE_FLOAT,
+    VV_VAE_INT8,
+    VV_VAE_COUNT
+} vv_vae_numerics_t;
+
+/** @brief asr-bitnet's LM head: F16 as the reference computes it, or int8
+ *         rows (half the bytes per decode step). */
+typedef enum vv_head_format {
+    VV_HEAD_AUTO = 0,       /**< F16                                        */
+    VV_HEAD_F16,
+    VV_HEAD_INT8,
+    VV_HEAD_COUNT
+} vv_head_format_t;
+
+/** @brief "auto" | "gguf" | "safetensors"; VV_SOURCE_COUNT if unknown. */
+vv_weights_source_t vv_weights_source_parse(const char* name);
+const char* vv_weights_source_name(vv_weights_source_t s);
+/** @brief "auto" | "float" | "int8"; VV_VAE_COUNT if unknown. */
+vv_vae_numerics_t vv_vae_numerics_parse(const char* name);
+const char* vv_vae_numerics_name(vv_vae_numerics_t v);
+/** @brief "auto" | "f16" | "int8"; VV_HEAD_COUNT if unknown. */
+vv_head_format_t vv_head_format_parse(const char* name);
+const char* vv_head_format_name(vv_head_format_t h);
+
 /** @brief Parameters for vv_inference_init(). Pass NULL for defaults. */
 typedef struct vv_init_params {
     float  vram_budget;   /**< 0.0-1.0 fraction of free VRAM. Default: 1.0   */
@@ -476,6 +522,9 @@ typedef struct vv_init_params {
     const struct vv_smooth_stats* smooth;
     float  smooth_alpha;
     int    smooth_maps;
+    int    weights_source; /**< vv_weights_source_t (asr-bitnet). Default: auto */
+    int    vae_numerics;   /**< vv_vae_numerics_t. Default: auto             */
+    int    head_format;    /**< vv_head_format_t (asr-bitnet). Default: auto */
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -495,6 +544,9 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.smooth = NULL;
     p.smooth_alpha = 0.0f;
     p.smooth_maps = 0;
+    p.weights_source = VV_SOURCE_AUTO;
+    p.vae_numerics = VV_VAE_AUTO;
+    p.head_format = VV_HEAD_AUTO;
     return p;
 }
 

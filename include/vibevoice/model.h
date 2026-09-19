@@ -52,6 +52,7 @@ typedef struct vv_weight {
      */
     bool            act_int8;
     bool            is_quantized; /**< quant_kind != VV_QUANT_NONE           */
+    float           tscale;       /**< TERNARY only: the tensor's scale      */
 } vv_weight_t;
 
 /** @brief Attention layer weights. */
@@ -118,6 +119,27 @@ typedef struct vv_model {
     /* Safetensors handles (kept open for mmap) */
     vv_safetensors_t**   st_files;
     int                  n_st_files;
+
+    /* ── asr-bitnet only ──
+     * Norms, the final norm and the q/k/v biases are FP32 (the reference
+     * keeps them so); vv_model_bitnet_prepare_gpu() makes the norms FP16
+     * for the GPU kernels. */
+    /** Q6_K token table as shipped (GGUF source), [V][K/256 * 210] bytes:
+     *  what the reference embeds from, so the CPU looks rows up in it.
+     *  embed_tokens is then empty until the GPU path needs an FP16 table. */
+    vv_tensor_t          embed_q6k;
+    /** The head row-quantized to int8 [V][K] with FP32 scales [V], when the
+     *  int8 head was asked for (--head int8). */
+    vv_tensor_t          head_i8;
+    vv_tensor_t          head_i8_scale;
+    /** With the F16 head kept (the default on the CPU), head_i8 is only a
+     *  filter and this holds its per-row error bounds, FP32 [V][3]:
+     *  ||w - s q||, s ||q||, ||w|| (vv_bitnet_head_filter_build). */
+    vv_tensor_t          head_bound;
+    /** Reference int8 speech encoders + connectors (--vae int8). */
+    struct vv_i8vae*     i8vae;
+    int                  vae_numerics;  /**< vv_vae_numerics_t loaded     */
+    int                  weights_source;/**< vv_weights_source_t read     */
 } vv_model_t;
 
 /* ─── Walking a layer's tensors ─────────────────────────────────────────── */
@@ -188,6 +210,11 @@ typedef struct vv_model_load_opts {
     const struct vv_smooth_stats* smooth;
     float smooth_alpha;   /**< migration strength; 0 = the default       */
     int   smooth_maps;    /**< vv_smooth_map_t mask; 0 = the default     */
+    /* asr-bitnet only; ignored (and refused when set) for other families */
+    int source;  /**< vv_weights_source_t: GGUF pair or F32 safetensors    */
+    int head;    /**< vv_head_format_t: F16 as the reference, or int8      */
+    int vae;     /**< vv_vae_numerics_t; AUTO picks by family and backend  */
+    int cpu;     /**< nonzero when the model will run on the CPU           */
 } vv_model_load_opts_t;
 
 static inline vv_model_load_opts_t vv_model_load_opts_default(void) {
@@ -196,8 +223,40 @@ static inline vv_model_load_opts_t vv_model_load_opts_default(void) {
     o.smooth = NULL;
     o.smooth_alpha = 0.0f;
     o.smooth_maps = 0;
+    o.source = 0;
+    o.vae = 0;
+    o.head = 0;
+    o.cpu = 0;
     return o;
 }
+
+/**
+ * @brief The encoder asr-bitnet runs when none is asked for, per backend.
+ * See docs/BITNET.md for the measurements behind the choice.
+ */
+int vv_bitnet_default_vae(int cpu);
+
+/**
+ * @brief Load an asr-bitnet model from the GGUF pair VibeASR.cpp ships
+ *        (`vibeasr-lm-i2_s-embed-q6_k.gguf`, `vibeasr-vae-encoder-i8_s.gguf`).
+ *
+ * Called by vv_model_load_ex() after the config is parsed. The ternary
+ * codes, the Q6_K table, the F16 head and the int8 encoder weights are
+ * copied out of the mappings, which are closed again before returning.
+ */
+vv_status_t vv_model_load_bitnet_gguf(vv_model_t* model, const char* model_dir,
+                                      const vv_model_load_opts_t* opts);
+
+/** @brief Whether `model_dir` holds the BitNet GGUF pair. */
+bool vv_model_has_bitnet_gguf(const char* model_dir);
+
+/**
+ * @brief Make an asr-bitnet model ready for the GPU kernels, in place:
+ *        FP32 norms become FP16 and a Q6_K-only embedding gets an FP16
+ *        table (the Q6_K rows dequantized, as the reference looks them up).
+ *        Idempotent; a no-op for other families.
+ */
+vv_status_t vv_model_bitnet_prepare_gpu(vv_model_t* model);
 
 /**
  * @brief Load the full model from a directory containing safetensors + config.

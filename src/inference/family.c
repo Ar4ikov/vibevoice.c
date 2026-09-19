@@ -29,6 +29,7 @@ vv_status_t vv_family_init(vv_family_t* f, const vv_model_config_t* cfg,
     f->mode             = (cfg->family == VV_FAMILY_ASR_STREAMING_7B)
                           ? VV_GEN_CHUNKED : VV_GEN_ONE_SHOT;
     f->normalize_audio  = cfg->audio.normalize_audio;
+    f->vibeasr_audio    = cfg->family == VV_FAMILY_ASR_BITNET;
     f->sample_rate      = cfg->audio.target_sample_rate;
     f->frame_samples    = cfg->audio.compress_ratio;
     f->chunk_frames     = (f->mode == VV_GEN_CHUNKED) ? cfg->audio.chunk_frames : 0;
@@ -44,6 +45,20 @@ vv_status_t vv_family_init(vv_family_t* f, const vv_model_config_t* cfg,
     t->speech_end     = vv_tokenizer_special_id(tok, VV_TOKEN_SPEECH_END);
     t->text_chunk_end = vv_tokenizer_special_id(tok, VV_TOKEN_TEXT_CHUNK_END);
 
+    if (cfg->family == VV_FAMILY_ASR_BITNET &&
+        t->speech_start < 0 && t->speech_pad < 0 && t->speech_end < 0) {
+        /*
+         * VibeVoice-ASR-BitNet ships Qwen2's plain tokenizer.json (three
+         * added tokens, no <|object_ref_start|> & co). VibeASR.cpp does not
+         * look the markers up either: utils/prompt_builder.h hard-codes
+         * Qwen2.5's ids, which the 151936-row embedding has.
+         */
+        t->speech_start = 151646;
+        t->speech_end   = 151647;
+        t->speech_pad   = 151648;
+        VV_LOG_I("family: speech markers not in tokenizer.json; using "
+                 "Qwen2.5's ids 151646/151647/151648 as VibeASR.cpp does");
+    }
     if (t->speech_start < 0 || t->speech_pad < 0 || t->speech_end < 0) {
         VV_LOG_E("family: the tokenizer has no speech marker tokens");
         return VV_ERR_MODEL_FORMAT;
@@ -140,7 +155,21 @@ static vv_status_t build_chatml(const vv_family_t* f, const vv_tokenizer_t* tok,
 
     char buf[1024];
     int w;
-    if (context_info && context_info[0])
+    if (f->id == VV_FAMILY_ASR_BITNET) {
+        /*
+         * BitNet answers in plain text: VibeASR.cpp's default
+         * `--prompt-format text` (utils/prompt_builder.h) drops the keys.
+         */
+        if (context_info && context_info[0])
+            w = snprintf(buf, sizeof(buf),
+                         "\nThis is a %.2f seconds audio, with extra info: %s\n\n"
+                         "Please transcribe it.<|im_end|>\n",
+                         (double)dur, context_info);
+        else
+            w = snprintf(buf, sizeof(buf),
+                         "\nThis is a %.2f seconds audio, please transcribe "
+                         "it.<|im_end|>\n", (double)dur);
+    } else if (context_info && context_info[0])
         w = snprintf(buf, sizeof(buf),
                      "\nThis is a %.2f seconds audio, with extra info: %s\n\n"
                      "Please transcribe it with these keys: %s<|im_end|>\n",
