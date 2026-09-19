@@ -10,7 +10,7 @@ COPY cli cli
 COPY third_party third_party
 COPY tests tests
 ARG CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90"
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVV_ENABLE_TRT=OFF \
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     -DVV_BUILD_BENCH=OFF -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
     && cmake --build build --parallel 2 \
     && ctest --test-dir build --output-on-failure

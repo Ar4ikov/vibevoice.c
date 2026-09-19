@@ -15,6 +15,7 @@
 #include "vibevoice/text_tokenizer.h"
 #include "vibevoice/tokenizer_encoder.h"
 #include "vibevoice/connector.h"
+#include "vibevoice/frontend.h"
 #include "vibevoice/cpu_kernels.h"
 #include "vibevoice/vibevoice.h"
 #include "cJSON.h"
@@ -172,43 +173,98 @@ static size_t lm_head_own_bytes(const vv_model_t* model) {
     return model->lm_head_tied ? 0 : model->lm_head.size_bytes;
 }
 
-/*
- * The Conv-VAE encoder allocates its activations per call and frees them
- * again, so this never shows up in a steady-state reading — but it is real
- * while a segment is encoding, and a budget that ignores it hands the
- * encoder a card with nothing left. Measured at 174 MB for the 60 s segment
- * the streaming path uses, which is the longest one there is.
+/**
+ * @brief Build the host descriptions of both encoders and both connectors.
+ *
+ * Host-only and cheap (the tensors are borrowed from the model); done before
+ * placement so the budget can size the front end from the real layer plan.
  */
-#define VV_ENCODER_SCRATCH_BYTES ((size_t)256 * 1024 * 1024)
+static void build_frontend_host(vv_inference_ctx_t* c) {
+    const vv_llm_config_t* llm = &c->model->config.llm;
+    vv_status_t s;
+    if (c->model->n_acoustic_weights > 0 && !c->acoustic_encoder) {
+        s = vv_conv_vae_init(c->model->acoustic_weights,
+                              c->model->n_acoustic_weights,
+                              &c->model->config.acoustic,
+                              true, &c->acoustic_encoder);
+        if (s != VV_OK) VV_LOG_W("inference: failed to init acoustic encoder");
+    }
+    if (c->model->n_semantic_weights > 0 && !c->semantic_encoder) {
+        s = vv_conv_vae_init(c->model->semantic_weights,
+                              c->model->n_semantic_weights,
+                              &c->model->config.semantic,
+                              false, &c->semantic_encoder);
+        if (s != VV_OK) VV_LOG_W("inference: failed to init semantic encoder");
+    }
+    if (c->acoustic_encoder && !vv_conv_vae_complete(c->acoustic_encoder)) {
+        VV_LOG_W("inference: acoustic encoder is missing weights; not used");
+        vv_conv_vae_free(c->acoustic_encoder);
+        c->acoustic_encoder = NULL;
+    }
+    if (c->semantic_encoder && !vv_conv_vae_complete(c->semantic_encoder)) {
+        VV_LOG_W("inference: semantic encoder is missing weights; not used");
+        vv_conv_vae_free(c->semantic_encoder);
+        c->semantic_encoder = NULL;
+    }
+
+    if (c->model->acoustic_connector_fc1.tensor.data && !c->acoustic_connector) {
+        c->acoustic_connector = (vv_connector_t*)vv_alloc(sizeof(vv_connector_t));
+        if (c->acoustic_connector) {
+            vv_connector_init(c->acoustic_connector,
+                               c->model->config.acoustic_vae_dim,
+                               llm->hidden_size);
+            c->acoustic_connector->fc1_weight = c->model->acoustic_connector_fc1.tensor;
+            c->acoustic_connector->fc1_bias   = c->model->acoustic_connector_fc1.quant.packed;
+            c->acoustic_connector->norm_weight = c->model->acoustic_connector_norm.tensor;
+            c->acoustic_connector->fc2_weight = c->model->acoustic_connector_fc2.tensor;
+            c->acoustic_connector->fc2_bias   = c->model->acoustic_connector_fc2.quant.packed;
+        }
+    }
+    if (c->model->semantic_connector_fc1.tensor.data && !c->semantic_connector) {
+        c->semantic_connector = (vv_connector_t*)vv_alloc(sizeof(vv_connector_t));
+        if (c->semantic_connector) {
+            vv_connector_init(c->semantic_connector,
+                               c->model->config.semantic_vae_dim,
+                               llm->hidden_size);
+            c->semantic_connector->fc1_weight = c->model->semantic_connector_fc1.tensor;
+            c->semantic_connector->fc1_bias   = c->model->semantic_connector_fc1.quant.packed;
+            c->semantic_connector->norm_weight = c->model->semantic_connector_norm.tensor;
+            c->semantic_connector->fc2_weight = c->model->semantic_connector_fc2.tensor;
+            c->semantic_connector->fc2_bias   = c->model->semantic_connector_fc2.quant.packed;
+        }
+    }
+}
+
+static void free_frontend_host(vv_inference_ctx_t* c) {
+    if (c->acoustic_encoder) vv_conv_vae_free(c->acoustic_encoder);
+    if (c->semantic_encoder) vv_conv_vae_free(c->semantic_encoder);
+    if (c->acoustic_connector) {
+        vv_connector_free(c->acoustic_connector);
+        vv_free(c->acoustic_connector);
+    }
+    if (c->semantic_connector) {
+        vv_connector_free(c->semantic_connector);
+        vv_free(c->semantic_connector);
+    }
+    c->acoustic_encoder = c->semantic_encoder = NULL;
+    c->acoustic_connector = c->semantic_connector = NULL;
+}
 
 /**
  * @brief Bytes the speech front end will take on the device.
  *
- * The two Conv-VAE encoders and the two connectors are uploaded after
- * placement has been decided, so the budget has to reserve for them or the
- * cap is one the process quietly walks past.
+ * Both encoders' and both connectors' FP16 weights, and the arena their
+ * launches run in, sized from the largest launch rather than guessed. Held
+ * once per device: every slot on it shares them. The old reservation was a
+ * flat 256 MB against a real peak of ~640 MB per 60 s segment, plus an
+ * uncounted 1.4 GB copy of the weights for every extra slot.
  */
-static size_t calc_frontend_gpu_bytes(const vv_model_t* model) {
-    /* Host copies are FP32 and land as FP16, so the device pays half. */
-    size_t total = 0;
-    for (int i = 0; i < model->n_acoustic_weights; i++) {
-        total += model->acoustic_weights[i].tensor.size_bytes;
-        total += model->acoustic_weights[i].bias.size_bytes;
-    }
-    for (int i = 0; i < model->n_semantic_weights; i++) {
-        total += model->semantic_weights[i].tensor.size_bytes;
-        total += model->semantic_weights[i].bias.size_bytes;
-    }
-    #define ADD_T(w) do { total += (w).tensor.size_bytes; \
-                          total += (w).bias.size_bytes; } while (0)
-    ADD_T(model->acoustic_connector_fc1);
-    ADD_T(model->acoustic_connector_norm);
-    ADD_T(model->acoustic_connector_fc2);
-    ADD_T(model->semantic_connector_fc1);
-    ADD_T(model->semantic_connector_norm);
-    ADD_T(model->semantic_connector_fc2);
-    #undef ADD_T
-    return total / 2;
+static size_t calc_frontend_gpu_bytes(const vv_inference_ctx_t* c) {
+    const vv_frontend_params_t fp = vv_frontend_params_default();
+    return vv_frontend_device_bytes(c->acoustic_encoder, c->semantic_encoder,
+                                    c->acoustic_connector,
+                                    c->semantic_connector, &fp)
+         + vv_frontend_stream_bytes(c->acoustic_encoder, c->semantic_encoder);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -526,6 +582,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
 
     const vv_llm_config_t* llm = &c->model->config.llm;
     int max_seq = (p.max_seq_len > 0) ? p.max_seq_len : 32768;
+    build_frontend_host(c);
 
     /*
      * How the model is spread. Layer sharding only makes sense with more
@@ -550,8 +607,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         const size_t ws = (size_t)512 * 1024 * 1024;
         const size_t head = c->model->embed_tokens.size_bytes
                           + lm_head_own_bytes(c->model)
-                          + calc_frontend_gpu_bytes(c->model)
-                          + VV_ENCODER_SCRATCH_BYTES;
+                          + calc_frontend_gpu_bytes(c);
         size_t room[VV_MAX_GPUS];
         for (int i = 0; i < p.gpus.n; i++) {
             size_t b = vv_gpu_budget(&p.gpus, i, p.vram_budget);
@@ -623,15 +679,14 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
          * Leave them out and a cap overshoots by about 2 GB, which makes it
          * no cap at all.
          */
-        const size_t frontend = calc_frontend_gpu_bytes(c->model);
+        const size_t frontend = calc_frontend_gpu_bytes(c);
         const size_t reserve = vv_gpu_reserved(&p.gpus, c->gpu_index)
-                             + frontend + VV_ENCODER_SCRATCH_BYTES;
-        VV_LOG_I("budget: reserving %.1f MB (in use %.1f, front end %.1f, "
-                 "encoder scratch %.1f)",
+                             + frontend;
+        VV_LOG_I("budget: reserving %.1f MB (in use %.1f, speech front end "
+                 "%.1f incl. its arena)",
                  (double)reserve / (1024.0*1024.0),
                  (double)vv_gpu_reserved(&p.gpus, c->gpu_index) / (1024.0*1024.0),
-                 (double)frontend / (1024.0*1024.0),
-                 (double)VV_ENCODER_SCRATCH_BYTES / (1024.0*1024.0));
+                 (double)frontend / (1024.0*1024.0));
         available = available > reserve ? available - reserve : 0;
 
         size_t per_layer = calc_per_layer_gpu_bytes(c->model);
@@ -1014,6 +1069,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     goto init_common;
 
 fail_gpu:
+    free_frontend_host(c);
     if (c->layer_pool) vv_layer_pool_free(c->layer_pool);
     if (c->kv_cache) vv_kv_cache_free(c->kv_cache);
     if (c->workspace && c->use_gpu) vv_dev_free(c->workspace);
@@ -1036,17 +1092,15 @@ init_common:
 
 
 /**
- * @brief Attach the speech encoders, connectors and tokenizer to a context.
+ * @brief Attach the tokenizer and the speech front end to a context.
  *
- * Shared by vv_inference_init and vv_inference_clone; everything here reads
- * the model's CPU-side tensors, so a clone builds its own without touching
- * the parent.
+ * Shared by vv_inference_init and vv_inference_clone. The parent brings the
+ * front end up on its device — the one upload of the encoder and connector
+ * weights; a clone borrows it (set by the caller) and gets only its own
+ * streaming state and events.
  */
 static void attach_frontend(vv_inference_ctx_t* c) {
-    const vv_llm_config_t* llm = &c->model->config.llm;
-    vv_status_t s;
-
-    s = vv_tokenizer_load(c->model_dir, &c->tokenizer);
+    vv_status_t s = vv_tokenizer_load(c->model_dir, &c->tokenizer);
     if (s != VV_OK)
         VV_LOG_W("inference: failed to load tokenizer from '%s'", c->model_dir);
 
@@ -1056,62 +1110,44 @@ static void attach_frontend(vv_inference_ctx_t* c) {
         VV_LOG_W("inference: the tokenizer lacks tokens %s needs",
                  vv_model_family_name(c->model->config.family));
 
-    if (c->model->n_acoustic_weights > 0) {
-        s = vv_conv_vae_init(c->model->acoustic_weights,
-                              c->model->n_acoustic_weights,
-                              &c->model->config.acoustic,
-                              true, &c->acoustic_encoder);
-        if (s != VV_OK) VV_LOG_W("inference: failed to init acoustic encoder");
-    }
-    if (c->model->n_semantic_weights > 0) {
-        s = vv_conv_vae_init(c->model->semantic_weights,
-                              c->model->n_semantic_weights,
-                              &c->model->config.semantic,
-                              false, &c->semantic_encoder);
-        if (s != VV_OK) VV_LOG_W("inference: failed to init semantic encoder");
-    }
-
-    if (c->model->acoustic_connector_fc1.tensor.data) {
-        c->acoustic_connector = (vv_connector_t*)vv_alloc(sizeof(vv_connector_t));
-        if (c->acoustic_connector) {
-            vv_connector_init(c->acoustic_connector,
-                               c->model->config.acoustic_vae_dim,
-                               llm->hidden_size);
-            c->acoustic_connector->fc1_weight = c->model->acoustic_connector_fc1.tensor;
-            c->acoustic_connector->fc1_bias   = c->model->acoustic_connector_fc1.quant.packed;
-            c->acoustic_connector->norm_weight = c->model->acoustic_connector_norm.tensor;
-            c->acoustic_connector->fc2_weight = c->model->acoustic_connector_fc2.tensor;
-            c->acoustic_connector->fc2_bias   = c->model->acoustic_connector_fc2.quant.packed;
-        }
-    }
-    if (c->model->semantic_connector_fc1.tensor.data) {
-        c->semantic_connector = (vv_connector_t*)vv_alloc(sizeof(vv_connector_t));
-        if (c->semantic_connector) {
-            vv_connector_init(c->semantic_connector,
-                               c->model->config.semantic_vae_dim,
-                               llm->hidden_size);
-            c->semantic_connector->fc1_weight = c->model->semantic_connector_fc1.tensor;
-            c->semantic_connector->fc1_bias   = c->model->semantic_connector_fc1.quant.packed;
-            c->semantic_connector->norm_weight = c->model->semantic_connector_norm.tensor;
-            c->semantic_connector->fc2_weight = c->model->semantic_connector_fc2.tensor;
-            c->semantic_connector->fc2_bias   = c->model->semantic_connector_fc2.quant.packed;
-        }
+    if (!c->is_clone) build_frontend_host(c);
+    if (!c->use_gpu) {
+        /* Repack the CPU encoders' FP16 weights now, not in the first
+           request, whose time it would otherwise be charged to. */
+        const double t_w = vv_time_ms();
+        vv_status_t sa = VV_OK, ss = VV_OK;
+        if (c->acoustic_encoder) sa = vv_conv_vae_prepare_cpu(c->acoustic_encoder);
+        if (c->semantic_encoder) ss = vv_conv_vae_prepare_cpu(c->semantic_encoder);
+        if (sa != VV_OK || ss != VV_OK)
+            VV_LOG_W("inference: CPU speech encoder weights not prepared");
+        else if (c->acoustic_encoder || c->semantic_encoder)
+            VV_LOG_I("inference: CPU speech encoder ready (%.0f ms)",
+                     vv_time_ms() - t_w);
+        return;
     }
 
-    if (c->use_gpu) {
+    if (!c->is_clone && (c->acoustic_encoder || c->semantic_encoder)) {
+        const vv_frontend_params_t fp = vv_frontend_params_default();
         double t_w = vv_time_ms();
-        size_t before = 0, after = 0;
-        vv_dev_get_device_info(c->gpu_id, NULL, &before, NULL);
-        if (c->acoustic_encoder) vv_conv_vae_warmup(c->acoustic_encoder);
-        if (c->semantic_encoder) vv_conv_vae_warmup(c->semantic_encoder);
-        vv_dev_get_device_info(c->gpu_id, NULL, &after, NULL);
-        /* Measured, not predicted: the budget above reserves for this, and
-           a reserve nobody ever checks is a reserve that drifts. */
-        VV_LOG_I("inference: speech encoder weights staged to GPU "
-                 "(%.0f ms, %.1f MB)", vv_time_ms() - t_w,
-                 before > after ? (double)(before - after) / (1024.0*1024.0)
-                                : 0.0);
+        s = vv_frontend_create(c->acoustic_encoder, c->semantic_encoder,
+                               c->acoustic_connector, c->semantic_connector,
+                               &fp, &c->frontend);
+        if (s != VV_OK) {
+            VV_LOG_E("inference: speech front end unavailable on gpu %d: %s",
+                     c->gpu_id, vv_status_str(s));
+            c->frontend = NULL;
+            return;
+        }
+        VV_LOG_I("inference: speech front end ready (%.0f ms, %.1f MB)",
+                 vv_time_ms() - t_w,
+                 (double)vv_frontend_bytes(c->frontend) / (1024.0 * 1024.0));
     }
+    if (!c->frontend) return;
+    s = vv_frontend_stream_create(c->frontend, &c->fe_stream);
+    if (s == VV_OK) s = vv_dev_event_create(&c->fe_ready);
+    if (s == VV_OK) s = vv_dev_event_create(&c->fe_done);
+    if (s != VV_OK)
+        VV_LOG_E("inference: no speech encoder state: %s", vv_status_str(s));
 }
 
 vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
@@ -1154,6 +1190,7 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
     c->embed_table_gpu = parent->embed_table_gpu;
     c->lm_head_gpu     = parent->lm_head_gpu;
     c->final_norm_gpu  = parent->final_norm_gpu;
+    c->frontend        = parent->frontend;     /* one per device, shared */
     memcpy(c->model_dir, parent->model_dir, sizeof(c->model_dir));
 
     vv_status_t s = vv_dev_stream_create(&c->compute_stream);
@@ -1575,6 +1612,171 @@ static vv_status_t cpu_head_argmax(vv_inference_ctx_t* ctx,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Speech front end — GPU path
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Latents through the host: the acoustic draw, and tensor dumps.
+ *
+ * The draw is taken once over the whole clip, after the segments are
+ * concatenated, which is where the reference takes it; so the latents have
+ * to exist in full before the connectors run. Off the default path. The
+ * latents and the FP32 staging live in a per-context buffer that only grows
+ * (a longer clip than any before), so in serve this mode does not cudaFree
+ * -- and stall the other slots -- per request. The dump path (VV_DUMP_DIR,
+ * debugging only) still allocates its connector scratch per call.
+ */
+static vv_status_t encode_audio_host(vv_inference_ctx_t* ctx,
+                                     const vv_inference_params_t* params,
+                                     const float* audio, int n_samples,
+                                     int frames, void* rows) {
+    const int hs = ctx->model->config.llm.hidden_size;
+    const int vd[2] = { ctx->model->config.acoustic.vae_dim,
+                        ctx->model->config.semantic.vae_dim };
+    const char* names[2] = { "c_ac_mean", "c_sem_mean" };
+    void* lat[2] = { NULL, NULL };
+    void* f32 = NULL;
+    uint16_t* h16 = NULL;
+    float* h32 = NULL;
+    vv_status_t s = VV_OK;
+    const size_t fr = (size_t)(frames > 0 ? frames : 1);
+    const size_t maxv = (size_t)(vd[0] > vd[1] ? vd[0] : vd[1]);
+
+    {
+        const size_t al = 256;
+        const size_t b0 = (fr * (size_t)vd[0] * 2 + al - 1) / al * al;
+        const size_t b1 = (fr * (size_t)vd[1] * 2 + al - 1) / al * al;
+        const size_t need = b0 + b1 + fr * maxv * sizeof(float);
+        if (ctx->fe_lat_bytes < need) {
+            if (ctx->fe_lat_buf) {
+                vv_dev_stream_sync(ctx->compute_stream);
+                vv_dev_free(ctx->fe_lat_buf);
+            }
+            ctx->fe_lat_buf = NULL;
+            ctx->fe_lat_bytes = 0;
+            s = vv_dev_alloc(&ctx->fe_lat_buf, need);
+            if (s == VV_OK) ctx->fe_lat_bytes = need;
+        }
+        if (s == VV_OK) {
+            lat[0] = ctx->fe_lat_buf;
+            lat[1] = (char*)ctx->fe_lat_buf + b0;
+            f32 = (char*)ctx->fe_lat_buf + b0 + b1;
+        }
+    }
+    h16 = (uint16_t*)vv_alloc(fr * maxv * 2);
+    h32 = (float*)vv_alloc(fr * maxv * sizeof(float));
+    if (s == VV_OK && (!h16 || !h32)) s = VV_ERR_OUT_OF_MEMORY;
+
+    if (s == VV_OK) {
+        vv_frontend_job_t job;
+        memset(&job, 0, sizeof(job));
+        vv_frontend_stream_reset(ctx->fe_stream);
+        job.audio = audio;
+        job.n_samples = n_samples;
+        job.stream = ctx->fe_stream;
+        job.is_final = true;
+        job.ac_latents = lat[0];
+        job.sem_latents = lat[1];
+        job.done_event = ctx->fe_done;
+        s = vv_frontend_submit(ctx->frontend, &job);
+        if (s == VV_OK) s = vv_dev_event_sync(ctx->fe_done);
+        if (s == VV_OK && job.n_frames != frames) s = VV_ERR_SHAPE_MISMATCH;
+    }
+
+    for (int e = 0; e < 2 && s == VV_OK; e++) {
+        const size_t n = (size_t)frames * (size_t)vd[e];
+        s = vv_dev_memcpy_d2h(h16, lat[e], n * 2, ctx->compute_stream);
+        if (s != VV_OK) break;
+        for (size_t i = 0; i < n; i++) h32[i] = vv_half_to_float(h16[i]);
+        dump_f32(names[e], h32, n);
+        if (e != 0 || !params ||
+            params->acoustic_sampling == VV_ACOUSTIC_MODE)
+            continue;
+        sample_acoustic(ctx, params, h32, frames);
+        /* Back to FP16 the way the old path did it: on the device. */
+        s = vv_dev_memcpy_h2d(f32, h32, n * sizeof(float), ctx->compute_stream);
+        if (s == VV_OK)
+            s = vv_vae_f32_to_f16_dev((const float*)f32, lat[0], (int64_t)n,
+                                      ctx->compute_stream);
+        if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
+    }
+
+    if (s == VV_OK && dump_dir()) {
+        /* Each connector alone, for tools/compare_ref.py. */
+        const char* fn[2] = { "c_ac_feat", "c_sem_feat" };
+        void* tmp = NULL;
+        uint16_t* th = (uint16_t*)vv_alloc(fr * (size_t)hs * 2);
+        float* tf = (float*)vv_alloc(fr * (size_t)hs * sizeof(float));
+        if (th && tf && vv_dev_alloc(&tmp, fr * (size_t)hs * 2) == VV_OK) {
+            for (int e = 0; e < 2; e++) {
+                vv_dev_memset_async(tmp, 0, fr * (size_t)hs * 2,
+                                    ctx->compute_stream);
+                vv_dev_event_record(ctx->fe_ready, ctx->compute_stream);
+                if (vv_frontend_connect(ctx->frontend, e == 0 ? lat[0] : NULL,
+                                        e == 1 ? lat[1] : NULL, frames, tmp, hs,
+                                        ctx->fe_ready, ctx->fe_done) != VV_OK)
+                    continue;
+                vv_dev_event_sync(ctx->fe_done);
+                vv_dev_memcpy_d2h(th, tmp, (size_t)frames * hs * 2,
+                                  ctx->compute_stream);
+                for (size_t i = 0; i < (size_t)frames * hs; i++)
+                    tf[i] = vv_half_to_float(th[i]);
+                dump_f32(fn[e], tf, (size_t)frames * hs);
+            }
+            vv_dev_free(tmp);
+        }
+        vv_free(th);
+        vv_free(tf);
+        /* The prompt's rows must still wait for its own embedding. */
+        vv_dev_event_record(ctx->fe_ready, ctx->compute_stream);
+    }
+
+    if (s == VV_OK)
+        s = vv_frontend_connect(ctx->frontend, lat[0], lat[1], frames, rows, hs,
+                                ctx->fe_ready, ctx->fe_done);
+    if (s == VV_OK) s = vv_dev_event_sync(ctx->fe_done);
+
+    vv_free(h16);
+    vv_free(h32);
+    return s;
+}
+
+/**
+ * @brief Encode the clip into the prompt's speech rows, asynchronously.
+ *
+ * On return the work is enqueued and ctx->fe_done will fire when the rows
+ * are written. Row writes wait for ctx->fe_ready (the embedding).
+ */
+static vv_status_t encode_audio_gpu(vv_inference_ctx_t* ctx,
+                                    const vv_inference_params_t* params,
+                                    const float* audio, int n_samples,
+                                    int frames, void* rows) {
+    const bool sampling = params &&
+                          params->acoustic_sampling != VV_ACOUSTIC_MODE;
+    if (sampling || dump_dir())
+        return encode_audio_host(ctx, params, audio, n_samples, frames, rows);
+
+    vv_frontend_job_t job;
+    memset(&job, 0, sizeof(job));
+    vv_frontend_stream_reset(ctx->fe_stream);
+    job.audio = audio;
+    job.n_samples = n_samples;
+    job.stream = ctx->fe_stream;
+    job.is_final = true;
+    job.rows = rows;
+    job.rows_ld = ctx->model->config.llm.hidden_size;
+    job.wait_event = ctx->fe_ready;
+    job.done_event = ctx->fe_done;
+    vv_status_t s = vv_frontend_submit(ctx->frontend, &job);
+    if (s == VV_OK && job.n_frames != frames) {
+        VV_LOG_E("inference: %d speech frames written, the prompt has %d",
+                 job.n_frames, frames);
+        s = VV_ERR_SHAPE_MISMATCH;
+    }
+    return s;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Transcribe — GPU path
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1641,125 +1843,22 @@ static vv_status_t transcribe_gpu(
     }
     vv_dev_set_device(ctx->gpu_id);
 
-    /* ═══ STEP 1: Audio encoding ═══ */
+    /* ═══ STEP 1: Prompt ═══
+     *
+     * The frame count is a function of the sample count alone, so the
+     * prompt and its embedding exist before a sample is encoded, and the
+     * front end writes the audio rows straight into them: no latents or
+     * features on the host, no combined buffer, no overlay copy.
+     */
     double t_step = vv_time_ms();
-    VV_LOG_I("inference: step 1 — encoding audio");
-
-    float* acoustic_latents = NULL, *semantic_latents = NULL;
-    float* acoustic_features = NULL, *semantic_features = NULL;
-    float* combined_fp32 = NULL;
-    int n_acoustic_frames = 0, n_semantic_frames = 0;
-
     dump_f32("c_audio24k", audio_samples, (size_t)num_samples);
 
-    /*
-     * The workspace stays allocated across the speech encoder. Freeing it
-     * first to make room, as this used to, cost two device-wide synchronising
-     * cudaFree calls per request, did nothing for a second slot whose
-     * workspace was still resident, and left the context with a NULL
-     * workspace for the rest of the process whenever the re-allocation
-     * failed. The encoder already tiles its FFN over time when a segment will
-     * not fit, which is the right answer to a card with no room.
-     */
-    if (ctx->acoustic_encoder &&
-        ctx->acoustic_encoder->stages != NULL &&
-        ctx->acoustic_encoder->input_conv.weight.data != NULL) {
-        s = vv_conv_vae_encode_cpu(ctx->acoustic_encoder,
-                                    audio_samples, num_samples,
-                                    &acoustic_latents, &n_acoustic_frames);
-        if (s != VV_OK) VV_LOG_W("inference: acoustic encoder failed");
+    if (!ctx->frontend || !ctx->fe_stream) {
+        VV_LOG_E("inference: no speech encoder on the device");
+        return VV_ERR_WEIGHT_MISSING;
     }
-    if (ctx->semantic_encoder &&
-        ctx->semantic_encoder->stages != NULL &&
-        ctx->semantic_encoder->input_conv.weight.data != NULL) {
-        s = vv_conv_vae_encode_cpu(ctx->semantic_encoder,
-                                    audio_samples, num_samples,
-                                    &semantic_latents, &n_semantic_frames);
-        if (s != VV_OK) VV_LOG_W("inference: semantic encoder failed");
-    }
-
-    int n_audio_frames;
-    if (n_acoustic_frames > 0 && n_semantic_frames > 0)
-        n_audio_frames = n_acoustic_frames < n_semantic_frames ?
-                         n_acoustic_frames : n_semantic_frames;
-    else if (n_acoustic_frames > 0) n_audio_frames = n_acoustic_frames;
-    else if (n_semantic_frames > 0) n_audio_frames = n_semantic_frames;
-    else { n_audio_frames = num_samples / 3200; if (n_audio_frames < 1) n_audio_frames = 1; }
+    const int n_audio_frames = vv_frontend_frames(ctx->frontend, num_samples);
     perf->audio_frames = n_audio_frames;
-
-    if (acoustic_latents)
-        dump_f32("c_ac_mean", acoustic_latents,
-                 (size_t)n_audio_frames * (size_t)ctx->acoustic_encoder->vae_dim);
-    if (semantic_latents)
-        dump_f32("c_sem_mean", semantic_latents,
-                 (size_t)n_audio_frames * (size_t)ctx->semantic_encoder->vae_dim);
-
-    sample_acoustic(ctx, params, acoustic_latents, n_audio_frames);
-
-    /* Connectors */
-    if (acoustic_latents && ctx->acoustic_connector)
-        vv_connector_forward_auto(ctx->acoustic_connector,
-                                   acoustic_latents, n_audio_frames,
-                                   &acoustic_features);
-    if (semantic_latents && ctx->semantic_connector)
-        vv_connector_forward_auto(ctx->semantic_connector,
-                                   semantic_latents, n_audio_frames,
-                                   &semantic_features);
-    if (acoustic_latents) vv_free(acoustic_latents);
-    if (semantic_latents) vv_free(semantic_latents);
-
-    int combined_elems = n_audio_frames * hs;
-    combined_fp32 = (float*)vv_alloc((size_t)combined_elems * sizeof(float));
-    if (!combined_fp32) {
-        if (acoustic_features) vv_free(acoustic_features);
-        if (semantic_features) vv_free(semantic_features);
-        return VV_ERR_OUT_OF_MEMORY;
-    }
-    if (acoustic_features && semantic_features)
-        for (int i = 0; i < combined_elems; i++)
-            combined_fp32[i] = acoustic_features[i] + semantic_features[i];
-    else if (acoustic_features) memcpy(combined_fp32, acoustic_features, (size_t)combined_elems * sizeof(float));
-    else if (semantic_features) memcpy(combined_fp32, semantic_features, (size_t)combined_elems * sizeof(float));
-    else memset(combined_fp32, 0, (size_t)combined_elems * sizeof(float));
-    if (acoustic_features)
-        dump_f32("c_ac_feat", acoustic_features, (size_t)combined_elems);
-    if (semantic_features)
-        dump_f32("c_sem_feat", semantic_features, (size_t)combined_elems);
-    dump_f32("c_combined", combined_fp32, (size_t)combined_elems);
-
-    if (acoustic_features) vv_free(acoustic_features);
-    if (semantic_features) vv_free(semantic_features);
-
-    /* ═══ Diagnostic: check feature statistics ═══ */
-    {
-        float fmin = combined_fp32[0], fmax = combined_fp32[0];
-        float fsum = 0.0f;
-        int nan_count = 0, inf_count = 0;
-        for (int i = 0; i < combined_elems; i++) {
-            float v = combined_fp32[i];
-            if (v != v) nan_count++;
-            else if (v > 1e30f || v < -1e30f) inf_count++;
-            else { if (v < fmin) fmin = v; if (v > fmax) fmax = v; }
-            fsum += v;
-        }
-        float fmean = fsum / (float)combined_elems;
-        VV_LOG_D("inference: combined features [%d x %d]: min=%.4f max=%.4f mean=%.6f nan=%d inf=%d",
-                 n_audio_frames, hs, fmin, fmax, fmean, nan_count, inf_count);
-    }
-
-    uint16_t* combined_fp16 = (uint16_t*)vv_alloc((size_t)combined_elems * sizeof(uint16_t));
-    if (!combined_fp16) { vv_free(combined_fp32); return VV_ERR_OUT_OF_MEMORY; }
-    float_to_half(combined_fp32, combined_fp16, combined_elems);
-    vv_free(combined_fp32);
-    combined_fp32 = NULL;
-
-    perf->audio_encode_ms = vv_time_ms() - t_step;
-
-    VV_LOG_D("inference: step 1 complete — audio encoded + connectors done (%.0f ms)",
-             vv_time_ms() - t_step);
-
-    /* ═══ STEP 2: Build ChatML input sequence ═══ */
-    t_step = vv_time_ms();
 
     int32_t* input_ids = NULL;
     int seq_len = 0;
@@ -1773,7 +1872,7 @@ static vv_status_t transcribe_gpu(
         s = vv_family_build_prompt(&ctx->family, ctx->tokenizer,
                                    n_audio_frames, perf->audio_duration_sec,
                                    ctx_info, &pr);
-        if (s != VV_OK) { vv_free(combined_fp16); return s; }
+        if (s != VV_OK) return s;
         input_ids = pr.ids;
         seq_len = pr.n;
         audio_offset = pr.audio_offset;
@@ -1802,7 +1901,6 @@ static vv_status_t transcribe_gpu(
             VV_LOG_E("inference: no KV pages for this request: %s",
                      vv_status_str(s));
             vv_free(input_ids);
-            vv_free(combined_fp16);
             return s;
         }
     }
@@ -1815,47 +1913,59 @@ static vv_status_t transcribe_gpu(
     int32_t* input_ids_gpu = NULL;
 
     s = vv_dev_alloc(&hidden_states_gpu, hidden_bytes);
-    if (s != VV_OK) { vv_free(input_ids); vv_free(combined_fp16); return s; }
+    if (s != VV_OK) { vv_free(input_ids); return s; }
 
     /* Embedding: all tokens (text + speech_pad placeholders) */
     if (embed_on_cpu) {
         float* embed_fp32 = (float*)vv_alloc((size_t)seq_len * hs * sizeof(float));
-        if (!embed_fp32) { vv_dev_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return VV_ERR_OUT_OF_MEMORY; }
+        if (!embed_fp32) { vv_dev_free(hidden_states_gpu); vv_free(input_ids); return VV_ERR_OUT_OF_MEMORY; }
         vv_embedding_cpu(ctx->model->embed_tokens.data, input_ids, embed_fp32, seq_len, hs);
         uint16_t* embed_fp16 = (uint16_t*)vv_alloc(hidden_bytes);
-        if (!embed_fp16) { vv_free(embed_fp32); vv_dev_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return VV_ERR_OUT_OF_MEMORY; }
+        if (!embed_fp16) { vv_free(embed_fp32); vv_dev_free(hidden_states_gpu); vv_free(input_ids); return VV_ERR_OUT_OF_MEMORY; }
         float_to_half(embed_fp32, embed_fp16, seq_len * hs);
         vv_free(embed_fp32);
         vv_dev_memcpy_h2d(hidden_states_gpu, embed_fp16, hidden_bytes, ctx->compute_stream);
         vv_free(embed_fp16);
     } else {
         s = vv_dev_alloc((void**)&input_ids_gpu, (size_t)seq_len * sizeof(int32_t));
-        if (s != VV_OK) { vv_dev_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return s; }
+        if (s != VV_OK) { vv_dev_free(hidden_states_gpu); vv_free(input_ids); return s; }
         vv_dev_memcpy_h2d(input_ids_gpu, input_ids, (size_t)seq_len * sizeof(int32_t), ctx->compute_stream);
         s = vv_embedding_dev(ctx->embed_table_gpu, input_ids_gpu, hidden_states_gpu, seq_len, hs, ctx->compute_stream);
         vv_dev_free(input_ids_gpu);
-        if (s != VV_OK) { vv_dev_free(hidden_states_gpu); vv_free(input_ids); vv_free(combined_fp16); return s; }
+        if (s != VV_OK) { vv_dev_free(hidden_states_gpu); vv_free(input_ids); return s; }
     }
     vv_free(input_ids);
+    /* The front end's row writes wait for this, not for the host. */
+    vv_dev_event_record(ctx->fe_ready, ctx->compute_stream);
+    perf->sequence_build_ms = vv_time_ms() - t_step;
 
-    /* Overlay audio features at the speech_pad positions */
-    if (n_audio_frames > 0) {
-        void* audio_dst = (uint8_t*)hidden_states_gpu
-                        + (size_t)audio_offset * (size_t)hs * 2;
-        vv_dev_memcpy_h2d(audio_dst, combined_fp16,
-                            (size_t)n_audio_frames * (size_t)hs * 2,
-                            ctx->compute_stream);
+    /* ═══ STEP 2: Audio → the prompt's speech rows ═══ */
+    t_step = vv_time_ms();
+    VV_LOG_I("inference: step 1 — encoding audio");
+    {
+        void* audio_rows = (uint8_t*)hidden_states_gpu
+                         + (size_t)audio_offset * (size_t)hs * 2;
+        s = encode_audio_gpu(ctx, params, audio_samples, num_samples,
+                             n_audio_frames, audio_rows);
+        if (s == VV_OK) s = vv_dev_stream_wait_event(ctx->compute_stream, ctx->fe_done);
+        /* Only to time it: prefill cannot start before this anyway. */
+        if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
+        if (s != VV_OK) {
+            VV_LOG_E("inference: speech encoder failed: %s", vv_status_str(s));
+            vv_dev_free(hidden_states_gpu);
+            return s;
+        }
     }
-    vv_free(combined_fp16);
-    vv_dev_stream_sync(ctx->compute_stream);
+    perf->audio_encode_ms = vv_time_ms() - t_step;
+    VV_LOG_D("inference: step 1 complete — audio encoded + connectors done (%.0f ms)",
+             perf->audio_encode_ms);
 
     /* ── Diagnostic: compare text-embedding vs audio-feature magnitudes ── */
-    {
+    if (vv_log_get_level() >= VV_LOG_DEBUG) {
         const int sample_dim = (hs < 32) ? hs : 32;  /* sample first 32 dims */
         uint16_t diag_buf[32];
         float sum_sq;
 
-        /* Text embedding: read token at position 0 (im_start) */
         vv_dev_memcpy_d2h(diag_buf, hidden_states_gpu,
                             (size_t)sample_dim * 2, ctx->compute_stream);
         sum_sq = 0.0f;
@@ -1863,9 +1973,8 @@ static vv_status_t transcribe_gpu(
             float v = half_to_float_single(diag_buf[d]);
             sum_sq += v * v;
         }
-        VV_LOG_I("diag: text embed[0] L2(first %d dims) = %.6f", sample_dim, sqrtf(sum_sq));
+        VV_LOG_D("diag: text embed[0] L2(first %d dims) = %.6f", sample_dim, sqrtf(sum_sq));
 
-        /* Audio features: read first audio frame at audio_offset */
         if (n_audio_frames > 0) {
             void* audio_pos = (uint8_t*)hidden_states_gpu
                             + (size_t)audio_offset * (size_t)hs * 2;
@@ -1876,11 +1985,9 @@ static vv_status_t transcribe_gpu(
                 float v = half_to_float_single(diag_buf[d]);
                 sum_sq += v * v;
             }
-            VV_LOG_I("diag: audio feat[0] L2(first %d dims) = %.6f", sample_dim, sqrtf(sum_sq));
+            VV_LOG_D("diag: audio feat[0] L2(first %d dims) = %.6f", sample_dim, sqrtf(sum_sq));
         }
     }
-
-    perf->sequence_build_ms = vv_time_ms() - t_step;
 
     if (dump_dir()) {
         size_t n = (size_t)seq_len * (size_t)hs;
@@ -1890,6 +1997,11 @@ static vv_status_t transcribe_gpu(
             vv_dev_memcpy_d2h(h, hidden_states_gpu, n * 2,
                               ctx->compute_stream);
             dump_f16_as_f32("c_embeds", h, n);
+            {
+                const size_t off = (size_t)audio_offset * (size_t)hs;
+                dump_f16_as_f32("c_combined", h + off,
+                                (size_t)n_audio_frames * (size_t)hs);
+            }
             vv_free(h);
         }
     }
@@ -2305,13 +2417,11 @@ static vv_status_t transcribe_cpu(
     float* acoustic_features = NULL, *semantic_features = NULL;
     int n_acoustic_frames = 0, n_semantic_frames = 0;
 
-    if (ctx->acoustic_encoder && ctx->acoustic_encoder->stages &&
-        ctx->acoustic_encoder->input_conv.weight.data) {
+    if (ctx->acoustic_encoder) {
         vv_conv_vae_encode_cpu(ctx->acoustic_encoder, audio_samples, num_samples,
                                 &acoustic_latents, &n_acoustic_frames);
     }
-    if (ctx->semantic_encoder && ctx->semantic_encoder->stages &&
-        ctx->semantic_encoder->input_conv.weight.data) {
+    if (ctx->semantic_encoder) {
         vv_conv_vae_encode_cpu(ctx->semantic_encoder, audio_samples, num_samples,
                                 &semantic_latents, &n_semantic_frames);
     }
@@ -2327,9 +2437,9 @@ static vv_status_t transcribe_cpu(
     sample_acoustic(ctx, params, acoustic_latents, n_audio_frames);
 
     if (acoustic_latents && ctx->acoustic_connector)
-        vv_connector_forward_auto(ctx->acoustic_connector, acoustic_latents, n_audio_frames, &acoustic_features);
+        vv_connector_forward_cpu(ctx->acoustic_connector, acoustic_latents, n_audio_frames, &acoustic_features);
     if (semantic_latents && ctx->semantic_connector)
-        vv_connector_forward_auto(ctx->semantic_connector, semantic_latents, n_audio_frames, &semantic_features);
+        vv_connector_forward_cpu(ctx->semantic_connector, semantic_latents, n_audio_frames, &semantic_features);
     if (acoustic_latents) vv_free(acoustic_latents);
     if (semantic_latents) vv_free(semantic_latents);
 
@@ -2613,10 +2723,13 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
     }
 
     if (ctx->tokenizer) vv_tokenizer_free(ctx->tokenizer);
-    if (ctx->acoustic_encoder) vv_conv_vae_free(ctx->acoustic_encoder);
-    if (ctx->semantic_encoder) vv_conv_vae_free(ctx->semantic_encoder);
-    if (ctx->acoustic_connector) vv_free(ctx->acoustic_connector);
-    if (ctx->semantic_connector) vv_free(ctx->semantic_connector);
+    if (ctx->fe_stream) vv_frontend_stream_free(ctx->fe_stream);
+    if (ctx->fe_ready) vv_dev_event_destroy(ctx->fe_ready);
+    if (ctx->fe_done) vv_dev_event_destroy(ctx->fe_done);
+    if (ctx->fe_lat_buf) vv_dev_free(ctx->fe_lat_buf);
+    /* Clones borrow the device's front end; the parent goes last. */
+    if (!ctx->is_clone && ctx->frontend) vv_frontend_free(ctx->frontend);
+    free_frontend_host(ctx);
 
     if (ctx->model && !ctx->is_clone) {
         if (ctx->use_gpu && ctx->placement == VV_PLACE_ALL_GPU)

@@ -431,6 +431,8 @@ typedef struct vv_shard {
 /* Forward declarations for opaque types */
 struct vv_tokenizer;
 struct vv_conv_vae_encoder;
+struct vv_frontend;
+struct vv_frontend_stream;
 struct vv_connector;
 
 typedef struct vv_inference_ctx {
@@ -479,11 +481,26 @@ typedef struct vv_inference_ctx {
     vv_family_t    family;
     bool           family_ok;
 
-    /* Audio encoding components */
+    /* Audio encoding components (host descriptions; owned by the parent) */
     struct vv_conv_vae_encoder* acoustic_encoder;
     struct vv_conv_vae_encoder* semantic_encoder;
     struct vv_connector*        acoustic_connector;
     struct vv_connector*        semantic_connector;
+
+    /*
+     * The device's speech front end — encoder and connector weights, the
+     * arena, the batching service — is one per device: the parent owns it
+     * and clones borrow it. What each context owns is its streaming state
+     * and the two events that order the front end against its own stream.
+     */
+    struct vv_frontend*        frontend;
+    struct vv_frontend_stream* fe_stream;
+    void*                      fe_ready;   /**< event: prompt rows embedded */
+    void*                      fe_done;    /**< event: audio rows written   */
+    /** Latents + FP32 staging for the acoustic draw and dumps, grown to the
+        longest clip seen and kept, so those modes do not allocate per request. */
+    void*                      fe_lat_buf;
+    size_t                     fe_lat_bytes;
 
     /* Model directory path (for loading tokenizer) */
     char           model_dir[512];

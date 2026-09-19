@@ -20,9 +20,6 @@
 .PARAMETER NoBuild
     Only configure, skip build
 
-.PARAMETER NoTRT
-    Disable TensorRT even if found
-
 .PARAMETER CudaArch
     CUDA architectures (default: "80;86;89")
 
@@ -46,7 +43,7 @@
     .\build.ps1 -BuildType Debug
     .\build.ps1 -Clean -Test
     .\build.ps1 -BuildType Release -Bench -NVTX
-    .\build.ps1 -NoTRT -CudaArch "86"
+    .\build.ps1 -CudaArch "86"
 #>
 
 [CmdletBinding()]
@@ -58,7 +55,6 @@ param(
     [switch]$Test,
     [switch]$Bench,
     [switch]$NoBuild,
-    [switch]$NoTRT,
     [switch]$Verbose,
     [switch]$NVTX,
 
@@ -81,7 +77,7 @@ function Write-Err    { param([string]$msg) Write-Host "[ERROR]     $msg" -Foreg
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════════╗" -ForegroundColor Magenta
 Write-Host "  ║       vibevoice.c  Build System              ║" -ForegroundColor Magenta
-Write-Host "  ║       Pure C  |  CUDA  |  TensorRT           ║" -ForegroundColor Magenta
+Write-Host "  ║       Pure C  |  CUDA                        ║" -ForegroundColor Magenta
 Write-Host "  ╚══════════════════════════════════════════════╝" -ForegroundColor Magenta
 Write-Host ""
 
@@ -175,23 +171,6 @@ if (Test-Path $nvccPath) {
 # Make sure nvcc is on PATH
 $env:PATH = "$cudaPath\bin;$env:PATH"
 
-# ─── Detect TensorRT ─────────────────────────────────────────────────────────
-$trtFlags = @("-DVV_ENABLE_TRT=OFF")
-
-if (-not $NoTRT) {
-    $trtPath = $env:TENSORRT_PATH
-    if ($trtPath -and (Test-Path (Join-Path $trtPath "include\NvInfer.h"))) {
-        $trtFlags = @("-DVV_ENABLE_TRT=ON", "-DTENSORRT_PATH=$trtPath")
-        Write-Ok "TensorRT: $trtPath"
-    } elseif ($trtPath) {
-        Write-Warn "TensorRT: TENSORRT_PATH set but NvInfer.h not found, disabled"
-    } else {
-        Write-Step "TensorRT: not found (set TENSORRT_PATH to enable)"
-    }
-} else {
-    Write-Step "TensorRT: disabled by -NoTRT"
-}
-
 # ─── Detect generator ────────────────────────────────────────────────────────
 if (-not $Generator) {
     if (Get-Command ninja -ErrorAction SilentlyContinue) {
@@ -233,7 +212,7 @@ $cmakeArgs = @(
     "-DVV_BUILD_BENCH=ON",
     "-DVV_BUILD_CLI=ON",
     $nvtxFlag
-) + $trtFlags
+)
 
 & cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) {

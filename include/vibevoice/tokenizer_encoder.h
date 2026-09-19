@@ -9,6 +9,23 @@
  * Both use same architecture: causal 1D Conv-VAE with
  * encoder_ratios=[8,5,5,4,2,2] (total compression 3200x).
  * Output frame rate: 24000 / 3200 = 7.5 Hz
+ *
+ * Three objects, because three different things vary at three different
+ * rates:
+ *
+ *   vv_conv_vae_encoder_t  the architecture and the host weights, borrowed
+ *                          from the loader; one per model
+ *   vv_vae_weights_t       the FP16 device copy; immutable, one per device,
+ *                          shared by every slot and request on it
+ *   vv_vae_state_t         one audio stream's convolution tails (~700 KB);
+ *                          what makes chunked encoding equal to encoding the
+ *                          whole signal, for any chunk length
+ *   vv_vae_arena_t         preallocated scratch, sized from (items, samples)
+ *
+ * vv_vae_encode takes a batch of items — segments of one file, chunks of
+ * several live streams, stateless windows, in any mix — packs them along
+ * time and runs every layer once over the lot. Nothing is allocated, freed
+ * or synchronised inside it; it only enqueues work on the stream it is given.
  */
 #ifndef VV_TOKENIZER_ENCODER_H
 #define VV_TOKENIZER_ENCODER_H
@@ -48,42 +65,22 @@ typedef struct vv_encoder_block {
     vv_tensor_t ffn_layer_scale;
 } vv_encoder_block_t;
 
-/** @brief Single encoder stage (downsample + N blocks). */
+/** @brief Single encoder stage (N blocks, then an optional downsample). */
 typedef struct vv_encoder_stage {
-    vv_conv1d_weights_t downsample;      /**< Strided conv for downsampling */
+    vv_conv1d_weights_t downsample;      /**< Strided conv into the next stage */
     vv_encoder_block_t* blocks;
     int                 n_blocks;
-    int                 channels;        /**< Output channels for this stage */
+    int                 channels;        /**< Channels inside this stage */
 } vv_encoder_stage_t;
 
-/** @brief FP16 GPU mirror of one encoder block's weights. */
-typedef struct vv_encoder_block_gpu {
-    void* norm_w;
-    void* conv_w;
-    void* conv_b;
-    void* gamma;
-    void* ffn_norm_w;
-    void* ffn_gamma;
-    void* l1_w;
-    void* l1_b;
-    void* l2_w;
-    void* l2_b;
-    int   ffn_hidden;
-    int   channels;
-    void* cache;      /**< streaming tail for the depthwise mixer conv */
-    int   cache_len;
-} vv_encoder_block_gpu_t;
+struct vv_vae_cpu_weights;
 
-/** @brief FP16 GPU mirror of one encoder stage. */
-typedef struct vv_encoder_stage_gpu {
-    void* ds_w;
-    void* ds_b;
-    void* ds_cache;   /**< streaming tail for the downsample conv */
-    int   ds_cache_len;
-    vv_encoder_block_gpu_t* blocks;
-} vv_encoder_stage_gpu_t;
-
-/** @brief Full Conv-VAE encoder. */
+/**
+ * @brief Full Conv-VAE encoder: architecture plus borrowed FP32 host weights.
+ *
+ * Immutable after vv_conv_vae_init except for the CPU path's lazily built
+ * FP16 copies, which are created once under the caller's control.
+ */
 typedef struct vv_conv_vae_encoder {
     /* Initial convolution (1 channel → encoder_n_filters) */
     vv_conv1d_weights_t input_conv;
@@ -92,38 +89,21 @@ typedef struct vv_conv_vae_encoder {
     vv_encoder_stage_t* stages;
     int                 n_stages;
 
-    /* Final projection to VAE dim (mean and optionally logvar) */
+    /* Final projection to VAE dim (mean) */
     vv_conv1d_weights_t proj_mean;       /**< Project to vae_dim (mean) */
-    vv_conv1d_weights_t proj_logvar;     /**< Project to vae_dim (logvar), acoustic only */
 
     /* Config */
     int   vae_dim;
     float fix_std;
+    float eps;                           /**< RMSNorm epsilon (layernorm_eps) */
     bool  gaussian;                      /**< true for acoustic, false for semantic */
     bool  causal;
 
-    /* GPU buffers (pre-allocated at init) */
-    void* gpu_workspace;
-    size_t workspace_size;
-
-    /*
-     * FP16 GPU mirrors of every weight, uploaded once on the first encode.
-     * Re-uploading per block cost ~270 MB of H2D traffic and hundreds of
-     * cudaMalloc/cudaFree pairs per call, which dominated audio encoding.
-     */
-    bool  gpu_weights_ready;
-    void* input_w_gpu;
-    void* input_b_gpu;
-    void* proj_w_gpu;
-    void* proj_b_gpu;
-    void* input_cache;
-    int   input_cache_len;
-    void* proj_cache;
-    int   proj_cache_len;
-    vv_encoder_stage_gpu_t* gpu_stages;
+    /** FP16 weights repacked for the CPU GEMMs; built on first CPU encode. */
+    struct vv_vae_cpu_weights* cpu;
 } vv_conv_vae_encoder_t;
 
-/* ─── API ───────────────────────────────────────────────────────────────── */
+/* ─── Construction ──────────────────────────────────────────────────────── */
 
 /**
  * @brief Initialize a Conv-VAE encoder from model weights.
@@ -139,45 +119,140 @@ vv_status_t vv_conv_vae_init(const vv_weight_t* model_weights, int n_weights,
                               vv_conv_vae_encoder_t** encoder);
 
 /**
- * @brief Run Conv-VAE encoder forward pass (CPU reference).
+ * @brief Whether the encoder has every weight the forward pass reads.
+ */
+bool vv_conv_vae_complete(const vv_conv_vae_encoder_t* encoder);
+
+/** @brief Free the encoder structure and its CPU weight copies. */
+vv_status_t vv_conv_vae_free(vv_conv_vae_encoder_t* encoder);
+
+/**
+ * @brief Output frames for `n_samples` of a fresh stream ending there.
  *
- * @param encoder      Initialized encoder
- * @param audio        Input audio [n_samples] at 24kHz
- * @param n_samples    Number of input samples
- * @param output       Output: [n_frames, vae_dim] latent tokens
- * @param n_frames     Output: number of frames
+ * ceil(n_samples / 3200) for this model, computed layer by layer so it is
+ * right for any stride schedule. The prompt can be built from this before a
+ * single sample has been encoded.
+ */
+int vv_conv_vae_frames(const vv_conv_vae_encoder_t* encoder, int64_t n_samples);
+
+/* ─── CPU encoder ───────────────────────────────────────────────────────── */
+
+/**
+ * @brief Run the encoder on the CPU over a whole clip.
+ *
+ * Time-tiled with carried convolution state, so memory is bounded by the
+ * tile, not the clip; the FFNs go through the packed FP16 GEMM. Never
+ * touches an accelerator.
+ *
+ * @param output    Out: [n_frames, vae_dim] FP32, caller frees with vv_free
  */
 vv_status_t vv_conv_vae_encode_cpu(vv_conv_vae_encoder_t* encoder,
                                     const float* audio, int n_samples,
                                     float** output, int* n_frames);
 
 /**
- * @brief Run Conv-VAE encoder forward pass on GPU.
- *
- * @param encoder      Initialized encoder (weights on GPU)
- * @param audio_gpu    Input audio on GPU [n_samples]
- * @param n_samples    Number of samples
- * @param output_gpu   Output on GPU: [n_frames, vae_dim]
- * @param n_frames     Output: number of frames
- * @param stream       CUDA stream
+ * @brief Build the CPU path's repacked FP16 weights ahead of the first
+ * encode. Optional (the first encode does it otherwise) and not thread-safe:
+ * call it before the encoder is shared.
  */
-vv_status_t vv_conv_vae_encode_dev(const vv_conv_vae_encoder_t* encoder,
-                                     const void* audio_gpu, int n_samples,
-                                     void** output_gpu, int* n_frames,
-                                     void* stream);
+vv_status_t vv_conv_vae_prepare_cpu(vv_conv_vae_encoder_t* encoder);
+
+/* ─── GPU encoder ───────────────────────────────────────────────────────── */
+
+typedef struct vv_vae_weights vv_vae_weights_t;
+typedef struct vv_vae_state   vv_vae_state_t;
+typedef struct vv_vae_arena   vv_vae_arena_t;
+
+/** @brief Device bytes vv_vae_weights_upload will take. */
+size_t vv_vae_weights_bytes(const vv_conv_vae_encoder_t* encoder);
 
 /**
- * @brief Upload the encoder weights to the GPU ahead of the first encode.
+ * @brief Upload the encoder's weights, as FP16, to the current device.
  *
- * Without this the ~600 ms of host-to-device traffic lands inside the first
- * transcription and is charged to audio encoding.
+ * Init-time only: this allocates and synchronises. The result is immutable
+ * and may be read by any number of streams at once.
  */
-vv_status_t vv_conv_vae_warmup(vv_conv_vae_encoder_t* encoder);
+vv_status_t vv_vae_weights_upload(const vv_conv_vae_encoder_t* encoder,
+                                  void* stream, vv_vae_weights_t** out);
+void vv_vae_weights_free(vv_vae_weights_t* w);
+
+/** @brief The host description these weights were uploaded from. */
+const vv_conv_vae_encoder_t* vv_vae_weights_encoder(const vv_vae_weights_t* w);
+
+/** @brief Device bytes one vv_vae_state_t takes. */
+size_t vv_vae_state_bytes(const vv_conv_vae_encoder_t* encoder);
 
 /**
- * @brief Free Conv-VAE encoder resources.
+ * @brief Streaming state for one audio stream, on the current device.
+ *
+ * A state is used by one stream of work at a time: consecutive encodes that
+ * share it must be ordered (same CUDA stream, or joined by events), because
+ * each reads the tails the previous one wrote.
  */
-vv_status_t vv_conv_vae_free(vv_conv_vae_encoder_t* encoder);
+vv_status_t vv_vae_state_create(const vv_vae_weights_t* w, vv_vae_state_t** out);
+
+/** @brief Start a new stream. Host-only, costs nothing on the device. */
+void vv_vae_state_reset(vv_vae_state_t* st);
+void vv_vae_state_free(vv_vae_state_t* st);
+
+/**
+ * @brief Frames the next encode of `n_samples` through `st` will produce.
+ *
+ * `st` NULL means a stateless window (fresh context, final). Does not change
+ * the state.
+ */
+int vv_vae_frames(const vv_vae_weights_t* w, const vv_vae_state_t* st,
+                  int64_t n_samples, bool is_final);
+
+/**
+ * @brief Device bytes of an arena for batches of up to `max_items` items
+ * totalling `max_samples` samples.
+ *
+ * Dominated by two stage-0 activation buffers, 2 x 32 channels x 2 bytes
+ * per sample, plus a fixed FFN tile.
+ */
+size_t vv_vae_arena_bytes(const vv_conv_vae_encoder_t* encoder,
+                          int max_items, int64_t max_samples);
+
+vv_status_t vv_vae_arena_create(const vv_conv_vae_encoder_t* encoder,
+                                int max_items, int64_t max_samples,
+                                vv_vae_arena_t** out);
+void vv_vae_arena_free(vv_vae_arena_t* a);
+
+/** @brief Largest batch, in items and in samples, the arena was sized for. */
+int     vv_vae_arena_max_items(const vv_vae_arena_t* a);
+int64_t vv_vae_arena_max_samples(const vv_vae_arena_t* a);
+
+/** @brief Bytes of the arena any encode so far has actually used. */
+size_t vv_vae_arena_high_water(const vv_vae_arena_t* a);
+
+/** @brief One piece of audio in a batched encode. */
+typedef struct vv_vae_item {
+    const void*     audio;       /**< device FP16 [n_samples]                 */
+    int             n_samples;
+    /**
+     * Carried context. NULL encodes a stateless window: zero left context
+     * and a final (ceil-aligned) right edge, exactly as a fresh encode of
+     * just these samples would.
+     */
+    vv_vae_state_t* state;
+    /** Last chunk of the stream: pad the right edge, then reset `state`. */
+    bool            is_final;
+    void*           out;         /**< device FP16 rows [frame][out_ld]        */
+    int             out_ld;      /**< row stride in elements (>= vae_dim)     */
+    int             skip_frames; /**< leading frames produced but not written */
+    int             n_frames;    /**< out: frames produced, skipped included  */
+} vv_vae_item_t;
+
+/**
+ * @brief Encode a batch of items; enqueue only.
+ *
+ * Every item's output equals, bit for bit, what encoding it alone would give,
+ * and a stream cut into chunks of any length equals the whole stream. At most
+ * vv_vae_arena_max_items() items and vv_vae_arena_max_samples() samples.
+ */
+vv_status_t vv_vae_encode(const vv_vae_weights_t* w, vv_vae_arena_t* a,
+                          vv_vae_item_t* items, int n_items, void* stream);
 
 /* ─── Acoustic latent sampling ──────────────────────────────────────────── */
 

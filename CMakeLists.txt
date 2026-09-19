@@ -21,7 +21,6 @@ option(VV_ENABLE_BLAS  "Enable OpenBLAS for CPU GEMM"   OFF)
 option(VV_BUILD_TESTS  "Build test executables"          ON)
 option(VV_BUILD_BENCH  "Build benchmark executable"      ON)
 option(VV_BUILD_CLI    "Build CLI executable"            ON)
-option(VV_ENABLE_TRT   "Enable TensorRT support"         ON)
 option(VV_ENABLE_NVTX  "Enable NVTX profiling markers"   OFF)
 
 # ─── Probe for CUDA after C/CXX toolchain is ready ───────────────────────────
@@ -81,39 +80,6 @@ if(VV_ENABLE_BLAS)
         else()
             message(WARNING "OpenBLAS not found — using naive CPU GEMM")
         endif()
-    endif()
-endif()
-
-# ─── Find TensorRT (optional) ────────────────────────────────────────────────
-set(VV_HAS_TRT OFF)
-if(VV_HAS_CUDA AND VV_ENABLE_TRT)
-    if(DEFINED ENV{TENSORRT_PATH})
-        set(TENSORRT_ROOT "$ENV{TENSORRT_PATH}")
-    elseif(DEFINED TENSORRT_PATH)
-        set(TENSORRT_ROOT "${TENSORRT_PATH}")
-    endif()
-
-    if(TENSORRT_ROOT)
-        find_library(NVINFER_LIB nvinfer
-            PATHS "${TENSORRT_ROOT}/lib" NO_DEFAULT_PATH)
-        find_library(NVINFER_PLUGIN_LIB nvinfer_plugin
-            PATHS "${TENSORRT_ROOT}/lib" NO_DEFAULT_PATH)
-        find_library(NVONNXPARSER_LIB nvonnxparser
-            PATHS "${TENSORRT_ROOT}/lib" NO_DEFAULT_PATH)
-        find_path(TENSORRT_INCLUDE_DIR NvInfer.h
-            PATHS "${TENSORRT_ROOT}/include" NO_DEFAULT_PATH)
-    else()
-        find_library(NVINFER_LIB nvinfer)
-        find_library(NVINFER_PLUGIN_LIB nvinfer_plugin)
-        find_library(NVONNXPARSER_LIB nvonnxparser)
-        find_path(TENSORRT_INCLUDE_DIR NvInfer.h)
-    endif()
-
-    if(NVINFER_LIB AND TENSORRT_INCLUDE_DIR)
-        set(VV_HAS_TRT ON)
-        message(STATUS "TensorRT found: ${NVINFER_LIB}")
-    else()
-        message(WARNING "TensorRT not found, TRT support disabled")
     endif()
 endif()
 
@@ -181,6 +147,8 @@ add_library(vibevoice_core STATIC
     src/text_tokenizer/vocab.c
     src/text_tokenizer/special_tokens.c
     src/tokenizer_encoder/conv_vae.c
+    src/tokenizer_encoder/vae_gpu.c
+    src/tokenizer_encoder/vae_cpu.c
     src/tokenizer_encoder/latent_sample.c
     src/connector/speech_connector.c
     src/model/safetensors.c
@@ -193,6 +161,7 @@ add_library(vibevoice_core STATIC
     src/quant/dequant_cpu.c
     src/cpu/cpu_kernels.c
     src/inference/pipeline.c
+    src/inference/frontend.c
     src/inference/decoder.c
     src/inference/kv_cache.c
     src/inference/sampling.c
@@ -263,8 +232,8 @@ if(VV_HAS_CUDA)
         src/cuda/int8_gemv.cu
         src/cuda/w4a16.cu
         src/cuda/lm_head.cu
-        src/cuda/conv1d.cu
         src/cuda/conv_vae.cu
+        src/cuda/vae_kernels.cu
         src/cuda/rmsnorm.cu
         src/cuda/rope.cu
         src/cuda/attention.cu
@@ -282,24 +251,6 @@ if(VV_HAS_CUDA)
     endif()
 endif()
 
-# ─── vibevoice_trt (TensorRT wrapper, optional) ──────────────────────────────
-if(VV_HAS_TRT)
-    add_library(vibevoice_trt STATIC
-        src/trt/engine_builder.c
-        src/trt/engine_runtime.c
-        src/trt/trt_utils.c
-    )
-    target_include_directories(vibevoice_trt PRIVATE ${TENSORRT_INCLUDE_DIR})
-    target_link_libraries(vibevoice_trt PUBLIC
-        ${NVINFER_LIB}
-        ${NVINFER_PLUGIN_LIB}
-    )
-    if(NVONNXPARSER_LIB)
-        target_link_libraries(vibevoice_trt PUBLIC ${NVONNXPARSER_LIB})
-    endif()
-    target_compile_definitions(vibevoice_trt PUBLIC VV_HAS_TRT=1)
-endif()
-
 # ─── vibevoice shared library ─────────────────────────────────────────────────
 add_library(vibevoice SHARED
     src/core/alloc.c  # re-add for DLL export; in production use object libs
@@ -308,9 +259,6 @@ target_link_libraries(vibevoice PUBLIC vibevoice_core)
 if(VV_HAS_CUDA)
     target_link_libraries(vibevoice PUBLIC vibevoice_cuda)
 endif()
-if(VV_HAS_TRT)
-    target_link_libraries(vibevoice PUBLIC vibevoice_trt)
-endif()
 
 # ─── CLI executable ───────────────────────────────────────────────────────────
 if(VV_BUILD_CLI)
@@ -318,9 +266,6 @@ if(VV_BUILD_CLI)
     target_link_libraries(vv_cli PRIVATE vibevoice_core)
     if(VV_HAS_CUDA)
         target_link_libraries(vv_cli PRIVATE vibevoice_cuda)
-    endif()
-    if(VV_HAS_TRT)
-        target_link_libraries(vv_cli PRIVATE vibevoice_trt)
     endif()
 endif()
 
@@ -343,6 +288,7 @@ if(VV_BUILD_TESTS)
     vv_add_test(test_safetensors tests/test_safetensors.c)
     vv_add_test(test_nf4 tests/test_nf4.c)
     vv_add_test(test_conv_vae tests/test_conv_vae.c)
+    vv_add_test(test_vae_stream tests/test_vae_stream.c)
     vv_add_test(test_tokenizer tests/test_tokenizer.c)
     vv_add_test(test_kv_quant tests/test_kv_quant.c)
     vv_add_test(test_kv_shard tests/test_kv_shard.c)
@@ -403,6 +349,12 @@ if(VV_BUILD_BENCH)
     if(VV_HAS_CUDA)
         target_link_libraries(vv_bench PRIVATE vibevoice_cuda)
     endif()
+    # Speech front end throughput, alone and under concurrency.
+    add_executable(vv_bench_encoder bench/bench_encoder.c)
+    target_link_libraries(vv_bench_encoder PRIVATE vibevoice_core)
+    if(VV_HAS_CUDA)
+        target_link_libraries(vv_bench_encoder PRIVATE vibevoice_cuda)
+    endif()
 endif()
 
 # ─── Install ──────────────────────────────────────────────────────────────────
@@ -423,7 +375,6 @@ message(STATUS "  vibevoice.c ${VV_VERSION_FULL} build configuration:")
 message(STATUS "    Revision:  ${VV_REVISION}")
 message(STATUS "    CUDA:      ${VV_HAS_CUDA}")
 message(STATUS "    OpenBLAS:  ${VV_HAS_BLAS}")
-message(STATUS "    TensorRT:  ${VV_HAS_TRT}")
 message(STATUS "    CLI:       ${VV_BUILD_CLI}")
 message(STATUS "    Tests:     ${VV_BUILD_TESTS}")
 message(STATUS "")

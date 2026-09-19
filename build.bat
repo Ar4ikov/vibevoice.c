@@ -15,11 +15,9 @@ REM    build.bat rebuild             -- Clean + full rebuild
 REM
 REM  Environment variables (optional overrides):
 REM    CUDA_PATH           -- CUDA Toolkit root (auto-detected if not set)
-REM    TENSORRT_PATH       -- TensorRT SDK root (disabled if not set)
 REM    VV_CUDA_ARCH        -- CUDA architectures, e.g. "80;86;89" (default)
 REM    VV_BUILD_DIR        -- Build directory (default: build)
 REM    VV_GENERATOR        -- CMake generator (default: "Ninja" if found, else VS)
-REM    VV_NO_TRT           -- Set to 1 to disable TensorRT even if found
 REM    VV_JOBS             -- Parallel jobs for build (default: all cores)
 REM ============================================================================
 
@@ -104,23 +102,6 @@ echo [vibevoice] CUDA: %CUDA_PATH%
 REM Ensure nvcc is on PATH
 set "PATH=%CUDA_PATH%\bin;%PATH%"
 
-REM --- Detect TensorRT (optional) ---------------------------------------------
-set "TRT_CMAKE_FLAG=-DVV_ENABLE_TRT=OFF"
-if defined VV_NO_TRT (
-    echo [vibevoice] TensorRT: disabled by VV_NO_TRT
-) else (
-    if defined TENSORRT_PATH (
-        if exist "%TENSORRT_PATH%\include\NvInfer.h" (
-            set "TRT_CMAKE_FLAG=-DVV_ENABLE_TRT=ON -DTENSORRT_PATH=%TENSORRT_PATH%"
-            echo [vibevoice] TensorRT: %TENSORRT_PATH%
-        ) else (
-            echo [vibevoice] TensorRT: TENSORRT_PATH set but NvInfer.h not found, disabling
-        )
-    ) else (
-        echo [vibevoice] TensorRT: not found -- set TENSORRT_PATH to enable
-    )
-)
-
 REM --- CUDA architectures -----------------------------------------------------
 if not defined VV_CUDA_ARCH set "VV_CUDA_ARCH=80;86;89"
 echo [vibevoice] CUDA architectures: %VV_CUDA_ARCH%
@@ -149,7 +130,7 @@ echo.
 if not exist "%VV_BUILD_DIR%" mkdir "%VV_BUILD_DIR%"
 
 echo [vibevoice] cmake -S "%PROJECT_ROOT%" -B "%VV_BUILD_DIR%" -G "%VV_GENERATOR%" ...
-cmake -S "%PROJECT_ROOT%" -B "%VV_BUILD_DIR%" -G "%VV_GENERATOR%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DCMAKE_CUDA_ARCHITECTURES="%VV_CUDA_ARCH%" -DVV_BUILD_TESTS=ON -DVV_BUILD_BENCH=ON -DVV_BUILD_CLI=ON %TRT_CMAKE_FLAG%
+cmake -S "%PROJECT_ROOT%" -B "%VV_BUILD_DIR%" -G "%VV_GENERATOR%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DCMAKE_CUDA_ARCHITECTURES="%VV_CUDA_ARCH%" -DVV_BUILD_TESTS=ON -DVV_BUILD_BENCH=ON -DVV_BUILD_CLI=ON
 
 if %errorlevel% neq 0 (
     echo [ERROR] CMake configure failed!

@@ -89,6 +89,45 @@ Write the entry for a change under Unreleased in the same pull request.
   transcript and reports success.
 - A decode step that fails now fails the request; before, the tokens so far
   were post-processed and returned as a complete transcript.
+- **Speech front end** ([#16](https://github.com/Ar4ikov/vibevoice.c/issues/16)):
+  the Conv-VAE encoders are split into weights (FP16, one copy per device,
+  shared by every slot -- each `--slots` clone used to upload its own
+  1.4 GB), per-stream state (the convolution tails, ~1.4 MB) and one arena
+  sized from (jobs, samples) per launch and counted by the placement budget
+  in place of the flat 256 MB guess. An encode is kernel launches on the
+  caller's stream and nothing else: the ~110 `cudaMalloc`/`cudaFree` pairs
+  per segment, the per-stage syncs and the host round trips are gone. One
+  launch takes any mix of jobs packed along time -- segments of a file,
+  several requests, chunks of live streams, stateless windows (from zero
+  state, as Streaming-7B's 26-frame windows need) -- and both encoders run
+  concurrently on two streams. The mixer is one fused RMSNorm + depthwise
+  conv + gamma-residual kernel, the FFN norm, bias, GELU and residual ride
+  in the GEMMs' operand load and epilogues, and the downsample and head
+  convs are an FP32 GEMM over im2col columns that sums in the direct
+  kernel's order; nothing re-associates a sum, so latents, prompt
+  embeddings and transcripts stay bit-identical to before (jfk, test30,
+  test120, the 32-minute file, `--acoustic-sampling gaussian`). Streaming
+  is exact for any chunk length, not only multiples of 3200 samples. The
+  connectors run on the device and write the prompt's rows in place. With
+  `serve --slots N` a per-device worker plans one launch at a time from
+  whatever has arrived, so concurrent requests share launches and a short
+  request is not stuck behind a long file's encode; the encoder runs at
+  background stream priority so other slots' decode steps go first. The
+  CPU encoder is time-tiled with carried state (bounded memory), OpenMP,
+  through the packed GEMM, and no longer runs on the GPU under `--cpu`.
+  Batched, chunked and windowed encodes equal one-by-one bit for bit
+  (`tests/test_vae_stream.c`). 3090, against master with the attention
+  backends and the W4A16 path: encoder 197 -> 52 ms on 11 s, 1347 -> 350 ms
+  on 120 s (RTF 0.054 -> 0.046), 21.9 -> 5.4 s on the 32-minute file (RTF
+  0.067 -> 0.058; AWQ 0.060 -> 0.051); eight 30 s files through
+  `serve --slots 4` 13.1 -> 10.5 s and 20.5 -> 16.9 GB of VRAM; jfk sent
+  0.3 s into a 32-minute request 2.4 -> 2.3 s; CPU encoder on 11 s 71 ->
+  2.5 s.
+- The TensorRT stubs (`src/trt`, `trt.h`, the CMake option, the ONNX/TRT
+  export tools) are removed; they never ran, and `VV_ENABLE_TRT` defaulted
+  to ON, linking `libnvinfer` into dev builds. `--trt-acoustic` and
+  `--trt-semantic` still parse for this release and log a deprecation
+  warning.
 
 ## [0.2.0](https://github.com/Ar4ikov/vibevoice.c/releases/tag/v0.2.0) — 2026-09-18
 

@@ -5,7 +5,6 @@
  * Usage:
  *   vv_cli --model <path> --audio <file.wav> [--output <file.json>]
  *          [--gpu <id>] [--max-tokens <N>] [--hotwords "word1,word2"]
- *          [--trt-acoustic <plan>] [--trt-semantic <plan>]
  *          [--kv-cache FMT] [--verbose]
  */
 
@@ -40,8 +39,8 @@ typedef struct {
     const char* model_dir;
     const char* audio_path;
     const char* output_path;
-    const char* trt_acoustic;
-    const char* trt_semantic;
+    /* --trt-acoustic / --trt-semantic: accepted for one release, ignored. */
+    bool        trt_flag_seen;
     int         gpu_id;
     const char* gpus;
     const char* gpu_memory;
@@ -107,8 +106,6 @@ static void print_usage(const char* prog) {
         "  --max-tokens <N>      Max decode tokens (default: 64000)\n"
         "  --max-seq-len <N>     KV-cache window in tokens (default: 32768)\n"
         "  --hotwords <words>    Comma-separated hotwords\n"
-        "  --trt-acoustic <plan> TensorRT engine for acoustic encoder\n"
-        "  --trt-semantic <plan> TensorRT engine for semantic encoder\n"
         "  --kv-cache FMT        KV-cache storage: fp16 (default), fp8,\n"
         "                        fp8-e5m2, tq4, tq3, tq2, tq1.5\n"
         "  --quant <fmt>         Weights: auto (default: as the checkpoint\n"
@@ -165,10 +162,12 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->max_seq_len = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--hotwords") == 0 && i + 1 < argc) {
             args->hotwords = argv[++i];
-        } else if (strcmp(argv[i], "--trt-acoustic") == 0 && i + 1 < argc) {
-            args->trt_acoustic = argv[++i];
-        } else if (strcmp(argv[i], "--trt-semantic") == 0 && i + 1 < argc) {
-            args->trt_semantic = argv[++i];
+        } else if ((strcmp(argv[i], "--trt-acoustic") == 0 ||
+                    strcmp(argv[i], "--trt-semantic") == 0) && i + 1 < argc) {
+            /* The TensorRT path never got past stubs and is gone; the flags
+               stay parseable for one release so existing scripts still run. */
+            args->trt_flag_seen = true;
+            ++i;
         } else if (strcmp(argv[i], "--attn") == 0 && i + 1 < argc) {
             args->attn = argv[++i];
         } else if (strcmp(argv[i], "--kv-paged") == 0 && i + 1 < argc) {
@@ -262,6 +261,10 @@ int main(int argc, char** argv) {
     vv_log_set_level(args.verbose ? VV_LOG_DEBUG : VV_LOG_INFO);
 
     VV_LOG_I("vibevoice.c %s (%s)", vv_version(), vv_build_ref());
+    if (args.trt_flag_seen)
+        VV_LOG_W("--trt-acoustic/--trt-semantic are deprecated and ignored: "
+                 "the speech encoder runs on its own CUDA kernels. The flags "
+                 "go away in the next release.");
     VV_LOG_I("Model: %s", args.model_dir);
     VV_LOG_I("Audio: %s", args.audio_path);
 

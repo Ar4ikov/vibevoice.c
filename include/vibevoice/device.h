@@ -64,6 +64,12 @@ vv_status_t vv_dev_memset(void* ptr, int value, size_t size);
 vv_status_t vv_dev_memset_async(void* ptr, int value, size_t size,
                                 void* stream);
 vv_status_t vv_dev_stream_create(void** stream);
+/**
+ * @brief A stream whose work yields to that of every vv_dev_stream_create
+ * stream: the lowest scheduling priority, one step below the rest. For bulk
+ * work that should not hold up other requests' decode steps.
+ */
+vv_status_t vv_dev_stream_create_background(void** stream);
 vv_status_t vv_dev_stream_destroy(void* stream);
 vv_status_t vv_dev_stream_sync(void* stream);
 vv_status_t vv_dev_set_device(int device_id);
@@ -521,46 +527,164 @@ vv_status_t vv_argmax_dev(
     const void* logits, int V, void* scratch_v, void* scratch_i,
     void* out_token, void* out_value, void* stream);
 
-/* ─── Conv-VAE speech tokenizer ──────────────────────────────────────────── */
-
-vv_status_t vv_conv1d_dev(
-    const void* input_fp16, const void* weight_fp16, const void* bias_fp16,
-    void* output_fp16, int in_channels, int in_length, int out_channels,
-    int kernel_size, int stride, int groups, bool causal,
-    int* out_length, void* stream);
-
-/** @brief conv1d with the padding and output length given explicitly. */
-vv_status_t vv_conv1d_raw_dev(
-    const void* input_fp16, const void* weight_fp16, const void* bias_fp16,
-    void* output_fp16, int in_channels, int in_length, int out_channels,
-    int kernel_size, int stride, int groups, int pad_left, int out_length,
-    void* stream);
-
-vv_status_t vv_rmsnorm_channel_first_dev(
-    const void* input, const void* weight, void* output,
-    int channels, int length, float eps, void* stream);
-
-vv_status_t vv_residual_add_scaled_dev(
-    void* x, const void* y, const void* scale,
-    int channels, int length, void* stream);
-
-vv_status_t vv_channel_bias_add_dev(void* output, const void* bias,
-                                    int channels, int length, void* stream);
-
-vv_status_t vv_silu_dev(void* data, int total, void* stream);
-vv_status_t vv_gelu_dev(void* data, int total, void* stream);
+/* ─── Conversions ──────────────────────────────────────────────────────────── */
 
 vv_status_t vv_fp32_to_fp16_dev(const void* in_fp32, void* out_fp16,
                                 int n, void* stream);
 vv_status_t vv_fp16_to_fp32_dev(const void* in_fp16, void* out_fp32,
                                 int n, void* stream);
 
-vv_status_t vv_gather_tile_dev(const void* src, void* dst, int channels,
-                               int full_len, int tile_offset, int tile_len,
+/* ─── Batched, streaming Conv-VAE (vae_kernels.cu) ───────────────────────── */
+
+/*
+ * Activations are channel-first and packed along time: the items of one
+ * launch sit side by side in one [C][ld] buffer. Only convolutions look back
+ * in time, so only they need item boundaries, which they take from a
+ * descriptor table passed by value — no upload, nothing to keep alive, and a
+ * launch that could be captured into a graph as it stands.
+ */
+
+/** @brief Items per launch; bounded so the table fits in the kernel params. */
+#define VV_VAE_MAX_ITEMS 32
+
+/** @brief One item's view of one convolution layer. */
+typedef struct vv_vae_conv_item {
+    int64_t     in_off;    /**< first input column in the packed input      */
+    int64_t     out_off;   /**< first output column in the packed output    */
+    const void* in_ptr;    /**< the item's own input, overriding in_off     */
+    const void* tail_in;   /**< [in_ch][cap] left context; NULL = zeros     */
+    void*       tail_out;  /**< [in_ch][cap] receives the next context      */
+    void*       out_ptr;   /**< transposed output: rows [frame][out_ld]     */
+    int         in_len;    /**< input columns this chunk                    */
+    int         out_len;   /**< output columns this chunk                   */
+    int         have;      /**< context columns in front of the input       */
+    int         keep;      /**< context columns to leave for the next chunk */
+    int         out_ld;    /**< transposed output row stride, elements      */
+    int         skip;      /**< leading output frames not written           */
+} vv_vae_conv_item_t;
+
+typedef struct vv_vae_conv_desc {
+    int                n;     /**< items                                    */
+    int                cap;   /**< context stride per channel, columns      */
+    vv_vae_conv_item_t it[VV_VAE_MAX_ITEMS];
+} vv_vae_conv_desc_t;
+
+/**
+ * @brief Causal conv (groups = 1) over every item: stem, downsample, head.
+ * @param transposed  Write each item's output as rows [frame][out_ch] at its
+ *                    out_ptr (the head) instead of packed channel-first.
+ */
+vv_status_t vv_vae_conv_dev(const vv_vae_conv_desc_t* d, const void* x,
+                            int64_t ld_in, const void* w, const void* b,
+                            void* y, int64_t ld_out, int in_ch, int out_ch,
+                            int k, int stride, bool transposed, void* stream);
+
+/** @brief Save each item's next left context (the last `keep` columns). */
+vv_status_t vv_vae_tail_dev(const vv_vae_conv_desc_t* d, const void* x,
+                            int64_t ld_in, int in_ch, void* stream);
+
+/**
+ * @brief 1/rms per packed column into rinv[0..T), and per context column of
+ * the items in `d` (may be NULL) into rinv[T + item * cap + j].
+ */
+vv_status_t vv_vae_rms_dev(const void* x, int64_t ld, int64_t T, int C,
+                           float eps, float* rinv,
+                           const vv_vae_conv_desc_t* d, void* stream);
+
+/**
+ * @brief xout = xin + gamma * (dwconv(rmsnorm(xin)) + bias), fused.
+ * rinv comes from vv_vae_rms_dev over the same input and descriptor.
+ */
+vv_status_t vv_vae_mixer_dev(const vv_vae_conv_desc_t* d, const void* xin,
+                             void* xout, int64_t ld, const float* rinv,
+                             int64_t T_total, const void* norm_w,
+                             const void* conv_w, const void* conv_b,
+                             const void* gamma, int C, int k, void* stream);
+
+/** @brief Epilogues of vv_vae_gemm_nn_dev. */
+#define VV_VAE_EPI_BIAS_GELU  0  /**< C = gelu(A @ B + bias)                 */
+#define VV_VAE_EPI_BIAS_RESID 1  /**< C += gamma * (A @ B + bias), in place  */
+#define VV_VAE_EPI_BIAS       2  /**< C = A @ B + bias, rounded once         */
+
+/**
+ * @brief Lay the inputs of a strided conv out as GEMM columns.
+ *
+ * col[ic * k + kk][q] is what tap kk of input channel ic sees for packed
+ * output column p0 + q: context from the item's state, its input, or the
+ * zero padding past a final chunk — the same resolution vv_vae_conv_dev
+ * makes. A GEMM of the [out][in * k] weight against it is the conv.
+ */
+vv_status_t vv_vae_im2col_dev(const vv_vae_conv_desc_t* d, const void* x,
+                              int64_t ld_in, int in_ch, int k, int stride,
+                              int64_t p0, int pc, void* col, int64_t ldcol,
+                              void* stream);
+
+/**
+ * @brief The conv over im2col columns (vv_vae_im2col_dev): y = w @ col + b.
+ *
+ * FP32 on the CUDA cores, each output summing its products in the direct
+ * kernel's (in channel, tap) order, so the result is bit-identical to
+ * vv_vae_conv_dev. `w` is [out_ch][K] with K = in_ch * k.
+ * @param y     Packed channel-first output (already offset to column p0),
+ *              stride ld_out; NULL writes the transposed rows of the items
+ *              in `d` instead (the head), column q being packed column p0 + q.
+ * @param tile  16, 32 or 64 (block tile edge), or 0 to pick the widest that
+ *              fills the card. The bits do not depend on it.
+ */
+vv_status_t vv_vae_conv_gemm_dev(const vv_vae_conv_desc_t* d, const void* w,
+                                 const void* col, int64_t ldcol, const void* b,
+                                 void* y, int64_t ld_out, int out_ch, int K,
+                                 int64_t p0, int pc, int tile, void* stream);
+
+/**
+ * @brief C[M, P] (stride ldc) from A[M, K] @ B[K, P] (stride ldb).
+ * @param rinv, norm_w  Both or neither: B is RMS-normalised while it is
+ *                      staged, B[k][p] * rinv[p] * norm_w[k].
+ * @param tile          64 or 128 (block tile edge), or 0 to choose from the
+ *                      grid size. Every element sums its K products in the
+ *                      same order whatever the tile, so the bits do not
+ *                      depend on it.
+ */
+vv_status_t vv_vae_gemm_nn_dev(int epilogue, const void* A, const void* B,
+                               int64_t ldb, void* C, int64_t ldc,
+                               int M, int K, int P, const void* bias,
+                               const void* gamma, const float* rinv,
+                               const void* norm_w, int tile, void* stream);
+
+/** @brief Where the rows of a TN GEMM go (speech connectors). */
+#define VV_VAE_ROWS_PLAIN        0  /**< C[r][c], stride ldc                  */
+#define VV_VAE_ROWS_STORE        1  /**< segment rows, as computed            */
+#define VV_VAE_ROWS_STORE_TRUNC  2  /**< segment rows, FP16 truncated          */
+#define VV_VAE_ROWS_ACC_TRUNC    3  /**< segment rows += value, truncated      */
+
+typedef struct vv_vae_row_seg {
+    int   row0;   /**< first packed row of this segment */
+    int   ld;     /**< destination row stride, elements */
+    void* dst;
+} vv_vae_row_seg_t;
+
+typedef struct vv_vae_rows {
+    int              mode;
+    int              n;
+    vv_vae_row_seg_t seg[VV_VAE_MAX_ITEMS];
+} vv_vae_rows_t;
+
+/**
+ * @brief C[M, N] = A[M, K] (stride lda) @ B[N, K]^T + bias, with the rows
+ * scattered per `rows` (NULL = plain). Truncation reproduces the host-side
+ * FP32 sum and float_to_half the connectors' outputs used to go through.
+ */
+vv_status_t vv_vae_gemm_tn_dev(const void* A, int64_t lda, const void* B,
+                               void* C, int64_t ldc, int M, int N, int K,
+                               const void* bias, const vv_vae_rows_t* rows,
                                void* stream);
-vv_status_t vv_scatter_tile_dev(const void* src, void* dst, int channels,
-                                int full_len, int tile_offset, int tile_len,
-                                void* stream);
+
+/** @brief FP32 -> FP16 with a 64-bit count. */
+vv_status_t vv_vae_f32_to_f16_dev(const float* in, void* out, int64_t n,
+                                  void* stream);
+
+/** @brief Block the calling host thread until `ev` has completed. */
+vv_status_t vv_dev_event_sync(void* ev);
 
 #ifdef __cplusplus
 }

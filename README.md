@@ -30,7 +30,7 @@ $ vv_cli --model ./model_hf --audio meeting.wav --output transcript.json
                              your country.
 [ 11.73 -  22.29] Speaker 1  He hoped there would be stew for dinner, turnips
                              and carrots and bruised potatoes...
-RTF 0.055  (120 s of audio in 6.5 s)
+RTF 0.046  (120 s of audio in 5.5 s)
 ```
 
 ---
@@ -67,15 +67,15 @@ RTX 3090, CUDA 12.4, Ryzen 9 5900X. Defaults unless noted.
 | | |
 |---|---|
 | Model load | **9.5 s** |
-| Speech encoding | **243 ms** per 11 s of audio |
+| Speech encoding | **50 ms** per 11 s of audio, 352 ms per 120 s, 5.4 s per 32 min |
 | Prefill | **3056 tok/s** on a 14449-token prompt |
 | Decode | **131 tok/s** at 0.2K context, 123 at 1.5K, 93 averaged over a 14K-to-24K window; 132 / 129 / 107 with `--attn flashinfer` |
-| RTF | **0.055** on a 120 s file, **0.067** on 32 minutes (0.060 with `--attn flashinfer`) |
+| RTF | **0.046** on a 120 s file, **0.058** on 32 minutes (0.051 with `--attn flashinfer`) |
 | VRAM | 9.8 GB (3.2 GB weights + 1.8 GB KV at a 32K window) |
 
 `transformers` + `bitsandbytes` on the same GPU and checkpoint: 27.6 tok/s.
 
-A 32-minute recording transcribes in 128 s (115 s with `--attn flashinfer`):
+A 32-minute recording transcribes in 112 s (98 s with `--attn flashinfer`):
 14449 prompt tokens, 9522 generated, 168 segments, flat memory throughout.
 
 ### CPU only
@@ -88,8 +88,11 @@ defaulted to physical cores.
 | Prefill | **77 tok/s**, 991 GFLOP/s across the quantized GEMMs |
 | Decode | **7.9 tok/s** (12 cores, AVX2) |
 | RTF | **0.81** on a 30 s file |
+| Speech encoder | **2.4 s** per 11 s of audio (was 70 s) |
 
-Output is identical to the GPU path.
+Output is identical to the GPU path. The CPU speech encoder is time-tiled
+with carried context, so its memory is bounded by the tile rather than the
+file, and its FFNs and downsamples go through the same packed GEMM.
 
 Prefill is a packed GEMM: both operands are copied into k-major panels and a
 6x16 register tile accumulates over the k-block, with the panels sized so the
@@ -153,8 +156,25 @@ curl http://localhost:8080/v1/audio/transcriptions \
      -F file=@meeting.mp3 -F response_format=verbose_json
 ```
 
-`--slots N` runs N requests concurrently against **one** copy of the weights;
-each slot costs only its own KV cache and workspace. Two 30-second files
+`--slots N` runs N requests concurrently against **one** copy of the weights,
+the speech encoders' included; each slot costs only its own KV cache,
+workspace and 1.4 MB of encoder state. Their encoder work goes through one
+worker per device that plans one launch at a time from whatever has
+arrived, so concurrent requests share launches and a short request that
+arrives while a long file is encoding goes out in the long file's next
+launch instead of after all of it. Eight 30-second files on one 3090:
+
+| `--slots` | before | now | VRAM per slot added |
+|---|---|---|---|
+| 1 | 18.5 s | **14.4 s** | |
+| 2 | 18.1 s | **14.8 s** | |
+| 4 | 18.2 s | **14.8 s** | 3.6 GB -> **2.3 GB** |
+
+A short request that arrives while a long file is being encoded joins the
+long file's next launch, and the encoder runs at background stream
+priority, so the short one's decode is not queued behind it: an 11 s clip
+sent 0.3 s after a 32-minute one returns in 2.3 s (0.75 s alone).
+ Two 30-second files
 finish in 4.2 s together against 5.8 s back to back, returning identical
 transcripts either way. Not 2×, because decode
 is bandwidth-bound on the weights and interleaves — everything either side of
@@ -535,8 +555,7 @@ Tagging, what each tag guarantees, and how to cut a release:
 
 ```bash
 export PATH=/usr/local/cuda-12.4/bin:$PATH
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DVV_ENABLE_TRT=OFF \
-      -DCMAKE_CUDA_ARCHITECTURES=86
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build -j
 ```
 
@@ -572,7 +591,7 @@ the performance cores. **There is no Metal backend.** See "Not done" below.
 VV_TEST_MODEL=./model_hf ctest --test-dir build --output-on-failure
 ```
 
-Twenty-eight entries — the attention suites run once per backend
+Twenty-nine entries — the attention suites run once per backend
 (`VV_ATTN=fa1|fa2|flashinfer`). The ones that need weights report SKIP without
 `VV_TEST_MODEL`. `test_cpu_kernels` checks every CPU kernel against a scalar
 reference, which is what makes the SIMD paths verifiable per architecture —
@@ -620,6 +639,38 @@ flowchart LR
 No mel spectrogram, no FFT. Raw 24 kHz PCM goes straight into two Conv-VAE
 tokenizers, each compressing 3200× (ratios 8·5·5·4·2·2) down to 7.5 Hz. The
 two latent streams are projected to the LLM's 3584 dims and added.
+
+### The speech front end
+
+Both encoders and both connectors are one object per device: FP16 weights
+uploaded once, an arena sized from the largest launch (30 s of audio across
+up to 16 jobs by default, `VV_ENC_BATCH_SEC` to change it), and a
+per-stream state holding every convolution's left context. An encode is
+kernel launches on the caller's stream and nothing else -- no allocation, no
+free, no sync -- so it cannot stall another slot's decode.
+
+A launch packs its jobs along time with no padding. Norms, GEMMs and GELU
+run over the concatenated axis without knowing jobs exist; only the
+convolutions look back in time, and they find each job's edge, and its left
+context in its state, in a descriptor table passed with the launch. So one
+launch can mix segments of a long file, several requests and chunks of live
+streams, and every one of them comes out bit-identical to encoding it
+alone. Streaming is exact for any chunk length: a layer that cannot finish
+an output keeps `total - out * stride` inputs for the next chunk rather than
+a fixed `k - stride`. A job with no state is a stateless window, encoded
+from zero context the way Streaming-7B encodes its 26-frame windows.
+
+The acoustic and semantic encoders run concurrently on two streams. Each
+mixer is one kernel (RMSNorm, depthwise conv, gamma residual), the FFN's
+norm is applied while its GEMM stages the operand and its bias, GELU and
+residual are the GEMMs' epilogues. The downsample and head convolutions run
+as a tiled FP32 GEMM over im2col columns that adds each output's products
+in the direct convolution's order, and the few-column deep-stage FFN GEMMs
+use a smaller tile rather than a K split -- nothing re-associates a sum,
+so the latents, the prompt embedding and the transcript are bit-identical
+to the per-request encoder this replaced. The connectors then write the
+prompt's hidden rows in place, the semantic one accumulating onto the
+acoustic one.
 
 ### The acoustic latent is a distribution
 
@@ -876,8 +927,6 @@ speech encoder or the connectors touches the default stream any more.
   claim that cannot be stood behind. The seam exists:
   `include/vibevoice/device.h` declares the op set, a build links exactly one
   implementation of it, and `src/device/device_none.c` shows the shape.
-- **`src/trt/`** is stubs. The CUDA encoder does 11 s of audio in 243 ms, so
-  TensorRT may never be worth it.
 
 ---
 
@@ -898,10 +947,10 @@ src/inference/       pipeline, decoder, KV cache, sampling, post-processing
 src/engine/          slot pool over one set of weights
 src/server/          HTTP and the OpenAI-compatible API
 cli/                 transcribe, serve, chat, mic
-tools/               reference diffing, AWQ conversion, ONNX/TRT export
+tools/               reference diffing, AWQ conversion
 ```
 
 ## Licence
 
-MIT, matching the model. Third-party: cJSON (MIT). CUDA and TensorRT are
-covered by the NVIDIA EULA.
+MIT, matching the model. Third-party: cJSON (MIT). CUDA is covered by the
+NVIDIA EULA.
