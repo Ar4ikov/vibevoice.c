@@ -699,7 +699,14 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         size_t kv_per_token = vv_kv_cache_bytes(
             c->primary_layers, llm->num_key_value_heads,
             llm->head_dim, 1, p.kv_format);
-        size_t ws_target = (size_t)512 * 1024 * 1024;
+        /*
+         * A streaming model's context starts at the 256 MB workspace (see
+         * the allocation below), and so does every clone of it; budgeting
+         * 512 MB per slot there would starve the KV pool the sessions share.
+         */
+        size_t ws_target =
+            c->model->config.family == VV_FAMILY_ASR_STREAMING_7B
+            ? (size_t)256 * 1024 * 1024 : (size_t)512 * 1024 * 1024;
 
         /*
          * The context is the first thing to give up. A shorter window costs
