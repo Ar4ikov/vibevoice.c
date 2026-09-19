@@ -60,9 +60,32 @@
 extern const char   vv_metal_source[];
 extern const size_t vv_metal_source_len;
 
-/* Commit a stream's command buffer after this many launches so the GPU
- * starts on long sequences while the rest is still being encoded. */
+/*
+ * When to commit a stream's command buffer. Early enough that the GPU
+ * starts while the rest is still being encoded -- and, more importantly,
+ * that no single buffer runs long enough for the system's GPU watchdog:
+ * a speech encoder pass over 16 minutes of audio filled one with about a
+ * minute of work and was killed ("Caused GPU Timeout Error"). The
+ * threadgroup count is the cheap proxy for how much work that is; 64K of
+ * them is well under a second even for the slowest kernels here (a
+ * 2048-row NF4 GEMM runs 9.5K in 140 ms).
+ */
 #define MTL_FLUSH_EVERY 128
+#define MTL_FLUSH_GROUPS (64u * 1024u)
+
+/*
+ * How much submitted work a stream may have outstanding. The watchdog that
+ * killed the encoder counts from submission, not from when a buffer starts
+ * running, so a queue seconds deep times out however short each buffer is.
+ * The bound is on the work itself, not on the number of buffers: a decode
+ * step is ~450 tiny launches across four buffers and must never stall on
+ * one of them, while one encoder buffer alone can be a second of GPU.
+ * Committing past the budget waits for the oldest buffer to finish, which
+ * is also the backpressure that stops a long file's encoder from running
+ * minutes ahead of the GPU.
+ */
+#define MTL_INFLIGHT_GROUPS (192u * 1024u)
+#define MTL_MAX_IN_FLIGHT 8
 
 /*
  * Allocations from this size up are anonymous mappings wrapped as buffers:
@@ -88,6 +111,7 @@ typedef struct mtl_alloc {
 /* ─── Recorded launches (graph capture) ─────────────────────────────────── */
 
 typedef struct mtl_cmd {
+    const char* name;                     /* the MSL function, for traces  */
     void*    pso;                         /* id<MTLComputePipelineState>, unretained */
     void*    buf[VV_MTL_MAX_BUFS];        /* id<MTLBuffer>, unretained               */
     size_t   off[VV_MTL_MAX_BUFS];
@@ -122,9 +146,15 @@ typedef struct mtl_pso_slot {
     id<MTLCommandBuffer>         cb;      /* being filled                 */
     id<MTLComputeCommandEncoder> enc;     /* open on cb, or nil           */
     id<MTLCommandBuffer>         last;    /* last committed               */
+    id<MTLCommandBuffer>         queued[MTL_MAX_IN_FLIGHT];
+    uint64_t                     queued_groups[MTL_MAX_IN_FLIGHT];
+    int                          n_queued;
+    uint64_t                     groups_out;/* groups in queued[]          */
     os_unfair_lock               lock;
     int                          n_disp;  /* launches in cb               */
+    uint64_t                     n_groups;/* threadgroups in cb            */
     mtl_graph_t*                 rec;     /* capturing into, or NULL      */
+    const char*                  last_kernel; /* for VV_METAL_TRACE        */
     vv_status_t                  error;   /* sticky, from a failed cb     */
 }
 @end
@@ -164,6 +194,7 @@ typedef struct mtl_pso_slot {
     mtl_pso_slot_t    pso[MTL_PSO_SLOTS];
     os_unfair_lock    pso_lock;
     bool              sync_each;    /* VV_METAL_SYNC=1: wait after every launch */
+    double            trace_ms;     /* VV_METAL_TRACE=<ms>: report long buffers */
 }
 @end
 @implementation VVMetal
@@ -229,6 +260,8 @@ static VVMetal* mtl(void) {
             m->streams = [NSHashTable weakObjectsHashTable];
             const char* e = getenv("VV_METAL_SYNC");
             m->sync_each = e && e[0] == '1';
+            const char* tr = getenv("VV_METAL_TRACE");
+            m->trace_ms = (tr && tr[0]) ? atof(tr) : 0.0;
 
             id<MTLDevice> d = MTLCreateSystemDefaultDevice();
             const char* off = getenv("VV_METAL_DISABLE");
@@ -495,6 +528,7 @@ static id<MTLCommandBuffer> current_cb(VVStream* s) {
     if (!s->cb) {
         s->cb = [s->queue commandBuffer];
         s->n_disp = 0;
+        s->n_groups = 0;
     }
     return s->cb;
 }
@@ -506,19 +540,78 @@ static id<MTLComputeCommandEncoder> encoder(VVStream* s) {
     return s->enc;
 }
 
+/**
+ * @brief Drop the queued buffers that have finished, oldest first.
+ *
+ * Status is a non-blocking read, so this is how the stream learns the GPU
+ * caught up without ever waiting for it.
+ */
+static void retire_finished(VVStream* s) {
+    int done = 0;
+    while (done < s->n_queued) {
+        const MTLCommandBufferStatus st = s->queued[done].status;
+        if (st != MTLCommandBufferStatusCompleted &&
+            st != MTLCommandBufferStatusError) break;
+        if (st == MTLCommandBufferStatusError && s->error == VV_OK) {
+            VV_LOG_E("metal: command buffer failed: %s",
+                     s->queued[done].error.localizedDescription.UTF8String);
+            s->error = VV_ERR_CUDA;
+        }
+        s->groups_out -= s->queued_groups[done];
+        s->queued[done] = nil;
+        done++;
+    }
+    if (!done) return;
+    for (int i = done; i < s->n_queued; i++) {
+        s->queued[i - done] = s->queued[i];
+        s->queued_groups[i - done] = s->queued_groups[i];
+        s->queued[i] = nil;
+    }
+    s->n_queued -= done;
+}
+
 /** @brief Commit whatever is being filled. Caller holds the stream lock. */
 static void flush_locked(VVStream* s) {
     if (!s->cb) return;
     end_encoder(s);
+    const double trace = mtl()->trace_ms;
+    if (trace > 0.0) {
+        const int nd = s->n_disp;
+        const uint64_t ng = s->n_groups;
+        const char* last = s->last_kernel;
+        [s->cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            const double ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+            if (ms >= trace)
+                VV_LOG_I("metal: command buffer %8.1f ms, %d launches, "
+                         "%llu groups, last '%s'", ms, nd,
+                         (unsigned long long)ng, last ? last : "?");
+        }];
+    }
     [s->cb commit];
     s->last = s->cb;
+    const uint64_t ng_cb = s->n_groups;
+    /* Forget the ones that already finished; asking costs nothing. */
+    retire_finished(s);
+    /* Then wait, oldest first, until this one fits within the budget. */
+    while (s->n_queued == MTL_MAX_IN_FLIGHT ||
+           (s->n_queued > 0 && s->groups_out + ng_cb > MTL_INFLIGHT_GROUPS)) {
+        [s->queued[0] waitUntilCompleted];
+        retire_finished(s);
+    }
+    s->queued_groups[s->n_queued] = ng_cb;
+    s->queued[s->n_queued++] = s->cb;
+    s->groups_out += ng_cb;
     s->cb = nil;
     s->n_disp = 0;
+    s->n_groups = 0;
 }
 
 /** @brief Commit and wait; reports a GPU-side failure once. */
 static vv_status_t drain_locked(VVStream* s) {
     flush_locked(s);
+    for (int i = 0; i < s->n_queued; i++) s->queued[i] = nil;
+    s->n_queued = 0;
+    s->groups_out = 0;
     id<MTLCommandBuffer> last = s->last;
     if (last) {
         [last waitUntilCompleted];
@@ -582,6 +675,8 @@ static void encode_cmd(VVStream* s, const mtl_cmd_t* c) {
     [e dispatchThreadgroups:MTLSizeMake(c->grid[0], c->grid[1], c->grid[2])
       threadsPerThreadgroup:MTLSizeMake(c->block[0], c->block[1], c->block[2])];
     s->n_disp++;
+    s->n_groups += (uint64_t)c->grid[0] * c->grid[1] * c->grid[2];
+    s->last_kernel = c->name;
 }
 
 static vv_status_t graph_append(mtl_graph_t* g, const mtl_cmd_t* c) {
@@ -627,6 +722,7 @@ vv_status_t vv_mtl_run(void* stream, const vv_mtl_launch_t* l) {
 
         mtl_cmd_t c;
         memset(&c, 0, sizeof(c));
+        c.name = l->kernel;
         c.pso = (__bridge void*)pso;
         c.nbufs = l->nbufs;
         for (int i = 0; i < l->nbufs; i++) {
@@ -678,10 +774,16 @@ vv_status_t vv_mtl_run(void* stream, const vv_mtl_launch_t* l) {
         } else {
             encode_cmd(s, &c);
             if (null_stream || mtl()->sync_each) {
+                const double t0 = mtl()->sync_each ? vv_time_ms() : 0.0;
                 st = drain_locked(s);
                 if (st != VV_OK)
                     VV_LOG_E("metal: '%s' failed on the GPU", l->kernel);
-            } else if (s->n_disp >= MTL_FLUSH_EVERY) {
+                else if (mtl()->sync_each)
+                    VV_LOG_I("metal: %-28s %8.3f ms  grid %u x %u x %u",
+                             l->kernel, vv_time_ms() - t0, l->grid[0],
+                             l->grid[1], l->grid[2]);
+            } else if (s->n_disp >= MTL_FLUSH_EVERY ||
+                       s->n_groups >= MTL_FLUSH_GROUPS) {
                 flush_locked(s);
             }
         }
@@ -1240,8 +1342,11 @@ vv_status_t vv_dev_graph_launch(void* graph_exec, void* stream) {
         st = VV_ERR_UNSUPPORTED;
     } else {
         @autoreleasepool {
-            for (int i = 0; i < g->n; i++) encode_cmd(s, &g->cmds[i]);
-            /* One submission for the whole step. */
+            for (int i = 0; i < g->n; i++) {
+                encode_cmd(s, &g->cmds[i]);
+                if (s->n_groups >= MTL_FLUSH_GROUPS) flush_locked(s);
+            }
+            /* The rest of the step in one submission. */
             flush_locked(s);
             if (null_stream || mtl()->sync_each) st = drain_locked(s);
         }
