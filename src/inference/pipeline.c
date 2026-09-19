@@ -18,6 +18,9 @@
 #include "vibevoice/frontend.h"
 #include "vibevoice/cpu_kernels.h"
 #include "vibevoice/vibevoice.h"
+#include "vibevoice/bitnet.h"
+#include "vibevoice/vae_i8.h"
+#include "vibevoice/gguf.h"
 #include "cJSON.h"
 
 #include <string.h>
@@ -587,11 +590,24 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         if (lo.smooth_maps <= 0 && em && em[0])
             lo.smooth_maps = atoi(em);
     }
+    lo.source = p.weights_source;
+    lo.head = p.head_format;
+    lo.vae = p.vae_numerics;
+    lo.cpu = cpu_only ? 1 : 0;
     s = vv_model_load_ex(model_dir, &lo, &c->model);
     if (s != VV_OK) {
         VV_LOG_E("inference: failed to load model: %s", vv_status_str(s));
         vv_free(c);
         return s;
+    }
+    if (!cpu_only) {
+        /* BitNet's FP32 norms and Q6_K table, in the forms the GPU reads. */
+        s = vv_model_bitnet_prepare_gpu(c->model);
+        if (s != VV_OK) {
+            vv_model_free(c->model);
+            vv_free(c);
+            return s;
+        }
     }
 
     const vv_llm_config_t* llm = &c->model->config.llm;
@@ -1742,6 +1758,73 @@ static void save_tokens(const int32_t* ids, int n) {
     fclose(f);
 }
 
+/* ─── Host-side embedding, final norm and head ──────────────────────────────
+ *
+ * Most models: an FP16 table, FP16 norm weights, an FP16 head. asr-bitnet
+ * from its GGUF pair embeds from the Q6_K table the reference looks rows up
+ * in, keeps its final norm in FP32 and computes the head in the reference's
+ * order, or from int8 rows when --head int8 asked for them.
+ */
+
+static vv_status_t embed_host(const vv_model_t* m, const int32_t* ids, int n,
+                              float* out) {
+    const int hs = m->config.llm.hidden_size;
+    const int V = m->config.llm.vocab_size;
+    if (!m->embed_q6k.data)
+        return vv_embedding_cpu(m->embed_tokens.data, ids, out, n, hs);
+    const size_t row = (size_t)m->embed_q6k.shape[1];
+    for (int i = 0; i < n; i++) {
+        if (ids[i] < 0 || ids[i] >= V) return VV_ERR_INVALID_ARG;
+        vv_q6k_dequant_row((const uint8_t*)m->embed_q6k.data + (size_t)ids[i] * row,
+                           out + (size_t)i * hs, hs);
+    }
+    return VV_OK;
+}
+
+static void final_norm_host(const vv_model_t* m, const float* x, float* y) {
+    const vv_llm_config_t* c = &m->config.llm;
+    if (m->final_norm.dtype == VV_DTYPE_F32)
+        vv_bitnet_rmsnorm_cpu(x, (const float*)m->final_norm.data, y, 1,
+                              c->hidden_size, c->rms_norm_eps);
+    else
+        vv_rmsnorm_cpu(x, m->final_norm.data, y, 1, c->hidden_size,
+                       c->rms_norm_eps);
+}
+
+static vv_status_t head_host(const vv_model_t* m, const float* x,
+                             void* scratch, size_t scratch_bytes,
+                             int32_t* token) {
+    const vv_llm_config_t* c = &m->config.llm;
+    const int hs = c->hidden_size, V = c->vocab_size;
+    if (m->head_bound.data && m->lm_head.data && m->head_i8.data) {
+        /* the F16 head's own argmax, read through its int8 filter */
+        float v = 0.0f;
+        int n = 0;
+        vv_status_t s = vv_bitnet_head_filtered_argmax_cpu(
+            x, (const uint16_t*)m->lm_head.data, (const int8_t*)m->head_i8.data,
+            (const float*)m->head_i8_scale.data, (const float*)m->head_bound.data,
+            V, hs, scratch, scratch_bytes, token, &v, &n);
+        /* the logit, to diff against VibeASR.cpp's (bit for bit so far) */
+        VV_LOG_D("head: token %d logit %.6f (%d rows scored in F16)",
+                 (int)*token, (double)v, n);
+        return s;
+    }
+    if (m->head_i8.data) {
+        int8_t q[8192];
+        float sc;
+        if (hs > 8192) return VV_ERR_UNSUPPORTED;
+        vv_status_t s = vv_act_quant_i8_cpu(x, 1, hs, q, &sc, NULL);
+        if (s != VV_OK) return s;
+        return vv_i8_head_argmax_cpu(q, sc, (const int8_t*)m->head_i8.data,
+                                     (const float*)m->head_i8_scale.data, V,
+                                     hs, token, NULL);
+    }
+    if (m->config.family == VV_FAMILY_ASR_BITNET)
+        return vv_bitnet_head_f16_argmax_cpu(x, (const uint16_t*)m->lm_head.data,
+                                             V, hs, token, NULL);
+    return vv_lm_head_argmax_cpu(x, m->lm_head.data, V, hs, token, NULL);
+}
+
 /**
  * @brief Greedy token from a head that stays on the host.
  *
@@ -2033,11 +2116,13 @@ static vv_status_t transcribe_gpu(
     double t_step = vv_time_ms();
     dump_f32("c_audio24k", audio_samples, (size_t)num_samples);
 
-    if (!ctx->frontend || !ctx->fe_stream) {
+    const vv_i8vae_t* i8vae = ctx->model->i8vae;
+    if (!i8vae && (!ctx->frontend || !ctx->fe_stream)) {
         VV_LOG_E("inference: no speech encoder on the device");
         return VV_ERR_WEIGHT_MISSING;
     }
-    const int n_audio_frames = vv_frontend_frames(ctx->frontend, num_samples);
+    const int n_audio_frames = i8vae ? vv_i8vae_frames(i8vae, num_samples)
+                                     : vv_frontend_frames(ctx->frontend, num_samples);
     perf->audio_frames = n_audio_frames;
 
     int32_t* input_ids = NULL;
@@ -2116,13 +2201,45 @@ static vv_status_t transcribe_gpu(
     }
     vv_free(input_ids);
     /* The front end's row writes wait for this, not for the host. */
-    vv_dev_event_record(ctx->fe_ready, ctx->compute_stream);
+    if (ctx->fe_ready) vv_dev_event_record(ctx->fe_ready, ctx->compute_stream);
     perf->sequence_build_ms = vv_time_ms() - t_step;
 
     /* ═══ STEP 2: Audio → the prompt's speech rows ═══ */
     t_step = vv_time_ms();
     VV_LOG_I("inference: step 1 — encoding audio");
-    {
+    if (i8vae) {
+        /*
+         * VibeASR.cpp's int8 encoder runs on the host (it is not streamable:
+         * one scale per whole tensor), and its summed features go into the
+         * prompt's rows as FP16.
+         */
+        void* audio_rows = (uint8_t*)hidden_states_gpu
+                         + (size_t)audio_offset * (size_t)hs * 2;
+        float* feat = (float*)vv_alloc((size_t)(n_audio_frames > 0 ? n_audio_frames : 1)
+                                       * hs * sizeof(float));
+        uint16_t* h16 = (uint16_t*)vv_alloc((size_t)(n_audio_frames > 0 ? n_audio_frames : 1)
+                                            * hs * 2);
+        int nf = 0;
+        s = (feat && h16) ? VV_OK : VV_ERR_OUT_OF_MEMORY;
+        if (s == VV_OK)
+            s = vv_i8vae_encode(i8vae, audio_samples, num_samples,
+                                VV_I8VAE_WINDOW_SAMPLES, feat, &nf);
+        if (s == VV_OK && nf != n_audio_frames) s = VV_ERR_SHAPE_MISMATCH;
+        if (s == VV_OK) {
+            for (size_t i = 0; i < (size_t)nf * hs; i++)
+                h16[i] = vv_float_to_half_rne(feat[i]);
+            s = vv_dev_memcpy_h2d(audio_rows, h16, (size_t)nf * hs * 2,
+                                  ctx->compute_stream);
+        }
+        if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
+        vv_free(feat);
+        vv_free(h16);
+        if (s != VV_OK) {
+            VV_LOG_E("inference: int8 speech encoder failed: %s", vv_status_str(s));
+            vv_dev_free(hidden_states_gpu);
+            return s;
+        }
+    } else {
         void* audio_rows = (uint8_t*)hidden_states_gpu
                          + (size_t)audio_offset * (size_t)hs * 2;
         s = encode_audio_gpu(ctx, params, audio_samples, num_samples,
@@ -2575,7 +2692,6 @@ static vv_status_t transcribe_cpu(
     vv_status_t s;
     const vv_llm_config_t* llm = &ctx->model->config.llm;
     int hs = llm->hidden_size;
-    int vocab_size = llm->vocab_size;
     int max_new_tokens = params ? params->max_new_tokens : 64000;
     if (max_new_tokens <= 0) max_new_tokens = 64000;
 
@@ -2604,6 +2720,30 @@ static vv_status_t transcribe_cpu(
     float* acoustic_features = NULL, *semantic_features = NULL;
     int n_acoustic_frames = 0, n_semantic_frames = 0;
 
+    if (ctx->model->i8vae) {
+        /* VibeASR.cpp's int8 encoder: features come out already summed. */
+        int nf = 0;
+        const int cap = vv_i8vae_frames(ctx->model->i8vae, num_samples);
+        float* feat = (float*)vv_alloc((size_t)(cap > 0 ? cap : 1) * hs * sizeof(float));
+        if (!feat) return VV_ERR_OUT_OF_MEMORY;
+        s = vv_i8vae_encode(ctx->model->i8vae, audio_samples, num_samples,
+                            VV_I8VAE_WINDOW_SAMPLES, feat, &nf);
+        if (s != VV_OK) { vv_free(feat); return s; }
+        if (dump_dir()) {
+            /* the towers one by one, for a diff against VibeASR.cpp's */
+            float* t = (float*)vv_alloc((size_t)(cap > 0 ? cap : 1) * hs * sizeof(float));
+            int tn = 0;
+            if (t && vv_i8vae_encode_tower(ctx->model->i8vae, 0, audio_samples,
+                                           num_samples, t, &tn) == VV_OK)
+                dump_f32("c_i8_acoustic", t, (size_t)tn * hs);
+            if (t && vv_i8vae_encode_tower(ctx->model->i8vae, 1, audio_samples,
+                                           num_samples, t, &tn) == VV_OK)
+                dump_f32("c_i8_semantic", t, (size_t)tn * hs);
+            vv_free(t);
+        }
+        acoustic_features = feat;
+        n_acoustic_frames = n_semantic_frames = nf;
+    }
     if (ctx->acoustic_encoder) {
         vv_conv_vae_encode_cpu(ctx->acoustic_encoder, audio_samples, num_samples,
                                 &acoustic_latents, &n_acoustic_frames);
@@ -2644,6 +2784,7 @@ static vv_status_t transcribe_cpu(
     else memset(combined, 0, (size_t)combined_elems * sizeof(float));
     if (acoustic_features) vv_free(acoustic_features);
     if (semantic_features) vv_free(semantic_features);
+    dump_f32("c_speech_features", combined, (size_t)combined_elems);
 
     perf->audio_encode_ms = vv_time_ms() - t_step;
 
@@ -2667,14 +2808,16 @@ static vv_status_t transcribe_cpu(
         audio_offset = pr.audio_offset;
     }
     perf->prefill_tokens = seq_len;
+    dump_i32("c_prompt_ids", prompt_ids, (size_t)seq_len);
 
     /* Allocate FP32 hidden states on CPU */
     float* hidden = (float*)vv_alloc((size_t)seq_len * hs * sizeof(float));
     if (!hidden) { vv_free(prompt_ids); vv_free(combined); return VV_ERR_OUT_OF_MEMORY; }
 
     /* Embed all prompt tokens */
-    vv_embedding_cpu(ctx->model->embed_tokens.data, prompt_ids, hidden, seq_len, hs);
+    s = embed_host(ctx->model, prompt_ids, seq_len, hidden);
     vv_free(prompt_ids);
+    if (s != VV_OK) { vv_free(hidden); vv_free(combined); return s; }
 
     /* Overlay audio features at speech_pad positions */
     if (n_audio_frames > 0) {
@@ -2690,9 +2833,20 @@ static vv_status_t transcribe_cpu(
     s = vv_decoder_prefill_cpu(ctx->model, hidden, seq_len, ctx->kv_cache,
                                 (float*)ctx->workspace, ctx->workspace_size);
     if (s != VV_OK) { vv_free(hidden); return s; }
+    if (ctx->model->config.family == VV_FAMILY_ASR_BITNET &&
+        ctx->family.frame_samples > 0) {
+        /*
+         * VibeASR.cpp reserves ceil(n/3200) pads, feeds the floor(n/3200)
+         * frames its convolutions produce and decodes from the reserved
+         * length: generated tokens sit that many positions further on.
+         */
+        const int fs = ctx->family.frame_samples;
+        const int reserved = (int)(((int64_t)num_samples + fs - 1) / fs);
+        if (reserved > n_audio_frames)
+            ctx->kv_cache->rope_gap = reserved - n_audio_frames;
+    }
 
     /* Final norm + lm_head + sample (CPU FP32) */
-    const void* norm_w = ctx->model->final_norm.data;
     float* normed = (float*)vv_alloc((size_t)hs * sizeof(float));
     float* hidden_one = (float*)vv_alloc((size_t)hs * sizeof(float));
     float* logits = NULL;   /* the fused head never materialises them */
@@ -2704,11 +2858,10 @@ static vv_status_t transcribe_cpu(
     }
 
     float* last_hidden = hidden + (size_t)(seq_len - 1) * hs;
-    vv_rmsnorm_cpu(last_hidden, norm_w, normed, 1, hs, llm->rms_norm_eps);
+    final_norm_host(ctx->model, last_hidden, normed);
 
     int32_t token_id = 0;
-    s = vv_lm_head_argmax_cpu(normed, ctx->model->lm_head.data,
-                              vocab_size, hs, &token_id, NULL);
+    s = head_host(ctx->model, normed, ctx->workspace, ctx->workspace_size, &token_id);
     vv_free(hidden); hidden = NULL;
     if (s != VV_OK) {
         VV_LOG_E("inference: CPU LM head failed: %s", vv_status_str(s));
@@ -2733,17 +2886,16 @@ static vv_status_t transcribe_cpu(
 
     while (n_generated < max_new_tokens && !token_ends(ctx, token_id)) {
         /* Embed */
-        vv_embedding_cpu(ctx->model->embed_tokens.data, &token_id,
-                          hidden_one, 1, hs);
+        s = embed_host(ctx->model, &token_id, 1, hidden_one);
+        if (s != VV_OK) break;
         /* Decoder step */
         s = vv_decoder_step_cpu(ctx->model, hidden_one, ctx->kv_cache,
                                  (float*)ctx->workspace, ctx->workspace_size);
         if (s != VV_OK) break;
 
         /* Norm + LM head */
-        vv_rmsnorm_cpu(hidden_one, norm_w, normed, 1, hs, llm->rms_norm_eps);
-        s = vv_lm_head_argmax_cpu(normed, ctx->model->lm_head.data,
-                                  vocab_size, hs, &token_id, NULL);
+        final_norm_host(ctx->model, hidden_one, normed);
+        s = head_host(ctx->model, normed, ctx->workspace, ctx->workspace_size, &token_id);
         if (s != VV_OK) break;
         if (token_ends(ctx, token_id)) break;
 
@@ -2765,6 +2917,7 @@ static vv_status_t transcribe_cpu(
     perf->decode_tokens = n_generated;
     perf->decode_tok_per_sec = (perf->decode_ms > 0.001)
         ? (double)n_generated / perf->decode_ms * 1000.0 : 0.0;
+    if (output_tokens) dump_i32("c_tokens", output_tokens, (size_t)n_generated);
 
     /* ═══ STEP 5: Post-processing ═══ */
     t_step = vv_time_ms();

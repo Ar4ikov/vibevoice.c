@@ -16,6 +16,7 @@
 
 #include "vibevoice/bitnet.h"
 #include "vibevoice/device.h"
+#include "vibevoice/inference.h"
 #include "vibevoice/vibevoice.h"
 
 #include <float.h>
@@ -46,9 +47,11 @@ static float frand(void) { return (float)(urand() >> 8) / 16777216.0f * 2.0f - 1
 
 /* ─── References ────────────────────────────────────────────────────────── */
 
-/* ggml fork, ggml-quants.c quantize_row_i8_s, transcribed */
-static inline int ref_nearest_int(float fval) {
-    float val = fval + 12582912.f;
+/* ggml fork, ggml-quants.c quantize_row_i8_s, transcribed. The reference
+ * build contracts nearest_int(x[i] * s) into fma(x, s, 1.5 * 2^23), so the
+ * product is rounded once, together with the magic constant. */
+static inline int ref_nearest_int_mul(float x, float s) {
+    float val = fmaf(x, s, 12582912.f);
     int i;
     memcpy(&i, &val, sizeof(int));
     return (i & 0x007fffff) - 0x00400000;
@@ -61,7 +64,7 @@ static void ref_quantize_row_i8_s(const float* x, int8_t* y, int n, float* s_out
     float s = 127 / max;
     int32_t sum = 0;
     for (int i = 0; i < n; ++i) {
-        int v = ref_nearest_int(x[i] * s);
+        int v = ref_nearest_int_mul(x[i], s);
         if (v > 127) v = 127;
         if (v < -128) v = -128;
         sum += v;
@@ -175,15 +178,39 @@ static void test_act_quant(void) {
     for (int k = 0; k < K; k++) x[1 * K + k] = (float)((k % 255) - 127) * 0.5f;
     for (int k = 0; k < K; k++) x[2 * K + k] = 0.0f;
     x[3 * K + 17] = 1e6f;
-    CHECK(vv_act_quant_i8_cpu(x, M, K, q, sc, sum) == VV_OK, "quant");
-    for (int m = 0; m < M; m++) {
-        float rs;
-        int32_t rsum;
-        ref_quantize_row_i8_s(x + m * K, rq, K, &rs, &rsum);
-        CHECK(memcmp(rq, q + m * K, K) == 0, "row %d codes", m);
-        CHECK(rs == sc[m], "row %d scale %.9g vs %.9g", m, sc[m], rs);
-        CHECK(rsum == sum[m], "row %d sum", m);
+    /* row 4: values whose product with s rounds to k + 0.5 in FP32 while the
+     * exact product does not -- the fused and the unfused quantizer differ */
+    {
+        float* r = x + 4 * K;
+        r[0] = 3.1f;
+        const float s = (float)(127.0 / 3.1);
+        int hits = 0;
+        for (int k = 1; k < K; k++) {
+            const float t = ((float)(k % 200) - 100.0f + 0.5f) / s;
+            uint32_t u;
+            memcpy(&u, &t, 4);
+            u += (uint32_t)(k % 5) - 2u;          /* a few ulps either side */
+            memcpy(&r[k], &u, 4);
+            const float p = r[k] * s;
+            if (p - floorf(p) == 0.5f && fmaf(r[k], s, -p) != 0.0f) hits++;
+        }
+        CHECK(hits > 0, "row 4 has no fused-rounding case");
     }
+    for (int pass = 0; pass < 2; pass++) {
+        /* the scalar fmaf path, then the best ISA's (AVX2 + FMA on x86) */
+        vv_bitnet_cpu_force_isa(pass == 0 ? 1 : 0);
+        memset(q, 0, (size_t)M * K);
+        CHECK(vv_act_quant_i8_cpu(x, M, K, q, sc, sum) == VV_OK, "quant");
+        for (int m = 0; m < M; m++) {
+            float rs;
+            int32_t rsum;
+            ref_quantize_row_i8_s(x + m * K, rq, K, &rs, &rsum);
+            CHECK(memcmp(rq, q + m * K, K) == 0, "pass %d row %d codes", pass, m);
+            CHECK(rs == sc[m], "row %d scale %.9g vs %.9g", m, sc[m], rs);
+            CHECK(rsum == sum[m], "pass %d row %d sum", pass, m);
+        }
+    }
+    vv_bitnet_cpu_force_isa(0);
     free(x); free(q); free(rq);
 }
 
@@ -340,6 +367,67 @@ static void test_head_argmax(void) {
     }
     vv_bitnet_cpu_force_isa(0);
     free(w); free(ws);
+}
+
+/* ggml_vec_dot_f16 (x86 F16C: 4 x 8 FMA lanes over 32, then the reduction)
+ * of an F16 row with an activation rounded to F16, transcribed */
+static float ref_vec_dot_f16(const uint16_t* w, const float* x, int K) {
+    float acc[4][8];
+    memset(acc, 0, sizeof(acc));
+    for (int i = 0; i < K; i += 32)
+        for (int j = 0; j < 4; j++)
+            for (int l = 0; l < 8; l++) {
+                const float xh = vv_half_to_float(vv_float_to_half_rne(x[i + 8 * j + l]));
+                acc[j][l] = fmaf(vv_half_to_float(w[i + 8 * j + l]), xh, acc[j][l]);
+            }
+    float s0[8], t0[4];
+    for (int l = 0; l < 8; l++) s0[l] = (acc[0][l] + acc[2][l]) + (acc[1][l] + acc[3][l]);
+    for (int l = 0; l < 4; l++) t0[l] = s0[l] + s0[l + 4];
+    return (t0[0] + t0[1]) + (t0[2] + t0[3]);
+}
+
+static void test_f16_head(void) {
+    printf("F16 head: full scan == ggml, int8 filter == full scan\n");
+    enum { V = 5003, K = 1536 };
+    uint16_t* w = malloc(sizeof(uint16_t) * V * K);
+    int8_t* q = malloc((size_t)V * K);
+    float* sc = malloc(sizeof(float) * V);
+    float* bd = malloc(sizeof(float) * 3 * V);
+    float* x = malloc(sizeof(float) * K);
+    const size_t sb = vv_bitnet_head_filter_scratch(V, K);
+    void* scratch = malloc(sb);
+    for (size_t i = 0; i < (size_t)V * K; i++) w[i] = vv_float_to_half(frand() * 0.05f);
+    /* a few rows close to each other at the top, and an exact tie */
+    for (int k = 0; k < K; k++) {
+        w[(size_t)4000 * K + k] = vv_float_to_half(0.04f * (float)((k % 13) - 6) / 6.0f);
+        w[(size_t)77 * K + k] = w[(size_t)4000 * K + k];            /* tie, lower id */
+        w[(size_t)3000 * K + k] = vv_float_to_half(0.0399f * (float)((k % 13) - 6) / 6.0f);
+    }
+    CHECK(vv_bitnet_head_filter_build(w, V, K, q, sc, bd) == VV_OK, "filter build");
+    for (int trial = 0; trial < 4; trial++) {
+        for (int k = 0; k < K; k++)
+            x[k] = trial < 2 ? (float)((k % 13) - 6) * (1.0f + 0.01f * frand())
+                             : frand() * 3.0f;
+        int32_t rt = -1;
+        float rv = -INFINITY;
+        for (int r = 0; r < V; r++) {
+            const float v = ref_vec_dot_f16(w + (size_t)r * K, x, K);
+            if (rt < 0 || v > rv) { rv = v; rt = r; }
+        }
+        int32_t t1 = -2, t2 = -3;
+        float v1 = 0, v2 = 0;
+        int n = 0;
+        CHECK(vv_bitnet_head_f16_argmax_cpu(x, w, V, K, &t1, &v1) == VV_OK, "scan");
+        CHECK(vv_bitnet_head_filtered_argmax_cpu(x, w, q, sc, bd, V, K, scratch, sb,
+                                                 &t2, &v2, &n) == VV_OK, "filter");
+        CHECK(t1 == rt && v1 == rv, "trial %d scan %d %.9g vs ggml %d %.9g", trial,
+              t1, v1, rt, rv);
+        CHECK(t2 == rt && v2 == rv, "trial %d filter %d %.9g vs ggml %d %.9g", trial,
+              t2, v2, rt, rv);
+        CHECK(n > 0 && n < V / 4, "trial %d: %d rows scored exactly", trial, n);
+        if (trial < 2) CHECK(rt == 77, "trial %d tie resolved to %d, not 77", trial, rt);
+    }
+    free(w); free(q); free(sc); free(bd); free(x); free(scratch);
 }
 
 static void test_requant(void) {
@@ -557,6 +645,7 @@ int main(void) {
     test_ternary_gemm_isas();
     test_i8_gemm_isas();
     test_head_argmax();
+    test_f16_head();
     test_requant();
 #ifdef VV_HAS_ACCEL
     if (vv_dev_device_count() > 0) test_gpu();

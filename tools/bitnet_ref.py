@@ -180,10 +180,14 @@ def quantize_i8s(w):
 
 
 def act_quant(x):
-    """ggml quantize_row_i8_s per row: s = 127/max(|x|,1e-5), rint, [-128,127]."""
+    """ggml quantize_row_i8_s per row: s = 127/max(|x|,1e-5), rint, [-128,127].
+
+    The reference build fuses x * s + 1.5 * 2^23 into one FMA, so the product
+    is rounded to an integer exactly (FP64 holds it), not first to FP32."""
     amax = np.maximum(np.abs(x).max(axis=-1).astype(np.float64), 0.00001)
     s = (127.0 / amax).astype(F32)
-    q = np.clip(np.rint(x * s[:, None]), -128, 127).astype(np.int8)
+    q = np.clip(np.rint(x.astype(np.float64) * s[:, None].astype(np.float64)),
+                -128, 127).astype(np.int8)
     return q, s
 
 

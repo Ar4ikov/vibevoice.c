@@ -166,10 +166,18 @@ static int best_isa(unsigned mask) {
  * kernel runs), read-only afterwards. */
 static int g_isa = ISA_AUTO;
 static unsigned g_isa_mask = 0;
+static int g_fma = 0;           /* AVX2 + FMA3: the vector activation quantizer */
 static vv_once_t g_isa_once = VV_ONCE_INIT;
 
 static void init_isa(void) {
     g_isa_mask = detect_isa_mask();
+#ifdef VV_BN_X86
+    if (g_isa_mask & (1u << ISA_AVX2)) {
+        unsigned r[4];
+        cpuid(1, 0, r);
+        g_fma = (r[2] >> 12) & 1;
+    }
+#endif
     g_isa = best_isa(g_isa_mask);
     const char* env = getenv("VV_BITNET_ISA");
     if (env && *env) {
@@ -332,19 +340,67 @@ vv_status_t vv_i8_rowquant_f32(const float* w, int64_t N, int64_t K,
 
 /* ─── Activation quantization ───────────────────────────────────────────── */
 
-/* round-half-to-even via the 1.5 * 2^23 trick, as ggml's nearest_int */
-static inline int nearest_int(float f) {
-    float v = f + 12582912.0f;
+/*
+ * ggml's nearest_int(x * s): the 1.5 * 2^23 trick, round half to even. The
+ * reference is built with GCC's default -ffp-contract=fast, which fuses the
+ * inlined `x * s + 12582912.f` into one FMA (libggml.so: vfmadd132ss in
+ * quantize_row_i8_s), so the product is never rounded to a float on its
+ * own: an x * s that rounds to exactly k + 0.5 but lies just below it
+ * becomes k, not the even neighbour. fmaf repeats that; jfk.wav hits it in
+ * the first layer (19.49999998 -> 19, not 20).
+ */
+static inline int nearest_int_mul(float x, float s) {
+    const float v = fmaf(x, s, 12582912.0f);
     int32_t i;
     memcpy(&i, &v, 4);
     return (i & 0x007fffff) - 0x00400000;
 }
 
+#ifdef VV_BN_X86
+/* The same per element, 8 lanes: FMA with the magic constant, then the
+ * integer bits; returns the row's code sum. amax is taken by the caller. */
+VV_TGT("avx2,fma") static int32_t quant_row_fma(const float* x, int8_t* q,
+                                                int K, float s) {
+    const __m256 vs = _mm256_set1_ps(s), magic = _mm256_set1_ps(12582912.0f);
+    const __m256i mant = _mm256_set1_epi32(0x007fffff);
+    const __m256i bias = _mm256_set1_epi32(0x00400000);
+    const __m256i lo = _mm256_set1_epi32(-128), hi = _mm256_set1_epi32(127);
+    __m256i acc = _mm256_setzero_si256();
+    int k = 0;
+    for (; k + 8 <= K; k += 8) {
+        const __m256 v = _mm256_fmadd_ps(_mm256_loadu_ps(x + k), vs, magic);
+        __m256i i = _mm256_sub_epi32(
+            _mm256_and_si256(_mm256_castps_si256(v), mant), bias);
+        i = _mm256_min_epi32(_mm256_max_epi32(i, lo), hi);
+        acc = _mm256_add_epi32(acc, i);
+        /* int32 -> int8, in lane order */
+        const __m128i p16 = _mm_packs_epi32(_mm256_castsi256_si128(i),
+                                            _mm256_extracti128_si256(i, 1));
+        const __m128i p8 = _mm_packs_epi16(p16, p16);
+        _mm_storel_epi64((__m128i*)(q + k), p8);
+    }
+    int32_t t[8];
+    _mm256_storeu_si256((__m256i*)t, acc);
+    int32_t sum = t[0] + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7];
+    for (; k < K; k++) {
+        int v = nearest_int_mul(x[k], s);
+        if (v > 127) v = 127;
+        if (v < -128) v = -128;
+        sum += v;
+        q[k] = (int8_t)v;
+    }
+    return sum;
+}
+#endif
+
 vv_status_t vv_act_quant_i8_cpu(const float* x, int M, int K, int8_t* q,
                                 float* scale, int32_t* sum) {
     if (!x || !q || !scale) return VV_ERR_NULL_PTR;
     if (M <= 0 || K <= 0) return VV_ERR_INVALID_ARG;
+    const int cur = isa();
+    const int fma_ok = g_fma && cur != ISA_SCALAR && cur != ISA_NEON;
     int m;
+    (void)fma_ok;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (M > 1)
 #endif
@@ -361,8 +417,16 @@ vv_status_t vv_act_quant_i8_cpu(const float* x, int M, int K, int8_t* q,
         const double dmax = amax > 0.00001 ? (double)amax : 0.00001;
         const float s = (float)(127.0 / dmax);
         int32_t acc = 0;
+#ifdef VV_BN_X86
+        if (fma_ok) {
+            acc = quant_row_fma(xr, qr, K, s);
+            scale[m] = s;
+            if (sum) sum[m] = acc;
+            continue;
+        }
+#endif
         for (int k = 0; k < K; k++) {
-            int v = nearest_int(xr[k] * s);
+            int v = nearest_int_mul(xr[k], s);
             if (v > 127) v = 127;
             if (v < -128) v = -128;
             acc += v;

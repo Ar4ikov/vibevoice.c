@@ -74,7 +74,10 @@ __global__ void act_quant_kernel(const void* __restrict__ x, int f16, int K,
 
     int acc = 0;
     for (int k = threadIdx.x; k < K; k += AQ_THREADS) {
-        int v = __float2int_rn(__fmul_rn(aq_load(x, f16, base + k), s));
+        /* ggml's nearest_int(x * s) as the reference build contracts it:
+         * one FMA with 1.5 * 2^23, the product never rounded on its own */
+        const float t = __fmaf_rn(aq_load(x, f16, base + k), s, 12582912.0f);
+        int v = (__float_as_int(t) & 0x007fffff) - 0x00400000;
         v = v > 127 ? 127 : (v < -128 ? -128 : v);
         q[base + k] = (int8_t)v;
         acc += v;

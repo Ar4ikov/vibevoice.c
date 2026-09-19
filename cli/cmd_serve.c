@@ -51,6 +51,11 @@ static void usage(void) {
         "                        dense checkpoint on this clip first\n"
         "  --calib-stats <file>  Read the calibration from a file, or, with\n"
         "                        --calib, write it there\n"
+        "  --vae <numerics>      auto (default) | float | int8 — speech encoder\n"
+        "                        (int8: VibeVoice-ASR-BitNet, VibeASR.cpp's)\n"
+        "  --source <from>       BitNet weights: auto | gguf | safetensors\n"
+        "  --head <fmt>          BitNet head on the CPU: auto (exact, int8\n"
+        "                        filter) | f16 (full scan) | int8 (approximate)\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
         "  --kv-paged <mode>     auto (default: on with several slots) | on |\n"
@@ -147,6 +152,33 @@ int vv_cmd_serve(int argc, char** argv) {
                 return 1;
             }
             ep.weight_quant = (int)q;
+        }
+        else if (strcmp(a, "--vae") == 0 && next) {
+            const vv_vae_numerics_t v = vv_vae_numerics_parse(argv[++i]);
+            if (v >= VV_VAE_COUNT) {
+                fprintf(stderr, "error: --vae is auto, float or int8, not '%s'\n",
+                        argv[i]);
+                return 1;
+            }
+            ep.vae_numerics = (int)v;
+        }
+        else if (strcmp(a, "--source") == 0 && next) {
+            const vv_weights_source_t v = vv_weights_source_parse(argv[++i]);
+            if (v >= VV_SOURCE_COUNT) {
+                fprintf(stderr, "error: --source is auto, gguf or safetensors, "
+                                "not '%s'\n", argv[i]);
+                return 1;
+            }
+            ep.weights_source = (int)v;
+        }
+        else if (strcmp(a, "--head") == 0 && next) {
+            const vv_head_format_t v = vv_head_format_parse(argv[++i]);
+            if (v >= VV_HEAD_COUNT) {
+                fprintf(stderr, "error: --head is auto, f16 or int8, not '%s'\n",
+                        argv[i]);
+                return 1;
+            }
+            ep.head_format = (int)v;
         }
         else if (strcmp(a, "--acoustic-sampling") == 0 && next) {
             vv_acoustic_sampling_t m = vv_acoustic_sampling_parse(argv[++i]);

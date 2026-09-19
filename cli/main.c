@@ -55,6 +55,9 @@ typedef struct {
     const char* calib;
     const char* calib_stats;
     const char* attn;
+    const char* source;
+    const char* vae;
+    const char* head;
     const char* kv_paged;
     bool        cpu_only;
     float       vram_budget;
@@ -123,6 +126,16 @@ static void print_usage(const char* prog) {
         "                        into the weights --quant quantizes\n"
         "  --calib-stats <file>  Read those ranges from a file instead, or,\n"
         "                        with --calib, write them there\n"
+        "  --vae <numerics>      Speech encoder: auto (default) | float |\n"
+        "                        int8 (VibeVoice-ASR-BitNet: VibeASR.cpp's\n"
+        "                        int8 encoder, bit-exact to it; the CPU\n"
+        "                        default)\n"
+        "  --source <from>       BitNet weights: auto (default: the GGUF pair\n"
+        "                        when present) | gguf | safetensors\n"
+        "  --head <fmt>          BitNet LM head on the CPU: auto (default: the\n"
+        "                        F16 head's exact argmax through an int8\n"
+        "                        filter) | f16 (full scan) | int8 (int8 rows\n"
+        "                        only, approximate)\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
         "  --kv-paged <mode>     auto (default) | on | off — take KV from a\n"
@@ -191,6 +204,12 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->calib = argv[++i];
         } else if (strcmp(argv[i], "--calib-stats") == 0 && i + 1 < argc) {
             args->calib_stats = argv[++i];
+        } else if (strcmp(argv[i], "--vae") == 0 && i + 1 < argc) {
+            args->vae = argv[++i];
+        } else if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
+            args->source = argv[++i];
+        } else if (strcmp(argv[i], "--head") == 0 && i + 1 < argc) {
+            args->head = argv[++i];
         } else if (strcmp(argv[i], "--vram-budget") == 0 && i + 1 < argc) {
             args->vram_budget = (float)atof(argv[++i]);
             if (args->vram_budget < 0.0f) args->vram_budget = 0.0f;
@@ -393,6 +412,36 @@ int main(int argc, char** argv) {
         }
         init_params.weight_quant = (int)q;
     }
+    if (args.vae) {
+        const vv_vae_numerics_t v = vv_vae_numerics_parse(args.vae);
+        if (v >= VV_VAE_COUNT) {
+            fprintf(stderr, "error: --vae is auto, float or int8, not '%s'\n",
+                    args.vae);
+            vv_free(raw_audio);
+            return 1;
+        }
+        init_params.vae_numerics = (int)v;
+    }
+    if (args.source) {
+        const vv_weights_source_t v = vv_weights_source_parse(args.source);
+        if (v >= VV_SOURCE_COUNT) {
+            fprintf(stderr, "error: --source is auto, gguf or safetensors, "
+                            "not '%s'\n", args.source);
+            vv_free(raw_audio);
+            return 1;
+        }
+        init_params.weights_source = (int)v;
+    }
+    if (args.head) {
+        const vv_head_format_t v = vv_head_format_parse(args.head);
+        if (v >= VV_HEAD_COUNT) {
+            fprintf(stderr, "error: --head is auto, f16 or int8, not '%s'\n",
+                    args.head);
+            vv_free(raw_audio);
+            return 1;
+        }
+        init_params.head_format = (int)v;
+    }
     if (args.kv_cache) {
         vv_kv_format_t f = vv_kv_format_parse(args.kv_cache);
         if (f >= VV_KV_FORMAT_COUNT) {
@@ -454,10 +503,15 @@ int main(int argc, char** argv) {
     VV_LOG_I("Model loaded in %.1f ms", t1 - t0);
 
     /* Resample to 24 kHz; normalize to -25 dBFS unless the model says not. */
-    s = vv_audio_prepare_ex(raw_audio, raw_len, raw_sr,
-                            ctx->family_ok ? ctx->family.normalize_audio
-                                           : true,
-                            &audio, &n_samples);
+    if (ctx->family_ok && ctx->family.vibeasr_audio)
+        s = vv_audio_prepare_vibeasr(raw_audio, raw_len, raw_sr,
+                                     ctx->family.normalize_audio,
+                                     &audio, &n_samples);
+    else
+        s = vv_audio_prepare_ex(raw_audio, raw_len, raw_sr,
+                                ctx->family_ok ? ctx->family.normalize_audio
+                                               : true,
+                                &audio, &n_samples);
     vv_free(raw_audio);
     if (s != VV_OK) {
         VV_LOG_E("Failed to prepare audio: %s", vv_status_str(s));

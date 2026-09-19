@@ -150,12 +150,14 @@ add_library(vibevoice_core STATIC
     src/tokenizer_encoder/conv_vae.c
     src/tokenizer_encoder/vae_gpu.c
     src/tokenizer_encoder/vae_cpu.c
+    src/tokenizer_encoder/vae_i8.c
     src/tokenizer_encoder/latent_sample.c
     src/connector/speech_connector.c
     src/model/safetensors.c
     src/model/config.c
     src/model/loader.c
     src/model/gguf.c
+    src/model/loader_gguf.c
     src/quant/nf4_table.c
     src/quant/kv_format.c
     src/quant/awq_repack.c
@@ -175,7 +177,15 @@ add_library(vibevoice_core STATIC
     src/inference/family.c
     src/inference/stream.c
     src/inference/stream_ctx.c
+    src/inference/bitnet_lm.c
 )
+# The BitNet reference paths repeat VibeASR.cpp's float expressions operation
+# for operation; a fused multiply-add the compiler invents would move bits.
+if(NOT MSVC)
+    set_source_files_properties(src/tokenizer_encoder/vae_i8.c
+        src/inference/bitnet_lm.c src/cpu/bitnet_cpu.c src/model/gguf.c
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 # With no accelerator backend the device op set still has to link. The stub
 # implements memory and streams on the host and refuses every compute op,
 # which is what steers the pipeline to the CPU kernels.
@@ -365,6 +375,12 @@ if(VV_BUILD_TESTS)
     add_test(NAME test_bitnet_dp4a COMMAND test_bitnet)
     set_tests_properties(test_bitnet_dp4a PROPERTIES
                          ENVIRONMENT "VV_BITNET_MMA=0")
+    vv_add_test(test_bitnet_vae tests/test_bitnet_vae.c)
+    # Again with every op recomputing its FP32 results in the second pass
+    # instead of keeping them: the other half of each two-pass op.
+    add_test(NAME test_bitnet_vae_recompute COMMAND test_bitnet_vae)
+    set_tests_properties(test_bitnet_vae_recompute PROPERTIES
+                         ENVIRONMENT "VV_I8VAE_KEEP_K=1000000;VV_I8VAE_KEEP_DW=0")
 endif()
 
 # ─── Benchmark ────────────────────────────────────────────────────────────────

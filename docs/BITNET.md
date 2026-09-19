@@ -132,9 +132,12 @@ isolation. Against the latent F32 weights the same layers give 0.63 / 0.27 /
   151648 equals the F32 embedding rounded to F16). The head is an ordinary
   F16 `mul_mat`: the activation is converted to F16, products accumulate in
   FP32. It is 467 MB — the largest read of every decode step.
-* This runtime adds an **int8 row-quantized head** (`vv_i8_rowquant_f32`,
-  `vv_i8_head_argmax_{cpu,dev}`, 233 MB) as an option; whether its argmax
-  matches the F16 head on real transcripts is a phase-2 measurement.
+* This runtime keeps an **int8 row-quantized copy** of the head (233 MB) on
+  the CPU, as a filter in front of the F16 one: every row's int8 logit comes
+  with a rigorous bound on its distance from the F16 logit (see "The head"
+  below), only rows that could still win are scored in F16, and the token
+  is the full F16 scan's, ties included. `--head int8` uses the int8 rows
+  alone (approximate); `--head f16` scans the whole F16 table.
 
 ### I8_S (int8, the encoder)
 
@@ -162,6 +165,21 @@ steps**. Consequences:
 * requantization: `q = cvtps(clamp(y · 127/amax, −127, 127))` (round half to
   even; the scalar tails of `rms_norm_scaled`/`add_scaled` use `roundf`,
   ties away, and `mul_mat_add` tails `rintf` — only exact .5 ties differ);
+* `add_scaled` splits the flat tensor into `-t` equal ranges; each range's
+  scalar head (up to the next row start) and tail (its last `len % 8`
+  elements) compute `a / s_a · γ + b / s_b` with divisions and requantize
+  the tail with `roundf`, while the 8-wide body multiplies by `1/s_a`,
+  `1/s_b`. **The encoder's output therefore depends on the thread count**;
+  this runtime repeats the partition, so equal thread counts give equal
+  features;
+* the build is `-march=native` with GCC's default `-ffp-contract=fast`, and
+  GCC contracts the intrinsic `_mm256_add_ps(_mm256_mul_ps(…))` pairs as
+  well as plain C: in `libggml.so` the `mul_mat_add` epilogue is
+  `fma((float)acc, w_scale/x_scale, bias)` (vector body and scalar tail),
+  the `add_scaled` body `fma(b, 1/s_b, (a · 1/s_a) · γ)` and its scalar
+  parts `fma(a / s_a, γ, b / s_b)`. Without the fused form the stem's
+  output scale already differs in the last bit, and the error compounds to
+  a feature cosine of 0.98;
 * the input audio itself is quantized: `s = 127/max(|a|, 1e-5)`,
   `q = clamp(roundf(a·s), −128, 127)`, i.e. **8-bit audio**.
 
@@ -177,9 +195,11 @@ h = linear2(h) + b2
 x = h / s_h · ffn_gamma + x / s_x
 ```
 
-Linear/conv: `y = (float)Σ w·a · (w_scale / a_scale) + bias`, then the
-global-absmax requantization. `vv_i8_linear_cpu`, `vv_i8_gemm_dev`,
-`vv_i8s_requant_{cpu,dev}` implement exactly this.
+Linear/conv: `y = fma((float)Σ w·a, w_scale / a_scale, bias)`, then the
+global-absmax requantization. `src/tokenizer_encoder/vae_i8.c` implements
+the whole encoder this way; `tests/test_bitnet_vae.c` checks it against an
+op-by-op transcription at several thread counts and, with the model,
+against a hash of VibeASR.cpp's features.
 
 Two deliberate departures from the HF model in the reference's int8 path:
 
@@ -200,8 +220,8 @@ GELU):
 
 So the int8 pipeline already costs more than the ReLU swap does; matching the
 reference's transcripts needs its exact int8 encoder, while an FP16 encoder on
-the I8_S weights would be closer to the model as trained. Phase 2 has to pick
-one, per backend, with a transcript diff and WER behind the choice.
+the I8_S weights is closer to the model as trained. This runtime offers both
+and picks per backend; see "Which encoder" below.
 
 The connectors (`fc1 → RMSNorm → fc2`) live in the VAE GGUF and are int8 too;
 the encoder emits 1536-wide features directly and the acoustic and semantic
@@ -239,12 +259,22 @@ model writes `<|im_start|>assistant\n` itself and the reference strips it.
 Stops on 151645 or 151643.
 
 Decoding defaults to **sampling** (top-k 40, top-p 0.9, temperature 0.7,
-seed 42); `--greedy` gives argmax. All numbers below are `--greedy`.
+seed 42); `--greedy` gives argmax. All numbers below are `--greedy`, which
+is what this runtime does.
+
+The model directory's `tokenizer.json` is Qwen2's plain one (three added
+tokens, no `<|object_ref_start|>` & co.), so the `asr-bitnet` family falls
+back to the same hard-coded 151646/7/8 when the tokenizer lacks them, and
+builds exactly the prompt above (the tokenizer splits the text segments the
+way the reference's per-segment `tokenize` calls do; the ids are equal).
 
 Audio: `dr_wav`, linear-interpolation resampling to 24 kHz, RMS
-normalization to −25 dBFS (`scalar = 10^(−25/20) / (rms + 1e-6)`). This
-runtime resamples with a windowed sinc, so 16 kHz inputs will differ slightly
-at the input.
+normalization to −25 dBFS (`scalar = 10^(−25/20) / (rms + 1e-6)` with the RMS
+taken as a float). The int8 encoder quantizes the whole clip with one scale,
+so a gain that differs in the last bit already moves int8 samples; the
+`asr-bitnet` family therefore prepares audio exactly this way
+(`vv_audio_prepare_vibeasr`) instead of with the windowed-sinc resampler
+and double-precision gain the other families use.
 
 ## Ground truth on gpubox
 

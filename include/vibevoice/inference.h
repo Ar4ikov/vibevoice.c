@@ -83,6 +83,15 @@ typedef struct vv_kv_cache {
     /** vv_kv_cache_reserve_wait() does not wait: a short pool is
      *  VV_ERR_KV_POOL_EXHAUSTED at once (a live stream sets it). */
     bool     no_wait;
+    /*
+     * Positions RoPE skips from here on: a row appended at cache index i is
+     * rotated as position i + rope_gap. asr-bitnet's reference feeds the
+     * floor(n/3200) frames it has but starts decoding at the prompt length
+     * with ceil(n/3200) pads, so its first generated token sits one or more
+     * positions past the last row it cached. Zero everywhere else; reset
+     * clears it. Only the CPU BitNet layer reads it.
+     */
+    int      rope_gap;
 } vv_kv_cache_t;
 
 /**
@@ -382,6 +391,68 @@ vv_status_t vv_decoder_step_cpu(
     vv_kv_cache_t* kv_cache,
     float* workspace,
     size_t workspace_size);
+
+/* ─── asr-bitnet on the CPU (bitnet_lm.c) ──────────────────────────────── */
+
+/**
+ * @brief One ternary (BitNet) transformer layer over T rows at positions
+ *        pos0.., computed as VibeASR.cpp's ggml graph does (see the file
+ *        comment for the operation order). FP32 norms and biases, an FP32
+ *        cache holding F16-rounded values.
+ */
+vv_status_t vv_bitnet_layer_cpu(const vv_layer_weights_t* L,
+                                const vv_llm_config_t* c, float* h,
+                                vv_kv_cache_t* kv, int layer, int pos0, int T,
+                                void* ws, size_t ws_bytes);
+
+/** @brief Workspace bytes vv_bitnet_layer_cpu needs for T rows over a cache
+ *         of up to kv_max positions. */
+size_t vv_bitnet_layer_cpu_bytes(const vv_llm_config_t* c, int T, int kv_max);
+
+/** @brief ggml's rms_norm then mul: sum of squares in double, FP32 weight. */
+void vv_bitnet_rmsnorm_cpu(const float* x, const float* w, float* y, int T,
+                           int n, float eps);
+
+/**
+ * @brief Greedy token from an F16 head, as the reference's F16 mul_mat
+ *        computes the logits: the activation rounded to F16, then
+ *        ggml_vec_dot_f16 (4 x 8 FMA lanes, its reduction); ties go to the
+ *        lowest id, as llama.cpp's greedy sampler. K % 32 == 0, K <= 8192.
+ */
+vv_status_t vv_bitnet_head_f16_argmax_cpu(const float* x, const uint16_t* w,
+                                          int V, int K, int32_t* token,
+                                          float* value);
+
+/**
+ * @brief Row-quantize an F16 head to int8 and record, per row, the bounds
+ *        vv_bitnet_head_filtered_argmax_cpu() needs: ||w - s q||_2,
+ *        s ||q||_2 and ||w||_2 (rounded up), into bound[V][3].
+ */
+vv_status_t vv_bitnet_head_filter_build(const uint16_t* w, int V, int K,
+                                        int8_t* q, float* scale, float* bound);
+
+/**
+ * @brief The same token as vv_bitnet_head_f16_argmax_cpu(), reading the
+ *        int8 copy of the head instead of all of the F16 one.
+ *
+ * Every row's int8 logit comes with a rigorous bound on its distance to the
+ * F16 logit the reference computes (weight and activation rounding by
+ * Cauchy-Schwarz, plus the float error of the F16 dot's FMA lanes). Rows whose
+ * upper bound falls below the best lower bound cannot win; the rest -- a
+ * handful per token -- are scored exactly as the full F16 scan scores them.
+ * So the argmax, ties included, is the full scan's, and a decode step reads
+ * 233 MB of head instead of 467 MB.
+ *
+ * @param scratch  at least vv_bitnet_head_filter_scratch(V, K) bytes
+ * @param n_exact  out, rows scored in F16; may be NULL
+ */
+vv_status_t vv_bitnet_head_filtered_argmax_cpu(
+    const float* x, const uint16_t* w, const int8_t* q, const float* scale,
+    const float* bound, int V, int K, void* scratch, size_t scratch_bytes,
+    int32_t* token, float* value, int* n_exact);
+
+/** @brief Scratch bytes vv_bitnet_head_filtered_argmax_cpu() needs. */
+size_t vv_bitnet_head_filter_scratch(int V, int K);
 
 /* ─── Sampling ──────────────────────────────────────────────────────────── */
 
