@@ -70,6 +70,8 @@ typedef struct {
     bool present;      /**< quant_method == "compressed-tensors"            */
     int  w_bits;       /**< weights.num_bits of the Linear scheme (0: none) */
     bool act_int8;     /**< input_activations: 8-bit int, dynamic           */
+    bool mixed;        /**< config_groups disagree on weight bits or on
+                            int8 activations; not supported               */
     char format[32];   /**< "int-quantized", "pack-quantized", ...           */
 } ct_cfg_t;
 
@@ -1561,20 +1563,33 @@ static void ct_parse(const char* model_dir, ct_cfg_t* ct) {
         if (cJSON_IsString(fmt) && fmt->valuestring)
             snprintf(ct->format, sizeof(ct->format), "%s", fmt->valuestring);
         const cJSON* groups = cJSON_GetObjectItem(qc, "config_groups");
+        /*
+         * One scheme for every Linear: the loader applies it by weight dtype,
+         * not by each group's `targets`, so groups that disagree on weight
+         * bits or on int8 activations are flagged and refused.
+         */
         const cJSON* g;
+        int n_groups = 0;
         cJSON_ArrayForEach(g, groups) {
             const cJSON* wa = cJSON_GetObjectItem(g, "weights");
             const cJSON* nb = wa ? cJSON_GetObjectItem(wa, "num_bits") : NULL;
-            if (cJSON_IsNumber(nb) && ct->w_bits == 0)
-                ct->w_bits = nb->valueint;
+            const int bits = cJSON_IsNumber(nb) ? nb->valueint : 0;
+            bool a8 = false;
             const cJSON* ia = cJSON_GetObjectItem(g, "input_activations");
             if (ia && !cJSON_IsNull(ia)) {
                 const cJSON* ab = cJSON_GetObjectItem(ia, "num_bits");
                 const cJSON* ty = cJSON_GetObjectItem(ia, "type");
-                if (cJSON_IsNumber(ab) && ab->valueint == 8 &&
-                    cJSON_IsString(ty) && strcmp(ty->valuestring, "int") == 0)
-                    ct->act_int8 = true;
+                a8 = cJSON_IsNumber(ab) && ab->valueint == 8 &&
+                     cJSON_IsString(ty) && ty->valuestring &&
+                     strcmp(ty->valuestring, "int") == 0;
             }
+            if (n_groups == 0) {
+                ct->w_bits = bits;
+                ct->act_int8 = a8;
+            } else if (bits != ct->w_bits || a8 != ct->act_int8) {
+                ct->mixed = true;
+            }
+            n_groups++;
         }
     }
     cJSON_Delete(root);
@@ -2071,6 +2086,13 @@ static vv_status_t model_load_impl(const char* model_dir,
                                           : VV_SMOOTH_MAPS_DEFAULT;
     }
     ct_parse(model_dir, &L.ct);
+    if (L.ct.mixed) {
+        VV_LOG_E("loader: this compressed-tensors checkpoint mixes schemes "
+                 "(config_groups differ in weight bits or activations); "
+                 "only one scheme for all Linear layers is supported");
+        vv_model_free(model);
+        return VV_ERR_UNSUPPORTED;
+    }
     if (L.ct.present)
         VV_LOG_I("loader: compressed-tensors checkpoint (%s, %d-bit weights%s)",
                  L.ct.format[0] ? L.ct.format : "?", L.ct.w_bits,
