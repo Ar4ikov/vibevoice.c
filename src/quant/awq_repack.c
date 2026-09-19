@@ -151,7 +151,8 @@ vv_status_t vv_gptq_repack(const uint32_t* qweight, const uint32_t* qzeros,
                            const uint16_t* scales, const int32_t* g_idx,
                            int K, int N, int group_size, int zero_bias,
                            uint8_t* out_packed, uint16_t* out_scales,
-                           uint16_t* out_mins, uint8_t* out_zeros)
+                           uint16_t* out_mins, uint8_t* out_zeros,
+                           int32_t* out_perm)
 {
     if (!qweight || !qzeros || !scales || !out_packed || !out_scales ||
         !out_mins) {
@@ -162,25 +163,52 @@ vv_status_t vv_gptq_repack(const uint32_t* qweight, const uint32_t* qzeros,
     if (group_size <= 0 || (K % group_size) != 0)
         return VV_ERR_INVALID_ARG;
 
-    /*
-     * Act-order checkpoints permute the input channels before grouping, so
-     * group g is a scattered set of k. Honouring that would need the
-     * activations permuted at run time; refusing is better than the silent
-     * garbage this used to produce.
-     */
-    if (g_idx) {
-        for (int k = 0; k < K; k++) {
-            if (g_idx[k] != k / group_size) {
-                VV_LOG_E("gptq: act-order (desc_act) checkpoint: g_idx[%d] = "
-                         "%d, expected %d; not supported", k, (int)g_idx[k],
-                         k / group_size);
-                return VV_ERR_UNSUPPORTED;
-            }
-        }
-    }
-
     const int n_groups = K / group_size;
     const int z_words = N / 8;
+
+    /*
+     * Act-order checkpoints quantize the input channels in order of
+     * importance, so group g is a scattered set of k. Sorting the channels
+     * by group (a counting sort, stable) makes every group a contiguous run
+     * again; the activations are then gathered through the same order at
+     * run time. That only works if every group has exactly group_size
+     * members, which is what GPTQ produces.
+     */
+    bool act_order = false;
+    if (g_idx) {
+        for (int k = 0; k < K; k++) {
+            if (g_idx[k] < 0 || g_idx[k] >= n_groups) {
+                VV_LOG_E("gptq: g_idx[%d] = %d is outside 0..%d", k,
+                         (int)g_idx[k], n_groups - 1);
+                return VV_ERR_UNSUPPORTED;
+            }
+            if (g_idx[k] != k / group_size) act_order = true;
+        }
+    }
+    if (act_order) {
+        if (!out_perm) {
+            VV_LOG_E("gptq: act-order (desc_act) checkpoint and no "
+                     "permutation buffer to reorder it into");
+            return VV_ERR_UNSUPPORTED;
+        }
+        int* next = (int*)vv_alloc((size_t)n_groups * sizeof(int));
+        if (!next) return VV_ERR_OUT_OF_MEMORY;
+        for (int g = 0; g < n_groups; g++) next[g] = 0;
+        for (int k = 0; k < K; k++) next[g_idx[k]]++;
+        for (int g = 0; g < n_groups; g++) {
+            if (next[g] != group_size) {
+                VV_LOG_E("gptq: act-order group %d has %d channels, expected "
+                         "%d; not supported", g, next[g], group_size);
+                vv_free(next);
+                return VV_ERR_UNSUPPORTED;
+            }
+            next[g] = g * group_size;
+        }
+        for (int k = 0; k < K; k++) out_perm[next[g_idx[k]]++] = k;
+        vv_free(next);
+    } else if (out_perm) {
+        for (int k = 0; k < K; k++) out_perm[k] = k;
+    }
 
     int n;
 #ifdef _OPENMP
@@ -200,6 +228,18 @@ vv_status_t vv_gptq_repack(const uint32_t* qweight, const uint32_t* qzeros,
             srow[g] = sh;
             mrow[g] = vv_float_to_half(-(float)zi * vv_half_to_float(sh));
             if (zrow) zrow[g] = (uint8_t)zi;
+        }
+        if (act_order) {
+            /* column j holds input channel out_perm[j] */
+            for (int j = 0; j < K; j += 2) {
+                const int k0 = out_perm[j], k1 = out_perm[j + 1];
+                const uint32_t w0 = qweight[(size_t)(k0 >> 3) * N + n];
+                const uint32_t w1 = qweight[(size_t)(k1 >> 3) * N + n];
+                const uint8_t q0 = (uint8_t)((w0 >> (4 * (k0 & 7))) & 0xFu);
+                const uint8_t q1 = (uint8_t)((w1 >> (4 * (k1 & 7))) & 0xFu);
+                prow[j >> 1] = (uint8_t)((q0 << 4) | q1);
+            }
+            continue;
         }
         for (int r = 0; r < K / 8; r++) {
             const uint32_t w = qweight[(size_t)r * N + n];

@@ -228,6 +228,34 @@ vv_status_t vv_w4a16_gemv_dev(
     const void* x, const void* packed, const void* sz, const void* bias,
     void* y, int N, int K, int group_size, void* stream);
 
+/** @brief One projection of a fused GEMV (see vv_w4a16_gemv_multi_dev). */
+typedef struct vv_w4a16_proj {
+    const void* packed;   /**< GPU-layout codes [N][K/2]                   */
+    const void* sz;       /**< half2 {scale, zero} [N][K/G]                */
+    const void* bias;     /**< FP16 [N] or NULL                            */
+    void*       y;        /**< FP16 [N] output                             */
+    int         N;        /**< output rows                                 */
+} vv_w4a16_proj_t;
+
+/**
+ * @brief Up to three GEMVs of the same x (and K, group size) in one launch,
+ *        e.g. q/k/v or gate/up. Each row is computed exactly as a single
+ *        vv_w4a16_gemv_dev over the combined row count would compute it.
+ *        Graph-capturable like vv_w4a16_gemv_dev.
+ */
+vv_status_t vv_w4a16_gemv_multi_dev(
+    const void* x, const vv_w4a16_proj_t* projs, int n_proj,
+    int K, int group_size, void* stream);
+
+/**
+ * @brief out[m][j] = x[m][perm[j]] (FP16, K % 8 == 0, perm 16-byte aligned).
+ *        Puts activations in the column order of an act-order (desc_act)
+ *        GPTQ weight, whose input channels were sorted by group at load.
+ */
+vv_status_t vv_w4a16_gather_dev(
+    const void* x, const int32_t* perm, void* out, int M, int K,
+    void* stream);
+
 /**
  * @brief C[M,N] = A[M,K] . W^T (+ bias). Small M runs the GEMV kernel,
  *        larger M a fused tensor-core GEMM (sm_80+) that keeps the weights

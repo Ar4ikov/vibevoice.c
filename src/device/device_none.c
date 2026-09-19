@@ -171,6 +171,14 @@ vv_status_t vv_w4a16_gemv_dev(const void* x, const void* p, const void* sz,
                               void* st) {
     U(x) U(p) U(sz) U(b) U(y) U(N) U(K) U(g) U(st) return VV_ERR_UNSUPPORTED;
 }
+vv_status_t vv_w4a16_gemv_multi_dev(const void* x, const vv_w4a16_proj_t* p,
+                                    int n, int K, int g, void* st) {
+    U(x) U(p) U(n) U(K) U(g) U(st) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_w4a16_gather_dev(const void* x, const int32_t* p, void* o,
+                                int M, int K, void* st) {
+    U(x) U(p) U(o) U(M) U(K) U(st) return VV_ERR_UNSUPPORTED;
+}
 vv_status_t vv_w4a16_gemm_dev(const void* a, const void* p, const void* sz,
                               const void* b, void* o, void* t, size_t tb,
                               int M, int N, int K, int g, void* st) {

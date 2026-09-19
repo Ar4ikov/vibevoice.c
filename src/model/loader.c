@@ -518,9 +518,10 @@ static vv_status_t load_nf4_scales(const loader_t* L, const char* wname,
  * The two formats pack along different axes and are told apart by shape:
  *   AWQ   qweight [K, N/8], scales [K/G, N]   (scales width = 8 x qweight)
  *   GPTQ  qweight [K/8, N], scales [K/G, N]   (scales width = qweight)
- * A GPTQ g_idx is checked: plain k / G is fine, act-order is refused.
- * Every size is checked against the header and the config before anything
- * is indexed: the file is untrusted input.
+ * A GPTQ g_idx is checked: plain k / G loads as is, an act-order one has
+ * its input channels sorted by group and keeps the order in w->perm.
+ * Every size is checked against the header before anything is indexed:
+ * the file is untrusted input.
  */
 static vv_status_t load_awq_weight(const loader_t* L, const char* base,
                                    int N_want, int K_want, vv_weight_t* w) {
@@ -589,10 +590,12 @@ static vv_status_t load_awq_weight(const loader_t* L, const char* base,
         return VV_ERR_SHAPE_MISMATCH;
     }
     /* The repack indexes all three by these sizes: hold the data to them. */
-    if (qzeros.shape[0] != n_groups || qzeros.shape[1] != N / 8 ||
-        qzeros.size_bytes != (size_t)n_groups * (size_t)(N / 8) * 4) {
-        VV_LOG_E("loader: '%s.qzeros' is not int32[%d, %d]", base,
-                 n_groups, N / 8);
+    if (qweight.size_bytes != (size_t)K * N / 2 ||
+        qzeros.size_bytes != (size_t)n_groups * (N / 8) * 4 ||
+        scales.size_bytes != (size_t)n_groups * N * 2 ||
+        qzeros.shape[0] != n_groups || qzeros.shape[1] != N / 8) {
+        VV_LOG_E("loader: '%s' tensor sizes do not match K=%d N=%d "
+                 "groups=%d", base, K, N, n_groups);
         AWQ_FREE_INPUTS();
         return VV_ERR_SHAPE_MISMATCH;
     }
@@ -611,8 +614,10 @@ static vv_status_t load_awq_weight(const loader_t* L, const char* base,
     uint16_t* sc     = (uint16_t*)vv_alloc(group_bytes);
     uint16_t* mn     = (uint16_t*)vv_alloc(group_bytes);
     uint8_t*  zr     = (uint8_t*)vv_alloc(zero_bytes);
-    if (!packed || !sc || !mn || !zr) {
-        vv_free(packed); vv_free(sc); vv_free(mn); vv_free(zr);
+    int32_t*  perm   = (gptq_layout && have_gidx)
+                     ? (int32_t*)vv_alloc((size_t)K * sizeof(int32_t)) : NULL;
+    if (!packed || !sc || !mn || !zr || (gptq_layout && have_gidx && !perm)) {
+        vv_free(packed); vv_free(sc); vv_free(mn); vv_free(zr); vv_free(perm);
         AWQ_FREE_INPUTS();
         return VV_ERR_OUT_OF_MEMORY;
     }
@@ -629,7 +634,8 @@ static vv_status_t load_awq_weight(const loader_t* L, const char* base,
                            (const uint32_t*)qzeros.data,
                            (const uint16_t*)scales.data,
                            have_gidx ? (const int32_t*)g_idx.data : NULL,
-                           K, N, group_size, zero_bias, packed, sc, mn, zr);
+                           K, N, group_size, zero_bias, packed, sc, mn, zr,
+                           perm);
     } else {
         zero_bias = have_gidx ? 1 : 0;
         s = vv_awq_repack((const uint32_t*)qweight.data,
@@ -641,8 +647,14 @@ static vv_status_t load_awq_weight(const loader_t* L, const char* base,
     #undef AWQ_FREE_INPUTS
     if (s != VV_OK) {
         VV_LOG_E("loader: cannot repack '%s': %s", base, vv_status_str(s));
-        vv_free(packed); vv_free(sc); vv_free(mn); vv_free(zr);
+        vv_free(packed); vv_free(sc); vv_free(mn); vv_free(zr); vv_free(perm);
         return s;
+    }
+    /* Only an act-order weight needs its order kept. */
+    if (perm) {
+        bool identity = true;
+        for (int k = 0; k < K && identity; k++) identity = perm[k] == k;
+        if (identity) { vv_free(perm); perm = NULL; }
     }
 
     w->quant_kind   = VV_QUANT_INT4G;
@@ -661,9 +673,18 @@ static vv_status_t load_awq_weight(const loader_t* L, const char* base,
     w->zeros.size_bytes = zero_bytes;
     w->zeros.dtype = VV_DTYPE_U8;
 
-    VV_LOG_D("loader: %s '%s' N=%d K=%d group=%d%s",
+    if (perm) {
+        w->perm.data = perm;
+        w->perm.size_bytes = (size_t)K * sizeof(int32_t);
+        w->perm.dtype = VV_DTYPE_I32;
+        w->perm.ndim = 1;
+        w->perm.shape[0] = K;
+    }
+
+    VV_LOG_D("loader: %s '%s' N=%d K=%d group=%d%s%s",
              gptq_layout ? "GPTQ" : "AWQ", base, N, K, group_size,
-             zero_bias ? " (zeros stored minus one)" : "");
+             zero_bias ? " (zeros stored minus one)" : "",
+             perm ? " (act-order)" : "");
     return VV_OK;
 }
 
@@ -1290,6 +1311,7 @@ int vv_layer_tensors(vv_layer_weights_t* L,
         out[k++] = &p[i]->tensor;
         out[k++] = &p[i]->quant.scales;
         out[k++] = &p[i]->mins;
+        out[k++] = &p[i]->perm;
         out[k++] = &p[i]->bias;
     }
     return k;

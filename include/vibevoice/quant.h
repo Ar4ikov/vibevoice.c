@@ -70,19 +70,25 @@ vv_status_t vv_awq_repack(const uint32_t* qweight, const uint32_t* qzeros,
  *   scales  FP16  [K/G][N]
  *   g_idx   int32 [K]           group of each input channel, or NULL
  *
- * The runtime layout needs each group to be a contiguous run of k, so a
- * g_idx that is anything other than k / G (act-order / desc_act
- * checkpoints) is refused with VV_ERR_UNSUPPORTED rather than silently
- * producing wrong weights.
+ * The runtime layout needs each group to be a contiguous run of k. Act-order
+ * (desc_act) checkpoints scatter each group over the input channels; for
+ * those the channels are sorted by group (stable, so plain k / G stays the
+ * identity): output column j holds input channel out_perm[j], and the
+ * product must run on x[out_perm[j]] (vv_w4a16_gather_dev). A g_idx whose
+ * groups are not all exactly group_size channels, or an act-order g_idx
+ * with out_perm NULL, is refused with VV_ERR_UNSUPPORTED.
  *
  * @param zero_bias 1 for the classic "gptq" format (stored zero - 1),
  *                  0 for "gptq_v2"
+ * @param out_perm  int32 [K], receives the column order (the identity when
+ *                  the groups are already contiguous), or NULL
  */
 vv_status_t vv_gptq_repack(const uint32_t* qweight, const uint32_t* qzeros,
                            const uint16_t* scales, const int32_t* g_idx,
                            int K, int N, int group_size, int zero_bias,
                            uint8_t* out_packed, uint16_t* out_scales,
-                           uint16_t* out_mins, uint8_t* out_zeros);
+                           uint16_t* out_mins, uint8_t* out_zeros,
+                           int32_t* out_perm);
 
 /**
  * @brief Convert one row-major INT4G weight to the GPU layout in place.

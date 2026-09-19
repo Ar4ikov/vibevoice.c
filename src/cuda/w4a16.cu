@@ -32,6 +32,8 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <limits.h>
 
 #include "vibevoice/device.h"
 
@@ -99,31 +101,58 @@ __device__ __forceinline__ uint4 w4_ld_stream(const uint4* p) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * GEMV (and tiny-M GEMM): y[M,N] = x[M,K] . W^T + bias
+ * GEMV: y[N] = W . x + bias, for up to W4V_MAX_SEGS projections that share x
  *
- * LPR lanes share R output rows (LPR 8..128; above 32 the rows span several
+ * LPR lanes share R output rows (LPR 16..128; above 32 the rows span several
  * warps and the partial sums meet in shared memory). Each lane walks the
- * rows' 16-byte chunks with a stride of LPR and keeps U chunk columns in
- * flight; the x values of a chunk are loaded once and used for all R rows.
- * Per chunk, row and query row the 32 products are formed as four HFMA2
- * chains of four and flushed to FP32, so no FP16 partial ever sums more
- * than four terms.
+ * rows' 16-byte chunks with a stride of LPR; the x values of a chunk are
+ * loaded once and used for all R rows. Per chunk and row the 32 products
+ * are formed as four HFMA2 chains of four and flushed to FP32, so no FP16
+ * partial ever sums more than four terms.
+ *
+ * Several projections of the same input (q/k/v, gate/up) go in one launch:
+ * the grid is the concatenation of their row blocks and each block looks up
+ * which projection it belongs to. The 0.9 MB k and v projections on their
+ * own are too short to get past the kernel's ramp-up; behind q they ride
+ * along at q's bandwidth.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #define W4V_THREADS 128
+#define W4V_MAX_SEGS 3
 
-template <int LPR, int M, int U, int R>
+/** @brief The projections of one launch, passed by value (kernel params). */
+struct w4v_segs {
+    const uint4* w[W4V_MAX_SEGS];
+    const half2* sz[W4V_MAX_SEGS];
+    const half*  bias[W4V_MAX_SEGS];
+    half*        y[W4V_MAX_SEGS];
+    int          n[W4V_MAX_SEGS];
+    int          first_block[W4V_MAX_SEGS];   /* unused: INT_MAX */
+};
+
+template <int LPR, int R>
 __global__ void __launch_bounds__(W4V_THREADS)
-w4a16_gemv_kernel(const half*  __restrict__ x,
-                  const uint4* __restrict__ w,
-                  const half2* __restrict__ sz,
-                  const half*  __restrict__ bias,
-                  half*        __restrict__ y,
-                  int N, int K, int gshift)
+w4a16_gemv_kernel(const half* __restrict__ x, const w4v_segs segs,
+                  int K, int gshift)
 {
     constexpr int GPB = W4V_THREADS / LPR;            /* lane groups/block */
     constexpr int WIDTH = LPR < 32 ? LPR : 32;
-    const int row0 = (blockIdx.x * GPB + (int)threadIdx.x / LPR) * R;
+
+    /* Which projection this block serves; selects, not indexed loads. */
+    const int bx = (int)blockIdx.x;
+    const int seg = bx >= segs.first_block[2] ? 2
+                  : (bx >= segs.first_block[1] ? 1 : 0);
+    const uint4* w = seg == 0 ? segs.w[0] : (seg == 1 ? segs.w[1] : segs.w[2]);
+    const half2* sz = seg == 0 ? segs.sz[0]
+                    : (seg == 1 ? segs.sz[1] : segs.sz[2]);
+    const half* bias = seg == 0 ? segs.bias[0]
+                     : (seg == 1 ? segs.bias[1] : segs.bias[2]);
+    half* y = seg == 0 ? segs.y[0] : (seg == 1 ? segs.y[1] : segs.y[2]);
+    const int N = seg == 0 ? segs.n[0] : (seg == 1 ? segs.n[1] : segs.n[2]);
+    const int blk = bx - (seg == 0 ? 0 : (seg == 1 ? segs.first_block[1]
+                                                   : segs.first_block[2]));
+
+    const int row0 = (blk * GPB + (int)threadIdx.x / LPR) * R;
     const int lr  = (int)threadIdx.x % LPR;
 
     const int nch = row0 < N ? (K >> 5) : 0;
@@ -137,88 +166,65 @@ w4a16_gemv_kernel(const half*  __restrict__ x,
         szrow[r] = sz + (size_t)rr * ngroups;
     }
 
-    float acc[R][M];
+    float acc[R];
 #pragma unroll
-    for (int r = 0; r < R; r++)
-#pragma unroll
-        for (int m = 0; m < M; m++) acc[r][m] = 0.0f;
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    for (int c0 = lr; c0 < nch; c0 += LPR * U) {
-        uint4 wv[U][R];
-        half2 sv[U][R];
+    for (int c = lr; c < nch; c += LPR) {
+        uint4 wv[R];
+        half2 sv[R];
 #pragma unroll
-        for (int u = 0; u < U; u++) {
-            const int c = c0 + u * LPR;
-            if (c < nch) {
-#pragma unroll
-                for (int r = 0; r < R; r++) {
-                    wv[u][r] = w4_ld_stream(wrow[r] + c);
-                    sv[u][r] = szrow[r][(c << 5) >> gshift];
-                }
-            }
+        for (int r = 0; r < R; r++) {
+            wv[r] = w4_ld_stream(wrow[r] + c);
+            sv[r] = szrow[r][(c << 5) >> gshift];
         }
+        const uint4* xp = (const uint4*)(x + (c << 5));
+        uint4 xv[4];
 #pragma unroll
-        for (int u = 0; u < U; u++) {
-            const int c = c0 + u * LPR;
-            if (c >= nch) break;
+        for (int i = 0; i < 4; i++) xv[i] = __ldg(xp + i);
+        const half2* xh = (const half2*)xv;           /* pairs 0..15 */
 #pragma unroll
-            for (int m = 0; m < M; m++) {
-                const uint4* xp = (const uint4*)(x + (size_t)m * K + (c << 5));
-                uint4 xv[4];
+        for (int r = 0; r < R; r++) {
+            const w4_group g = w4_make_group(sv[r]);
+            const uint32_t wd[4] = { wv[r].x, wv[r].y, wv[r].z, wv[r].w };
 #pragma unroll
-                for (int i = 0; i < 4; i++) xv[i] = __ldg(xp + i);
-                const half2* xh = (const half2*)xv;     /* pairs 0..15 */
-#pragma unroll
-                for (int r = 0; r < R; r++) {
-                    const w4_group g = w4_make_group(sv[u][r]);
-                    const uint32_t wd[4] = { wv[u][r].x, wv[u][r].y,
-                                             wv[u][r].z, wv[u][r].w };
-#pragma unroll
-                    for (int t = 0; t < 4; t++) {
-                        half2 wh[4];
-                        w4_dequant_word(wd[t], g, wh);
-                        /* word t, slot j -> pair t + 4j */
-                        half2 p = __hmul2(wh[0], xh[t]);
-                        p = __hfma2(wh[1], xh[t + 4],  p);
-                        p = __hfma2(wh[2], xh[t + 8],  p);
-                        p = __hfma2(wh[3], xh[t + 12], p);
-                        const float2 f = __half22float2(p);
-                        acc[r][m] += f.x + f.y;
-                    }
-                }
+            for (int t = 0; t < 4; t++) {
+                half2 wh[4];
+                w4_dequant_word(wd[t], g, wh);
+                /* word t, slot j -> pair t + 4j */
+                half2 p = __hmul2(wh[0], xh[t]);
+                p = __hfma2(wh[1], xh[t + 4],  p);
+                p = __hfma2(wh[2], xh[t + 8],  p);
+                p = __hfma2(wh[3], xh[t + 12], p);
+                const float2 f = __half22float2(p);
+                acc[r] += f.x + f.y;
             }
         }
     }
 
 #pragma unroll
-    for (int r = 0; r < R; r++)
+    for (int r = 0; r < R; r++) {
 #pragma unroll
-        for (int m = 0; m < M; m++) {
-#pragma unroll
-            for (int off = WIDTH / 2; off > 0; off >>= 1)
-                acc[r][m] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][m], off, WIDTH);
-        }
+        for (int off = WIDTH / 2; off > 0; off >>= 1)
+            acc[r] += __shfl_xor_sync(0xFFFFFFFFu, acc[r], off, WIDTH);
+    }
     if (LPR > 32) {
         constexpr int WPG = LPR / 32;                  /* warps per group */
-        __shared__ float red[R * M][W4V_THREADS / 32];
+        __shared__ float red[R][W4V_THREADS / 32];
         const int warp = (int)threadIdx.x >> 5;
         if ((threadIdx.x & 31) == 0) {
 #pragma unroll
-            for (int r = 0; r < R; r++)
-#pragma unroll
-                for (int m = 0; m < M; m++) red[r * M + m][warp] = acc[r][m];
+            for (int r = 0; r < R; r++) red[r][warp] = acc[r];
         }
         __syncthreads();
         if (lr == 0) {
 #pragma unroll
-            for (int r = 0; r < R; r++)
+            for (int r = 0; r < R; r++) {
+                float v = 0.0f;
 #pragma unroll
-                for (int m = 0; m < M; m++) {
-                    float v = 0.0f;
-#pragma unroll
-                    for (int i = 0; i < WPG; i++) v += red[r * M + m][warp + i];
-                    acc[r][m] = v;
-                }
+                for (int i = 0; i < WPG; i++) v += red[r][warp + i];
+                acc[r] = v;
+            }
         }
     }
     if (lr == 0) {
@@ -227,11 +233,28 @@ w4a16_gemv_kernel(const half*  __restrict__ x,
             const int row = row0 + r;
             if (row >= N) break;
             const float b = bias ? __half2float(bias[row]) : 0.0f;
-#pragma unroll
-            for (int m = 0; m < M; m++)
-                y[(size_t)m * N + row] = __float2half(acc[r][m] + b);
+            y[row] = __float2half(acc[r] + b);
         }
     }
+}
+
+/** @brief out[m][j] = x[m][perm[j]]: act-order activations, 8 columns/thread. */
+__global__ void w4a16_gather_kernel(const half* __restrict__ x,
+                                    const int32_t* __restrict__ perm,
+                                    half* __restrict__ out, int M, int K)
+{
+    const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const size_t total = (size_t)M * K;
+    if (i >= total) return;
+    const int m = (int)(i / K);
+    const int j = (int)(i % K);
+    const half* xr = x + (size_t)m * K;
+    const int4 p0 = *(const int4*)(perm + j);
+    const int4 p1 = *(const int4*)(perm + j + 4);
+    half v[8];
+    v[0] = xr[p0.x]; v[1] = xr[p0.y]; v[2] = xr[p0.z]; v[3] = xr[p0.w];
+    v[4] = xr[p1.x]; v[5] = xr[p1.y]; v[6] = xr[p1.z]; v[7] = xr[p1.w];
+    *(uint4*)(out + i) = *(const uint4*)v;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -591,91 +614,86 @@ bool w4_mma_allowed(void) {
     return w4_env_int("VV_W4A16_MMA", &v, 1) != 0;
 }
 
-/** @brief Largest M the GEMV kernel takes before the tensor-core GEMM. */
-int w4_gemv_max_m(void) {
-    static thread_local int v = -2;
-    int m = w4_env_int("VV_W4A16_GEMV_MAX_M", &v, 1);
-    return m < 1 ? 1 : (m > 4 ? 4 : m);
-}
-
-template <int LPR, int M, int U, int R>
-vv_status_t launch_gemv_lpr(const half* x, const uint4* w, const half2* sz,
-                            const half* bias, half* y, int N, int K,
-                            int gshift, cudaStream_t st)
+template <int LPR, int R>
+vv_status_t launch_gemv_lpr(const half* x, w4v_segs segs, int n_segs,
+                            int K, int gshift, cudaStream_t st)
 {
     constexpr int RPB = W4V_THREADS / LPR * R;
-    const int blocks = (N + RPB - 1) / RPB;
-    w4a16_gemv_kernel<LPR, M, U, R><<<blocks, W4V_THREADS, 0, st>>>(
-        x, w, sz, bias, y, N, K, gshift);
+    int blocks = 0;
+    for (int i = 0; i < W4V_MAX_SEGS; i++) {
+        if (i < n_segs) {
+            segs.first_block[i] = blocks;
+            blocks += (segs.n[i] + RPB - 1) / RPB;
+        } else {
+            segs.first_block[i] = INT_MAX;
+        }
+    }
+    w4a16_gemv_kernel<LPR, R><<<blocks, W4V_THREADS, 0, st>>>(
+        x, segs, K, gshift);
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
-template <int M, int U, int R>
-vv_status_t launch_gemv_u(const half* x, const uint4* w, const half2* sz,
-                          const half* bias, half* y, int N, int K,
-                          int gshift, int lpr, cudaStream_t st)
+template <int R>
+vv_status_t launch_gemv_r(const half* x, const w4v_segs& segs, int n_segs,
+                          int K, int gshift, int lpr, cudaStream_t st)
 {
     switch (lpr) {
-        case 8:   return launch_gemv_lpr<8,   M, U, R>(x, w, sz, bias, y, N, K, gshift, st);
-        case 16:  return launch_gemv_lpr<16,  M, U, R>(x, w, sz, bias, y, N, K, gshift, st);
-        case 32:  return launch_gemv_lpr<32,  M, U, R>(x, w, sz, bias, y, N, K, gshift, st);
-        case 64:  return launch_gemv_lpr<64,  M, U, R>(x, w, sz, bias, y, N, K, gshift, st);
-        default:  return launch_gemv_lpr<128, M, U, R>(x, w, sz, bias, y, N, K, gshift, st);
+        case 16:  return launch_gemv_lpr<16,  R>(x, segs, n_segs, K, gshift, st);
+        case 32:  return launch_gemv_lpr<32,  R>(x, segs, n_segs, K, gshift, st);
+        case 64:  return launch_gemv_lpr<64,  R>(x, segs, n_segs, K, gshift, st);
+        default:  return launch_gemv_lpr<128, R>(x, segs, n_segs, K, gshift, st);
     }
 }
 
-template <int M>
-vv_status_t launch_gemv(const void* x, const void* packed, const void* sz,
-                        const void* bias, void* y, int N, int K, int gshift,
-                        cudaStream_t st)
+/**
+ * @brief One GEMV launch over `n_segs` projections of the same x.
+ *
+ * At least 16 lanes per row, so every step reads 256 contiguous bytes of it
+ * (8 lanes, 128 bytes, measured 10-15% slower); more while the grid is short
+ * of ~48K threads, so a lone 512- or 256-row projection still reaches every
+ * SM; never more than twice the row's chunk count. (Capping at one chunk
+ * per lane, so none idles, was measured slower on the lone 512-row k/v:
+ * 3.8 us at 64 lanes against 3.4 us at 128.)
+ * One chunk in flight per lane: at 72 registers the occupancy that buys
+ * hides the latency better than unrolling does (swept on a 3090, one chunk
+ * beat two and four on every shape). Long rows (the down projection) go two
+ * to a lane group, so each x chunk fetched serves two weight chunks:
+ * 3584x18944 moves 750 -> 805 GB/s that way, while the short-K shapes lose
+ * from the halved grid. VV_W4A16_GEMV_LPR (16..128) and VV_W4A16_GEMV_R
+ * (1, 2) override the choice for tuning.
+ */
+vv_status_t launch_gemv(const void* x, const w4v_segs& segs, int n_segs,
+                        int K, int gshift, cudaStream_t st)
 {
+    long rows_total = 0;
+    for (int i = 0; i < n_segs; i++) rows_total += segs.n[i];
     const int nch = K >> 5;
-    /*
-     * At least 16 lanes per row, so every step reads 256 contiguous bytes of
-     * it (8 lanes, 128 bytes, measured 10-15% slower); more while the grid is
-     * short of ~48K threads, so the 512- and 256-row k/v projections still
-     * reach every SM; never more than twice the row's chunk count. One
-     * chunk in flight per lane: at 72 registers the occupancy that buys
-     * hides the latency better than unrolling does (swept on a 3090, U=1
-     * beat U=2/4 on every shape). Long rows (the down projection) go two
-     * to a lane group, so each x chunk fetched serves two weight chunks:
-     * 3584x18944 moves 750 -> 805 GB/s that way, while the short-K shapes
-     * lose from the halved grid.
-     */
-    static thread_local int lpr_env = -2, u_env = -2, r_env = -2;
+    static thread_local int lpr_env = -2, r_env = -2;
     const int r_req = w4_env_int("VV_W4A16_GEMV_R", &r_env, 0);
     const int rows = r_req > 0 ? (r_req >= 2 ? 2 : 1) : (K >= 8192 ? 2 : 1);
     int lpr = w4_env_int("VV_W4A16_GEMV_LPR", &lpr_env, 0);
     if (lpr <= 0) {
         lpr = 16;
-        while (lpr < 128 && (long)N / rows * lpr < 49152L) lpr *= 2;
+        while (lpr < 128 && rows_total / rows * lpr < 49152L) lpr *= 2;
         while (lpr > 16 && lpr > 2 * nch) lpr >>= 1;
     }
-    const int u = w4_env_int("VV_W4A16_GEMV_U", &u_env, 1);
     const half* xh = (const half*)x;
-    const uint4* w = (const uint4*)packed;
-    const half2* s = (const half2*)sz;
-    const half* b = (const half*)bias;
-    half* yh = (half*)y;
-    if (M == 1 && rows == 2) {
-        if (u <= 1) return launch_gemv_u<M, 1, 2>(xh, w, s, b, yh, N, K, gshift, lpr, st);
-        return launch_gemv_u<M, 2, 2>(xh, w, s, b, yh, N, K, gshift, lpr, st);
-    }
-    if (u <= 1 || M > 1) return launch_gemv_u<M, 1, 1>(xh, w, s, b, yh, N, K, gshift, lpr, st);
-    return launch_gemv_u<M, 2, 1>(xh, w, s, b, yh, N, K, gshift, lpr, st);
+    if (rows == 2) return launch_gemv_r<2>(xh, segs, n_segs, K, gshift, lpr, st);
+    return launch_gemv_r<1>(xh, segs, n_segs, K, gshift, lpr, st);
 }
 
-vv_status_t gemv_any_m(const void* x, const void* packed, const void* sz,
-                       const void* bias, void* y, int M, int N, int K,
-                       int gshift, cudaStream_t st)
+vv_status_t gemv_one(const void* x, const void* packed, const void* sz,
+                     const void* bias, void* y, int N, int K, int gshift,
+                     cudaStream_t st)
 {
-    switch (M) {
-        case 1: return launch_gemv<1>(x, packed, sz, bias, y, N, K, gshift, st);
-        case 2: return launch_gemv<2>(x, packed, sz, bias, y, N, K, gshift, st);
-        case 3: return launch_gemv<3>(x, packed, sz, bias, y, N, K, gshift, st);
-        case 4: return launch_gemv<4>(x, packed, sz, bias, y, N, K, gshift, st);
-        default: return VV_ERR_UNSUPPORTED;
-    }
+    w4v_segs segs;
+    memset(&segs, 0, sizeof(segs));
+    segs.w[0] = (const uint4*)packed;
+    segs.sz[0] = (const half2*)sz;
+    segs.bias[0] = (const half*)bias;
+    segs.y[0] = (half*)y;
+    segs.n[0] = N;
+    return launch_gemv(x, segs, 1, K, gshift, st);
 }
 
 /**
@@ -761,8 +779,8 @@ vv_status_t launch_gemm_cfg(w4_dev_info* info, int cfg,
     return VV_OK;
 }
 
-/** @brief Pick a tile configuration for M (VV_W4A16_CFG overrides). */
-int w4_pick_cfg(int M) {
+/** @brief Pick a tile configuration for M x N x K (VV_W4A16_CFG overrides). */
+int w4_pick_cfg(int M, int N, int K) {
     static thread_local int v = -2;
     const int forced = w4_env_int("VV_W4A16_CFG", &v, -1);
     if (forced >= 0 && forced < W4G_N_CFG) return forced;
@@ -770,12 +788,15 @@ int w4_pick_cfg(int M) {
      * Swept on a 3090 over the 7B projections: 16x64x128 is best up to 16
      * rows (the narrow N tile keeps 2-4x more blocks in flight while the
      * layer is weight-bound), 32x128x128 at 17-32, 64x128x128 from there on
-     * and 128x128x64 only once the grid is several waves deep.
+     * and 128x128x64 only once the grid is several waves deep. The square
+     * 3584x3584 q/o projection stays on 64x128x128 even at 1024-2048 rows
+     * (918 against 970 us at 2048): its 448 big tiles leave a partial last
+     * wave on 82 one-block SMs that the 64-row tile spreads more evenly.
      */
     if (M <= 16) return 2;
     if (M <= 32) return 3;
     if (M <= 512) return 6;
-    return 7;
+    return (long long)N * K >= 32LL * 1024 * 1024 ? 7 : 6;
 }
 
 vv_status_t launch_gemm(w4_dev_info* info, int cfg, const void* A,
@@ -827,8 +848,43 @@ vv_status_t vv_w4a16_gemv_dev(const void* x, const void* packed,
     if (!x || !packed || !sz || !y) return VV_ERR_NULL_PTR;
     const int gs = w4_gshift(group_size);
     if (gs < 0 || (K & 31) != 0 || N <= 0) return VV_ERR_UNSUPPORTED;
-    return launch_gemv<1>(x, packed, sz, bias, y, N, K, gs,
-                          (cudaStream_t)stream);
+    return gemv_one(x, packed, sz, bias, y, N, K, gs, (cudaStream_t)stream);
+}
+
+vv_status_t vv_w4a16_gemv_multi_dev(const void* x,
+                                    const vv_w4a16_proj_t* projs, int n_proj,
+                                    int K, int group_size, void* stream)
+{
+    if (!x || !projs) return VV_ERR_NULL_PTR;
+    if (n_proj < 1 || n_proj > W4V_MAX_SEGS) return VV_ERR_INVALID_ARG;
+    const int gs = w4_gshift(group_size);
+    if (gs < 0 || (K & 31) != 0) return VV_ERR_UNSUPPORTED;
+    w4v_segs segs;
+    memset(&segs, 0, sizeof(segs));
+    for (int i = 0; i < n_proj; i++) {
+        if (!projs[i].packed || !projs[i].sz || !projs[i].y)
+            return VV_ERR_NULL_PTR;
+        if (projs[i].N <= 0) return VV_ERR_UNSUPPORTED;
+        segs.w[i] = (const uint4*)projs[i].packed;
+        segs.sz[i] = (const half2*)projs[i].sz;
+        segs.bias[i] = (const half*)projs[i].bias;
+        segs.y[i] = (half*)projs[i].y;
+        segs.n[i] = projs[i].N;
+    }
+    return launch_gemv(x, segs, n_proj, K, gs, (cudaStream_t)stream);
+}
+
+vv_status_t vv_w4a16_gather_dev(const void* x, const int32_t* perm, void* out,
+                                int M, int K, void* stream)
+{
+    if (!x || !perm || !out) return VV_ERR_NULL_PTR;
+    if (M <= 0 || K <= 0 || (K & 7) != 0) return VV_ERR_INVALID_ARG;
+    const size_t total8 = (size_t)M * K / 8;
+    const int threads = 256;
+    w4a16_gather_kernel<<<(unsigned)((total8 + threads - 1) / threads),
+                          threads, 0, (cudaStream_t)stream>>>(
+        (const half*)x, perm, (half*)out, M, K);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
 vv_status_t vv_w4a16_gemm_dev(const void* A, const void* packed,
@@ -843,14 +899,13 @@ vv_status_t vv_w4a16_gemm_dev(const void* A, const void* packed,
         return VV_ERR_UNSUPPORTED;
     cudaStream_t st = (cudaStream_t)stream;
 
-    if (M <= w4_gemv_max_m())
-        return gemv_any_m(A, packed, sz, bias, C, M, N, K, gs, st);
+    if (M == 1) return gemv_one(A, packed, sz, bias, C, N, K, gs, st);
 
     w4_dev_info* info = w4_info();
     if (!info) return VV_ERR_CUDA_LAUNCH;
 
     if (info->major >= 8 && w4_mma_allowed()) {
-        vv_status_t s = launch_gemm(info, w4_pick_cfg(M), A, packed, sz, bias,
+        vv_status_t s = launch_gemm(info, w4_pick_cfg(M, N, K), A, packed, sz, bias,
                                     C, scratch, scratch_bytes, M, N, K, gs,
                                     st);
         if (s != VV_ERR_UNSUPPORTED) return s;
@@ -861,7 +916,8 @@ vv_status_t vv_w4a16_gemm_dev(const void* A, const void* packed,
     }
 
     /* Turing, or forced off: expand into the scratch, then dense GEMM. */
-    if (!scratch || scratch_bytes < (size_t)N * K * 2) return VV_ERR_NULL_PTR;
+    if (!scratch) return VV_ERR_NULL_PTR;
+    if (scratch_bytes < (size_t)N * K * 2) return VV_ERR_OVERFLOW;
     vv_status_t s = vv_w4a16_dequant_dev(packed, sz, scratch, N, K,
                                          group_size, stream);
     if (s != VV_OK) return s;

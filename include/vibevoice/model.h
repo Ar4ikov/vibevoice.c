@@ -36,6 +36,11 @@ typedef struct vv_weight {
     vv_tensor_t     zeros;        /**< INT4G only, host: exact integer zero
                                        point per group, uint8 [N][K/G];
                                        consumed by the GPU layout          */
+    vv_tensor_t     perm;         /**< INT4G act-order (GPTQ desc_act) only:
+                                       int32 [K]. The input channels were
+                                       sorted by group at load, so the
+                                       product runs on x[perm[j]]. Empty
+                                       when the groups were contiguous.    */
     int             quant_kind;   /**< vv_quant_kind_t                       */
     int             group_size;   /**< INT4G only: weights per scale         */
     int             int4g_layout; /**< INT4G only: vv_int4g_layout_t         */
@@ -105,14 +110,16 @@ typedef struct vv_model {
 
 /**
  * @brief Tensor slots one transformer layer has: 2 norms, then for each of
- *        the 7 projections its weight, scales, mins and bias.
+ *        the 7 projections its weight, scales, mins, act-order permutation
+ *        and bias. (`zeros` is not listed: it is host-only, consumed by the
+ *        GPU layout conversion and freed by vv_model_free.)
  *
  * Every slot is always listed, present or not, in a fixed order, so a caller
  * can index a saved array by slot position; an absent tensor has NULL data.
  * Whoever adds a per-weight tensor adds it to vv_layer_tensors() and bumps
  * this, and every upload, stage, pin, size and free follows.
  */
-#define VV_LAYER_TENSOR_SLOTS (2 + 7 * 4)
+#define VV_LAYER_TENSOR_SLOTS (2 + 7 * 5)
 
 /**
  * @brief Every tensor slot of `L`, in a fixed order.
