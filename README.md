@@ -224,6 +224,46 @@ label — a combined headset, or two identical ones on the same machine.
 `--from-file` replays a WAV at wall-clock speed through the identical path,
 which is how the streaming path is tested without a sound card.
 
+### Streaming transcription (VibeVoice-ASR-Streaming-7B)
+
+[`microsoft/VibeVoice-ASR-Streaming-7B`](https://huggingface.co/microsoft/VibeVoice-ASR-Streaming-7B)
+writes text while the audio arrives: a piece every 2.93 s of audio, 0.53 s
+of lookahead, speakers inline. Point any command at it and it streams:
+
+```bash
+vv_cli --model ./VibeVoice-ASR-Streaming-7B --quant int4 --audio talk.wav
+vv_cli mic --model ./VibeVoice-ASR-Streaming-7B --quant int4
+vv_cli serve --model ./VibeVoice-ASR-Streaming-7B --quant int4 --slots 16
+```
+
+`vv_cli --audio` prints each chunk's text as it is produced, then the
+transcript and speaker-turn segments. `mic` pushes capture blocks straight
+into one session (no VAD). `serve` answers `stream=true` uploads with SSE
+`transcript.text.delta` / `transcript.text.done` events, and takes live PCM
+of any rate over a WebSocket at `/v1/audio/stream`
+(`tools/stream_client.py` is a client). A session holds one slot; a client
+that disconnects releases it at the next token. The checkpoint is BF16 and
+runs as-is (`--quant none`, 18.6 GB) or quantized at load.
+
+With `--quant none` every chunk's tokens equal upstream
+`streaming_generate` on jfk, test30 and test120 (156/156 chunks). On a
+3090, test120 (120 s):
+
+| weights | per chunk (encode + prefill + decode) | RTF, file | VRAM | transcript vs upstream |
+|---|---|---|---|---|
+| `--quant none` (FP16) | 306 ms | 0.106 | 18.6 GB | identical |
+| `--quant int4` | **96 ms** | **0.033** | 9.8 GB | identical |
+| `--quant int8` | 259 ms | 0.090 | 12.5 GB | identical |
+| `--quant nf4` | 263 ms | 0.091 | 9.8 GB | punctuation differs, same words |
+
+`serve --quant int4` carries about 24 live WebSocket streams on one 3090
+with chunk latency under 300 ms at p95 (32 at the edge, 1.1 s p95), each
+producing the same text as a stream alone. `--cpu` works too, but at RTF
+about 1.1 with int4 it does not keep up with live audio.
+
+[docs/STREAMING.md](docs/STREAMING.md) has the protocol, the reference
+tooling and the full numbers.
+
 ### Chat
 
 ```bash
@@ -615,9 +655,9 @@ safetensors. The AWQ repo already carries its own.
 
 The loader also recognises `microsoft/VibeVoice-ASR-BitNet` (1.5B, tied head)
 and `microsoft/VibeVoice-ASR-Streaming-7B` by their configs. The streaming
-model generates chunk by chunk on a persistent KV cache, which a one-shot
-`vv_cli` run refuses for now; its prompt, stop tokens and chunk geometry are
-in place in `src/inference/family.c`.
+model ships its own `tokenizer.json` and generates chunk by chunk on a
+persistent KV cache; see
+[Streaming transcription](#streaming-transcription-vibevoice-asr-streaming-7b).
 
 ---
 
@@ -927,10 +967,12 @@ speech encoder or the connectors touches the default stream any more.
   claim that cannot be stood behind. The seam exists:
   `include/vibevoice/device.h` declares the op set, a build links exactly one
   implementation of it, and `src/device/device_none.c` shows the shape.
-- **VibeVoice-ASR-Streaming-7B** is half done. The protocol, the reference
-  diffing, the session API and the SSE/WebSocket plumbing are in. Running
-  the model is not: it needs BF16 loading and prefill into a non-empty KV
-  cache. See [docs/STREAMING.md](docs/STREAMING.md).
+- **Streaming-7B follow-ups.** A 29-row chunk prefill is fast only on the
+  W4A16 kernels (`--quant int4`); dense FP16, int8 and nf4 run it through
+  GEMMs sized for long prompts, and so does the CPU path, which is why it
+  runs slower than real time. A session that outgrows its KV window (about
+  40 minutes at 32K positions) ends cleanly instead of rolling over into a
+  fresh cache.
 
 ---
 

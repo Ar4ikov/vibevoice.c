@@ -2,26 +2,33 @@
 
 [`microsoft/VibeVoice-ASR-Streaming-7B`](https://huggingface.co/microsoft/VibeVoice-ASR-Streaming-7B)
 writes text while the audio is still arriving: one piece of text per 2.93 s
-chunk, with 0.53 s of lookahead. This page covers three things:
+chunk, with 0.53 s of lookahead. This page covers:
 
 1. The protocol, exactly as upstream `streaming_generate` runs it. It was
    checked against upstream commit `1541f59` running on gpubox.
 2. The reference dumps and the C-side diff (`tools/compare_ref.py
    dump-stream` / `cmp-stream`).
-3. The C session API (`include/vibevoice/stream.h`) and the server protocol
-   built on it.
+3. The C session API (`include/vibevoice/stream.h`), the backend over an
+   inference context, and the CLI and server built on it.
+4. The server protocol.
+5. Results: parity with upstream, latency, sessions per GPU.
 
 Tracking issue: #20.
 
-**Status.** Phase 1 is done: the reference, the protocol, and the model-free
-C pieces with tests. Phase 2 is the runtime backend. It needs three things
-that other branches are building:
+**Status.** The model runs end to end on GPU and CPU, from BF16 as-is or
+quantized at load (`--quant int4|int8|nf4`). With `--quant none` every
+chunk's token ids equal upstream `streaming_generate` on jfk, test30 and
+test120 (156/156 chunks). `vv_cli --audio` prints text chunk by chunk,
+`mic` streams live, `serve` answers `stream=true` with SSE and takes live
+PCM over a WebSocket. See [section 5](#5-results) for the numbers.
 
-- BF16 loading and the `asr-streaming-7b` family (#15);
-- the stateless-window encoder (#16);
-- prefill at `kv->current_len` with the split-KV small-q attention path (#17).
-
-Until then `vv_stream_open()` returns `VV_ERR_UNSUPPORTED`.
+```bash
+vv_cli --model ./VibeVoice-ASR-Streaming-7B --quant int4 --audio talk.wav
+vv_cli mic --model ./VibeVoice-ASR-Streaming-7B --quant int4 [--timestamps]
+vv_cli serve --model ./VibeVoice-ASR-Streaming-7B --quant int4 --slots 16
+python tools/stream_client.py --url ws://127.0.0.1:8080/v1/audio/stream \
+    --audio talk.wav                     # live PCM, paced to real time
+```
 
 ---
 
@@ -173,7 +180,7 @@ Measured with the reference (BF16, greedy, acoustic mean):
 
 The session refuses a chunk that would not fit rather than writing past the
 cache (`VV_ERR_OVERFLOW` plus an ERROR event). A rollover policy (re-prompt
-into a fresh cache) is a phase-2 option.
+into a fresh cache) is not implemented.
 
 ### Reference speed (for scale, not a target)
 
@@ -194,7 +201,8 @@ gpu-run 1 /mnt/ssd0/vibevoice/.venv/bin/python tools/compare_ref.py dump-stream 
     [--speech-dtype fp32|bf16] [--context-info "A,B"] \
     [--start S --duration D] [--check-upstream]
 
-VV_DUMP_DIR=cdump vv_cli --model <streaming-7b> --audio jfk.wav   # phase 2
+# the exact PCM the reference used, as a float32 WAV (see audio24k.f32)
+VV_DUMP_DIR=cdump vv_cli --model <streaming-7b> --quant none --audio jfk.wav
 python tools/compare_ref.py cmp-stream --ref ref/jfk --c cdump [--all] [-v]
 ```
 
@@ -220,18 +228,17 @@ Options:
 - `--check-upstream` also calls upstream `streaming_generate` itself, with
   the acoustic latent patched to the mean, and diffs the chunk texts.
 
-The C side (phase 2, when `VV_DUMP_DIR` is set) writes:
+The C side (when `VV_DUMP_DIR` is set) writes:
 
 | file | content |
 |---|---|
 | `stream_prompt_ids.bin` | int32 |
 | `stream_cNNNN_ids.bin` | int32 `[count, ids...]`, the stop id excluded (so an empty chunk still leaves a file) |
 | `stream_cNNNN_text.bin` | UTF-8 chunk text (absent when the text is empty) |
-| `stream_cNNNN_feats.bin` | float32 `[26, hidden]` (backend) |
-| `stream_cNNNN_logits.bin` | float32 `[vocab]`, the first token's logits (backend) |
+| `stream_cNNNN_feats.bin` | float32 `[26, hidden]`, the chunk's feature rows (backend) |
+| `stream_cNNNN_logits.bin` | float32 `[vocab]`, the first token's logits (GPU backend) |
 
-The session already writes the first three. The last two belong to the
-phase-2 backend.
+The session writes the first three, the backend the last two.
 
 `cmp-stream` reports:
 
@@ -241,7 +248,9 @@ phase-2 backend.
   max / rel / cosine, top-1 agreement and top-5 overlap.
 
 It stops at the first diverging chunk, because every later chunk runs on a
-different history. `--all` goes on anyway.
+different history. `--all` goes on anyway. When the C side wrote every
+chunk it also compares the joined transcript: identical or not, word edits,
+and a normalized WER (case and punctuation ignored).
 
 ### Checks done on gpubox
 
@@ -293,51 +302,67 @@ vv_stream_params_default(&p);        /* 22+4 frames, ids, 256 tok/chunk */
 p.context_info = "Azure,VibeVoice";
 p.on_event = on_event; p.user = &state;
 vv_stream_t* s;
-vv_stream_open(ctx, &p, &s);         /* phase 2; tests use _open_backend */
+vv_stream_open(ctx, &p, &s);         /* tests use _open_backend */
 while (have_audio) vv_stream_push(s, pcm24k, n);   /* events fire inline */
 vv_stream_finish(s);                 /* tail windows, then DONE */
 vv_stream_close(s);
 ```
 
-### Phase-2 hooks (`TODO(phase 2)` in `src/inference/stream.c`)
+### The backend over an inference context (`src/inference/stream_ctx.c`)
 
-The backend over a `vv_inference_ctx_t` implements the following.
+`vv_stream_open(ctx, ...)` takes the geometry and the special ids from the
+model's family and builds a backend over the context. The context belongs to
+the session until it closes.
 
-- `encode_text` / `token_bytes`: `ctx->tokenizer` through
-  `vv_tokenizer_encode` and `vv_stream_token_bytes`.
-- `prefill_prompt`: reset the KV cache (primary and shards), embed, and
-  `vv_decoder_prefill`.
-- `prefill_chunk`, in order:
-  - Encode the window through the stateless-window batched encoder (#16),
-    acoustic and semantic, with the acoustic latent as the mean.
-  - Run the connectors on the device, writing straight into rows
-    `feat_offset..` of the chunk's hidden buffer. Token rows go through the
-    embedding.
-  - Prefill at `kv->current_len` (#15). With about 29 query rows against a
-    growing cache this wants the split-KV small-q attention path (#17).
-  - Final norm on the last row, LM head, argmax.
-  - Call `vv_kv_cache_publish_len` on every shard.
-  - When dumping, write `stream_cNNNN_feats` / `_logits`.
-- `decode_step`: the existing graphed step. Keep the `graph_slot_t` array
-  and decode buffers in the session instead of on `transcribe_gpu`'s stack.
-  The captures are position-invariant, so they survive across chunks. The
-  replay needs the `kv->current_len < max_seq_len` guard (pipeline map H1).
-- `kv_len` / `kv_capacity`: `kv->current_len` / `kv->max_seq_len`.
-- Quantised KV: `k_ref` is built from the first append, which is the
-  prompt. Either accept that or delay it until the first chunk. Parity has
-  to be measured.
-- Family plumbing (#15):
-  - geometry from `preprocessor_config.json` (`chunk_frames`,
-    `lookahead_frames`);
-  - ids from `vv_stream_ids_from_tokenizer`;
-  - `vv_cli --audio` on a streaming checkpoint pushes the file through a
-    session and prints chunk by chunk;
-  - `mic` pushes capture blocks straight into a session instead of cutting
-    VAD utterances.
+- **Prompt**: the caches of the primary and of every shard are reset, the
+  31 prompt ids embedded and prefilled.
+- **Chunk**: the token rows (`[<|text_chunk_end|>] <|object_ref_start|> ...
+  <|object_ref_end|>`, features as `<|box_start|>` placeholders) are
+  embedded into a buffer allocated at open. The window goes to the device's
+  speech front end as a *stateless* job (no encoder state, as upstream
+  encodes each window), and the connectors write the 26 feature rows straight
+  into that buffer, after the embedding (an event, not a host sync). The 29
+  rows are prefilled at `kv->current_len` through every shard, the last row
+  goes through the final norm and the LM head, and its argmax is the first
+  token. The device lengths are then published for decode.
+- **Decode**: the same captured step as a one-shot transcription
+  (`pipeline_internal.h` exports it, so there is one implementation). The
+  captures live in the session and read the position from the device, so
+  they survive every prefill in between; a session re-captures only when the
+  attention launch shape moves, a few dozen times an hour. The token the
+  argmax leaves on the device is embedded from there.
+- **The chunk end** is folded into the next chunk's prefill as its first row
+  (the same cache, one forward fewer).
+- **Several windows ready at once** (a file, or a live session that fell
+  behind): their encodes go to the front end together first, up to 8, which
+  it packs into shared launches, and the chunks then copy their rows from
+  there. Batched windows are bit-identical to single ones, so this changes
+  timing only. `VV_STREAM_AHEAD=0` turns it off.
+- **Paged KV**: a chunk reserves its rows plus the chunk end before it runs,
+  waiting while other slots hold pages; decode steps take pages one at a
+  time. Pages go back to the pool when the session closes.
+- **Refusal**: the session checks the KV window before every chunk and every
+  step and ends with `VV_ERR_OVERFLOW` (an ERROR event, and the server tells
+  the client why) instead of writing past it. A pool that cannot supply
+  pages ends it with `VV_ERR_KV_POOL_EXHAUSTED`.
+- **Cancel**: `vv_stream_cancel()` from any thread, or from inside the event
+  callback; the session stops at the next token.
+- **CPU**: the same sequence over the host kernels (`--cpu`): the window
+  through both CPU encoders and connectors, `vv_decoder_prefill_cpu` at the
+  current length, the fused host head.
+- `VV_STREAM_PROFILE=1` syncs after each encode to report its time
+  separately.
 
-The engine holds one slot for a session's lifetime
-(`vv_engine_session_open`). Sessions count against `--slots` and the server
-queue.
+`vv_inference_transcribe()` on a streaming model runs a whole clip through
+a session (`vv_stream_transcribe()`), so `vv_cli`, `chat`, the engine and
+the non-streaming server path all work. The segments are the speaker turns
+the model writes inline (`" \n Speaker N:"`), timed to the chunks they came
+from, and `full_text` joins them.
+
+The engine holds one slot for a session's life (`vv_engine_stream_open`,
+`_push`, `_finish`, `_close`), resampling any input rate on the fly with a
+resampler that gives exactly what the whole-file resample gives. Sessions
+count against `--slots` and the server queue.
 
 ---
 
@@ -388,8 +413,9 @@ Client to server:
 
 - A text frame first:
   `{"type":"session.start","sample_rate":16000,"format":"pcm_s16le"|"pcm_f32le","hotwords":"A,B"}`.
-  Any rate other than 24000 goes through the existing resampler in
-  fixed-ratio streaming mode.
+  Any rate other than 24000 goes through a streaming resampler that
+  reproduces the whole-file resample sample for sample. The server answers
+  `{"type":"session.started",...}` once the session holds a slot.
 - Then binary frames of raw PCM, any size.
 - `{"type":"session.finish"}` flushes the zero-padded tail. Closing the
   socket instead abandons the tail.
@@ -403,14 +429,16 @@ Server to client (text frames):
 Then a close frame with 1000, or 1011 on an internal error.
 
 - Latency is one window: 3.47 s of audio before the first chunk can run,
-  plus about 30–60 ms of GPU time per chunk (a phase-2 estimate).
+  plus the chunk's compute (about 0.1 s with `--quant int4`, section 5).
 - The socket thread reads frames and pushes PCM into the session. The
   session runs in the same thread, because a chunk's compute (tens of ms)
   is far shorter than the 2.93 s between chunks. The kernel socket buffer
   absorbs the gap.
 - If the session falls behind real time, which only happens when a GPU is
-  shared across too many sessions, the chunker simply queues windows.
-  Phase 2 may batch consecutive windows through the encoder.
+  shared across too many sessions, the chunker queues windows and their
+  encodes go out together.
+- A client that sends nothing for 60 s is dropped; one that closes the
+  socket abandons its tail and releases its slot.
 
 ### What `http.c` needs
 
@@ -422,7 +450,7 @@ Then a close frame with 1000, or 1011 on an internal error.
 | WebSocket frames: incremental parser (masking, 16/64-bit lengths, fragmentation, control frames interleaved, size cap, protocol errors → close code), server frame header, send | **done**: `vv_ws_parser_t`, `vv_ws_frame_header`, `vv_http_ws_send` |
 | Read after the request (frames) with a timeout | **done**: `vv_http_read`. Bytes that arrived with the upgrade request are in `req->body` and are fed first. |
 | Disconnect detection | **done**: `vv_http_write` returns false, and `MSG_NOSIGNAL` means no SIGPIPE |
-| Incremental request-body read (a chunked or long upload feeding a session while it arrives) | **phase 2**. `read_request` buffers the whole body, which the security branch (#14) is reworking right now. Add a handler flag that makes the reader stop after the headers and hand over the socket. |
+| Incremental request-body read (a chunked or long upload feeding a session while it arrives) | Not done. `read_request` buffers the whole body; live input goes over the WebSocket instead. |
 | Keep-alive, chunked transfer encoding | Not needed. Every streaming response closes its connection. |
 | Text-frame UTF-8 validation (close 1007) | Not done. Control messages are parsed as JSON, which rejects garbage anyway. |
 
@@ -438,15 +466,91 @@ Then a close frame with 1000, or 1011 on an internal error.
 
 ---
 
-## Open questions for phase 2
+## 5. Results
 
-- **Encoder precision.** Upstream runs the encoder in BF16 and ours runs in
-  FP16/FP32. The FP32 and BF16 references agree on every token id on jfk
-  and test120. Check again on the long excerpt with `cmp-stream`.
-- **Quantised weights.** `--quant int4|int8|nf4` at load time (#15) changes
-  numerics. Measure the transcript diff and first-token logits cosine
-  against the BF16 reference per chunk.
-- **CPU path.** The same session and backend over `transcribe_cpu`'s
-  stages. Each chunk is 29 prefill rows and about 10 decode steps, so at
-  7.9 tok/s CPU decode a chunk takes about 1.3 s of decode for 2.93 s of
-  audio. Real time on a 5900X looks plausible (estimate).
+All on gpubox (RTX 3090, Ryzen 9 5900X), against the reference dumps in
+section 2 (upstream BF16, greedy, acoustic mean). Timings are the best of
+three runs unless marked otherwise.
+
+### Parity with upstream `streaming_generate`
+
+`tools/compare_ref.py cmp-stream --all` over a `VV_DUMP_DIR` dump. "WER"
+is over lower-cased words with punctuation dropped.
+
+| weights | jfk (4 chunks) | test30 (11) | test120 (41) | transcript |
+|---|---|---|---|---|
+| `--quant none` (FP16 dense), GPU | **4/4** ids identical | **11/11** | **41/41** | identical |
+| `--quant none`, `--cpu` | **4/4** | – | – | identical |
+| `--quant int8` | 4/4 | 11/11 | 41/41 | identical |
+| `--quant int4` (W4A16) | 4/4 | 11/11 | 39/41, from chunk 16 | identical |
+| `--quant int4`, `--cpu` | 4/4 | – | – | identical |
+| `--quant int8`, `--cpu` | 4/4 | – | – | identical |
+| `--quant nf4` | 4/4 | 8/11, from chunk 5 | 27/41, from chunk 5 | same words, punctuation differs (WER 0.00%) |
+
+- On int4 test120 the word "not" moves across the boundary between chunks
+  16 and 17 ("ask" | "not what" becomes "ask not" | "what"); the joined
+  transcript is the same.
+- nf4 writes "thick, peppered, flour-fattened" where the reference has
+  "thick peppered flour fattened": 4 and 24 raw word edits on test30 and
+  test120, none after normalisation.
+- On the 300 s excerpt of long30m, `--quant none` is 101/103 chunks
+  identical, with the same one-word boundary move in chunk 87, and the same
+  transcript.
+- KV formats with int4 weights, test120: `--kv-cache fp8` is 39/41 with the
+  same transcript; `tq4` is 36/41 with 3 word edits (WER 0.71%).
+- `--attn flashinfer` with int4 is 39/41 with the same transcript.
+- `test_stream` with the model: the emitter rebuilds 159/159 reference chunk
+  texts from the reference ids, and a live session (PCM pushed in small
+  blocks) reproduces jfk and test30 chunk for chunk.
+
+### One stream
+
+`vv_cli --audio test120.wav` (120 s, 41 chunks). "Per chunk" is encode +
+prefill + decode of one chunk; the encode is 22-29 ms of it with one window
+per launch, less when ready windows share a launch.
+
+| weights | per chunk, mean (p95) | RTF | decode | VRAM |
+|---|---|---|---|---|
+| `--quant none` (FP16) | 306 ms (379) | 0.106 | 55 tok/s | 18.6 GB |
+| `--quant int4` | **96 ms** (139) | **0.033** | 147 tok/s | 9.8 GB |
+| `--quant int8` | 259 ms | 0.090 | – | 12.5 GB |
+| `--quant nf4` | 263 ms (313) | 0.091 | 97 tok/s | 9.8 GB |
+| `--quant int4`, `--attn flashinfer` | 145 ms (238) | 0.050 | 120 tok/s | 9.8 GB |
+| `--quant int4`, 300 s excerpt | 129 ms (172) | 0.045 | 131 tok/s | 9.8 GB |
+| `--quant none`, 300 s excerpt | 342 ms (455) | 0.118 | 52 tok/s | 18.6 GB |
+
+The int8, nf4, FP16 and 300 s rows predate encoding ready windows ahead,
+which took about 11 ms off each int4 chunk; they would move by about as
+much. Only int4 uses kernels built for a 29-row prefill: the other formats
+run it through GEMMs sized for long prompts, which is most of the gap.
+
+CPU (`--cpu`, 12 cores, jfk, one run each): int4 2.8 s per chunk, RTF 1.09;
+int8 4.2 s, RTF 1.58; FP16 4.4 s, RTF 1.68. It works, but does not keep up
+with real time: a chunk prefill on the CPU runs at about 20 tok/s against
+77 tok/s for a long batch prompt.
+
+### Sessions per 3090
+
+`vv_cli serve --quant int4 --slots 48`, `tools/stream_client.py --sessions N
+--stagger 0.37`: N WebSocket clients each stream test120 at wall-clock speed.
+Latency is from sending a window's last sample to receiving its text.
+
+| sessions | latency p50 | p95 | max | keeps up | texts identical to one session |
+|---|---|---|---|---|---|
+| 1 | 116 ms | 138 ms | 149 ms | yes | yes |
+| 16 | 163 ms | 205 ms | 214 ms | yes | yes |
+| 24 | 213 ms | 264 ms | 279 ms | yes | yes |
+| 32 | 297 ms | 1.1 s | 2.2 s | yes, just (all done 0.7 s after the audio) | yes |
+| 40 | 11.3 s | 18.9 s | 21.5 s | no, 21 s behind by the end | yes |
+| 48 | 17.8 s | 33.3 s | 42.3 s | no | yes |
+
+So one 3090 carries about **24 live int4 streams** with sub-300 ms chunk
+latency, and about 32 at the edge; past that the queue grows. Every session
+produced the same text as a session alone, with no errors.
+
+Memory per session is a 256 MB workspace plus KV at about 45 MB per minute
+of audio (FP16) from the shared page pool. With 48 slots the server sizes
+the pool to what the card has left: 1261 pages, 80704 positions, 4.4 GB,
+enough for 49 two-minute streams at once. Before the budget charged
+streaming slots at their real 256 MB workspace, 32 slots got a 458 MB pool
+and live sessions past the fifth failed with "KV page pool exhausted".

@@ -57,6 +57,21 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
   `asr-streaming-7b` — промпт, стоп-токены, нормализация, геометрия чанков.
   Один проход по слоям — `vv_layer_tensors()`; prefill дописывает с
   `kv->current_len` (GPU и CPU), CPU prefill идёт чанками.
+* **VibeVoice-ASR-Streaming-7B** (`docs/STREAMING.md`, `include/vibevoice/stream.h`,
+  `src/inference/stream_ctx.c`): сессия на контексте — промпт в сброшенный
+  KV, каждое окно 26 кадров (22 + 4 lookahead) — stateless-задача фронтенда,
+  коннекторы пишут прямо в строки чанка, prefill `[<|text_chunk_end|>]
+  <|object_ref_start|> 26 фич <|object_ref_end|>` с `kv->current_len`,
+  greedy decode на захваченном графе (графы живут в сессии и переживают
+  prefill'ы). Несколько готовых окон кодируются одним заходом
+  (`encode_ahead`). `vv_inference_transcribe` для этой модели идёт через
+  сессию; `vv_cli --audio` печатает чанки по мере готовности, `mic` —
+  живой поток без VAD, `serve` — SSE `stream=true` и WebSocket
+  `/v1/audio/stream` (слот на сессию, отключение клиента отменяет сессию).
+  `--quant none` посимвольно совпадает с upstream `streaming_generate` на
+  jfk/test30/test120 (156/156 чанков); int4 на 3090 — 96 мс на чанк,
+  RTF 0.033; `serve` держит ~24 живых int4-потока на 3090 (p95 < 300 мс).
+  Нормализация громкости для этой модели выключена.
 * KV-кэш: `--kv-cache fp16|fp8|fp8-e5m2|tq4|tq3|tq2|tq1.5`. На 32K позиций
   1792 → 896 / 462 / 350 / 238 / 182 MB. fp8, fp8-e5m2 и tq4 дают
   идентичный транскрипт.
