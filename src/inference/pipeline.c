@@ -633,8 +633,21 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
      * flashinfer on any format) and a single device holding every layer's KV.
      */
     const int n_slots = p.n_slots > 0 ? p.n_slots : 1;
-    const vv_attn_backend_t attn_want =
+    vv_attn_backend_t attn_want =
         vv_attn_backend_from_env((vv_attn_backend_t)p.attn_backend);
+    /*
+     * The streaming model prefills 29 rows at a time on top of a cache that
+     * keeps growing. fa2 runs those as one row kernel -- 16 blocks on an
+     * 82-SM card, each walking the whole cache -- while flashinfer splits
+     * the cache across the idle SMs. `auto` is fa2 for the batch model to
+     * keep its transcripts bit-identical to the old kernels; this family
+     * has no such history, and with flashinfer it still matches upstream
+     * chunk for chunk (jfk, test30, test120), so `auto` takes the faster
+     * one here. `--attn fa2` still gets fa2.
+     */
+    if (attn_want == VV_ATTN_AUTO &&
+        c->model->config.family == VV_FAMILY_ASR_STREAMING_7B)
+        attn_want = VV_ATTN_FLASHINFER;
     const int attn_slab = vv_attn_resolve(
         (int)attn_want, p.kv_format, false, llm->num_attention_heads,
         llm->num_key_value_heads, llm->head_dim);
