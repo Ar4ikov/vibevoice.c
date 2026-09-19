@@ -34,7 +34,15 @@ vv_status_t vv_smooth_calibrate(const char* model_dir, int gpu_id,
     vv_init_params_t p = params ? *params : vv_init_params_default();
     p.weight_quant = VV_LOAD_QUANT_NONE;
     p.smooth = NULL;
-    p.gpus.n = 0;
+    /* Keep the caller's memory cap for that one device, if it gave one. */
+    {
+        vv_mem_cap_t cap = { 0, 0.0f };
+        for (int i = 0; i < p.gpus.n; i++)
+            if (p.gpus.id[i] == gpu_id) cap = p.gpus.cap[i];
+        p.gpus.n = 1;
+        p.gpus.id[0] = gpu_id;
+        p.gpus.cap[0] = cap;
+    }
     p.split_mode = VV_SPLIT_REPLICA;
     p.n_slots = 1;
     p.kv_paging = VV_KV_PAGED_OFF;

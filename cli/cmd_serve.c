@@ -212,11 +212,30 @@ int vv_cmd_serve(int argc, char** argv) {
         VV_LOG_W("serve: %d devices but only %d slot(s); raise --slots to use "
                  "them all", ep.gpus.n, ep.n_slots);
 
+    {
+        const char* sv = getenv("VV_SAVE_TOKENS");
+        if (sv && sv[0] && ep.n_slots > 1)
+            VV_LOG_W("serve: VV_SAVE_TOKENS is a single-request debugging "
+                     "aid; with %d slots concurrent requests overwrite '%s'",
+                     ep.n_slots, sv);
+    }
+
     vv_smooth_stats_t* smooth = NULL;
     if (calib || calib_stats) {
+        if (!vv_load_quant_takes_smooth(ep.weight_quant)) {
+            fprintf(stderr, "serve: --calib/--calib-stats fold into weights "
+                            "quantized at load; add --quant w8a8, w4a8, "
+                            "int8, int4 or nf4\n");
+            return 1;
+        }
+        /* The dense calibration load obeys the same placement limits. */
         vv_init_params_t ip = vv_init_params_default();
         ip.cpu_only = ep.cpu_only;
         ip.max_seq_len = ep.max_seq_len;
+        ip.gpu_layers = ep.gpu_layers;
+        ip.vram_budget = ep.vram_budget;
+        ip.attn_backend = ep.attn_backend;
+        ip.gpus = ep.gpus;
         if (vv_smooth_from_args(ep.model_dir, ep.gpu_id, &ip, calib,
                                 calib_stats, &smooth) != VV_OK)
             return 1;

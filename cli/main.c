@@ -427,6 +427,14 @@ int main(int argc, char** argv) {
     init_params.gpus = gpus;
     init_params.split_mode = (int)split;
     vv_smooth_stats_t* smooth = NULL;
+    if ((args.calib || args.calib_stats) &&
+        !vv_load_quant_takes_smooth(init_params.weight_quant)) {
+        fprintf(stderr, "error: --calib/--calib-stats fold into weights "
+                        "quantized at load; add --quant w8a8, w4a8, int8, "
+                        "int4 or nf4\n");
+        vv_free(raw_audio);
+        return 1;
+    }
     s = vv_smooth_from_args(args.model_dir, args.gpu_id, &init_params,
                             args.calib, args.calib_stats, &smooth);
     if (s != VV_OK) {

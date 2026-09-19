@@ -1671,7 +1671,9 @@ static bool token_ends(const vv_inference_ctx_t* ctx, int32_t token_id) {
  * per-token measure of how far a quantized model is from the one that wrote
  * the reference, free of the divergence a single early flip causes in free
  * decoding. The step after the last reference token is scored on whether
- * the model, too, stops there. Debugging aid: nothing reads it otherwise.
+ * the model, too, stops there. Debugging aid for one request at a time on
+ * the GPU path: the CPU path ignores both variables (and says so), and
+ * concurrent slots would all write the same VV_SAVE_TOKENS file.
  */
 typedef struct teacher {
     int32_t* ids;
@@ -2585,6 +2587,13 @@ static vv_status_t transcribe_cpu(
 
     VV_LOG_I("inference: CPU transcribe %d samples (%.2f sec)",
              num_samples, perf->audio_duration_sec);
+    {
+        const char* sv = getenv("VV_SAVE_TOKENS");
+        const char* te = getenv("VV_TEACHER_TOKENS");
+        if ((sv && sv[0]) || (te && te[0]))
+            VV_LOG_W("inference: VV_SAVE_TOKENS / VV_TEACHER_TOKENS work on "
+                     "the GPU path only; ignored here");
+    }
 
     if (!ctx->tokenizer) { VV_LOG_E("inference: no tokenizer"); return VV_ERR_NULL_PTR; }
     vv_kv_cache_reset(ctx->kv_cache, ctx->compute_stream);

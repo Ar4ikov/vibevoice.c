@@ -156,6 +156,15 @@ static inline bool vv_load_quant_act8(int q) {
     return q == VV_LOAD_QUANT_W8A8 || q == VV_LOAD_QUANT_W4A8;
 }
 
+/**
+ * @brief Whether SmoothQuant can fold into a load format: only into weights
+ *        quantized while they are read (not "auto", not dense "none").
+ *        Front ends check this before running a calibration pass.
+ */
+static inline bool vv_load_quant_takes_smooth(int q) {
+    return q > VV_LOAD_QUANT_NONE && q < VV_LOAD_QUANT_COUNT;
+}
+
 /** @brief "auto" | "none" | "nf4" | "int4" | "int8" | "w8a8" | "w4a8" →
  *         value; COUNT when unknown. */
 vv_load_quant_t vv_load_quant_parse(const char* name);
