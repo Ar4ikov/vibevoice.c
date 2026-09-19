@@ -42,7 +42,7 @@ static int g_fail = 0;
 #ifndef _WIN32
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -163,13 +163,11 @@ static bool ws_text(int fd, const char* s) {
 static bool recv_n(int fd, uint8_t* d, size_t n, int timeout_ms) {
     size_t got = 0;
     while (got < n) {
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(fd, &rd);
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        if (select(fd + 1, &rd, NULL, NULL, &tv) <= 0) return false;
+        struct pollfd p;
+        p.fd = fd;
+        p.events = POLLIN;
+        p.revents = 0;
+        if (poll(&p, 1, timeout_ms) <= 0) return false;
         const ssize_t k = recv(fd, d + got, n - got, 0);
         if (k <= 0) return false;
         got += (size_t)k;

@@ -33,6 +33,7 @@ typedef int socklen_t;
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <poll.h>
 typedef int SOCKET;
 #define INVALID_SOCKET (-1)
 #define close_socket close
@@ -631,17 +632,39 @@ bool vv_http_sse_send(vv_http_res_t* res, const char* event, const char* data) {
     return ok;
 }
 
+/* Waits until `fd` is readable (or hung up): 1 ready, 0 timeout, -1 error.
+ * POSIX uses poll(): select() with FD_SET on an fd >= FD_SETSIZE (1024) writes
+ * past the fd_set, and a server with a raised `ulimit -n` and many
+ * connections gets such fds. Winsock's fd_set is a counted array of handles,
+ * so select() is safe there. */
+static int wait_readable(SOCKET fd, int timeout_ms) {
+#ifdef _WIN32
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(fd, &rd);
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    const int r = select(0, &rd, NULL, NULL, &tv);
+    return r < 0 ? -1 : (r > 0 ? 1 : 0);
+#else
+    struct pollfd p;
+    p.fd = fd;
+    p.events = POLLIN;
+    p.revents = 0;
+    int r;
+    do { r = poll(&p, 1, timeout_ms); } while (r < 0 && errno == EINTR);
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+    return (p.revents & POLLNVAL) ? -1 : 1;
+#endif
+}
+
 int vv_http_read(vv_http_res_t* res, void* buf, size_t cap, int timeout_ms) {
     if (!res || !buf || cap == 0) return -1;
     const SOCKET fd = (SOCKET)(intptr_t)res->fd;
     if (timeout_ms >= 0) {
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(fd, &rd);
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        const int r = select((int)fd + 1, &rd, NULL, NULL, &tv);
+        const int r = wait_readable(fd, timeout_ms);
         if (r == 0) return -2;
         if (r < 0) return -1;
     }
@@ -653,13 +676,7 @@ int vv_http_read(vv_http_res_t* res, void* buf, size_t cap, int timeout_ms) {
 bool vv_http_peer_gone(vv_http_res_t* res) {
     if (!res) return true;
     const SOCKET fd = (SOCKET)(intptr_t)res->fd;
-    fd_set rd;
-    FD_ZERO(&rd);
-    FD_SET(fd, &rd);
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 0;
-    const int r = select((int)fd + 1, &rd, NULL, NULL, &tv);
+    const int r = wait_readable(fd, 0);
     if (r == 0) return false;          /* nothing to read: still there */
     if (r < 0) return true;
     char c;
