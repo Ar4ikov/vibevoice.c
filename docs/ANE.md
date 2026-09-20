@@ -103,8 +103,8 @@ audio length is a shape. A 30-second input did not compile at all:
 ## 5. What the measurements did find
 
 Core ML's own GPU path runs that same encoder graph in **10.2 ms per second
-of audio**. This runtime's Metal encoder does about 36 ms per second of
-audio per encoder. Nothing about the ANE explains that gap -- it is FP16
+of audio**. This runtime's Metal encoder does 62-71 ms per second of audio
+for the two encoders together -- 31 to 36 ms each, the same graph. Nothing about the ANE explains that gap -- it is FP16
 against the FP32 convolutions `src/metal/kernels/vae.metal` runs to keep
 batching and chunking bit-exact (see `docs/METAL.md`). So the 3.6x is ours
 to take, on the GPU, and it is tracked as its own piece of work rather than
@@ -116,7 +116,56 @@ block. The CPU kernels in `src/cpu/` are NEON and do not. That is a second
 piece of headroom that needs no new hardware, only `cblas` -- at the cost of
 the summation order the CPU path is currently bit-exact under.
 
-## 6. Reproducing this
+## 6. Metal 4 tensor operations, and what M5 changes
+
+The Neural Engine is not the only matrix hardware Apple exposes. Metal 4
+adds tensor operations -- `mpp::tensor_ops::matmul2d` from
+MetalPerformancePrimitives -- and on M5 those run on the neural accelerators
+Apple put in each GPU core. This machine reports them as available
+(`MTLGPUFamilyMetal4` on an Apple9 GPU), which means the path can be written
+and checked here rather than guessed at.
+
+It can also be written without changing how anything is submitted: a tensor
+is constructed inside the kernel from a plain device pointer
+(`tensor(ptr, dextents<int32_t,2>(K, M))`), so the existing buffers, encoder
+and command queue all stay. Only the language version moves to 4.0.
+
+`tools/metal4_probe/` runs `matmul2d` next to this runtime's `vv_gemm_tn` on
+the same shapes, checking both against a CPU reference first:
+
+| M x N x K | `vv_gemm_tn` | `matmul2d` (64x64 tile) |
+|---|---|---|
+| 512 x 18944 x 3584 | 1.88 TFLOP/s | 1.39 |
+| 2048 x 18944 x 3584 | 1.03-1.22 | 1.34-1.57 |
+| 128 x 18944 x 3584 | 0.70 | 0.80-0.85 |
+
+The same band, which is what the hardware says should happen: on Apple9 both
+go to the same simdgroup matrix units, whose measured ceiling here is
+2.7 TFLOP/s. Tensor operations are not faster on an M4 and were never going
+to be. They are more accurate (FP32 destination, worst relative error
+1.7e-05 against 2.4e-04) and much shorter to write.
+
+Two things worth knowing before writing any of it, because each produced
+nonsense first:
+
+- Extents are **(columns, rows)** and `slice(x, y)` shifts columns then
+  rows, so a row-major M x K matrix is `dextents<int32_t,2>(K, M)` and its
+  row offset is the *second* slice argument. Getting this backwards computes
+  something plausible-looking at 17 TFLOP/s, which is six times the GPU's
+  peak and therefore a lie.
+- The destination cannot be `half`, and operands cannot be `device const`:
+  the implementation matches value types literally and otherwise falls
+  through to `static_assert(..., "Unsupported type")`.
+
+**What this is for is M5.** The table above is the floor -- the same code on
+hardware with neural accelerators is where the interesting number is, and
+this repo cannot measure that yet. The other half of the reason to care is
+in the type table: `matmul2d` takes `half x int4b_format` natively, which is
+the W4A16 shape this runtime already stores. `src/metal/kernels/w4a16.metal`
+dequantizes into threadgroup memory to feed simdgroup matrices; a tensor-ops
+version would hand the four bits to the hardware as they are.
+
+## 7. Reproducing this
 
 `tools/ane_probe/` holds what produced the tables: `gen.py` and `gen_enc.py`
 emit the Core ML models (coremltools, run once, never at run time), and

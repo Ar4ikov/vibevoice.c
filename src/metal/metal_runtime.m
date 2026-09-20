@@ -287,12 +287,13 @@ static VVMetal* mtl(void) {
                 m->cores = query_core_count();
                 if (m->cores <= 0) m->cores = 8;
                 /*
-                 * Which generation, and whether this GPU has the matrix
-                 * units Metal 4 exposes as tensor operations -- Apple10 and
-                 * up (M5), where a simdgroup-matrix GEMM is the thing that
-                 * would be rewritten to use them. Logged, not acted on:
-                 * there is no such device here to measure on, and an
-                 * untested kernel is a claim, not a feature (docs/ANE.md).
+                 * Which generation, and whether Metal 4's tensor operations
+                 * are available. They are the door to M5's per-core neural
+                 * accelerators, and they are offered on Apple9 too, where
+                 * they reach the same band as the simdgroup-matrix kernels
+                 * here because they run on the same units (docs/ANE.md has
+                 * the measurements). Logged, not acted on: the hardware
+                 * that would make the switch pay is not here to measure.
                  */
                 int fam = 7;
                 for (int f = 10; f >= 7; f--)
