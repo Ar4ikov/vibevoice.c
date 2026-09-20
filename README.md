@@ -86,9 +86,9 @@ defaults unless noted.
 | | |
 |---|---|
 | Model load | **17 s** |
-| Speech encoding | **2.2 s** per 30 s of audio, 94 s per 16 min |
-| Prefill | **99 tok/s** on a 286-token prompt |
-| Decode | **14.9 tok/s** at 0.3K context |
+| Speech encoding | **2.2 s** per 30 s of audio, 88 s per 16 min |
+| Prefill | **99 tok/s** on a 286-token prompt, 46 on a 7225-token one |
+| Decode | **14.9 tok/s** at 0.3K context, 5.5 at 7K |
 | RTF | **0.61** on a 30 s file |
 | Memory | 6.7 GB resident, 10 GB peak while loading |
 

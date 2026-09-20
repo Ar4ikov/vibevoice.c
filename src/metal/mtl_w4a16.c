@@ -12,6 +12,7 @@
 #include "metal_internal.h"
 
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
@@ -21,6 +22,7 @@ typedef struct {
 
 typedef struct { int M, K; } gather_p;
 typedef struct { int N, K, gshift; } deq_p;
+typedef struct { int M, N, K, gshift; } w4_gemm_p;
 
 static int gshift_of(int group_size) {
     switch (group_size) {
@@ -134,12 +136,33 @@ vv_status_t vv_w4a16_gemm_dev(const void* A, const void* packed,
     if (M == 1)
         return vv_w4a16_gemv_dev(A, packed, sz, bias, C, N, K, group_size,
                                  stream);
-    if (!scratch) return VV_ERR_NULL_PTR;
-    if (scratch_bytes < (size_t)N * K * 2) return VV_ERR_OVERFLOW;
-    vv_status_t s = vv_w4a16_dequant_dev(packed, sz, scratch, N, K,
-                                         group_size, stream);
-    if (s == VV_OK)
-        s = vv_gemm_fp16_dev(A, scratch, C, M, N, K, 1.0f, 0.0f, stream);
+    /*
+     * The weight stays in four bits: the tile GEMM dequantizes a chunk a row
+     * into threadgroup memory as it goes, so no scratch is needed and the
+     * 136 MB of FP16 the old path wrote for one 7B projection is never
+     * written. Same halves, same k order, same output bits.
+     */
+    (void)scratch; (void)scratch_bytes;
+    /* VV_W4_FUSED=0 restores the dequant-then-GEMM path, when its 136 MB of
+     * scratch is there: the two are bit for bit, which is how that was
+     * checked. */
+    { const char* e = getenv("VV_W4_FUSED");
+      if (e && e[0] == '0' && scratch && scratch_bytes >= (size_t)N * K * 2) {
+        vv_status_t s0 = vv_w4a16_dequant_dev(packed, sz, scratch, N, K,
+                                              group_size, stream);
+        if (s0 == VV_OK)
+            s0 = vv_gemm_fp16_dev(A, scratch, C, M, N, K, 1.0f, 0.0f, stream);
+        if (s0 != VV_OK || !bias) return s0;
+        return vv_bias_add_dev(C, bias, M, N, stream); } }
+    w4_gemm_p p = { M, N, K, gs };
+    vv_mtl_launch_t l = launch("vv_w4a16_gemm", &p, sizeof(p));
+    l.bufs[0] = A; l.bufs[1] = packed; l.bufs[2] = sz; l.bufs[3] = C;
+    l.nbufs = 4;
+    l.grid[0] = (uint32_t)((N + 63) / 64);
+    l.grid[1] = (uint32_t)((M + 63) / 64);
+    l.block[0] = 128;
+    l.tg_mem = 4 * 32 * (32 + 4) * 4;        /* the epilogue's staging */
+    vv_status_t s = vv_mtl_run(stream, &l);
     if (s != VV_OK || !bias) return s;
     return vv_bias_add_dev(C, bias, M, N, stream);
 }

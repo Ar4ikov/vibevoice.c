@@ -124,3 +124,88 @@ kernel void vv_w4a16_dequant(constant vv_w4_deq_p& p [[buffer(0)]],
     for (int i = 0; i < 8; i++)
         dst[i] = half4(v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]);
 }
+
+/*
+ * GEMM without unrolling the weight: C[M,N] = A[M,K] . W[N,K]^T.
+ *
+ * The tile is linear.metal's (64x64 of C per threadgroup, four simdgroups of
+ * 32x32, K in steps of 32) -- these files are one library, so its helpers and
+ * strides are reused rather than repeated. What changes is where B comes from:
+ * a K step of 32 is exactly one 16-byte chunk of a row, so each step
+ * dequantizes one chunk per row straight into threadgroup memory and the
+ * weight is read once, in four bits, instead of being written out as 136 MB
+ * of FP16 first.
+ *
+ * The values are the same halves `vv_w4a16_dequant` would have written and
+ * the k order is the same, so this is bit for bit what dequant + vv_gemm_tn
+ * produced. Bias stays with the caller's vv_bias_add, added after the output
+ * has been rounded to FP16, as it was before.
+ */
+struct vv_w4_gemm_p { int M; int N; int K; int gshift; };
+
+kernel void vv_w4a16_gemm(constant vv_w4_gemm_p& p [[buffer(0)]],
+                          device const half* A [[buffer(1)]],
+                          device const uint4* w [[buffer(2)]],
+                          device const half2* sz [[buffer(3)]],
+                          device half* C [[buffer(4)]],
+                          threadgroup uchar* smem [[threadgroup(0)]],
+                          VV_GRID_ARGS) {
+    threadgroup half* As = (threadgroup half*)smem;
+    threadgroup half* Bs = As + G_BM * G_LDS;
+    const uint tid = threadIdx.x;
+    const int row0 = (int)blockIdx.y * G_BM, col0 = (int)blockIdx.x * G_BN;
+    const int wm = (int)warp >> 1, wn = (int)warp & 1;
+    const int nch = p.K >> 5, ngroups = p.K >> p.gshift;
+
+    simdgroup_float8x8 acc[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) acc[i][j] = simdgroup_float8x8(0.0f);
+
+    /* Two threads a row: one takes the chunk's words 0,1 and the other 2,3. */
+    const int br = (int)(tid >> 1), wsel = (int)(tid & 1) * 2;
+    const int gn = col0 + br;
+    const bool live = gn < p.N;
+    device const uint4* wrow = w + (ulong)(live ? gn : 0) * (ulong)nch;
+    device const half2* srow = sz + (ulong)(live ? gn : 0) * (ulong)ngroups;
+
+    for (int k0 = 0; k0 < p.K; k0 += G_BK) {
+        g_load_kmajor(As, A, row0, p.M, p.K, k0, tid);
+        {
+            const int c = k0 >> 5;
+            threadgroup half* d = Bs + br * G_LDS;
+            const uint4 wv = live ? wrow[c] : uint4(0u);
+            const half2 szv = live ? srow[(c << 5) >> p.gshift] : half2(0.0h);
+            const half s = szv.x, z = szv.y;
+            const uint w01[2] = { wsel == 0 ? wv.x : wv.z,
+                                  wsel == 0 ? wv.y : wv.w };
+            for (int t = 0; t < 2; t++) {
+                const uint word = w01[t];
+                const int tt = wsel + t;
+                for (int j = 0; j < 4; j++) {
+                    const int k = 2 * (tt + 4 * j);
+                    d[k]     = live ? ((half)((word >> (4 * j)) & 0xFu) - z) * s
+                                    : (half)0.0h;
+                    d[k + 1] = live ? ((half)((word >> (4 * (j + 4))) & 0xFu) - z) * s
+                                    : (half)0.0h;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < G_BK; kk += 8) {
+            simdgroup_half8x8 a[4], b[4];
+            for (int i = 0; i < 4; i++)
+                simdgroup_load(a[i], As + (wm * 32 + i * 8) * G_LDS + kk, G_LDS);
+            for (int j = 0; j < 4; j++)
+                simdgroup_load(b[j], Bs + (wn * 32 + j * 8) * G_LDS + kk, G_LDS,
+                               ulong2(0, 0), true);
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float* stage = (threadgroup float*)smem + (int)warp * 32 * G_LDC;
+    g_epilogue(stage, acc, C, p.N, row0 + wm * 32, col0 + wn * 32, p.M, p.N,
+               1.0f, 0.0f, lane);
+}
