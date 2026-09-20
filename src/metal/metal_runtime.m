@@ -195,6 +195,8 @@ typedef struct mtl_pso_slot {
     os_unfair_lock    pso_lock;
     bool              sync_each;    /* VV_METAL_SYNC=1: wait after every launch */
     double            trace_ms;     /* VV_METAL_TRACE=<ms>: report long buffers */
+    int               family;       /* Apple<N> GPU family                      */
+    bool              metal4;       /* Metal 4: tensor ops (M5 and up)          */
 }
 @end
 @implementation VVMetal
@@ -284,6 +286,24 @@ static VVMetal* mtl(void) {
                 snprintf(m->name, sizeof(m->name), "%s", d.name.UTF8String);
                 m->cores = query_core_count();
                 if (m->cores <= 0) m->cores = 8;
+                /*
+                 * Which generation, and whether this GPU has the matrix
+                 * units Metal 4 exposes as tensor operations -- Apple10 and
+                 * up (M5), where a simdgroup-matrix GEMM is the thing that
+                 * would be rewritten to use them. Logged, not acted on:
+                 * there is no such device here to measure on, and an
+                 * untested kernel is a claim, not a feature (docs/ANE.md).
+                 */
+                int fam = 7;
+                for (int f = 10; f >= 7; f--)
+                    if ([d supportsFamily:(MTLGPUFamily)(MTLGPUFamilyApple1 + f - 1)]) {
+                        fam = f; break;
+                    }
+                m->family = fam;
+                m->metal4 = [d supportsFamily:MTLGPUFamilyMetal4];
+                VV_LOG_D("metal: %s, GPU family Apple%d, %d cores, Metal 4 %s",
+                         m->name, fam, m->cores,
+                         m->metal4 ? "yes (tensor operations available)" : "no");
                 VVStream* s = [VVStream new];
                 s->queue = [d newCommandQueue];
                 s->lock = OS_UNFAIR_LOCK_INIT;

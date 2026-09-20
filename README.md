@@ -85,12 +85,12 @@ defaults unless noted.
 
 | | |
 |---|---|
-| Model load | **17 s** |
+| Model load | **30-58 s** (14-18 s to read and unpack, the rest to place) |
 | Speech encoding | **2.2 s** per 30 s of audio, 88 s per 16 min |
 | Prefill | **99 tok/s** on a 286-token prompt, 46 on a 7225-token one |
 | Decode | **14.9 tok/s** at 0.3K context, 5.5 at 7K |
 | RTF | **0.61** on a 30 s file |
-| Memory | 6.7 GB resident, 10 GB peak while loading |
+| Memory | 7.3 GB resident before the KV window, 10 GB peak while loading |
 
 **Not the Neural Engine, and the numbers for why.** The ANE is reachable
 only through Core ML, which means the weights are baked into a compiled

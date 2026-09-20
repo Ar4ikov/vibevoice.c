@@ -179,7 +179,37 @@ Against that, the kernels:
 
 ---
 
-## 5. What is left
+## 5. End to end, and what a 16 GB machine does to a measurement
+
+NF4 7B, `scerz/VibeVoice-ASR-4bit`, against `--cpu` on the same binary:
+
+| file | | CPU path | Metal |
+|---|---|---|---|
+| jfk.wav, 11 s | encoder | 34.6 s | **0.79 s** |
+| | decode | 1.0 tok/s | **17.3 tok/s** |
+| | RTF | 15.9 | **0.93** |
+| meeting30.wav, 30 s | encoder | 58.4 s | **1.85 s** |
+| | prefill, 286 tokens | — | 77-99 tok/s |
+| | RTF | 13.6 | **0.56** |
+| meeting.wav, 95 s | prefill, 777 tokens | — | 116 tok/s |
+| | RTF | — | **0.52** |
+| long.wav, 955 s | encoder | — | 88 s |
+| | prefill, 7225 tokens | — | 46 tok/s |
+| | decode | — | 5.5 tok/s |
+
+The model is 7.3 GB resident before the KV window on a machine with 16 GB.
+Once the page cache is full of 7.7 GB checkpoints, the same binary on the
+same file runs three to five times slower and nothing in any log says so:
+`vm_stat` does, with pages free under 100K. Every number here is from a run
+started with more than 4 GB free, and the spread in a column is what
+different amounts of free memory did to one build. A first run after
+`cmake --build` also pays 6.7 s to compile the kernel library, which the
+system then caches; `--verbose` prints it.
+
+The other engines on this chip -- the Neural Engine and the CPU's matrix
+unit -- were measured too, and `docs/ANE.md` is why they are not used.
+
+## 6. What is left
 
 - **The Conv-VAE encoder** is the largest remaining gap: ~2 s for 30 s of
   audio against 0.1 s on a 3090. Its convolutions are FP32 SIMT because

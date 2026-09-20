@@ -19,9 +19,9 @@ Write the entry for a change under Unreleased in the same pull request.
   required** -- the shaders are embedded as MSL source and compiled by the
   Metal framework on first use. `scripts/build-macos.sh` picks it up on
   Apple Silicon; `--cpu`, `VV_METAL_DISABLE=1` or `-DVV_ENABLE_METAL=OFF`
-  leave it out. M4, 8 GPU cores, NF4, 30 s file: load 17 s, encode 2.2 s,
-  prefill 99 tok/s, decode 14.9 tok/s, RTF 0.61 against 13.6 on the CPU path
-  of the same machine. Three ops decline rather than pretend: skinny linear,
+  leave it out. M4, 8 GPU cores, NF4, 30 s file: encode 1.9 s,
+  prefill 77-99 tok/s, decode 15-17 tok/s, RTF 0.56 against 13.6 on the CPU
+  path of the same machine. Three ops decline rather than pretend: skinny linear,
   the int8 MMA path (Apple GPUs have no integer matrix unit) and multi-GPU.
   See [docs/METAL.md](docs/METAL.md).
 - **Unified memory is budgeted as memory, not as a GPU limit.** Where the
