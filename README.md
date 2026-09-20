@@ -92,6 +92,17 @@ defaults unless noted.
 | RTF | **0.61** on a 30 s file |
 | Memory | 6.7 GB resident, 10 GB peak while loading |
 
+**Not the Neural Engine, and the numbers for why.** The ANE is reachable
+only through Core ML, which means the weights are baked into a compiled
+model and only FP16 ones run fast: the same prefill matmul is 14.9 TFLOP/s
+on the ANE in FP16 and leaves the ANE entirely once its weights are int4,
+which is what this runtime stores. Decode is memory bound and the ANE reads
+at 62 GB/s where the GPU kernels here read four bits at 94. The speech
+encoder — the one graph that looked like a fit — runs three times *slower*
+on the ANE than on the GPU, because its tensors are 32 channels by 720,000
+positions and the ANE is built for the opposite. `docs/ANE.md` has the
+tables, and `tools/ane_probe/` reproduces them.
+
 The whole pipeline runs on the GPU — the same code above `device.h`, with
 `src/metal/` linked instead of `src/cuda/`. **Xcode is not needed**: the
 shaders are compiled from source at startup by the Metal framework.
