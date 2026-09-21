@@ -69,6 +69,36 @@ static void bad_list(const char* text) {
     if (!pass) failures++;
 }
 
+/**
+ * @brief With --cpu the device flags are not evaluated at all.
+ *
+ * `all` is the case that broke: a CPU-only container started with
+ * `--gpus all --cpu` failed because no device was visible. A list that would
+ * not even parse shows the flags are skipped rather than checked, and none
+ * of it asks a device anything, so this passes on a machine without one.
+ */
+static void ok_cpu(const char* gpus, const char* mem) {
+    vv_gpu_set_t set;
+    memset(&set, 0, sizeof(set));
+    int id = 0;
+    const vv_status_t s = vv_gpu_set_from_flags(gpus, mem, true, &id, &set);
+    const int pass = s == VV_OK && set.n == 1 && set.id[0] == 0 && id == 0;
+    printf("  --cpu %-8s %-8s -> cpu      %s\n", gpus ? gpus : "-",
+           mem ? mem : "-", pass ? "ok" : "FAIL");
+    if (!pass) { printf("      status %d, n %d\n", (int)s, set.n); failures++; }
+}
+
+/** @brief Without --cpu, a bad list or cap still stops the run. */
+static void bad_flags(const char* gpus, const char* mem) {
+    vv_gpu_set_t set;
+    memset(&set, 0, sizeof(set));
+    int id = 0;
+    const int pass = vv_gpu_set_from_flags(gpus, mem, false, &id, &set) != VV_OK;
+    printf("  %-8s %-10s -> rejected     %s\n", gpus ? gpus : "-",
+           mem ? mem : "-", pass ? "ok" : "FAIL");
+    if (!pass) failures++;
+}
+
 int main(void) {
     printf("gpu_select: sizes\n");
     ok_size("8589934592", 8 * GiB);      /* a bare byte count            */
@@ -131,6 +161,14 @@ int main(void) {
             if (!three) failures++;
         }
     }
+
+    printf("gpu_select: the flags as a command applies them\n");
+    ok_cpu("all", NULL);
+    ok_cpu("all", "80%");
+    ok_cpu("0,x", "12Q");        /* not parsed, so not refused            */
+    ok_cpu(NULL, NULL);
+    bad_flags("0,x", NULL);      /* both stop before any device is asked  */
+    bad_flags("0", "1G,2G");
 
     printf(failures ? "FAILED (%d)\n" : "PASSED\n", failures);
     return failures ? 1 : 0;

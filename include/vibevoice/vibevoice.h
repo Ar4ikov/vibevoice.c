@@ -79,6 +79,17 @@ vv_status_t vv_gpu_set_caps(const char* text, vv_gpu_set_t* set);
 vv_status_t vv_gpu_set_resolve(vv_gpu_set_t* set, int fallback_id,
                                bool cpu_only);
 
+/**
+ * @brief `--gpus`, `--gpu-memory` and `--cpu` as every command applies them.
+ *
+ * Parse, caps, primary id (written back to `*gpu_id`), resolve. With
+ * `cpu_only` the flags are not evaluated and no device is queried. Either
+ * flag string may be NULL; `set` must start zeroed.
+ */
+vv_status_t vv_gpu_set_from_flags(const char* gpus, const char* gpu_memory,
+                                  bool cpu_only, int* gpu_id,
+                                  vv_gpu_set_t* set);
+
 /** @brief Bytes the `index`th device may use: free * budget, then the cap. */
 size_t vv_gpu_budget(const vv_gpu_set_t* set, int index, float vram_budget);
 

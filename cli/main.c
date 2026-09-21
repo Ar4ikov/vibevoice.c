@@ -348,11 +348,8 @@ int main(int argc, char** argv) {
 
     vv_gpu_set_t gpus;
     memset(&gpus, 0, sizeof(gpus));
-    if (args.gpus && vv_gpu_set_parse(args.gpus, &gpus) != VV_OK) return 1;
-    if (args.gpu_memory && vv_gpu_set_caps(args.gpu_memory, &gpus) != VV_OK)
-        return 1;
-    if (gpus.n > 0) args.gpu_id = gpus.id[0];
-    if (vv_gpu_set_resolve(&gpus, args.gpu_id, args.cpu_only) != VV_OK)
+    if (vv_gpu_set_from_flags(args.gpus, args.gpu_memory, args.cpu_only,
+                              &args.gpu_id, &gpus) != VV_OK)
         return 1;
     /*
      * One file is one request, and a request cannot be in two places at

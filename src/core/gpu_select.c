@@ -226,6 +226,33 @@ vv_status_t vv_gpu_set_resolve(vv_gpu_set_t* set, int fallback_id,
 }
 
 /**
+ * @brief The one sequence every command runs on its device flags.
+ *
+ * `--cpu` is looked at first, because it means "no device": evaluating
+ * `--gpus all` anyway made a GPU-less container fail on a device list it
+ * had just been told not to use -- which is what a scheduler hands a CPU-only
+ * replica whose run command carries `--gpus all`. So with it nothing is
+ * parsed or queried, and the log says the flags went unused.
+ */
+vv_status_t vv_gpu_set_from_flags(const char* gpus, const char* gpu_memory,
+                                  bool cpu_only, int* gpu_id,
+                                  vv_gpu_set_t* set) {
+    if (!gpu_id || !set) return VV_ERR_NULL_PTR;
+    if (cpu_only) {
+        if (gpus || gpu_memory)
+            VV_LOG_I("gpus: --cpu given; --gpus and --gpu-memory are ignored");
+        return vv_gpu_set_resolve(set, *gpu_id, true);
+    }
+
+    vv_status_t s;
+    if (gpus && (s = vv_gpu_set_parse(gpus, set)) != VV_OK) return s;
+    if (gpu_memory && (s = vv_gpu_set_caps(gpu_memory, set)) != VV_OK)
+        return s;
+    if (set->n > 0) *gpu_id = set->id[0];
+    return vv_gpu_set_resolve(set, *gpu_id, false);
+}
+
+/**
  * @brief What the device already holds that the budget cannot place.
  *
  * With an explicit cap this is the CUDA context, the driver's own
