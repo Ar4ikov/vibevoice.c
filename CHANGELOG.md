@@ -9,6 +9,8 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+## [0.5.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.4.1...v0.5.0) — 2026-09-21
+
 - Teacher forcing is a build option, off by default
   (`-DVV_TEACHER_FORCING=ON`). `VV_TEACHER_TOKENS` points at a file whose
   contents replace the tokens the model produced, and `serve` hands those to

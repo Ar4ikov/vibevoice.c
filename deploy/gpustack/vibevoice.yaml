@@ -50,6 +50,11 @@ version_configs:
     image_name: ghcr.io/ar4ikov/vibevoice.c:latest
     entrypoint: /usr/local/bin/vv_cli
     custom_framework: cuda
+  # The 0.5 release line: newest v0.5.x, moves when a patch is tagged.
+  '0.5':
+    image_name: ghcr.io/ar4ikov/vibevoice.c:0.5
+    entrypoint: /usr/local/bin/vv_cli
+    custom_framework: cuda
   # The 0.4 release line: newest v0.4.x, moves when a patch is tagged.
   '0.4':
     image_name: ghcr.io/ar4ikov/vibevoice.c:0.4
