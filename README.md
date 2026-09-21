@@ -78,6 +78,44 @@ RTX 3090, CUDA 12.4, Ryzen 9 5900X. Defaults unless noted.
 A 32-minute recording transcribes in 112 s (98 s with `--attn flashinfer`):
 14449 prompt tokens, 9522 generated, 168 segments, flat memory throughout.
 
+### Apple Silicon (Metal)
+
+MacBook Air M4, 8 GPU cores, 16 GB unified memory, macOS 26.4. NF4 weights,
+defaults unless noted.
+
+| | |
+|---|---|
+| Model load | **30-58 s** (14-18 s to read and unpack, the rest to place) |
+| Speech encoding | **2.2 s** per 30 s of audio, 88 s per 16 min |
+| Prefill | **99 tok/s** on a 286-token prompt, 46 on a 7225-token one |
+| Decode | **14.9 tok/s** at 0.3K context, 5.5 at 7K |
+| RTF | **0.61** on a 30 s file |
+| Memory | 7.3 GB resident before the KV window, 10 GB peak while loading |
+
+**Not the Neural Engine, and the numbers for why.** The ANE is reachable
+only through Core ML, which means the weights are baked into a compiled
+model and only FP16 ones run fast: the same prefill matmul is 14.9 TFLOP/s
+on the ANE in FP16 and leaves the ANE entirely once its weights are int4,
+which is what this runtime stores. Decode is memory bound and the ANE reads
+at 62 GB/s where the GPU kernels here read four bits at 94. The speech
+encoder — the one graph that looked like a fit — runs three times *slower*
+on the ANE than on the GPU, because its tensors are 32 channels by 720,000
+positions and the ANE is built for the opposite. `docs/ANE.md` has the
+tables, and `tools/ane_probe/` reproduces them.
+
+The whole pipeline runs on the GPU — the same code above `device.h`, with
+`src/metal/` linked instead of `src/cuda/`. **Xcode is not needed**: the
+shaders are compiled from source at startup by the Metal framework.
+`docs/METAL.md` is the design, what it costs, and what is still slow (the
+Conv-VAE encoder, mostly).
+
+Two things are specific to a machine whose GPU memory *is* its RAM. An
+uploaded weight's host copy is freed rather than kept, and the placement
+budget counts those bytes as available, because moving them to the device is
+a memcpy and not another gigabyte. And the KV window is trimmed to what the
+machine can actually spare, not to what Metal says it will allow: the
+difference between the two is a 16 GB Mac that swaps and one that does not.
+
 ### CPU only
 
 No GPU, or `--cpu`. Runtime-selected AVX2 on x86 and NEON on ARM, threads
@@ -673,12 +711,16 @@ that runs it.
 ### macOS
 
 ```bash
-brew install libomp        # optional, but without it the kernels are serial
+brew install libomp        # optional, but without it the CPU kernels are serial
 scripts/build-macos.sh
 ```
 
-This is the CPU build: NEON on Apple Silicon, AVX2 on Intel Macs, threads on
-the performance cores. **There is no Metal backend.** See "Not done" below.
+On Apple Silicon this builds the Metal backend — no Xcode, only the Command
+Line Tools: the shaders ship as source in the binary and the Metal framework
+compiles them on first use. `vv_cli --version` ends in `[metal]` when it is
+in; `--cpu` or `VV_METAL_DISABLE=1` runs the CPU path instead, as does an
+Intel Mac, where the build is CPU-only (AVX2). `-DVV_ENABLE_METAL=OFF` leaves
+it out entirely.
 
 ### Tests
 
@@ -1027,12 +1069,13 @@ speech encoder or the connectors touches the default stream any more.
 
 ## Not done
 
-- **Metal.** macOS runs on the CPU path. A Metal backend was not written
-  because it can be neither compiled nor run from the machine this was
-  developed on, and a few thousand lines of untested shaders would be a
-  claim that cannot be stood behind. The seam exists:
-  `include/vibevoice/device.h` declares the op set, a build links exactly one
-  implementation of it, and `src/device/device_none.c` shows the shape.
+- **Metal is slower than the hardware allows in three places.** The Conv-VAE
+  encoder is the big one: 2.2 s for 30 s of audio against 0.1 s on a 3090,
+  because its convolutions are FP32 SIMT to keep batching and chunking
+  bit-exact. BitNet's ternary GEMV reaches 8-17 GB/s of the M4's 96.
+  `vv_skinny_linear_dev` declines and 9..64 rows pad to a 64-row tile. There
+  is no integer matrix unit on Apple GPUs, so `--quant w8a8` prefill runs the
+  tiled int32 kernel. Multi-GPU is one device by definition.
 - **Streaming-7B follow-ups.** The CPU path runs a 29-row chunk prefill
   through GEMMs sized for long prompts, which is why it runs slower than
   real time. On the GPU every format has kernels for it, but int8 and nf4

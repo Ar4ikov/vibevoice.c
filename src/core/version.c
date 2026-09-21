@@ -34,8 +34,10 @@ const char* vv_build_ref(void) {
 
 const char* vv_build_features(void) {
     return
-#ifdef VV_HAS_CUDA
+#if defined(VV_HAS_CUDA)
         "cuda"
+#elif defined(VV_HAS_METAL)
+        "metal"
 #else
         "cpu-only"
 #endif
