@@ -359,6 +359,24 @@ static void fix_visible_devices(void) {
                  cvd, fixed);
         setenv("CUDA_VISIBLE_DEVICES", fixed, 1);
     }
+    /*
+     * A scheduler that mounts every card of the worker and then narrows the
+     * list to what it assigned leaves the rest in /dev, invisible to CUDA.
+     * `--gpus all` is then fewer cards than the container holds, and the
+     * only sign of it is one line in the log — so say it, with where the
+     * knob is: GPUStack's "GPUs per Replica" under manual scheduling.
+     */
+    if (s == VV_OK) {
+        int listed = 1;
+        for (const char* q = fixed; *q; q++) listed += (*q == ',');
+        if (listed < n_nodes)
+            VV_LOG_W("cuda: this container holds %d cards but "
+                     "CUDA_VISIBLE_DEVICES='%s' assigns %d of them to this "
+                     "process; --gpus all is those %d. For more, raise what "
+                     "the scheduler gives the replica (GPUStack: Schedule "
+                     "Mode Manual, GPUs per Replica)",
+                     n_nodes, cvd, listed, listed);
+    }
 }
 #endif
 

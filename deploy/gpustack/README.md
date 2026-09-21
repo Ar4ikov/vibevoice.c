@@ -147,8 +147,21 @@ cannot span workers) in two cases. You can pick them yourself: set
 **Scheduling → Schedule Mode** to Manual and fill in **GPU Selector** and
 **GPUs per Replica**. GPUStack also assigns them by itself when no single
 card has room for its estimate (see [Memory](#memory)); in that case it gives
-the replica every GPU on the worker. What the runtime does with several GPUs
-is set by `--split-mode`:
+the replica every GPU on the worker. Otherwise the automatic scheduler hands
+a custom backend **one** card, whatever the run command says: `--gpus all`
+names the assigned cards and cannot ask for more. The worker still mounts
+every card of the machine (`NVIDIA_VISIBLE_DEVICES` lists them all) and
+narrows `CUDA_VISIBLE_DEVICES` to the one it assigned, so a replica meant for
+two cards runs on one with nothing but a log line to show for it:
+`cuda: this container holds 2 cards but CUDA_VISIBLE_DEVICES='0' assigns 1 of
+them to this process` (from 0.5.1; `gpu 0:` is the only `gpu N:` line before
+that). Over the API the selector is
+`"gpu_selector": {"gpu_ids": ["<worker>:cuda:0", "<worker>:cuda:1"],
+"gpus_per_replica": 2}`; `GET /v2/gpu-devices` lists the ids. **Changing a
+deployment's GPU selector or parameters does not restart its running
+replica** in 2.2.2 (observed through `PUT /v2/models/<id>`): delete the
+replica, and GPUStack recreates it with the new spec in about half a minute.
+What the runtime does with several GPUs is set by `--split-mode`:
 
 | `--split-mode` | what it does | measured on two RTX 3090s ([#9](https://github.com/Ar4ikov/vibevoice.c/pull/9), [#10](https://github.com/Ar4ikov/vibevoice.c/pull/10)) |
 |---|---|---|
@@ -167,6 +180,29 @@ One two-GPU replica with `--slots 2` holds the same per card as two one-GPU
 replicas. The difference is the queue: the two-GPU replica has one, and the
 next request goes to whichever slot frees up first. Two replicas each have
 their own, so a request can wait behind one replica while the other is idle.
+
+**Eight parallel transcriptions on two 24 GB cards** (AWQ, one replica with
+both GPUs selected, image 0.5.0):
+
+```text
+--slots 8
+--split-mode replica
+--kv-paged on
+--kv-cache fp8
+--max-seq-len 16384
+--gpu-memory 12GiB
+--attn flashinfer
+--queue-size 32
+```
+
+Four slots land on each card behind one queue, and each card's slots share a
+paged KV pool of about 52K tokens, so two 30-minute files or four short ones
+run at once per card. The replica holds 11.3 GB per card; eight 11-second
+clips sent together come back in 1.7 s. The same deployment with
+`--max-seq-len 65536` on one card held 18.2 GB against GPUStack's 8.9 GB
+reservation, which is why the cap and the window are set explicitly: the
+reservation decides placement only, and every slot's full window is what the
+pool is sized for.
 
 **CPU only.** GPUStack starts a replica without a GPU only when
 **Advanced → Allow CPU Offloading** is on and no card fits. Add `--cpu` to its
