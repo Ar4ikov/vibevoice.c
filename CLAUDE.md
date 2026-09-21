@@ -72,7 +72,9 @@ cudart, cuBLAS не используется (свои WMMA-ядра, быстр
   CPU — `cpu_int8.c`. SmoothQuant: `--calib <audio>` / `--calib-stats`.
   32-минутный промпт: 7152 tok/s (W8A8), 5100 (W4A8) против 3451 у `int4`;
   WER 0 против BF16 на jfk/test30/test120/32 мин. `VV_SAVE_TOKENS` /
-  `VV_TEACHER_TOKENS` — teacher-forced top-1 (W8A8+SQ 98.8%).
+  `VV_TEACHER_TOKENS` — teacher-forced top-1 (W8A8+SQ 98.8%); форсирование
+  собирается только с `-DVV_TEACHER_FORCING=ON` (иначе файл из переменной
+  решал бы, что «сказала» модель клиенту — CodeQL 4/5).
 * Линейные слои на 9..64 строках (чанк Streaming-7B — 29, короткий промпт,
   хвост чанкованного) для плотного FP16, `int8` и NF4 — `gemm_skinny.cu`:
   блок на 64 столбца, q/k/v и gate/up одним запуском, вес читается в своём
