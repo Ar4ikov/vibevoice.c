@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 static double ms(void) { return [NSDate timeIntervalSinceReferenceDate]*1000.0; }
@@ -13,7 +14,8 @@ int main(int argc, const char** argv) { @autoreleasepool {
     printf("%s  M=%d N=%d K=%d  (%.1f GFLOP a run)\n", dev.name.UTF8String,
            M, N, K, 2.0*M*N*K/1e9);
     NSError* e = nil;
-    NSString* path = @"/private/tmp/claude-501/-Users-ar4ikov-vibevoice-c/daa7a3ba-db32-4b48-8d4c-c849230d0803/scratchpad/mtl4/gemm.metal";
+    const char* env = getenv("VV_METAL_SRC");
+    NSString* path = env ? [NSString stringWithUTF8String:env] : @"gemm.metal";
     NSString* src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&e];
     MTLCompileOptions* o = [MTLCompileOptions new];
     o.languageVersion = (MTLLanguageVersion)((4 << 16) + 0);

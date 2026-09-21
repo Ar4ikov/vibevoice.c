@@ -21,7 +21,7 @@ puts on each device) and then the mean time under `MLComputeUnitsAll`,
 `CPUAndNeuralEngine`, `CPUAndGPU` and `CPUOnly`. The third argument is the
 FLOP count of one run, and is optional.
 
-`gen_enc.py` reads the encoder's shapes straight from the checkpoint at
-`/Users/ar4ikov/models/vibevoice-asr-4bit` (edit `MODEL`) and fills them with
+`gen_enc.py` reads the encoder's shapes straight from a checkpoint
+(`VV_MODEL=/path/to/model_hf`, `./model_hf` by default) and fills them with
 random weights: the question it answers is how long that graph takes, not
 what it outputs.

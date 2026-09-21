@@ -3,11 +3,14 @@ import json, struct, sys, numpy as np, coremltools as ct
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 
-MODEL='/Users/ar4ikov/models/vibevoice-asr-4bit/'
+import os
+MODEL = os.environ.get('VV_MODEL', './model_hf').rstrip('/') + '/'
 def shapes(prefix):
+    """Tensor shapes from every safetensors shard in the checkpoint."""
+    import glob
     h={}
-    for f in ('model-00001-of-00002.safetensors','model-00002-of-00002.safetensors'):
-        with open(MODEL+f,'rb') as fh:
+    for f in sorted(glob.glob(MODEL + '*.safetensors')):
+        with open(f,'rb') as fh:
             n=struct.unpack('<Q',fh.read(8))[0]; h.update(json.loads(fh.read(n)))
     return {k[len(prefix):]: v['shape'] for k,v in h.items() if k.startswith(prefix)}
 

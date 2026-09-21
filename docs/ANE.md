@@ -138,11 +138,15 @@ the same shapes, checking both against a CPU reference first:
 | 512 x 18944 x 3584 | 1.88 TFLOP/s | 1.39 |
 | 2048 x 18944 x 3584 | 1.03-1.22 | 1.34-1.57 |
 | 128 x 18944 x 3584 | 0.70 | 0.80-0.85 |
+| 128 x 3584 x 3584 | 1.60 | **2.23** |
 
 The same band, which is what the hardware says should happen: on Apple9 both
 go to the same simdgroup matrix units, whose measured ceiling here is
-2.7 TFLOP/s. Tensor operations are not faster on an M4 and were never going
-to be. They are more accurate (FP32 destination, worst relative error
+2.7 TFLOP/s. Neither is a different engine, so neither can be several times
+the other. Where `matmul2d` does pull ahead -- the narrow, short shapes on
+the last row, 83% of the ceiling against 59% -- it is out-tiling a kernel
+written for the wide ones, which is a fair thing to lose to and a reason to
+look again at the small-M path. They are more accurate (FP32 destination, worst relative error
 1.7e-05 against 2.4e-04) and much shorter to write.
 
 Two things worth knowing before writing any of it, because each produced
