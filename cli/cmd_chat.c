@@ -99,12 +99,8 @@ static void usage(const char* which) {
 
 /** @brief Turn --gpus/--gpu-memory into the engine's device set. */
 static int resolve_gpus(chat_args_t* a) {
-    if (a->gpus && vv_gpu_set_parse(a->gpus, &a->ep.gpus) != VV_OK) return 1;
-    if (a->gpu_memory && vv_gpu_set_caps(a->gpu_memory, &a->ep.gpus) != VV_OK)
-        return 1;
-    if (a->ep.gpus.n > 0) a->ep.gpu_id = a->ep.gpus.id[0];
-    return vv_gpu_set_resolve(&a->ep.gpus, a->ep.gpu_id, a->ep.cpu_only)
-           == VV_OK ? 0 : 1;
+    return vv_gpu_set_from_flags(a->gpus, a->gpu_memory, a->ep.cpu_only,
+                                 &a->ep.gpu_id, &a->ep.gpus) == VV_OK ? 0 : 1;
 }
 
 static int parse_common(int argc, char** argv, chat_args_t* a,
