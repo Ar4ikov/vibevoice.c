@@ -96,6 +96,43 @@ GPUStack's gateway passes either of them through.
 GPUStack's reservation comes from the size of the repository's safetensors
 and has little to do with the last column; see [Memory](#memory).
 
+## Logo
+
+The UI draws a backend's logo straight from the `icon` column, as the `src`
+of an `<img>` — in practice a `data:` URI. Three things about 2.2.2 decide
+how it gets there:
+
+- **Importing this YAML cannot set it.** `POST /v1/inference-backends/from-yaml`
+  copies an allow-list of keys and `icon` is not one of them, so the line
+  would be dropped in silence. Neither does the edit form.
+- **The catalog is where icons come from.** GPUStack ships
+  `gpustack/assets/community-inference-backends.yaml`, and every backend in
+  it carries its logo inlined as a data URI. That file is built by the
+  [community repository](https://github.com/gpustack/community-inference-backends)
+  from a `logo.png` sitting next to each `spec.yaml`, and reaches operators
+  with the next GPUStack release.
+- **Meanwhile the column is writable.**
+  [`assets/brand/logo-256.png`](../../assets/brand/logo-256.png) is the mark
+  as a 256 px PNG — the UI renders it 20 px tall, so square is all that
+  matters. On a server with the embedded database:
+
+  ```bash
+  ICON="data:image/png;base64,$(base64 -w0 assets/brand/logo-256.png)"
+  psql -h 127.0.0.1 -U root -d gpustack -c \
+    "update inference_backends set icon = '$ICON' where backend_name = 'vibevoice-custom'"
+  ```
+
+  Re-importing the manifest does not clobber it, since `from-yaml` never
+  writes that column.
+
+To put it in the catalog instead: fork the community repository, add a
+`vibevoice.c/` directory with `spec.yaml` (this manifest, with
+`backend_name: vibevoice.c` — the `-custom` suffix is only required of
+backends imported by hand), a `README.md`, and `logo.png` copied from
+`assets/brand/`, then open a pull request. Their automation triggers only on
+`*/logo.png`, `*/spec.yaml` and `*/spec.yml`, so the logo has to be a PNG
+under exactly that name.
+
 ## GPUs
 
 The GPUStack worker exposes the GPUs it assigned to a replica through

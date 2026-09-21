@@ -9,6 +9,12 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- The mark ships as a PNG as well (`assets/brand/logo-256.png`), because a
+  catalogue that shows a logo usually takes one format and it is not SVG.
+  The GPUStack guide says how its backend list gets an icon: not from the
+  imported YAML, which drops the field, but from the community catalog or
+  from the column directly.
+
 - **The language model answers text too**: `POST /v1/chat/completions`,
   OpenAI-shaped, so the same deployment can be pointed at by a chat client
   ([#43](https://github.com/Ar4ikov/vibevoice.c/issues/43)). Messages render

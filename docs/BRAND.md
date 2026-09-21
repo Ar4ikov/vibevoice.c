@@ -33,6 +33,7 @@ runtime's own and carries no endorsement — see [Attribution](#attribution).
 | [`assets/brand/mark-inverse.svg`](../assets/brand/mark-inverse.svg) | the mark alone, dark surfaces |
 | [`assets/brand/banner.svg`](../assets/brand/banner.svg) | repository header; carries its own plate, so it needs no theme switch |
 | [`assets/brand/icon.svg`](../assets/brand/icon.svg) | avatar, favicon, registry listing |
+| [`assets/brand/logo-256.png`](../assets/brand/logo-256.png) | the same icon rasterized, for catalogues that take a PNG and nothing else — GPUStack's backend list is one ([deploy/gpustack](../deploy/gpustack/README.md#logo)) |
 
 Every file is hand-written SVG with no external references, no embedded
 fonts and no raster data. The wordmark is drawn as geometry, not set in a
