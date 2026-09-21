@@ -1797,6 +1797,20 @@ typedef struct teacher {
 
 static void teacher_load(teacher_t* t) {
     memset(t, 0, sizeof(*t));
+#ifndef VV_TEACHER_FORCING
+    /*
+     * Off unless the build asked for it (-DVV_TEACHER_FORCING=ON). The file
+     * this reads replaces the tokens the model would have produced, and a
+     * server hands those to a client -- an environment variable that rewrites
+     * answers has no business in a release binary, and CodeQL is right to
+     * call it an exposure (cpp/system-data-exposure). Measuring agreement is
+     * a developer's job on a developer's build.
+     */
+    if (getenv("VV_TEACHER_TOKENS"))
+        VV_LOG_W("teacher: VV_TEACHER_TOKENS is set but this build has no "
+                 "teacher forcing; configure with -DVV_TEACHER_FORCING=ON");
+    return;
+#else
     const char* path = getenv("VV_TEACHER_TOKENS");
     if (!path || !path[0]) return;
     FILE* f = fopen(path, "rb");
@@ -1817,6 +1831,7 @@ static void teacher_load(teacher_t* t) {
     fclose(f);
     if (!t->ids) { t->n = 0; return; }
     VV_LOG_I("teacher: forcing %d reference tokens from '%s'", t->n, path);
+#endif
 }
 
 /**
