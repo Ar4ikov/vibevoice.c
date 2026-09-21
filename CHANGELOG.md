@@ -34,6 +34,23 @@ Write the entry for a change under Unreleased in the same pull request.
   reports as free is also bounded by what the OS can still give, so the KV
   window is trimmed to what exists instead of to what Metal permits. A
   discrete card is unaffected: it reclaims nothing and decides as before.
+- **INT4 weights are not unrolled to run a GEMM on Metal.**
+  `vv_w4a16_gemm_dev` dequantized a whole projection into scratch first --
+  136 MB for one 7B gate or up, and more scratch than its callers hand it,
+  which returned `VV_ERR_OVERFLOW` on the widest shapes. The tile GEMM now
+  dequantizes one 16-byte chunk per row into threadgroup memory as it goes,
+  which is exactly one K step of 32. Bit for bit what the old path produced;
+  `VV_W4_FUSED=0` restores it.
+- **The Neural Engine was measured, and is not used**
+  ([docs/ANE.md](docs/ANE.md)). It is reachable only through Core ML, with
+  the weights baked into a compiled model, and only FP16 ones run fast:
+  14.9 TFLOP/s on a prefill matmul, but int4 weights are not placed on it at
+  all, decode reads at 62 GB/s against the GPU kernels' 94, and the speech
+  encoder's own graph runs three times slower there than on the GPU.
+  Metal 4's tensor operations -- M5's door to the GPU's neural accelerators,
+  and already offered on M4 -- land in the same band as the simdgroup-matrix
+  kernels here, because on this generation they are the same units.
+  `tools/ane_probe/` and `tools/metal4_probe/` reproduce both.
 
 ## [0.4.1](https://github.com/Ar4ikov/vibevoice.c/compare/v0.4.0...v0.4.1) — 2026-09-19
 
