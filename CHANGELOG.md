@@ -9,6 +9,8 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+## [0.5.1](https://github.com/Ar4ikov/vibevoice.c/compare/v0.5.0...v0.5.1) — 2026-09-21
+
 - A container that holds more `/dev/nvidiaN` nodes than
   `CUDA_VISIBLE_DEVICES` lists now says so in one warning, with the counts
   and where the knob is. GPUStack 2.2.2's automatic scheduler hands a custom
