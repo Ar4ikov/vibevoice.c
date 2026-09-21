@@ -88,6 +88,29 @@ static void ok_cpu(const char* gpus, const char* mem) {
     if (!pass) { printf("      status %d, n %d\n", (int)s, set.n); failures++; }
 }
 
+/**
+ * @brief CUDA_VISIBLE_DEVICES against the cards a container actually holds.
+ *
+ * `nodes` is what `/dev/nvidiaN` says is mounted. `want` is the list to use,
+ * "" for "drop it", NULL for "leave it alone".
+ */
+static void ok_visible(const char* cvd, const int* nodes, int n_nodes,
+                       const char* want) {
+    char got[64] = "";
+    const vv_status_t s = vv_cuda_visible_map(cvd, nodes, n_nodes,
+                                              got, sizeof(got));
+    int pass;
+    if (want == NULL)      pass = (s == VV_ERR_UNSUPPORTED);
+    else if (!want[0])     pass = (s == VV_ERR_NOT_FOUND);
+    else                   pass = (s == VV_OK && strcmp(got, want) == 0);
+    printf("  %-12s on %d node(s) -> %-8s %s\n", cvd ? cvd : "(unset)",
+           n_nodes, s == VV_OK ? got : (s == VV_ERR_NOT_FOUND ? "drop" : "keep"),
+           pass ? "ok" : "FAIL");
+    if (!pass) { printf("      wanted %s (status %d)\n",
+                        want ? (want[0] ? want : "drop") : "keep", (int)s);
+                 failures++; }
+}
+
 /** @brief Without --cpu, a bad list or cap still stops the run. */
 static void bad_flags(const char* gpus, const char* mem) {
     vv_gpu_set_t set;
@@ -169,6 +192,34 @@ int main(void) {
     ok_cpu(NULL, NULL);
     bad_flags("0,x", NULL);      /* both stop before any device is asked  */
     bad_flags("0", "1G,2G");
+
+    printf("gpu_select: CUDA_VISIBLE_DEVICES inside a container\n");
+    {
+        const int host2[]  = {0, 1};      /* the whole host, or both cards */
+        const int only1[]  = {1};         /* one card, host index 1        */
+        const int only0[]  = {0};
+        const int odd[]    = {1, 2};      /* cards 1 and 2 of four         */
+
+        /* On the host the two numberings agree, so nothing moves. */
+        ok_visible("0,1", host2, 2, "0,1");
+        ok_visible("1", host2, 2, "1");
+        ok_visible("0", only0, 1, "0");
+
+        /* GPUStack hands a replica host card 1 alone: '1' means the second
+         * of the one card mounted, which is why CUDA found none. */
+        ok_visible("1", only1, 1, "0");
+        ok_visible("1,2", odd, 2, "0,1");
+        ok_visible("2", odd, 2, "1");
+        ok_visible(" 2 , 1 ", odd, 2, "1,0");
+
+        /* Nothing to map, or nothing to map onto. */
+        ok_visible("3", only1, 1, "");
+        ok_visible("0,3", host2, 2, "");
+        ok_visible("GPU-6e7a1750-b891-de8b-b5dc-e301a2ac5b66", only1, 1, NULL);
+        ok_visible("MIG-GPU-6e7a1750/1/0", host2, 2, NULL);
+        ok_visible("", host2, 2, NULL);
+        ok_visible("0", host2, 0, NULL);   /* no driver in the container    */
+    }
 
     printf(failures ? "FAILED (%d)\n" : "PASSED\n", failures);
     return failures ? 1 : 0;

@@ -9,6 +9,18 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- A container is no longer told the host's GPU numbers
+  ([#41](https://github.com/Ar4ikov/vibevoice.c/issues/41)). GPUStack 2.2.2
+  mounts the cards it assigned by UUID and still sets
+  `CUDA_VISIBLE_DEVICES` to their host indexes, so a replica given host GPU 1
+  alone saw `/dev/nvidia1` as device 0, was asked for device 1, found none
+  and ran the whole model on the CPU. The list is now read against the nodes
+  the container actually holds and translated before CUDA starts, or dropped
+  with a warning when it names nothing present; a host, where the two
+  numberings agree, is untouched, and `VV_KEEP_CUDA_VISIBLE_DEVICES=1` turns
+  it off. An out-of-range `--gpus` id now also says that the ids count the
+  cards this process was given, not the host's.
+
 - GPUStack backend ([#25](https://github.com/Ar4ikov/vibevoice.c/issues/25)):
   the run command passes `--gpus all`, so a replica uses every GPU GPUStack
   assigned to it instead of only the first. GPUStack spreads a replica
