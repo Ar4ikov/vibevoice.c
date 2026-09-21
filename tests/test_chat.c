@@ -9,9 +9,11 @@
  */
 
 #include "vibevoice/server.h"
+#include "vibevoice/inference.h"
 #include "vibevoice/vibevoice.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -116,6 +118,74 @@ int main(void) {
         printf("  %-22s %s\n", "defaults", pass ? "ok" : "FAIL");
         if (!pass) failures++;
         vv_chat_request_free(&r);
+    }
+
+    printf("chat: sampling from logits\n");
+    {
+        /*
+         * A vocabulary where the ranking is known: token 7 is the most
+         * likely, then 3, then 11, and everything else is far below. The
+         * point of each case is which tokens can come out at all.
+         */
+        enum { V = 300 };
+        float* lg = (float*)vv_alloc(V * sizeof(float));
+        for (int i = 0; i < V; i++) lg[i] = -10.0f + (float)(i % 7) * 0.01f;
+        lg[7] = 4.0f; lg[3] = 3.0f; lg[11] = 2.0f;
+
+        int32_t tok = -1;
+        uint64_t rng = 1;
+        vv_sample_logits_f32(lg, V, 0.0f, 1.0f, 0, &rng, &tok);
+        printf("  %-22s %s\n", "greedy is the argmax", tok == 7 ? "ok" : "FAIL");
+        if (tok != 7) failures++;
+
+        /* top_k = 1 leaves the argmax whatever the temperature. */
+        int only_top = 1;
+        for (int i = 0; i < 64; i++) {
+            vv_sample_logits_f32(lg, V, 2.0f, 1.0f, 1, &rng, &tok);
+            if (tok != 7) only_top = 0;
+        }
+        printf("  %-22s %s\n", "top_k = 1", only_top ? "ok" : "FAIL");
+        if (!only_top) failures++;
+
+        /* A tiny nucleus keeps only the most likely token. */
+        int nucleus_ok = 1;
+        for (int i = 0; i < 64; i++) {
+            vv_sample_logits_f32(lg, V, 1.0f, 0.01f, 64, &rng, &tok);
+            if (tok != 7) nucleus_ok = 0;
+        }
+        printf("  %-22s %s\n", "top_p = 0.01", nucleus_ok ? "ok" : "FAIL");
+        if (!nucleus_ok) failures++;
+
+        /*
+         * The selection has to keep the k most likely, not the k it happened
+         * to see first: with a wide k and a high temperature the three peaks
+         * must all show up, and the filler must not.
+         */
+        int seen7 = 0, seen3 = 0, seen11 = 0, seen_filler = 0;
+        for (int i = 0; i < 400; i++) {
+            vv_sample_logits_f32(lg, V, 1.0f, 1.0f, 3, &rng, &tok);
+            if (tok == 7) seen7++;
+            else if (tok == 3) seen3++;
+            else if (tok == 11) seen11++;
+            else seen_filler++;
+        }
+        const int kept = seen7 && seen3 && seen11 && !seen_filler;
+        printf("  %-22s %s (7:%d 3:%d 11:%d other:%d)\n", "top_k keeps the top 3",
+               kept ? "ok" : "FAIL", seen7, seen3, seen11, seen_filler);
+        if (!kept) failures++;
+
+        /* Same seed, same answer. */
+        int32_t a[16], b[16];
+        uint64_t r1 = 12345, r2 = 12345;
+        for (int i = 0; i < 16; i++)
+            vv_sample_logits_f32(lg, V, 1.5f, 0.95f, 40, &r1, &a[i]);
+        for (int i = 0; i < 16; i++)
+            vv_sample_logits_f32(lg, V, 1.5f, 0.95f, 40, &r2, &b[i]);
+        const int same = memcmp(a, b, sizeof(a)) == 0;
+        printf("  %-22s %s\n", "a seed repeats", same ? "ok" : "FAIL");
+        if (!same) failures++;
+
+        vv_free(lg);
     }
 
     printf(failures ? "FAILED (%d)\n" : "PASSED\n", failures);

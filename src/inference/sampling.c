@@ -172,19 +172,27 @@ vv_status_t vv_sample_logits_f32(const float* logits, int vocab_size,
     if (k > vocab_size) k = vocab_size;
     if (k > 512) k = 512;               /* the tail beyond this is noise */
 
-    /* Selection into a small ascending-by-value array: O(V*k) compares with
-     * k tiny, and no allocation of a second 152k buffer. */
+    /*
+     * Selection into a small array kept ascending, so vals[0] is the one to
+     * beat and vals[n-1] is the most likely token. One compare rejects the
+     * whole tail, which is what makes a pass over 152k logits cheap; no
+     * second buffer of that size is ever allocated.
+     */
     float vals[512];
     int   ids[512];
     int   n = 0;
     for (int i = 0; i < vocab_size; i++) {
         const float v = logits[i];
-        if (n == k && v <= vals[0]) continue;
-        int pos = n < k ? n : 0;
-        if (n < k) n++;
-        else       pos = 0;
-        /* Drop the smallest (vals[0]) and insert v in order. */
-        int j = pos;
+        if (n == k) {
+            if (v <= vals[0]) continue;      /* worse than everything kept */
+        } else {
+            /* Grow at the bottom, then insert as if the array were full. */
+            for (int j = n; j > 0; j--) { vals[j] = vals[j - 1];
+                                          ids[j] = ids[j - 1]; }
+            vals[0] = -FLT_MAX; ids[0] = -1;
+            n++;
+        }
+        int j = 0;
         while (j + 1 < n && vals[j + 1] < v) { vals[j] = vals[j + 1];
                                                ids[j] = ids[j + 1]; j++; }
         vals[j] = v; ids[j] = i;
