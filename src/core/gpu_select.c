@@ -206,13 +206,14 @@ vv_status_t vv_gpu_set_resolve(vv_gpu_set_t* set, int fallback_id,
                      "(0..%d)", set->id[i], visible,
                      visible == 1 ? "is" : "are", visible - 1);
             /*
-             * In a container these are the cards the orchestrator handed over,
-             * numbered from zero whatever they are called on the host, so a
-             * list copied from `nvidia-smi` names devices that are not here.
+             * The ids count what this process can see, which is what
+             * CUDA_VISIBLE_DEVICES or a container's device set left of the
+             * machine — so a list copied from `nvidia-smi` names cards that
+             * are not here.
              */
-            VV_LOG_E("gpus: inside a container the ids count the cards this "
-                     "process was given, not the host's; use --gpus all, or "
-                     "give the replica more cards");
+            VV_LOG_E("gpus: the ids count the cards this process can see, not "
+                     "the host's; with CUDA_VISIBLE_DEVICES set, or under an "
+                     "orchestrator, they start at 0 again. Use --gpus all");
             return VV_ERR_NOT_FOUND;
         }
     }
