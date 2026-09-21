@@ -28,7 +28,7 @@ space where someone is representing the project.
 
 ## Enforcement
 
-Report it to the maintainer: [ar4ikov228@gmail.com](mailto:ar4ikov228@gmail.com),
+Report it to the maintainer: [bizy18588@gmail.com](mailto:bizy18588@gmail.com),
 or privately through
 [GitHub's advisory form](https://github.com/Ar4ikov/vibevoice.c/security/advisories/new)
 if it involves something that should not be public. Reports are read by the
