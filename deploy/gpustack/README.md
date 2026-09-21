@@ -186,6 +186,47 @@ that is less. For Streaming-7B with many slots, that means the rest of the
 card: `--slots 48` on a 3090 gets a 4.4 GB pool. On a card other deployments
 use, give such a replica a `--gpu-memory` cap.
 
+## Chat completions
+
+From 0.5.0 the backend also answers `POST /v1/chat/completions`, so the same
+deployment can be pointed at by a chat client: OpenAI's request and response,
+`stream: true` for `chat.completion.chunk` deltas, `temperature` / `top_p` /
+`stop` / `seed` / `max_completion_tokens`, and `usage` on the answer. A
+generation takes a slot the way a transcription does, so `--slots` and
+`--queue-size` bound both.
+
+GPUStack routes by model name, not by category, so a deployment whose
+category is **Speech-to-Text** serves this endpoint too — no second
+deployment, no second copy of the weights on the card.
+
+What the answers are worth is the checkpoint's business: VibeVoice-ASR is a
+Qwen2-7B fine-tuned to emit transcription JSON, and it answers a question by
+transcribing it more often than not. The endpoint is there so that an
+operator *can*, not because this checkpoint is a chat model.
+
+## Long files and the proxy in front
+
+A 32-minute file takes minutes to transcribe, and the request is held open
+for all of it. Anything with a 60-second read timeout between the client and
+the worker will answer **504** with an HTML error page — which is what a
+"partial JSON" usually turns out to be. Measured here: direct to the backend,
+359 KB of `verbose_json` with 564 segments after 8m21s; through an
+nginx-ingress with default timeouts, 504 after 60 s.
+
+Raise the timeout on whatever sits in front. For ingress-nginx:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+```
+
+`stream=true` does not rescue a long batch transcription: on a non-streaming
+model the transcript is one delta at the end, so the connection is just as
+quiet in between. Streaming-7B is the model that actually sends text while
+the audio is still going.
+
 ## Queue semantics
 
 `--slots` limits active transcriptions; `--queue-size` limits additional waiting
