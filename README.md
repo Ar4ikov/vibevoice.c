@@ -182,12 +182,41 @@ backend expects:
 |---|---|
 | `POST /v1/audio/transcriptions` | multipart `file`, plus optional `model`, `prompt` (used as hotwords), `temperature`, `response_format` |
 | `POST /v1/audio/translations` | same handler; this model outputs English |
+| `POST /v1/chat/completions` | the language model on text alone — see below |
 | `GET /v1/models`, `GET /v1/models/{id}` | the loaded model |
 | `GET /health`, `/healthz`, `/v1/health` | liveness, slot count, completed requests |
 | `GET /metrics` | Prometheus counters |
 
 `response_format` accepts `json`, `verbose_json` (segments with timings and
-speaker), `text`, `srt` and `vtt`.
+speaker), `text`, `srt` and `vtt`. `json` and `verbose_json` carry OpenAI's
+`usage` (`{"type":"duration","seconds":N}`), which is what a gateway in front
+of the server meters a transcription by.
+
+### Chat completions
+
+The checkpoint is a 7B language model with a speech front end bolted on, and
+the runtime already holds the tokenizer, the KV cache and the decode loop, so
+it will also answer text:
+
+```bash
+curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Name three colours."}],
+       "max_tokens":64,"temperature":0.8,"seed":42}'
+```
+
+OpenAI-shaped in and out: `messages` (string content or content parts),
+`max_completion_tokens` / `max_tokens`, `temperature`, `top_p`, `stop`,
+`seed`, `stream`, `usage`. `stream: true` sends `chat.completion.chunk`
+deltas, cut at whole UTF-8 characters, and closes with `[DONE]`. Decoding is
+greedy unless `temperature` is given; a `seed` then reproduces an answer
+exactly. A generation holds a slot exactly as a transcription does, so
+`--slots` and `--queue-size` bound both.
+
+**What comes back is this checkpoint talking.** VibeVoice-ASR was fine-tuned
+to emit transcription JSON, and asked for three colours it will cheerfully
+transcribe the question instead. The endpoint is plumbing, not a claim that
+the model is a good chat model; point it at a checkpoint that is, or use it
+to see what this one does.
 
 ```bash
 curl http://localhost:8080/v1/audio/transcriptions \

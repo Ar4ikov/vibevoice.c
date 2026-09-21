@@ -101,6 +101,17 @@ vv_status_t vv_engine_transcribe(vv_engine_t* e,
                                  vv_transcription_t** out,
                                  vv_perf_metrics_t* perf);
 
+/**
+ * @brief Generate text from a prompt. Blocks until a slot frees up.
+ *
+ * The language model alone, no audio: what `/v1/chat/completions` runs on.
+ * A slot serves one request at a time, transcription or generation.
+ */
+vv_status_t vv_engine_generate(vv_engine_t* e,
+                               const vv_generate_params_t* params,
+                               vv_generation_t** out,
+                               vv_perf_metrics_t* perf);
+
 /* ─── Streaming sessions (chunked models) ───────────────────────────────── */
 
 /** @brief Whether the loaded model transcribes chunk by chunk (Streaming-7B),

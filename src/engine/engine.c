@@ -279,6 +279,19 @@ vv_status_t vv_engine_transcribe(vv_engine_t* e,
     return s;
 }
 
+vv_status_t vv_engine_generate(vv_engine_t* e,
+                               const vv_generate_params_t* params,
+                               vv_generation_t** out,
+                               vv_perf_metrics_t* perf) {
+    if (!e || !params || !out) return VV_ERR_NULL_PTR;
+
+    const int slot = acquire_slot(e);
+    const vv_status_t s = vv_inference_generate(e->slots[slot], params, out);
+    if (perf) *perf = e->slots[slot]->last_perf;
+    release_slot(e, slot, s == VV_OK);
+    return s;
+}
+
 /* ─── Streaming sessions ────────────────────────────────────────────────── */
 
 struct vv_engine_stream {

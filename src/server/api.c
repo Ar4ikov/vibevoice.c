@@ -174,6 +174,13 @@ static void build_verbose_json(strbuf_t* b, const vv_transcription_t* tr,
                    "\"no_speech_prob\":0.0}");
     }
     sb_puts(b, "]");
+    /*
+     * OpenAI's duration usage, which is what a gateway in front of this
+     * meters a transcription by. Without it GPUStack logs "Error processing
+     * model usage" and records the request with zero of everything.
+     */
+    sb_printf(b, ",\"usage\":{\"type\":\"duration\",\"seconds\":%.3f}",
+              tr->duration);
     if (perf) {
         /* Not part of the OpenAI schema; harmless to clients, useful to us. */
         sb_printf(b, ",\"x_vibevoice\":{\"rtf\":%.4f,\"decode_tok_per_sec\":%.1f,"
@@ -419,7 +426,8 @@ static void handle_transcriptions(vv_server_t* sv, const vv_http_req_t* req,
     } else {
         sb_puts(&b, "{\"text\":\"");
         sb_json_escaped(&b, tr->full_text ? tr->full_text : "");
-        sb_puts(&b, "\"}");
+        sb_printf(&b, "\",\"usage\":{\"type\":\"duration\",\"seconds\":%.3f}}",
+                  tr->duration);
         vv_http_respond_json(res, 200, b.buf ? b.buf : "{}");
     }
     sb_free(&b);
@@ -972,6 +980,178 @@ static void handle_ws_stream(vv_server_t* sv, const vv_http_req_t* req,
     vv_free(w.pcm);
 }
 
+/* ─── POST /v1/chat/completions ─────────────────────────────────────────── */
+
+/**
+ * @brief What a streaming answer needs between callbacks.
+ *
+ * `gone` is set when a write fails or the peer closed: the generation stops
+ * at the next token rather than finishing into a socket nobody reads, which
+ * is what frees the slot early.
+ */
+typedef struct chat_sse {
+    vv_http_res_t* res;
+    const char*    id;
+    const char*    model;
+    uint64_t       created;
+    bool           gone;
+} chat_sse_t;
+
+static void chat_chunk_head(strbuf_t* b, const chat_sse_t* st) {
+    sb_puts(b, "{\"id\":\"");
+    sb_json_escaped(b, st->id);
+    sb_printf(b, "\",\"object\":\"chat.completion.chunk\",\"created\":%llu,"
+                 "\"model\":\"", (unsigned long long)st->created);
+    sb_json_escaped(b, st->model);
+    sb_puts(b, "\",\"choices\":[{\"index\":0,\"delta\":");
+}
+
+static bool chat_on_text(void* user, const char* delta) {
+    chat_sse_t* st = (chat_sse_t*)user;
+    if (st->gone) return false;
+
+    strbuf_t b; sb_init(&b);
+    chat_chunk_head(&b, st);
+    sb_puts(&b, "{\"content\":\"");
+    sb_json_escaped(&b, delta);
+    sb_puts(&b, "\"},\"finish_reason\":null}]}");
+    if (!vv_http_sse_send(st->res, NULL, b.buf ? b.buf : "{}")) st->gone = true;
+    sb_free(&b);
+    return !st->gone;
+}
+
+static void handle_chat(vv_server_t* sv, const vv_http_req_t* req,
+                        vv_http_res_t* res) {
+    if (strcmp(req->method, "POST") != 0) {
+        vv_http_error(res, 405, "invalid_request_error", "use POST");
+        return;
+    }
+
+    vv_chat_request_t cr;
+    const char* why = NULL;
+    vv_status_t s = vv_chat_request_parse(req->body, req->body_len, &cr, &why);
+    if (s != VV_OK) {
+        vv_http_error(res, s == VV_ERR_UNSUPPORTED ? 400 : 400,
+                      "invalid_request_error", why ? why : "bad request");
+        return;
+    }
+
+    /*
+     * A generation holds a slot exactly as a transcription does, so it goes
+     * through the same admission: the queue is what bounds how many clients
+     * can be waiting on the model at once.
+     */
+    if (!vv_queue_enter(&sv->queue)) {
+        vv_chat_request_free(&cr);
+        vv_http_error(res, 503, "server_overloaded",
+                      "the model is busy; retry later");
+        return;
+    }
+
+    char id[64];
+    const uint64_t created = (uint64_t)time(NULL);
+    snprintf(id, sizeof(id), "chatcmpl-%llx%04x",
+             (unsigned long long)created, (unsigned)(vv_time_ms()) & 0xffff);
+    const char* model = cr.model && cr.model[0] ? cr.model : sv->model_name;
+
+    vv_generate_params_t gp = vv_generate_params_default();
+    gp.prompt = cr.prompt;
+    gp.max_tokens = cr.max_tokens;
+    gp.temperature = cr.temperature;
+    gp.top_p = cr.top_p;
+    gp.top_k = cr.top_k;
+    gp.seed = cr.seed;
+    gp.stop = (const char* const*)cr.stop;
+    gp.n_stop = cr.n_stop;
+
+    chat_sse_t st;
+    memset(&st, 0, sizeof(st));
+    st.res = res; st.id = id; st.model = model; st.created = created;
+
+    if (cr.stream) {
+        if (!vv_http_respond_begin(res, 200, "text/event-stream")) {
+            vv_queue_leave(&sv->queue);
+            vv_chat_request_free(&cr);
+            return;
+        }
+        /* OpenAI's first chunk carries the role and no content. */
+        strbuf_t b; sb_init(&b);
+        chat_chunk_head(&b, &st);
+        sb_puts(&b, "{\"role\":\"assistant\",\"content\":\"\"},"
+                    "\"finish_reason\":null}]}");
+        if (!vv_http_sse_send(res, NULL, b.buf ? b.buf : "{}")) st.gone = true;
+        sb_free(&b);
+        gp.on_text = chat_on_text;
+        gp.user = &st;
+    }
+
+    vv_generation_t* g = NULL;
+    vv_perf_metrics_t perf;
+    memset(&perf, 0, sizeof(perf));
+    const double t0 = vv_time_ms();
+    s = vv_engine_generate(sv->engine, &gp, &g, &perf);
+    const double ms = vv_time_ms() - t0;
+    vv_queue_leave(&sv->queue);
+
+    if (s != VV_OK) {
+        const char* msg = vv_status_str(s);
+        if (cr.stream) {
+            if (!st.gone) {
+                strbuf_t b; sb_init(&b);
+                sb_puts(&b, "{\"error\":{\"type\":\"server_error\",\"message\":\"");
+                sb_json_escaped(&b, msg);
+                sb_puts(&b, "\"}}");
+                vv_http_sse_send(res, "error", b.buf ? b.buf : "{}");
+                sb_free(&b);
+            }
+        } else {
+            vv_http_error(res, s == VV_ERR_KV_POOL_EXHAUSTED ? 503 : 500,
+                          "server_error", msg);
+        }
+        vv_chat_request_free(&cr);
+        return;
+    }
+
+    count_request(sv, true, 0.0, ms);
+    VV_LOG_I("server: chat %d prompt + %d new tokens in %.0f ms (%s)",
+             g->prompt_tokens, g->completion_tokens, ms, g->finish_reason);
+
+    if (cr.stream) {
+        if (!st.gone) {
+            strbuf_t b; sb_init(&b);
+            chat_chunk_head(&b, &st);
+            sb_printf(&b, "{},\"finish_reason\":\"%s\"}],"
+                          "\"usage\":{\"prompt_tokens\":%d,"
+                          "\"completion_tokens\":%d,\"total_tokens\":%d}}",
+                      g->finish_reason, g->prompt_tokens, g->completion_tokens,
+                      g->prompt_tokens + g->completion_tokens);
+            vv_http_sse_send(res, NULL, b.buf ? b.buf : "{}");
+            sb_free(&b);
+            vv_http_sse_send(res, NULL, "[DONE]");
+        }
+    } else {
+        strbuf_t b; sb_init(&b);
+        sb_puts(&b, "{\"id\":\"");
+        sb_json_escaped(&b, id);
+        sb_printf(&b, "\",\"object\":\"chat.completion\",\"created\":%llu,"
+                      "\"model\":\"", (unsigned long long)created);
+        sb_json_escaped(&b, model);
+        sb_puts(&b, "\",\"choices\":[{\"index\":0,\"message\":{\"role\":"
+                    "\"assistant\",\"content\":\"");
+        sb_json_escaped(&b, g->text ? g->text : "");
+        sb_printf(&b, "\"},\"finish_reason\":\"%s\"}],\"usage\":"
+                      "{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+                      "\"total_tokens\":%d}}",
+                  g->finish_reason, g->prompt_tokens, g->completion_tokens,
+                  g->prompt_tokens + g->completion_tokens);
+        vv_http_respond_json(res, 200, b.buf ? b.buf : "{}");
+        sb_free(&b);
+    }
+
+    vv_generation_free(g);
+    vv_chat_request_free(&cr);
+}
+
 /*
  * Compare in time that depends only on the lengths, not on how many leading
  * bytes of a guess are right: strcmp() returns at the first difference,
@@ -1048,6 +1228,10 @@ static void route(const vv_http_req_t* req, vv_http_res_t* res, void* user) {
     if (strcmp(p, "/v1/models") == 0) { handle_models(sv, res, false); return; }
     if (strncmp(p, "/v1/models/", 11) == 0) {
         handle_models(sv, res, true);
+        return;
+    }
+    if (strcmp(p, "/v1/chat/completions") == 0) {
+        handle_chat(sv, req, res);
         return;
     }
     if (strcmp(p, "/v1/audio/transcriptions") == 0 ||

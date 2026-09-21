@@ -3271,3 +3271,454 @@ vv_status_t vv_pipeline_cpu_head_argmax(vv_inference_ctx_t* ctx,
                                         int32_t* token) {
     return cpu_head_argmax(ctx, normed_gpu, h, f, token);
 }
+
+/* ─── Text generation: the language model without the audio ─────────────── */
+
+/* Defined in special_tokens.c, like the family's other token names. */
+extern const char* VV_TOKEN_IM_START;
+
+/**
+ * @brief Emit the part of `pending` that is whole UTF-8, keep the rest.
+ *
+ * A byte-level BPE token can end in the middle of a character — Cyrillic and
+ * emoji are two tokens more often than not — so a delta cut at a token
+ * boundary would put half a code point on the wire and clients would render
+ * a replacement character that never goes away.
+ */
+static size_t utf8_complete(const char* s, size_t n) {
+    size_t cut = n;
+    for (size_t back = 1; back <= 4 && back <= n; back++) {
+        const unsigned char c = (unsigned char)s[n - back];
+        if ((c & 0xC0) == 0x80) continue;          /* continuation byte */
+        const size_t need = (c & 0x80) == 0    ? 1 :
+                            (c & 0xE0) == 0xC0 ? 2 :
+                            (c & 0xF0) == 0xE0 ? 3 :
+                            (c & 0xF8) == 0xF0 ? 4 : 1;
+        cut = (back >= need) ? n : n - back;
+        break;
+    }
+    return cut;
+}
+
+/** @brief The text ends with one of the caller's stop strings. */
+static size_t stop_cut(const char* text, size_t len,
+                       const char* const* stop, int n_stop) {
+    for (int i = 0; i < n_stop; i++) {
+        if (!stop[i] || !stop[i][0]) continue;
+        const size_t sl = strlen(stop[i]);
+        if (sl <= len && memcmp(text + len - sl, stop[i], sl) == 0)
+            return len - sl;
+    }
+    return (size_t)-1;
+}
+
+/** @brief Growing text buffer for the answer. */
+typedef struct gen_buf {
+    char*  s;
+    size_t n, cap;
+} gen_buf_t;
+
+static bool gen_push(gen_buf_t* b, const char* s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 1024;
+        while (cap < b->n + n + 1) cap *= 2;
+        char* p = (char*)vv_realloc(b->s, cap);
+        if (!p) return false;
+        b->s = p; b->cap = cap;
+    }
+    memcpy(b->s + b->n, s, n);
+    b->n += n;
+    b->s[b->n] = '\0';
+    return true;
+}
+
+void vv_generation_free(vv_generation_t* g) {
+    if (!g) return;
+    vv_free(g->text);
+    vv_free(g);
+}
+
+/**
+ * @brief Prompt in, answer out, on whichever device this context placed.
+ *
+ * The decode loop is the transcription one minus the audio: same prefill,
+ * same captured step, same stop tokens (`<|im_end|>` and `<|endoftext|>`
+ * are what the ChatML family already ends on). Sampling is the one
+ * addition — a transcript is decoded greedily on purpose, an answer usually
+ * is not — and it needs the logits on the host, so `temperature > 0` asks
+ * for a copy per token that greedy does not pay for.
+ */
+vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
+                                  const vv_generate_params_t* params,
+                                  vv_generation_t** out) {
+    if (!ctx || !params || !params->prompt || !out) return VV_ERR_NULL_PTR;
+    *out = NULL;
+    if (!ctx->tokenizer) return VV_ERR_NULL_PTR;
+
+    const vv_llm_config_t* llm = &ctx->model->config.llm;
+    const int hs = llm->hidden_size;
+    const int vocab_size = llm->vocab_size;
+    const bool cpu_only = (ctx->placement == VV_PLACE_CPU_ONLY);
+    const bool sampling = params->temperature > 0.0f;
+
+    int32_t* ids = NULL;
+    int seq_len = 0;
+    vv_status_t s = vv_tokenizer_encode(ctx->tokenizer, params->prompt,
+                                        &ids, &seq_len);
+    if (s != VV_OK) return s;
+    if (seq_len <= 0) { vv_free(ids); return VV_ERR_INVALID_ARG; }
+
+    int max_new = params->max_tokens > 0 ? params->max_tokens : 512;
+    const int window = ctx->kv_cache ? ctx->kv_cache->max_seq_len : 0;
+    if (window > 0 && seq_len >= window) {
+        VV_LOG_E("generate: the prompt is %d tokens and the KV window is %d; "
+                 "raise --max-seq-len", seq_len, window);
+        vv_free(ids);
+        return VV_ERR_OVERFLOW;
+    }
+    if (window > 0 && seq_len + max_new > window) max_new = window - seq_len;
+
+    vv_generation_t* g = (vv_generation_t*)vv_alloc(sizeof(*g));
+    if (!g) { vv_free(ids); return VV_ERR_OUT_OF_MEMORY; }
+    memset(g, 0, sizeof(*g));
+    g->prompt_tokens = seq_len;
+    g->finish_reason = "stop";
+
+    gen_buf_t text = {0};
+    gen_buf_t pending = {0};
+    uint64_t rng = params->seed ? params->seed
+                                : (uint64_t)(vv_time_ms() * 1000.0) | 1ull;
+    size_t emitted = 0;
+    bool cancelled = false;
+
+    /* A slot runs one request at a time, so the cache is this one's alone. */
+    vv_kv_cache_reset(ctx->kv_cache, ctx->compute_stream);
+    for (int i = 0; i < ctx->n_shards; i++) {
+        vv_dev_set_device(ctx->shards[i].gpu_id);
+        vv_kv_cache_reset(ctx->shards[i].kv_cache,
+                          ctx->shards[i].compute_stream);
+    }
+    if (!cpu_only) vv_dev_set_device(ctx->gpu_id);
+
+    if (ctx->kv_cache && ctx->kv_cache->pool) {
+        s = vv_kv_cache_reserve_wait(ctx->kv_cache, seq_len + max_new,
+                                     ctx->compute_stream);
+        if (s != VV_OK) {
+            VV_LOG_E("generate: no KV pages for this request: %s",
+                     vv_status_str(s));
+            vv_free(ids); vv_generation_free(g);
+            return s;
+        }
+    }
+
+    const double t_prefill = vv_time_ms();
+    int32_t token_id = 0;
+    int n_generated = 0;
+    /*
+     * The answer ends at <|im_end|> (vv_family_stop), but a model fine-tuned
+     * on one task also likes to open a turn of its own and keep talking:
+     * <|im_start|> ends it too, or the answer would carry a whole imagined
+     * conversation.
+     */
+    const int32_t im_start = vv_tokenizer_special_id(ctx->tokenizer,
+                                                     VV_TOKEN_IM_START);
+
+    /* ── The host path: the same steps, all in FP32 on the CPU ── */
+    if (cpu_only) {
+        if (sampling)
+            VV_LOG_W("generate: the CPU path decodes greedily; temperature "
+                     "and top_p are ignored");
+        float* hidden = (float*)vv_alloc((size_t)seq_len * hs * sizeof(float));
+        float* one    = (float*)vv_alloc((size_t)hs * sizeof(float));
+        float* normed = (float*)vv_alloc((size_t)hs * sizeof(float));
+        if (!hidden || !one || !normed) {
+            vv_free(hidden); vv_free(one); vv_free(normed);
+            vv_free(ids); vv_generation_free(g);
+            return VV_ERR_OUT_OF_MEMORY;
+        }
+        s = embed_host(ctx->model, ids, seq_len, hidden);
+        if (s == VV_OK)
+            s = vv_decoder_prefill_cpu(ctx->model, hidden, seq_len,
+                                       ctx->kv_cache, (float*)ctx->workspace,
+                                       ctx->workspace_size);
+        if (s == VV_OK) {
+            final_norm_host(ctx->model, hidden + (size_t)(seq_len - 1) * hs,
+                            normed);
+            s = head_host(ctx->model, normed, ctx->workspace,
+                          ctx->workspace_size, &token_id);
+        }
+        vv_free(hidden);
+
+        while (s == VV_OK && n_generated < max_new &&
+               !token_ends(ctx, token_id) && token_id != im_start) {
+            char piece[256];
+            size_t pn = 0;
+            if (vv_tokenizer_decode_into(ctx->tokenizer, &token_id, 1, true,
+                                         piece, sizeof(piece), &pn) != VV_OK)
+                pn = 0;
+            if (pn > 0 && !gen_push(&pending, piece, pn)) {
+                s = VV_ERR_OUT_OF_MEMORY; break;
+            }
+            n_generated++;
+
+            const size_t whole = utf8_complete(pending.s ? pending.s : "",
+                                               pending.n);
+            if (whole > 0) {
+                if (!gen_push(&text, pending.s, whole)) { s = VV_ERR_OUT_OF_MEMORY; break; }
+                memmove(pending.s, pending.s + whole, pending.n - whole);
+                pending.n -= whole;
+                if (pending.s) pending.s[pending.n] = '\0';
+            }
+            const size_t cut = stop_cut(text.s ? text.s : "", text.n,
+                                        params->stop, params->n_stop);
+            if (cut != (size_t)-1) { text.n = cut; if (text.s) text.s[cut] = '\0'; break; }
+            if (params->on_text && text.n > emitted) {
+                if (!params->on_text(params->user, text.s + emitted)) {
+                    cancelled = true; break;
+                }
+                emitted = text.n;
+            }
+
+            s = embed_host(ctx->model, &token_id, 1, one);
+            if (s == VV_OK)
+                s = vv_decoder_step_cpu(ctx->model, one, ctx->kv_cache,
+                                        (float*)ctx->workspace,
+                                        ctx->workspace_size);
+            if (s == VV_OK) {
+                final_norm_host(ctx->model, one, normed);
+                s = head_host(ctx->model, normed, ctx->workspace,
+                              ctx->workspace_size, &token_id);
+            }
+        }
+        vv_free(one); vv_free(normed);
+        goto done;
+    }
+
+    /* ── The device path ── */
+    {
+        const bool embed_on_cpu   = (ctx->embed_table_gpu == NULL);
+        const bool lm_head_on_cpu = (ctx->lm_head_gpu == NULL);
+        if (sampling && lm_head_on_cpu)
+            VV_LOG_W("generate: the head is on the host, which decodes "
+                     "greedily; temperature and top_p are ignored");
+
+        void* hidden_gpu = NULL;
+        void* one_gpu = NULL;
+        void* normed_gpu = NULL;
+        void* logits_gpu = NULL;
+        void* am_v = NULL;
+        void* am_i = NULL;
+        void* tok_dev = NULL;
+        uint16_t* host_h = NULL;
+        float* host_f = NULL;
+        float* logits_host = NULL;
+        const size_t one_hidden = (size_t)hs * 2;
+
+        s = vv_dev_alloc(&hidden_gpu, (size_t)seq_len * one_hidden);
+        if (s == VV_OK) s = vv_dev_alloc(&one_gpu, one_hidden);
+        if (s == VV_OK) s = vv_dev_alloc(&normed_gpu, one_hidden);
+        if (s == VV_OK) s = vv_dev_alloc(&tok_dev, sizeof(int32_t));
+        if (s == VV_OK && !lm_head_on_cpu) {
+            s = vv_dev_alloc(&logits_gpu, (size_t)vocab_size * sizeof(float));
+            if (s == VV_OK) s = vv_dev_alloc(&am_v, VV_ARGMAX_PARTIALS * sizeof(float));
+            if (s == VV_OK) s = vv_dev_alloc(&am_i, VV_ARGMAX_PARTIALS * sizeof(int32_t));
+        }
+        if (s == VV_OK && lm_head_on_cpu) {
+            host_h = (uint16_t*)vv_alloc(one_hidden);
+            host_f = (float*)vv_alloc((size_t)hs * sizeof(float));
+            if (!host_h || !host_f) s = VV_ERR_OUT_OF_MEMORY;
+        }
+        if (s == VV_OK && sampling && !lm_head_on_cpu) {
+            logits_host = (float*)vv_alloc((size_t)vocab_size * sizeof(float));
+            if (!logits_host) s = VV_ERR_OUT_OF_MEMORY;
+        }
+
+        /* Prompt → hidden states. */
+        if (s == VV_OK) {
+            if (embed_on_cpu) {
+                float* f32 = (float*)vv_alloc((size_t)seq_len * hs * sizeof(float));
+                uint16_t* f16 = (uint16_t*)vv_alloc((size_t)seq_len * one_hidden);
+                if (f32 && f16) {
+                    vv_embedding_cpu(ctx->model->embed_tokens.data, ids, f32,
+                                     seq_len, hs);
+                    float_to_half(f32, f16, seq_len * hs);
+                    s = vv_dev_memcpy_h2d(hidden_gpu, f16,
+                                          (size_t)seq_len * one_hidden,
+                                          ctx->compute_stream);
+                } else {
+                    s = VV_ERR_OUT_OF_MEMORY;
+                }
+                vv_free(f32); vv_free(f16);
+            } else {
+                int32_t* ids_gpu = NULL;
+                s = vv_dev_alloc((void**)&ids_gpu, (size_t)seq_len * sizeof(int32_t));
+                if (s == VV_OK) {
+                    s = vv_dev_memcpy_h2d(ids_gpu, ids,
+                                          (size_t)seq_len * sizeof(int32_t),
+                                          ctx->compute_stream);
+                    if (s == VV_OK)
+                        s = vv_embedding_dev(ctx->embed_table_gpu, ids_gpu,
+                                             hidden_gpu, seq_len, hs,
+                                             ctx->compute_stream);
+                    vv_dev_free(ids_gpu);
+                }
+            }
+        }
+
+        if (s == VV_OK) s = prefill_all_shards(ctx, hidden_gpu, seq_len);
+
+        /* The first token comes off the last prompt row. */
+        if (s == VV_OK) {
+            void* last = (uint8_t*)hidden_gpu + (size_t)(seq_len - 1) * one_hidden;
+            int32_t tok_host = 0;
+            s = vv_pipeline_head_argmax(ctx, last, normed_gpu, logits_gpu,
+                                        am_v, am_i, tok_dev, &tok_host,
+                                        host_h, host_f, &token_id);
+            if (s == VV_OK && sampling && logits_host) {
+                s = vv_dev_memcpy_d2h(logits_host, logits_gpu,
+                                      (size_t)vocab_size * sizeof(float),
+                                      ctx->compute_stream);
+                if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
+                if (s == VV_OK)
+                    s = vv_sample_logits_f32(logits_host, vocab_size,
+                                             params->temperature,
+                                             params->top_p, params->top_k,
+                                             &rng, &token_id);
+                if (s == VV_OK)
+                    s = vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
+                                          ctx->compute_stream);
+            }
+        }
+        vv_dev_free(hidden_gpu); hidden_gpu = NULL;
+
+        graph_slot_t graphs[VV_MAX_GPUS];
+        for (int i = 0; i <= ctx->n_shards; i++) { graphs[i].exec = NULL;
+                                                   graphs[i].shape = -1; }
+        const bool graph_ok = !sampling && decode_graph_enabled() &&
+                              ctx->layer_pool && ctx->layer_pool->all_resident &&
+                              ctx->kv_cache && ctx->kv_cache->d_len;
+
+        vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+        for (int i = 0; i < ctx->n_shards; i++) {
+            vv_dev_set_device(ctx->shards[i].gpu_id);
+            vv_kv_cache_publish_len(ctx->shards[i].kv_cache,
+                                    ctx->shards[i].compute_stream);
+        }
+        vv_dev_set_device(ctx->gpu_id);
+
+        while (s == VV_OK && n_generated < max_new &&
+               !token_ends(ctx, token_id) && token_id != im_start) {
+            char piece[256];
+            size_t pn = 0;
+            if (vv_tokenizer_decode_into(ctx->tokenizer, &token_id, 1, true,
+                                         piece, sizeof(piece), &pn) != VV_OK)
+                pn = 0;
+            if (pn > 0 && !gen_push(&pending, piece, pn)) {
+                s = VV_ERR_OUT_OF_MEMORY; break;
+            }
+            n_generated++;
+
+            const size_t whole = utf8_complete(pending.s ? pending.s : "",
+                                               pending.n);
+            if (whole > 0) {
+                if (!gen_push(&text, pending.s, whole)) { s = VV_ERR_OUT_OF_MEMORY; break; }
+                memmove(pending.s, pending.s + whole, pending.n - whole);
+                pending.n -= whole;
+                if (pending.s) pending.s[pending.n] = '\0';
+            }
+            const size_t cut = stop_cut(text.s ? text.s : "", text.n,
+                                        params->stop, params->n_stop);
+            if (cut != (size_t)-1) { text.n = cut; if (text.s) text.s[cut] = '\0'; break; }
+            if (params->on_text && text.n > emitted) {
+                if (!params->on_text(params->user, text.s + emitted)) {
+                    cancelled = true; break;
+                }
+                emitted = text.n;
+            }
+
+            /* Embed the token that is already on the device, step, sample. */
+            if (embed_on_cpu) {
+                if (token_id < 0 || token_id >= vocab_size) { s = VV_ERR_INVALID_ARG; break; }
+                s = vv_dev_memcpy_h2d(one_gpu,
+                                      (const uint8_t*)ctx->model->embed_tokens.data
+                                      + (size_t)token_id * one_hidden,
+                                      one_hidden, ctx->compute_stream);
+            } else {
+                if (lm_head_on_cpu || sampling)
+                    vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
+                                      ctx->compute_stream);
+                s = vv_embedding_dev(ctx->embed_table_gpu,
+                                     (const int32_t*)tok_dev, one_gpu, 1, hs,
+                                     ctx->compute_stream);
+            }
+            if (s != VV_OK) break;
+
+            s = decoder_step_graphed(ctx, one_gpu, graph_ok, graphs);
+            if (s == VV_ERR_OVERFLOW) {
+                VV_LOG_W("generate: the KV window is full (%d positions); the "
+                         "answer stops here -- raise --max-seq-len",
+                         ctx->kv_cache->max_seq_len);
+                s = VV_OK;
+                g->finish_reason = "length";
+                break;
+            }
+            if (s != VV_OK) break;
+
+            int32_t tok_host = 0;
+            s = vv_pipeline_head_argmax(ctx, one_gpu, normed_gpu, logits_gpu,
+                                        am_v, am_i, tok_dev, &tok_host,
+                                        host_h, host_f, &token_id);
+            if (s == VV_OK && sampling && logits_host) {
+                s = vv_dev_memcpy_d2h(logits_host, logits_gpu,
+                                      (size_t)vocab_size * sizeof(float),
+                                      ctx->compute_stream);
+                if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
+                if (s == VV_OK)
+                    s = vv_sample_logits_f32(logits_host, vocab_size,
+                                             params->temperature,
+                                             params->top_p, params->top_k,
+                                             &rng, &token_id);
+            }
+        }
+
+        for (int i = 0; i <= ctx->n_shards; i++)
+            if (graphs[i].exec) vv_dev_graph_destroy(graphs[i].exec);
+
+        vv_dev_free(one_gpu); vv_dev_free(normed_gpu); vv_dev_free(tok_dev);
+        if (logits_gpu) vv_dev_free(logits_gpu);
+        if (am_v) vv_dev_free(am_v);
+        if (am_i) vv_dev_free(am_i);
+        vv_free(host_h); vv_free(host_f); vv_free(logits_host);
+    }
+
+done:
+    vv_free(ids);
+    /* Whatever is left in `pending` is a broken character, not text. */
+    vv_free(pending.s);
+
+    if (ctx->kv_cache && ctx->kv_cache->pool) vv_pipeline_kv_release(ctx);
+
+    if (s != VV_OK) {
+        vv_free(text.s);
+        vv_generation_free(g);
+        return s;
+    }
+
+    if (cancelled)                    g->finish_reason = "cancelled";
+    else if (n_generated >= max_new)  g->finish_reason = "length";
+
+    g->text = text.s ? text.s : (char*)vv_alloc(1);
+    if (!g->text) { vv_generation_free(g); return VV_ERR_OUT_OF_MEMORY; }
+    if (!text.s) g->text[0] = '\0';
+    g->completion_tokens = n_generated;
+
+    vv_perf_metrics_t* perf = &ctx->last_perf;
+    perf->prefill_tokens = seq_len;
+    perf->decode_tokens = n_generated;
+    perf->total_ms = vv_time_ms() - t_prefill;
+    VV_LOG_I("generate: %d prompt + %d new tokens in %.0f ms (%s)",
+             seq_len, n_generated, perf->total_ms, g->finish_reason);
+
+    *out = g;
+    return VV_OK;
+}

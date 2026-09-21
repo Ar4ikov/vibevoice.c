@@ -166,6 +166,7 @@ add_library(vibevoice_core STATIC
     src/server/http.c
     src/server/api.c
     src/server/ws.c
+    src/server/chat_prompt.c
     src/text_tokenizer/bpe.c
     src/text_tokenizer/vocab.c
     src/text_tokenizer/special_tokens.c
@@ -383,6 +384,7 @@ if(VV_BUILD_TESTS)
     vv_add_test(test_decode_position tests/test_decode_position.c)
     vv_add_test(test_stream tests/test_stream.c)
     vv_add_test(test_ws tests/test_ws.c)
+    vv_add_test(test_chat tests/test_chat.c)
     vv_add_test(test_stream_server tests/test_stream_server.c)
     # The same suite again with the tensor-core prefill kernel switched off:
     # the scalar fallback has to agree with the reference too, and the two

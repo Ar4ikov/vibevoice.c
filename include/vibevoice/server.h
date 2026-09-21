@@ -76,6 +76,37 @@ static inline vv_server_params_t vv_server_params_default(void) {
     return p;
 }
 
+/* ─── Chat completions ──────────────────────────────────────────────────── */
+
+/**
+ * @brief An OpenAI chat request, as this server reads it.
+ *
+ * `prompt` is the ChatML text the messages render to, ready for the model.
+ * Built by vv_chat_request_parse() and freed by vv_chat_request_free().
+ */
+typedef struct vv_chat_request {
+    char*    prompt;        /**< ChatML, ending in the assistant turn      */
+    char*    model;         /**< As asked for; NULL when absent            */
+    int      max_tokens;    /**< max_completion_tokens, or max_tokens      */
+    float    temperature;   /**< 0 (the default) decodes greedily          */
+    float    top_p;
+    int      top_k;         /**< Not OpenAI's; 64 unless asked otherwise   */
+    uint64_t seed;
+    bool     stream;
+    char*    stop[4];       /**< Stop strings, at most four                */
+    int      n_stop;
+} vv_chat_request_t;
+
+/**
+ * @brief Parse a /v1/chat/completions body.
+ *
+ * @param err  set to a short reason on VV_ERR_*; never owned by the caller.
+ */
+vv_status_t vv_chat_request_parse(const char* body, size_t len,
+                                  vv_chat_request_t* out, const char** err);
+
+void vv_chat_request_free(vv_chat_request_t* r);
+
 /** @brief Bind, listen, and serve until vv_server_stop(). Blocks. */
 vv_status_t vv_server_run(vv_engine_t* engine, const vv_server_params_t* params,
                           vv_server_t** handle);
