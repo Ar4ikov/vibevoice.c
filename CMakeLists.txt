@@ -23,6 +23,9 @@ option(VV_BUILD_TESTS  "Build test executables"          ON)
 option(VV_BUILD_BENCH  "Build benchmark executable"      ON)
 option(VV_BUILD_CLI    "Build CLI executable"            ON)
 option(VV_ENABLE_NVTX  "Enable NVTX profiling markers"   OFF)
+option(VV_TEACHER_FORCING
+       "Let VV_TEACHER_TOKENS replace decoded tokens (developer builds only)"
+       OFF)
 
 # ─── Probe for CUDA after C/CXX toolchain is ready ───────────────────────────
 set(VV_HAS_CUDA OFF)
@@ -146,6 +149,12 @@ target_include_directories(cjson PUBLIC third_party/cjson)
 include_directories(${CMAKE_SOURCE_DIR}/src/core ${CMAKE_SOURCE_DIR}/src/server)
 
 # ─── vibevoice_core (pure C, no GPU) ─────────────────────────────────────────
+if(VV_TEACHER_FORCING)
+    # A file named by an environment variable then decides what the model
+    # "said", which a server would hand to a client. Off by default.
+    add_compile_definitions(VV_TEACHER_FORCING=1)
+endif()
+
 add_library(vibevoice_core STATIC
     src/core/alloc.c
     src/core/logger.c

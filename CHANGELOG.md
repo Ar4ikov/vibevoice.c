@@ -9,6 +9,17 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- Teacher forcing is a build option, off by default
+  (`-DVV_TEACHER_FORCING=ON`). `VV_TEACHER_TOKENS` points at a file whose
+  contents replace the tokens the model produced, and `serve` hands those to
+  a client: CodeQL called that an exposure of system data
+  (`cpp/system-data-exposure`, alerts 4 and 5) and it was right about a
+  release binary. A build without the flag says so when the variable is set.
+  `VV_SAVE_TOKENS` is unchanged.
+- The repository has its community files: `LICENSE` (MIT, as the README
+  always said), `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` and a
+  pull request template.
+
 - The mark ships as a PNG as well (`assets/brand/logo-256.png`), because a
   catalogue that shows a logo usually takes one format and it is not SVG.
   The GPUStack guide says how its backend list gets an icon: not from the

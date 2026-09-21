@@ -1137,7 +1137,14 @@ cli/                 transcribe, serve, chat, mic
 tools/               reference diffing, AWQ conversion
 ```
 
+## Contributing
+
+One issue, one branch, one pull request, with a CHANGELOG entry and numbers
+for anything claimed — [CONTRIBUTING.md](CONTRIBUTING.md) has the rest, and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) the ground rules. Security problems
+go through [SECURITY.md](SECURITY.md), privately.
+
 ## Licence
 
-MIT, matching the model. Third-party: cJSON (MIT). CUDA is covered by the
-NVIDIA EULA.
+[MIT](LICENSE), matching the model. Third-party: cJSON (MIT). CUDA is covered
+by the NVIDIA EULA.
