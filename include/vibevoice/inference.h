@@ -10,6 +10,8 @@
 #include "vibevoice/family.h"
 #include "vibevoice/device.h"
 
+#include <string.h>          /* the inline params defaults memset themselves */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -468,6 +470,16 @@ vv_status_t vv_sample_greedy(const void* logits_fp16, int vocab_size,
 vv_status_t vv_sample_topk(const void* logits_fp16, int vocab_size,
                              int k, float temperature, int32_t* token_id);
 
+/**
+ * @brief Draw one token from FP32 logits: temperature, top_k, then nucleus.
+ *
+ * `temperature` <= 0 is greedy. `rng` carries the stream, so the same seed
+ * gives the same answer. Nucleus is applied inside the `top_k` candidates.
+ */
+vv_status_t vv_sample_logits_f32(const float* logits, int vocab_size,
+                                 float temperature, float top_p, int top_k,
+                                 uint64_t* rng, int32_t* token_id);
+
 /* ─── Layer shards ──────────────────────────────────────────────────────── */
 
 /**
@@ -642,6 +654,58 @@ vv_status_t vv_inference_transcribe(
     vv_transcription_t** result);
 vv_status_t vv_inference_free(vv_inference_ctx_t* ctx);
 vv_status_t vv_transcription_free(vv_transcription_t* result);
+
+/* ─── Text generation (the LM without the audio) ────────────────────────── */
+
+/**
+ * @brief What to generate from a prompt that is already text.
+ *
+ * The caller has applied whatever template the model expects; this is the
+ * plain prompt → tokens → text path the chat endpoint runs on. `on_text` is
+ * called with each new piece of text as it is decoded, for streaming; it may
+ * return false to stop the generation (a client that went away).
+ */
+typedef struct vv_generate_params {
+    const char* prompt;          /**< Prompt text, already templated       */
+    int         max_tokens;      /**< Cap on new tokens. Default: 512      */
+    float       temperature;     /**< 0 = greedy (the default)             */
+    float       top_p;           /**< Nucleus, within top_k. Default: 1    */
+    int         top_k;           /**< Candidates kept. Default: 64         */
+    uint64_t    seed;            /**< 0 = pick one                         */
+    const char* const* stop;     /**< Stop strings, beyond the model's own */
+    int         n_stop;
+    bool      (*on_text)(void* user, const char* delta);
+    void*       user;
+} vv_generate_params_t;
+
+static inline vv_generate_params_t vv_generate_params_default(void) {
+    vv_generate_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.max_tokens = 512;
+    p.top_p = 1.0f;
+    p.top_k = 64;
+    return p;
+}
+
+/** @brief What a generation produced. Free with vv_generation_free(). */
+typedef struct vv_generation {
+    char*       text;
+    int         prompt_tokens;
+    int         completion_tokens;
+    const char* finish_reason;   /**< "stop" | "length" | "cancelled"      */
+} vv_generation_t;
+
+/**
+ * @brief Run the language model on text alone: prompt in, answer out.
+ *
+ * Shares the context's KV cache with transcription, so a slot does one or
+ * the other at a time. The speech front end is untouched.
+ */
+vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
+                                  const vv_generate_params_t* params,
+                                  vv_generation_t** out);
+
+void vv_generation_free(vv_generation_t* g);
 
 /**
  * @brief Parse the model's JSON answer into a structured transcription.

@@ -142,3 +142,88 @@ vv_status_t vv_sample_topk(const void* logits_fp16, int vocab_size,
     *token_id = selected;
     return VV_OK;
 }
+
+/* ─── Sampling from FP32 logits on the host ─────────────────────────────── */
+
+/**
+ * @brief Draw one token the way an OpenAI client asks for it.
+ *
+ * `temperature` <= 0 is greedy and ignores everything else. Otherwise the
+ * `top_k` most likely tokens are taken first and nucleus (`top_p`) is applied
+ * inside that set: a full sort of 152k logits per token would cost more than
+ * the decode step it follows, and past the first few dozen candidates the
+ * tail carries no mass worth keeping. `rng` is xorshift64*, so a seed
+ * reproduces an answer exactly.
+ */
+vv_status_t vv_sample_logits_f32(const float* logits, int vocab_size,
+                                 float temperature, float top_p, int top_k,
+                                 uint64_t* rng, int32_t* token_id) {
+    if (!logits || !token_id || vocab_size <= 0) return VV_ERR_NULL_PTR;
+
+    if (!(temperature > 0.0f)) {
+        int best = 0;
+        for (int i = 1; i < vocab_size; i++)
+            if (logits[i] > logits[best]) best = i;
+        *token_id = best;
+        return VV_OK;
+    }
+
+    int k = top_k > 0 ? top_k : 64;
+    if (k > vocab_size) k = vocab_size;
+    if (k > 512) k = 512;               /* the tail beyond this is noise */
+
+    /* Selection into a small ascending-by-value array: O(V*k) compares with
+     * k tiny, and no allocation of a second 152k buffer. */
+    float vals[512];
+    int   ids[512];
+    int   n = 0;
+    for (int i = 0; i < vocab_size; i++) {
+        const float v = logits[i];
+        if (n == k && v <= vals[0]) continue;
+        int pos = n < k ? n : 0;
+        if (n < k) n++;
+        else       pos = 0;
+        /* Drop the smallest (vals[0]) and insert v in order. */
+        int j = pos;
+        while (j + 1 < n && vals[j + 1] < v) { vals[j] = vals[j + 1];
+                                               ids[j] = ids[j + 1]; j++; }
+        vals[j] = v; ids[j] = i;
+    }
+
+    /* Softmax over the kept candidates, largest last. */
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        vals[i] = expf((vals[i] - vals[n - 1]) / temperature);
+        sum += vals[i];
+    }
+    for (int i = 0; i < n; i++) vals[i] /= sum;
+
+    /* Nucleus: keep the most likely tokens up to top_p of the mass. */
+    int first = 0;
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float acc = 0.0f;
+        first = n - 1;
+        for (int i = n - 1; i >= 0; i--) {
+            acc += vals[i];
+            first = i;
+            if (acc >= top_p) break;
+        }
+    }
+
+    float mass = 0.0f;
+    for (int i = first; i < n; i++) mass += vals[i];
+
+    uint64_t x = *rng ? *rng : 0x9E3779B97F4A7C15ull;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    *rng = x;
+    const float r = (float)((x * 0x2545F4914F6CDD1Dull) >> 11) /
+                    (float)(1ull << 53) * mass;
+
+    float acc = 0.0f;
+    for (int i = first; i < n; i++) {
+        acc += vals[i];
+        if (r <= acc) { *token_id = ids[i]; return VV_OK; }
+    }
+    *token_id = ids[n - 1];
+    return VV_OK;
+}

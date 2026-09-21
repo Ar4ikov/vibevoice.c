@@ -9,6 +9,23 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- **The language model answers text too**: `POST /v1/chat/completions`,
+  OpenAI-shaped, so the same deployment can be pointed at by a chat client
+  ([#43](https://github.com/Ar4ikov/vibevoice.c/issues/43)). Messages render
+  to the ChatML the checkpoint was trained on, `stream: true` sends
+  `chat.completion.chunk` deltas cut at whole UTF-8 characters, and
+  `temperature` / `top_p` / `top_k` / `seed` / `stop` / `max_completion_tokens`
+  do what they say -- greedy by default, and the same seed gives the same
+  answer. `usage` counts the prompt and the answer. A generation takes a
+  slot exactly as a transcription does, so the queue and `--slots` bound
+  both, and the two share the KV cache of the slot. 3090, AWQ: 135 tok/s,
+  the same decode path as a transcript; the CPU path answers too, greedily.
+  What comes back is this checkpoint talking -- it was fine-tuned to
+  transcribe, and it shows.
+- Transcriptions carry OpenAI's `usage` (`{"type":"duration","seconds":N}`)
+  in `json` and `verbose_json`. Without it GPUStack recorded every request
+  with zero usage and logged an error per call.
+
 - A container is no longer told the host's GPU numbers
   ([#41](https://github.com/Ar4ikov/vibevoice.c/issues/41)). GPUStack 2.2.2
   mounts the cards it assigned by UUID and still sets
