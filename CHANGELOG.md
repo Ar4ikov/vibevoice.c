@@ -9,6 +9,16 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- A container that holds more `/dev/nvidiaN` nodes than
+  `CUDA_VISIBLE_DEVICES` lists now says so in one warning, with the counts
+  and where the knob is. GPUStack 2.2.2's automatic scheduler hands a custom
+  backend one card whatever `--gpus all` asks, mounts every card anyway and
+  narrows the variable to the one it picked, so a two-card deployment ran on
+  one with nothing in the log to show for it. The GPUStack guide gets the
+  API form of the GPU selector, the fact that changing it does not restart
+  the running replica, and an eight-slots-on-two-cards recipe with what it
+  holds ([#46](https://github.com/Ar4ikov/vibevoice.c/pull/46)).
+
 ## [0.5.0](https://github.com/Ar4ikov/vibevoice.c/compare/v0.4.1...v0.5.0) — 2026-09-21
 
 - Teacher forcing is a build option, off by default
