@@ -90,6 +90,26 @@ vv_status_t vv_gpu_set_from_flags(const char* gpus, const char* gpu_memory,
                                   bool cpu_only, int* gpu_id,
                                   vv_gpu_set_t* set);
 
+/**
+ * @brief Read `CUDA_VISIBLE_DEVICES` against the devices a container holds.
+ *
+ * `nodes` are the GPU numbers actually present (the N of `/dev/nvidiaN`),
+ * ascending. Returns VV_OK and writes the list to use into `out` (which may
+ * equal the input), VV_ERR_NOT_FOUND when the list names nothing present, or
+ * VV_ERR_UNSUPPORTED when there is nothing to decide (no list, UUIDs, MIG
+ * ids, no nodes). See vv_cuda_fix_visible_devices() for why.
+ */
+vv_status_t vv_cuda_visible_map(const char* text, const int* nodes,
+                                int n_nodes, char* out, size_t out_size);
+
+/**
+ * @brief Apply that correction to this process, once, before CUDA starts.
+ *
+ * Called from vv_gpu_set_resolve(), which every command reaches before the
+ * device layer. A no-op off Linux, and with VV_KEEP_CUDA_VISIBLE_DEVICES=1.
+ */
+void vv_cuda_fix_visible_devices(void);
+
 /** @brief Bytes the `index`th device may use: free * budget, then the cap. */
 size_t vv_gpu_budget(const vv_gpu_set_t* set, int index, float vram_budget);
 

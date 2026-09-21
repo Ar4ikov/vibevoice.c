@@ -12,8 +12,13 @@
 #include "vibevoice/device.h"
 
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <dirent.h>
+#include <pthread.h>
+#endif
 
 /**
  * @brief Parse one memory cap: "8G", "18GiB", "8192M", "80%", "8589934592".
@@ -78,6 +83,8 @@ vv_status_t vv_gpu_set_parse(const char* text, vv_gpu_set_t* out) {
     memset(out, 0, sizeof(*out));
 
     if (strcmp(text, "all") == 0) {
+        /* Counting devices is the first thing that starts CUDA. */
+        vv_cuda_fix_visible_devices();
         const int n = vv_dev_device_count();
         if (n <= 0) {
             VV_LOG_E("gpus: 'all' asked for, but no device is visible");
@@ -187,6 +194,7 @@ vv_status_t vv_gpu_set_resolve(vv_gpu_set_t* set, int fallback_id,
     }
     if (cpu_only) return VV_OK;
 
+    vv_cuda_fix_visible_devices();
     const int visible = vv_dev_device_count();
     if (visible <= 0) {
         /* No driver: the caller falls back to the CPU path and says so. */
@@ -197,6 +205,14 @@ vv_status_t vv_gpu_set_resolve(vv_gpu_set_t* set, int fallback_id,
             VV_LOG_E("gpus: device %d asked for, but only %d %s visible "
                      "(0..%d)", set->id[i], visible,
                      visible == 1 ? "is" : "are", visible - 1);
+            /*
+             * In a container these are the cards the orchestrator handed over,
+             * numbered from zero whatever they are called on the host, so a
+             * list copied from `nvidia-smi` names devices that are not here.
+             */
+            VV_LOG_E("gpus: inside a container the ids count the cards this "
+                     "process was given, not the host's; use --gpus all, or "
+                     "give the replica more cards");
             return VV_ERR_NOT_FOUND;
         }
     }
@@ -223,6 +239,132 @@ vv_status_t vv_gpu_set_resolve(vv_gpu_set_t* set, int fallback_id,
         }
     }
     return VV_OK;
+}
+
+/**
+ * @brief Translate `CUDA_VISIBLE_DEVICES` into the numbering a container uses.
+ *
+ * A container is given a subset of the host's cards by mounting only their
+ * device nodes, and CUDA then numbers what it finds from 0. An orchestrator
+ * that also sets `CUDA_VISIBLE_DEVICES` to the *host* indexes — GPUStack
+ * 2.2.2 does — hands the process a list from the other namespace. Given host
+ * card 1 alone, the container holds `/dev/nvidia1`, the variable says `1`,
+ * CUDA is asked for the second of one card and reports **none**: the model
+ * lands on the CPU, or the run dies on `--gpus all`.
+ *
+ * The host's own numbering is the case where the two agree, so mapping each
+ * listed number to its position among the nodes present is a no-op there and
+ * the correction only where it is wrong. A list naming nothing present cannot
+ * be honoured at all — that is `VV_ERR_NOT_FOUND`, and the caller drops it.
+ */
+vv_status_t vv_cuda_visible_map(const char* text, const int* nodes,
+                                int n_nodes, char* out, size_t out_size) {
+    if (!out || out_size == 0) return VV_ERR_NULL_PTR;
+    out[0] = '\0';
+    if (!text || !nodes || n_nodes <= 0) return VV_ERR_UNSUPPORTED;
+
+    /* UUIDs and MIG ids already name a device rather than a position. */
+    for (const char* p = text; *p; p++)
+        if (!isdigit((unsigned char)*p) && *p != ',' && !isspace((unsigned char)*p))
+            return VV_ERR_UNSUPPORTED;
+
+    size_t used = 0;
+    int listed = 0, mapped = 0;
+    const char* p = text;
+    while (*p) {
+        while (*p == ',' || isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        char* end = NULL;
+        const long v = strtol(p, &end, 10);
+        if (end == p) return VV_ERR_UNSUPPORTED;
+        p = end;
+        listed++;
+
+        int pos = -1;
+        for (int i = 0; i < n_nodes; i++)
+            if (nodes[i] == (int)v) { pos = i; break; }
+        /*
+         * CUDA stops at the first entry it cannot resolve, so a list that is
+         * partly wrong is worth no more than one that is entirely wrong.
+         */
+        if (pos < 0) return VV_ERR_NOT_FOUND;
+
+        const int n = snprintf(out + used, out_size - used, "%s%d",
+                               mapped ? "," : "", pos);
+        if (n < 0 || (size_t)n >= out_size - used) return VV_ERR_INVALID_ARG;
+        used += (size_t)n;
+        mapped++;
+    }
+    if (listed == 0) return VV_ERR_UNSUPPORTED;
+    return VV_OK;
+}
+
+/**
+ * @brief Apply vv_cuda_visible_map() to this process, once, before CUDA runs.
+ *
+ * CUDA reads `CUDA_VISIBLE_DEVICES` when its runtime initializes and never
+ * again, so the correction has to happen before the first CUDA call. Every
+ * command reaches the device layer through vv_gpu_set_resolve() below, which
+ * is what calls this.
+ *
+ * Linux only: the nodes under `/dev` are what says which cards this process
+ * actually holds, and it is containers that renumber them. The once-flag is
+ * the only process-wide state here, for a variable that is process-wide too.
+ */
+#ifdef __linux__
+static pthread_once_t g_visible_once = PTHREAD_ONCE_INIT;
+
+static void fix_visible_devices(void) {
+    const char* keep = getenv("VV_KEEP_CUDA_VISIBLE_DEVICES");
+    if (keep && keep[0] && keep[0] != '0') return;
+    const char* cvd = getenv("CUDA_VISIBLE_DEVICES");
+    if (!cvd || !cvd[0]) return;
+
+    int nodes[VV_MAX_GPUS];
+    int n_nodes = 0;
+    DIR* d = opendir("/dev");
+    if (!d) return;
+    for (struct dirent* e = readdir(d); e && n_nodes < VV_MAX_GPUS;
+         e = readdir(d)) {
+        if (strncmp(e->d_name, "nvidia", 6) != 0 ||
+            !isdigit((unsigned char)e->d_name[6]))
+            continue;                            /* nvidiactl, nvidia-uvm, … */
+        char* end = NULL;
+        const long v = strtol(e->d_name + 6, &end, 10);
+        if (!end || *end != '\0') continue;
+        nodes[n_nodes++] = (int)v;
+    }
+    closedir(d);
+    for (int i = 1; i < n_nodes; i++) {          /* ascending; a tiny list */
+        const int v = nodes[i];
+        int j = i - 1;
+        while (j >= 0 && nodes[j] > v) { nodes[j + 1] = nodes[j]; j--; }
+        nodes[j + 1] = v;
+    }
+
+    char fixed[256];
+    const vv_status_t s = vv_cuda_visible_map(cvd, nodes, n_nodes,
+                                              fixed, sizeof(fixed));
+    if (s == VV_ERR_NOT_FOUND) {
+        VV_LOG_W("cuda: CUDA_VISIBLE_DEVICES='%s' names no device this "
+                 "container holds; ignoring it and using the %d that %s "
+                 "mounted (VV_KEEP_CUDA_VISIBLE_DEVICES=1 keeps it)",
+                 cvd, n_nodes, n_nodes == 1 ? "is" : "are");
+        unsetenv("CUDA_VISIBLE_DEVICES");
+    } else if (s == VV_OK && strcmp(fixed, cvd) != 0) {
+        VV_LOG_W("cuda: CUDA_VISIBLE_DEVICES='%s' is in the host's numbering; "
+                 "this container holds those cards as '%s', which is what is "
+                 "used (VV_KEEP_CUDA_VISIBLE_DEVICES=1 keeps it)",
+                 cvd, fixed);
+        setenv("CUDA_VISIBLE_DEVICES", fixed, 1);
+    }
+}
+#endif
+
+void vv_cuda_fix_visible_devices(void) {
+#ifdef __linux__
+    pthread_once(&g_visible_once, fix_visible_devices);
+#endif
 }
 
 /**
