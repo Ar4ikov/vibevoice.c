@@ -424,6 +424,15 @@ vv_status_t vv_decoder_verify(
     const vv_taps_t* taps);
 
 /**
+ * @brief The most rows vv_decoder_verify keeps exact on `model`.
+ *
+ * 16, except where layers run W4A8: past the rows its GEMV takes (8), the
+ * activations go to the GEMM, which adds the weight groups up in another
+ * order than the decode step does.
+ */
+int vv_decoder_verify_rows_max(const vv_model_t* model);
+
+/**
  * @brief One decode step through layers [first_layer, first_layer+n_layers).
  * @param pool  Optional layer pool for streaming (NULL = weights on GPU).
  * @param xfer  Transfer stream for async upload (NULL = use compute).

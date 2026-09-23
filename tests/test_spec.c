@@ -17,9 +17,9 @@
  * Without a GPU: the drafter's config.json is read and checked (what the
  * runtime refuses, and why).
  *
- * With VV_TEST_MODEL (a checkpoint) and VV_TEST_DRAFT (a drafter for it)
- * set, the jfk clip (VV_TEST_AUDIO, else tests/data/jfk.wav) is transcribed
- * with and without the drafter and the generated ids must be identical.
+ * With VV_TEST_MODEL (a checkpoint), VV_TEST_DRAFT (a drafter for it) and
+ * VV_TEST_AUDIO (a WAV) set, the clip is transcribed with and without the
+ * drafter and the generated ids must be identical.
  */
 
 #include "vibevoice/vibevoice.h"
@@ -540,6 +540,46 @@ static void test_conv(void) {
     free(xh); free(dh); free(base); free(oh);
 }
 
+/* Garbage in, real ids out: a row of NaN (a drafter whose FP16 overflowed)
+ * still gives k ids below V, and an index past the map takes its first id. */
+static void test_topk_nan(void) {
+    const int M = 3, V = 1000, k = 16;
+    float* lg = (float*)malloc((size_t)M * V * 4);
+    for (int i = 0; i < M * V; i++) lg[i] = frand();
+    for (int i = 0; i < V; i++) lg[i] = NAN;                 /* all NaN */
+    for (int i = 0; i < V; i += 2) lg[V + i] = NAN;          /* even ids NaN */
+    for (int i = 0; i < V; i++) lg[2 * V + i] = -INFINITY;
+    float* ld = (float*)dev_upload(lg, (size_t)M * V * 4);
+    float* tv = NULL;
+    int32_t* ti = NULL;
+    vv_dev_alloc((void**)&tv, (size_t)M * k * 4);
+    vv_dev_alloc((void**)&ti, (size_t)M * k * 4);
+    vv_status_t s = vv_topk_rows_dev(ld, M, V, k, tv, ti, NULL);
+    int32_t hi[3 * 16];
+    vv_dev_memcpy_d2h(hi, ti, sizeof(hi), NULL);
+    int bad = s != VV_OK;
+    for (int j = 0; !bad && j < k; j++) {
+        bad |= hi[j] != j || hi[2 * k + j] != j;   /* no real value: lowest ids */
+        bad |= hi[k + j] < 0 || hi[k + j] >= V || (hi[k + j] & 1) == 0;
+    }
+    CHECK(!bad, "top-k: NaN or -inf rows gave ids that are not the lowest");
+
+    int32_t map[8] = { 11, 12, 13, 14, 15, 16, 17, 18 };
+    int32_t idx[5] = { 3, -1, 8, 7, 0x7fffffff };
+    const int32_t want[5] = { 14, 11, 11, 18, 11 };
+    int32_t* md = (int32_t*)dev_upload(map, sizeof(map));
+    int32_t* id = (int32_t*)dev_upload(idx, sizeof(idx));
+    vv_status_t g = vv_gather_i32_dev(md, 8, id, 5, NULL);
+    vv_dev_memcpy_d2h(idx, id, sizeof(idx), NULL);
+    const int gbad = g != VV_OK || memcmp(idx, want, sizeof(want)) != 0;
+    CHECK(!gbad, "gather: an index outside the map was not clamped");
+    if (!bad && !gbad)
+        printf("  ok   top-k over NaN rows, gather past the map\n");
+    vv_dev_free(ld); vv_dev_free(tv); vv_dev_free(ti);
+    vv_dev_free(md); vv_dev_free(id);
+    free(lg);
+}
+
 static void test_topk_walk(void) {
     const int M = 7, V = 50000, k = 16, rank = 64, VC = 1000;
     float* lg = (float*)malloc((size_t)M * V * 4);
@@ -651,12 +691,12 @@ static int run_ids(const char* model, const char* draft, const float* pcm,
 static void test_transcript(void) {
     const char* model = getenv("VV_TEST_MODEL");
     const char* draft = getenv("VV_TEST_DRAFT");
-    if (!model || !draft) {
-        printf("  SKIP transcript: set VV_TEST_MODEL and VV_TEST_DRAFT\n");
+    const char* audio = getenv("VV_TEST_AUDIO");
+    if (!model || !draft || !audio) {
+        printf("  SKIP transcript: set VV_TEST_MODEL, VV_TEST_DRAFT and "
+               "VV_TEST_AUDIO\n");
         return;
     }
-    const char* audio = getenv("VV_TEST_AUDIO");
-    if (!audio) audio = VV_TEST_DATA_DIR "/jfk.wav";
     float* raw = NULL;
     int rn = 0, sr = 0;
     if (vv_audio_load_any(audio, &raw, &rn, &sr) != VV_OK) {
@@ -732,6 +772,7 @@ int main(void) {
     test_head_rows(1000, 512, 5);       /* a last warp with rows past V */
     test_conv();
     test_topk_walk();
+    test_topk_nan();
     test_transcript();
     printf(failures ? "test_spec: %d FAILED\n" : "test_spec: ok\n", failures);
     return failures ? 1 : 0;

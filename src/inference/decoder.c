@@ -1470,7 +1470,8 @@ vv_status_t vv_decoder_verify(
     const vv_taps_t* taps)
 {
     if (!model || !hidden_states || !kv_cache) return VV_ERR_NULL_PTR;
-    if (rows < 1 || rows > VERIFY_M_MAX) return VV_ERR_INVALID_ARG;
+    if (rows < 1 || rows > vv_decoder_verify_rows_max(model))
+        return VV_ERR_INVALID_ARG;
     const int base = kv_cache->current_len;
     if (base + rows > kv_cache->max_seq_len) return VV_ERR_OVERFLOW;
     vv_status_t s = vv_kv_cache_reserve(kv_cache, base + rows, compute_stream);
@@ -1496,6 +1497,21 @@ vv_status_t vv_decoder_verify(
         }
     }
     return VV_OK;
+}
+
+int vv_decoder_verify_rows_max(const vv_model_t* model) {
+    if (!model) return VERIFY_M_MAX;
+    for (int i = 0; i < model->num_layers; i++) {
+        const vv_layer_weights_t* L = &model->layers[i];
+        if (!layer_a8(L, &model->config.llm, true) ||
+            L->attn.q_proj.quant_kind != VV_QUANT_INT4G)
+            continue;
+        /* W4A8: the rows that still take the decode step's GEMV layout */
+        int m = VERIFY_M_MAX;
+        while (m > 1 && vv_w4a8_layout_for(m) != VV_Q8_W4_GEMV) m--;
+        return m;
+    }
+    return VERIFY_M_MAX;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

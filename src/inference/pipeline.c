@@ -1285,11 +1285,26 @@ static void attach_spec(vv_inference_ctx_t* c, const char* dir, int quant,
         why = "the embedding, LM head and final norm must be on the GPU";
     else if (!c->kv_cache || c->kv_cache->on_cpu)
         why = "the KV cache is not on the GPU";
+    else {
+        /* The drafter's kernels are CUDA's; a backend without them declines
+         * each one (VV_ERR_UNSUPPORTED). Ask before loading anything. */
+        int32_t none = 0;
+        if (vv_gather_i32_dev(&none, 1, &none, 0, NULL) == VV_ERR_UNSUPPORTED)
+            why = "this backend has no speculative decoding kernels";
+    }
     if (why) {
         VV_LOG_W("spec: %s; decoding without the drafter", why);
         if (!parent) return;
         c->drafter = NULL;
         return;
+    }
+    const int rows_max = vv_decoder_verify_rows_max(c->model);
+    if (verify_rows > rows_max) {
+        if (!parent)
+            VV_LOG_W("spec: this model checks at most %d rows exactly "
+                     "(W4A8); --draft-block %d -> %d", rows_max, verify_rows,
+                     rows_max);
+        verify_rows = rows_max;
     }
     vv_status_t s = VV_OK;
     if (!parent)
@@ -2701,25 +2716,37 @@ static vv_status_t transcribe_gpu(
         graph_slot_t graphs_taps[VV_MAX_GPUS];
         for (int i = 0; i < VV_MAX_GPUS; i++) { graphs_taps[i].exec = NULL;
                                                 graphs_taps[i].shape = -1; }
+        /* Whether the device holds the length and the token a step reads:
+         * a step leaves them there for the next, a block does not. */
+        bool dev_fresh = false;
         while (n_generated < max_new_tokens && !token_ends(ctx, token_id)) {
             int32_t outs[VV_SPEC_MAX_BLOCK];
             int n_out = 0;
             const double t0 = vv_time_ms();
             if (vv_spec_want_block(ctx->spec)) {
                 s = vv_spec_cycle(ctx, ctx->spec, token_id, outs, &n_out);
+                if (s == VV_ERR_KV_POOL_EXHAUSTED) {
+                    /* No pages for a whole block: plain steps for a while. */
+                    s = VV_OK;
+                    vv_spec_pause(ctx->spec);
+                    continue;
+                }
                 if (s == VV_ERR_OVERFLOW) { s = VV_OK; break; }
                 if (s != VV_OK) {
                     VV_LOG_E("inference: speculative step at %d failed: %s",
                              n_generated, vv_status_str(s));
                     break;
                 }
+                dev_fresh = false;
                 vv_spec_note_block(ctx->spec, n_out, vv_time_ms() - t0);
             } else {
                 /* A plain step, seen by the drafter as well. It reads the
                  * length and the token on the device. */
-                vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
-                s = vv_dev_memcpy_h2d(token_out_gpu, &token_id, sizeof(int32_t),
-                                      ctx->compute_stream);
+                if (!dev_fresh) {
+                    vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+                    s = vv_dev_memcpy_h2d(token_out_gpu, &token_id,
+                                          sizeof(int32_t), ctx->compute_stream);
+                }
                 if (s == VV_OK)
                     s = vv_embedding_dev(ctx->embed_table_gpu,
                                          (const int32_t*)token_out_gpu,
@@ -2740,6 +2767,7 @@ static vv_status_t transcribe_gpu(
                 }
                 if (s == VV_OK) s = vv_spec_push_step(ctx->spec);
                 if (s != VV_OK) break;
+                dev_fresh = true;
                 n_out = 1;
                 vv_spec_note_step(ctx->spec, vv_time_ms() - t0);
             }
@@ -3998,6 +4026,7 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
          */
         int32_t queued[VV_SPEC_MAX_BLOCK];
         int n_queued = 0, q_at = 0;
+        bool dev_fresh = false;     /* device length and token: a step's */
         graph_slot_t graphs_taps[VV_MAX_GPUS];
         for (int i = 0; i < VV_MAX_GPUS; i++) { graphs_taps[i].exec = NULL;
                                                 graphs_taps[i].shape = -1; }
@@ -4043,27 +4072,39 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
                 s = vv_spec_cycle(ctx, ctx->spec, token_id, queued, &n_out);
                 if (s == VV_OK) {
                     vv_spec_note_block(ctx->spec, n_out, vv_time_ms() - t0);
+                    dev_fresh = false;
                     n_queued = n_out;
                     q_at = 0;
                     token_id = queued[q_at++];
                     continue;
                 }
-                if (s != VV_ERR_OVERFLOW) break;
-                /* The window has no room for a block: plain steps from here,
-                 * which read the length and the token on the device. */
-                s = VV_OK;
-                spec_on = false;
-                vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
-                s = vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
-                                      ctx->compute_stream);
-                if (s != VV_OK) break;
-            } else if (spec_on) {
-                /* Blocks are not paying here: a plain step the drafter sees
-                 * as well, so they can resume later. */
+                if (s == VV_ERR_KV_POOL_EXHAUSTED) {
+                    /* No pages for a whole block: a plain step, below. */
+                    s = VV_OK;
+                    vv_spec_pause(ctx->spec);
+                } else if (s != VV_ERR_OVERFLOW) {
+                    break;
+                } else {
+                    /* The window has no room for a block: plain steps from
+                     * here, which read the length and the token on the
+                     * device. */
+                    s = VV_OK;
+                    spec_on = false;
+                    vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+                    s = vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
+                                          ctx->compute_stream);
+                    if (s != VV_OK) break;
+                }
+            }
+            if (spec_on) {
+                /* Blocks are not paying here (or found no pages): a plain
+                 * step the drafter sees as well, so they can resume later. */
                 const double t0 = vv_time_ms();
-                vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
-                s = vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
-                                      ctx->compute_stream);
+                if (!dev_fresh) {
+                    vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+                    s = vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
+                                          ctx->compute_stream);
+                }
                 if (s == VV_OK)
                     s = vv_embedding_dev(ctx->embed_table_gpu,
                                          (const int32_t*)tok_dev, one_gpu, 1,
@@ -4089,6 +4130,7 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
                 }
                 if (s == VV_OK) s = vv_spec_push_step(ctx->spec);
                 if (s != VV_OK) break;
+                dev_fresh = true;
                 vv_spec_note_step(ctx->spec, vv_time_ms() - t0);
                 continue;
             }

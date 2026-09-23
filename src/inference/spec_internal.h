@@ -55,6 +55,12 @@ bool vv_spec_want_block(vv_spec_t* s);
 void vv_spec_note_block(vv_spec_t* s, int tokens, double ms);
 void vv_spec_note_step(vv_spec_t* s, double ms);
 
+/** @brief A block found no room (VV_ERR_KV_POOL_EXHAUSTED: the shared page
+ *         pool cannot give a whole block's pages): a run of plain steps,
+ *         which need one page at most. vv_spec_cycle changes nothing before
+ *         it asks for the pages, so a step can follow at once. */
+void vv_spec_pause(vv_spec_t* s);
+
 /** @brief Taps for a plain step: its one row lands in row 0. */
 const vv_taps_t* vv_spec_step_taps(vv_spec_t* s);
 

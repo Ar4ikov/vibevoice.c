@@ -80,8 +80,9 @@ vv_status_t vv_add_scaled_f16_dev(float* h, const void* y, float sc, int n,
                                   bool set, void* s) {
     U(h) U(y) U(sc) U(n) U(set) U(s) return VV_ERR_UNSUPPORTED;
 }
-vv_status_t vv_gather_i32_dev(const int32_t* m, int32_t* i, int n, void* s) {
-    U(m) U(i) U(n) U(s) return VV_ERR_UNSUPPORTED;
+vv_status_t vv_gather_i32_dev(const int32_t* m, int nm, int32_t* i, int n,
+                              void* s) {
+    U(m) U(nm) U(i) U(n) U(s) return VV_ERR_UNSUPPORTED;
 }
 vv_status_t vv_dflash_block_ids_dev(const int32_t* a, int m, int n,
                                     int32_t* i, void* s) {

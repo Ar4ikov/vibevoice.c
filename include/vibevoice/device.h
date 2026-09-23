@@ -776,7 +776,8 @@ vv_status_t vv_argmax_rows_dev(const void* logits, int M, int V,
                                void* stream);
 
 /** @brief The `k` (<= 32) largest logits of each row, descending, ties to
- *         the lower id: values [M][k] FP32, ids [M][k] int32. */
+ *         the lower id: values [M][k] FP32, ids [M][k] int32. A NaN counts
+ *         as -inf, so every id is below V whatever the row holds. */
 vv_status_t vv_topk_rows_dev(const float* logits, int M, int V, int k,
                              float* out_vals, int32_t* out_ids, void* stream);
 
@@ -812,9 +813,10 @@ vv_status_t vv_rmsnorm_f32in_dev(const float* x, const void* w, void* y,
 vv_status_t vv_add_scaled_f16_dev(float* h, const void* y, float scale, int n,
                                   bool set, void* stream);
 
-/** @brief idx[i] = map[idx[i]] for i < n, in place (device). */
-vv_status_t vv_gather_i32_dev(const int32_t* map, int32_t* idx, int n,
-                              void* stream);
+/** @brief idx[i] = map[idx[i]] for i < n, in place (device); an index
+ *         outside [0, n_map) takes map[0]. */
+vv_status_t vv_gather_i32_dev(const int32_t* map, int n_map, int32_t* idx,
+                              int n, void* stream);
 
 /** @brief ids[0] = *anchor, ids[1..n) = mask_id (device). */
 vv_status_t vv_dflash_block_ids_dev(const int32_t* anchor, int mask_id,

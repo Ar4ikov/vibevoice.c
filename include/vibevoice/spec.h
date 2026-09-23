@@ -128,8 +128,13 @@ size_t vv_spec_context_bytes(const vv_drafter_config_t* c, int max_pos);
 vv_status_t vv_drafter_load(const char* dir, const vv_model_t* target,
                             int gpu_id, int quant, vv_drafter_t** out);
 
+/** @brief Free a drafter's device and host memory (NULL is fine). */
 void vv_drafter_free(vv_drafter_t* d);
+
+/** @brief The config a drafter was loaded with. */
 const vv_drafter_config_t* vv_drafter_get_config(const vv_drafter_t* d);
+
+/** @brief Device bytes a drafter's weights take. */
 size_t vv_drafter_device_bytes(const vv_drafter_t* d);
 
 /** @brief How speculation went for a context since its counters were

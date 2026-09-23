@@ -16,13 +16,15 @@
  *
  * Weights are FP16 on the device, activations FP16 except the residual
  * stream, which is FP32: a drafter trained in BF16 has activations FP16
- * cannot hold (a SwiGLU output of 2e4 feeding a 9472-wide down projection).
- * Three rescalings keep every FP16 intermediate in range without changing
- * the function: `fc` is stored divided by VV_SPEC_FC_SCALE and the RMSNorm
- * after it takes eps / VV_SPEC_FC_SCALE^2 (the target's features carry
- * activations of ~1.3e4); `up_proj` is divided by `mlp_div` and `down_proj`
- * multiplied by mlp_div / out_div, `o_proj` divided by out_div, and the two
- * sublayer outputs are added into the residual times out_div.
+ * cannot hold (a SwiGLU output of 2e4 feeding a 9472-wide down projection;
+ * the residual of the 7B's drafter reaches 3e6 in a few channels, the
+ * massive activations its target has too). Three rescalings keep every
+ * FP16 intermediate in range without changing the function: `fc` is stored
+ * divided by VV_SPEC_FC_SCALE and the RMSNorm after it takes
+ * eps / VV_SPEC_FC_SCALE^2 (the target's features carry activations of
+ * ~1.3e4); `up_proj` is divided by `mlp_div` (32) and `down_proj`
+ * multiplied by mlp_div / out_div, `o_proj` divided by out_div (1024), and
+ * the two sublayer outputs are added into the residual times out_div.
  *
  * By default (VV_DRAFTER_INT4) the projections are quantized at load into
  * INT4 groups of 128 (round to nearest, exact zero point) and run on the
@@ -501,7 +503,7 @@ vv_status_t vv_drafter_load(const char* dir, const vv_model_t* target,
     const int64_t kd = (int64_t)c->num_kv_heads * c->head_dim;
     const int64_t K = c->conv_kernel, G = H / c->conv_group;
     d->mlp_div = c->fp16_mlp_div > 0.0f ? c->fp16_mlp_div : 32.0f;
-    d->out_div = c->fp16_out_div > 0.0f ? c->fp16_out_div : 64.0f;
+    d->out_div = c->fp16_out_div > 0.0f ? c->fp16_out_div : 1024.0f;
     d->L = (dlayer_t*)vv_alloc(sizeof(dlayer_t) * (size_t)c->num_layers);
     if (!d->L) s = VV_ERR_OUT_OF_MEMORY;
     else memset(d->L, 0, sizeof(dlayer_t) * (size_t)c->num_layers);
@@ -612,10 +614,18 @@ struct vv_spec {
     /* blocks or steps (vv_spec_want_block) */
     double ctl_blk_tok, ctl_blk_ms, ctl_step_ms;
     int ctl_n_blk, ctl_plain_left, ctl_backoff;
+    int ctl_since_step;        /* blocks since the last plain step */
+    int ctl_step_high;         /* step times in a row set aside as outliers */
+    bool ctl_skip_step;        /* the next step's time is not a step's */
+    bool ctl_remeasure;        /* the plain run is one step, to measure it */
     void** allocs;
     int n_allocs, cap_allocs;
     vv_spec_stats_t stats;
 };
+
+static vv_status_t dlin(vv_spec_t* s, const void* x, const dlin_t* W, void* y,
+                        int M, int N, int K, void* stream);
+static size_t largest_packed(const vv_drafter_t* d);
 
 static vv_status_t salloc(vv_spec_t* s, void** p, size_t n) {
     if (s->n_allocs == s->cap_allocs) {
@@ -725,18 +735,46 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
      */
     s->Bv = verify_rows >= 2 ? verify_rows : 4;
     if (s->Bv > s->B) s->Bv = s->B;
+    /*
+     * The INT4 drafter's GEMMs run on the W4A16 tensor-core kernels. A card
+     * without them (below sm_80, or VV_W4A16_MMA=0) expands a weight into
+     * the scratch first: try the widest projection, and if that is what
+     * happens, give the scratch room for the largest.
+     */
+    if (d->fc.packed) {
+        const int K = s->n_taps * s->H;
+        st = dlin(s, s->cx, &d->fc, s->cxn, 2, s->H, K, stream);
+        if (st == VV_ERR_OVERFLOW) {
+            const size_t need = largest_packed(d) * 2;
+            VV_LOG_W("spec: no tensor-core W4A16 GEMM here; the INT4 drafter "
+                     "expands its weights into %zu MB of scratch "
+                     "(--draft-quant f16 reads them as they are)",
+                     need >> 20);
+            s->gemm_ws_bytes = need;
+            st = salloc(s, &s->gemm_ws, need);
+            if (st == VV_OK)
+                st = dlin(s, s->cx, &d->fc, s->cxn, 2, s->H, K, stream);
+        }
+        if (st == VV_OK) st = vv_dev_stream_sync(stream);
+        if (st != VV_OK) { vv_spec_free(s); return st; }
+    }
     vv_spec_reset(s);
     *out = s;
     return VV_OK;
 }
 
-/* Plain steps a sequence starts with: the step's cost, measured. */
-#define CTL_WARM_STEPS 2
+/* Plain steps a sequence starts with: the step's cost, measured. The first
+ * one's time is not used: it captures the tapped step's graph. */
+#define CTL_WARM_STEPS 3
 /* Blocks seen before they are judged, and the first plain run after a loss
  * (doubling up to CTL_RUN_MAX while blocks keep losing). */
 #define CTL_MIN_BLOCKS 4
 #define CTL_RUN_MIN 16
 #define CTL_RUN_MAX 512
+/* Blocks between two plain steps taken while blocks pay, to measure a step
+ * again: both slow down as the context grows, and are compared at the same
+ * length. */
+#define CTL_REMEASURE 64
 
 void vv_spec_reset(vv_spec_t* s) {
     if (!s) return;
@@ -745,6 +783,10 @@ void vv_spec_reset(vv_spec_t* s) {
     s->ctl_n_blk = 0;
     s->ctl_plain_left = CTL_WARM_STEPS;
     s->ctl_backoff = CTL_RUN_MIN;
+    s->ctl_since_step = 0;
+    s->ctl_step_high = 0;
+    s->ctl_skip_step = true;
+    s->ctl_remeasure = false;
 }
 
 bool vv_spec_want_block(vv_spec_t* s) {
@@ -753,11 +795,26 @@ bool vv_spec_want_block(vv_spec_t* s) {
 
 void vv_spec_note_step(vv_spec_t* s, double ms) {
     if (!s) return;
-    s->ctl_step_ms = s->ctl_step_ms > 0.0 ? 0.8 * s->ctl_step_ms + 0.2 * ms : ms;
+    /* A step that captured its graph (the first of a sequence, or one at a
+     * new attention split) is not what a step costs: such outliers are set
+     * aside, unless three in a row say the cost has really moved. */
+    if (s->ctl_skip_step) {
+        s->ctl_skip_step = false;
+    } else if (s->ctl_step_ms <= 0.0) {
+        s->ctl_step_ms = ms;
+    } else if (ms < 1.5 * s->ctl_step_ms || ++s->ctl_step_high >= 3) {
+        s->ctl_step_ms = 0.8 * s->ctl_step_ms + 0.2 * ms;
+        s->ctl_step_high = 0;
+    }
+    s->ctl_since_step = 0;
     if (s->ctl_plain_left > 0 && --s->ctl_plain_left == 0) {
-        /* Blocks again: judged on what they do from here. */
-        s->ctl_n_blk = 0;
-        s->ctl_blk_tok = s->ctl_blk_ms = 0.0;
+        /* Blocks again, judged on what they do from here -- unless the run
+         * was one step to measure, and they were paying. */
+        if (!s->ctl_remeasure) {
+            s->ctl_n_blk = 0;
+            s->ctl_blk_tok = s->ctl_blk_ms = 0.0;
+        }
+        s->ctl_remeasure = false;
     }
 }
 
@@ -770,15 +827,28 @@ void vv_spec_note_block(vv_spec_t* s, int tokens, double ms) {
         s->ctl_blk_tok = 0.8 * s->ctl_blk_tok + 0.2 * tokens;
         s->ctl_blk_ms = 0.8 * s->ctl_blk_ms + 0.2 * ms;
     }
-    if (++s->ctl_n_blk < CTL_MIN_BLOCKS || s->ctl_step_ms <= 0.0) return;
-    /* tokens per ms of blocks against a step's one token */
-    if (s->ctl_blk_tok * s->ctl_step_ms < s->ctl_blk_ms) {
-        s->ctl_plain_left = s->ctl_backoff;
-        if (s->ctl_backoff < CTL_RUN_MAX) s->ctl_backoff *= 2;
-        s->stats.fallbacks++;
-    } else if (s->ctl_n_blk >= 4 * CTL_MIN_BLOCKS) {
-        s->ctl_backoff = CTL_RUN_MIN;       /* blocks pay: forget the losses */
+    s->ctl_since_step++;
+    if (++s->ctl_n_blk >= CTL_MIN_BLOCKS && s->ctl_step_ms > 0.0) {
+        /* tokens per ms of blocks against a step's one token */
+        if (s->ctl_blk_tok * s->ctl_step_ms < s->ctl_blk_ms) {
+            s->ctl_plain_left = s->ctl_backoff;
+            if (s->ctl_backoff < CTL_RUN_MAX) s->ctl_backoff *= 2;
+            s->stats.fallbacks++;
+            return;
+        }
+        if (s->ctl_n_blk >= 4 * CTL_MIN_BLOCKS)
+            s->ctl_backoff = CTL_RUN_MIN;   /* blocks pay: forget the losses */
     }
+    if (s->ctl_since_step >= CTL_REMEASURE) {
+        s->ctl_plain_left = 1;
+        s->ctl_remeasure = true;
+    }
+}
+
+void vv_spec_pause(vv_spec_t* s) {
+    if (!s || s->ctl_plain_left > 0) return;
+    s->ctl_plain_left = CTL_RUN_MIN;
+    s->ctl_remeasure = false;
 }
 
 const vv_taps_t* vv_spec_step_taps(vv_spec_t* s) {
@@ -853,6 +923,20 @@ static vv_status_t dlin(vv_spec_t* s, const void* x, const dlin_t* W, void* y,
                                  s->gemm_ws_bytes, M, N, K, DRAFT_Q_GROUP,
                                  stream);
     return vv_gemm_fp16_dev(x, W->w, y, M, N, K, 1.0f, 0.0f, stream);
+}
+
+/* Elements of the largest INT4 projection, for the dequantizing GEMM. */
+static size_t largest_packed(const vv_drafter_t* d) {
+    const vv_drafter_config_t* c = &d->cfg;
+    const size_t H = (size_t)c->hidden_size;
+    const size_t qd = (size_t)c->num_heads * c->head_dim;
+    size_t m = (size_t)c->n_taps * H * H;                        /* fc */
+    if (qd * H > m) m = qd * H;                                  /* q, o */
+    if ((size_t)c->intermediate_size * H > m)                    /* MLP */
+        m = (size_t)c->intermediate_size * H;
+    const size_t conv = 2 * (size_t)c->conv_kernel *
+                        (H / (size_t)c->conv_group) * H;         /* kernels */
+    return conv > m ? conv : m;
 }
 
 /* A layer's K/V rows [pos, pos + n) of the drafter cache. */
@@ -1022,7 +1106,8 @@ static vv_status_t draft(vv_spec_t* s, const vv_inference_ctx_t* ctx,
     OK(vv_topk_rows_dev(s->logits, B - 1, d->Vd, s->topk, s->tk_v, s->tk_i,
                         stream));
     if (d->vmap)
-        OK(vv_gather_i32_dev(d->vmap, s->tk_i, (B - 1) * s->topk, stream));
+        OK(vv_gather_i32_dev(d->vmap, d->Vd, s->tk_i, (B - 1) * s->topk,
+                             stream));
     OK(vv_gemm_fp16_dev((const uint8_t*)s->xn + row, d->hproj, s->hp, B - 1,
                         s->rank, H, 1.0f, 0.0f, stream));
     OK(vv_dflash_walk_dev(s->hp, s->tk_v, s->tk_i, d->pred, d->succ,

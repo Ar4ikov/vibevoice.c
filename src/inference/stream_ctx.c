@@ -523,6 +523,13 @@ static vv_status_t gpu_decode_block(void* self, int32_t token, int32_t* out,
     if (s == VV_OK) {
         vv_pipeline_kv_publish(ctx);
         vv_spec_note_block(b->spec, *n, vv_time_ms() - t0);
+    } else if (s == VV_ERR_KV_POOL_EXHAUSTED) {
+        /* No pages for a whole block (a live session does not wait for
+         * them): a step, which needs one at most, and steps for a while.
+         * The cycle had changed nothing yet. */
+        vv_spec_pause(b->spec);
+        s = gpu_decode_step(self, token, out);
+        if (s == VV_OK) *n = 1;
     }
     return s;
 }
@@ -1114,6 +1121,10 @@ vv_status_t vv_stream_transcribe(vv_inference_ctx_t* ctx,
             s = vv_transcription_set_tokens(*result, col.ids, col.n_ids,
                                             col.chunk_n, col.chunk_stop,
                                             col.n);
+        if (s != VV_OK && *result) {
+            vv_transcription_free(*result);
+            *result = NULL;
+        }
     }
 
     if (st) {

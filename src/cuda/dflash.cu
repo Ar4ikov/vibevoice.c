@@ -16,6 +16,7 @@
 #include <cuda_fp16.h>
 #include <float.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 
 #include "vibevoice/device.h"
@@ -186,7 +187,13 @@ __device__ __forceinline__ bool tk_better(float v, int i, float w, int j) {
     return v > w || (v == w && i < j);
 }
 
-/* Largest `k` (<= KK) of each row, descending, ties to the lower id. */
+/*
+ * Largest `k` (<= KK) of each row, descending, ties to the lower id. A NaN
+ * counts as -inf, and an empty slot is (-inf, INT_MAX), which any real id
+ * beats on the tie: whatever the logits hold, every id that comes out is
+ * below V. (A drafter whose FP16 overflowed gave rows of NaN, and INT_MAX
+ * went on to index its vocabulary map.)
+ */
 template <int KK>
 __global__ void __launch_bounds__(TK_THREADS)
 topk_rows_kernel(const float* __restrict__ logits, int V, int k,
@@ -196,9 +203,10 @@ topk_rows_kernel(const float* __restrict__ logits, int V, int k,
     float lv[KK];
     int li[KK];
 #pragma unroll
-    for (int j = 0; j < KK; j++) { lv[j] = -FLT_MAX; li[j] = INT_MAX; }
+    for (int j = 0; j < KK; j++) { lv[j] = -INFINITY; li[j] = INT_MAX; }
     for (int i = threadIdx.x; i < V; i += TK_THREADS) {
-        const float v = l[i];
+        float v = l[i];
+        if (v != v) v = -INFINITY;
         if (!tk_better(v, i, lv[KK - 1], li[KK - 1])) continue;
         lv[KK - 1] = v;
         li[KK - 1] = i;
@@ -216,7 +224,7 @@ topk_rows_kernel(const float* __restrict__ logits, int V, int k,
     __shared__ int   ht[TK_THREADS];
     int head = 0;
     for (int r = 0; r < k; r++) {
-        float v = -FLT_MAX;
+        float v = -INFINITY;
         int i = INT_MAX;
 #pragma unroll
         for (int j = 0; j < KK; j++)
@@ -387,11 +395,13 @@ __global__ void dflash_accept_kernel(const int* __restrict__ draft,
     *n_out = a + 1;
 }
 
-__global__ void gather_i32_kernel(const int* __restrict__ map,
+__global__ void gather_i32_kernel(const int* __restrict__ map, int n_map,
                                   int* __restrict__ idx, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) idx[i] = map[idx[i]];
+    if (i >= n) return;
+    const int j = idx[i];
+    idx[i] = map[(unsigned)j < (unsigned)n_map ? j : 0];
 }
 
 extern "C" {
@@ -509,13 +519,14 @@ vv_status_t vv_add_scaled_f16_dev(float* h, const void* y, float scale, int n,
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
-vv_status_t vv_gather_i32_dev(const int32_t* map, int32_t* idx, int n,
-                              void* stream)
+vv_status_t vv_gather_i32_dev(const int32_t* map, int n_map, int32_t* idx,
+                              int n, void* stream)
 {
     if (!map || !idx) return VV_ERR_NULL_PTR;
     if (n <= 0) return VV_OK;
+    if (n_map <= 0) return VV_ERR_INVALID_ARG;
     gather_i32_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t)stream>>>(
-        (const int*)map, (int*)idx, n);
+        (const int*)map, n_map, (int*)idx, n);
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
