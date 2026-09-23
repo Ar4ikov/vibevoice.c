@@ -331,6 +331,26 @@ static void test_attn_rows(int backend, int fmt, bool paged, int n_q, int n_kv,
               name, bad_rows, M);
         if (!bad_rows) printf("  ok   %s\n", name);
         free(a); free(c);
+        /* VV_SPEC_BENCH=1: the block against one decode of the same length. */
+        if (getenv("VV_SPEC_BENCH") && getenv("VV_SPEC_BENCH")[0] == '1') {
+            double t1 = 0.0, tm = 0.0;
+            for (int rep = 0; rep < 2; rep++) {
+                const int it = 20;
+                double t0 = vv_time_ms();
+                for (int k = 0; k < it; k++)
+                    vv_attn_decode(b, q, &view, ob, n_q, L0 + 1, NULL, scr, NULL);
+                vv_dev_stream_sync(NULL);
+                t1 = (vv_time_ms() - t0) * 1000.0 / it;
+                t0 = vv_time_ms();
+                for (int k = 0; k < it; k++)
+                    vv_attn_decode_rows(b, q, &view, oa, n_q, M, L0 + 1, NULL,
+                                        scr, NULL);
+                vv_dev_stream_sync(NULL);
+                tm = (vv_time_ms() - t0) * 1000.0 / it;
+            }
+            printf("  bench %s: 1 row %.1f us, %d rows %.1f us (%.2fx)\n",
+                   name, t1, M, tm, tm / t1);
+        }
     }
     vv_dev_free(kf); vv_dev_free(vf); vv_dev_free(ks); vv_dev_free(vs);
     if (km) vv_dev_free(km);
@@ -699,6 +719,9 @@ int main(void) {
             }
         test_attn_rows(VV_ATTN_FA2, VV_KV_FP16, true, 28, 4, 700, 8);
         test_attn_rows(VV_ATTN_FLASHINFER, VV_KV_TQ4, true, 28, 4, 2040, 8);
+        /* A long file's cache (32 min: ~24K positions, 49 MB a layer). */
+        test_attn_rows(VV_ATTN_FA2, VV_KV_FP16, false, 28, 4, 24000, 4);
+        test_attn_rows(VV_ATTN_FA2, VV_KV_FP16, true, 28, 4, 24000, 4);
     }
     test_ternary_rows(1536, 1536);
     test_ternary_rows(8960, 1536);

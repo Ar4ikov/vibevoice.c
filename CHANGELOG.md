@@ -9,6 +9,28 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- Speculative decoding with [DFlash 2](https://inco.ai/blog/dflash2/)
+  drafters (`--draft <dir>`, also for `serve`, `chat` and streaming
+  sessions): a small drafter proposes a block of tokens in one pass, the
+  model checks the block in one pass and keeps what it agrees with. The
+  check computes every row with a decode step's own arithmetic — multi-row
+  copies of the W4A16 GEMV, the split-KV decode attention (fa1, fa2,
+  flashinfer, every KV format, paged or not), the ternary BitNet
+  projections, the LM head and the argmax, each tested bit for bit against
+  one row at a time — so a transcript with a drafter is byte-for-byte the
+  transcript without one. `--draft-block N` sets how many rows a pass
+  checks, `--draft-quant int4|f16` the drafter's weights (INT4 by default:
+  a draft only has to be good, not exact). Drafters are trained on the
+  target's own transcripts (`tools/dflash`: corpus, `vv_dflash_data
+  gen|trace`, `train.py`, `check_drafter.py`); the design and the numbers
+  are in [docs/DFLASH.md](docs/DFLASH.md). Metal and the CPU path decline
+  (`VV_ERR_UNSUPPORTED`) and decode without the drafter
+  ([#47](https://github.com/Ar4ikov/vibevoice.c/issues/47)).
+- `vv_init_params_default()` now zero-fills the struct first: the per-device
+  memory caps of an empty `gpus` set were left as stack garbage, so an API
+  caller that did not go through the CLI's flag parser could get a random
+  cap and land on the CPU-only placement with no error.
+
 ## [0.5.1](https://github.com/Ar4ikov/vibevoice.c/compare/v0.5.0...v0.5.1) — 2026-09-21
 
 - A container that holds more `/dev/nvidiaN` nodes than
