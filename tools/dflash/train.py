@@ -370,21 +370,35 @@ def make_blocks(t, B, max_anchors, rng):
 
 
 def draft_vocab(path, n, V):
-    """The n ids generated most often in a gen.jsonl, ascending, or None."""
+    """The n ids generated most often in a gen.jsonl, ascending, or None.
+
+    The ids that stopped a chunk or a transcript (`stops`) are always in: a
+    transcript's `tokens` leave them out, but a streaming chunk ends on one
+    every ~10 tokens, and a drafter that cannot propose it loses every
+    block that reaches a chunk's end (and is never trained on those labels,
+    which fall outside its head)."""
     if n <= 0:
         return None
     counts = np.zeros(V, np.int64)
+    stops = set()
     for line in open(path, encoding="utf-8"):
         line = line.strip()
         if not line:
             continue
-        ids = np.asarray(json.loads(line)["tokens"], np.int64)
+        j = json.loads(line)
+        ids = np.asarray(j["tokens"], np.int64)
         ids = ids[(ids >= 0) & (ids < V)]
         np.add.at(counts, ids, 1)
+        for sid in j.get("stops", []):
+            if 0 <= sid < V:
+                counts[sid] += 1
+                stops.add(int(sid))
     order = np.argsort(-counts, kind="stable")
-    keep = order[:n]
-    keep = keep[counts[keep] > 0]
-    return np.sort(keep).astype(np.int64)
+    keep = [int(i) for i in order[:n] if counts[i] > 0]
+    missing = [sid for sid in sorted(stops) if sid not in set(keep)]
+    if missing:
+        keep = keep[:n - len(missing)] + missing
+    return np.sort(np.asarray(keep, np.int64))
 
 
 def step_loss(model, emb, head, t, dev, B, gamma, max_anchors, rng,

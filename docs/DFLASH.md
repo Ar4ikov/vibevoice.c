@@ -65,9 +65,14 @@ plus `draft_vocab` (below).
 * **Draft vocabulary.** The drafter scores only the `draft_vocab` ids — the
   N most frequent in the transcripts it was trained on (32768 at most; the
   whole training corpus uses ~26 K distinct ids and 99 % of occurrences fall
-  in ~22 K). Those rows of the target's head are gathered once at load, so
-  the draft pass reads a fifth of the head. The target still checks against
-  the full vocabulary.
+  in ~22 K), plus every id that stopped a chunk or a transcript. Those are
+  not in a transcript's tokens, and leaving them out cost more than it
+  looks: a streaming chunk ends on `<|text_chunk_end|>` every ~10 tokens,
+  and a drafter that cannot propose it loses every block that reaches a
+  chunk's end (the first Streaming-1.5B drafter never cut a block at a
+  stop). The rows of the target's head for these ids are gathered once at
+  load, so the draft pass reads a fifth of the head. The target still
+  checks against the full vocabulary.
 
 ## Checking a block exactly
 
