@@ -48,11 +48,16 @@ plus `draft_vocab` (below).
 
 * **FP16 with an FP32 residual.** A drafter trained in BF16 has activations
   FP16 cannot hold: the target's tapped features reach 1.3e4 (Qwen2's massive
-  activations), a SwiGLU output 2e4 feeding a 9472-wide down projection. The
-  residual stream is FP32, and three exact rescalings keep every FP16
-  intermediate in range: `fc` is stored ÷64 with the RMSNorm's ε ÷64², `up`
-  ÷32 and `down` ×32/64, `o` ÷64, the two sublayer outputs added ×64
-  (`vv_fp16` in config.json overrides the factors).
+  activations), a SwiGLU output 2e4 feeding a 9472-wide down projection, and
+  the 7B drafter's own residual 3e6 in a few channels. The residual stream is
+  FP32, and three exact rescalings keep every FP16 intermediate in range:
+  `fc` is stored ÷64 with the RMSNorm's ε ÷64², `up` ÷32 and `down` ×32/1024,
+  `o` ÷1024, the two sublayer outputs added ×1024 (`vv_fp16` in config.json
+  overrides the factors). At ÷64 the 7B drafter's down projection overflowed
+  to inf on some blocks; ÷1024 drafts the same (Streaming-1.5B, test120: 2.71
+  against 2.68 tokens per block). Whatever the drafter computes, the ids it
+  proposes exist: the top-k counts a NaN as −inf and the vocabulary map
+  clamps, so a broken drafter costs drafts, never a request.
 * **INT4 by default** (`--draft-quant int4`; `f16` keeps the trained
   weights): the projections are quantized at load into INT4 groups of 128
   (round to nearest, exact zero point) and run on the W4A16 kernels — 625 MB
@@ -61,7 +66,11 @@ plus `draft_vocab` (below).
   tokens per cycle). A draft is only a proposal, so quantizing it costs
   acceptance, never correctness. For the same reason the drafter's block
   attends on flashinfer's tensor cores whatever backend the target uses
-  (0.21 ms a cycle less than the fa2 path on the 7B).
+  (0.21 ms a cycle less than the fa2 path on the 7B). Below sm_80 (or with
+  `VV_W4A16_MMA=0`) there is no tensor-core W4A16 GEMM, and the INT4
+  drafter expands each weight into a scratch before its GEMM (122 MB for
+  the 7B's drafter, said at load); `--draft-quant f16` reads them as they
+  are.
 * **Draft vocabulary.** The drafter scores only the `draft_vocab` ids — the
   N most frequent in the transcripts it was trained on (32768 at most; the
   whole training corpus uses ~26 K distinct ids and 99 % of occurrences fall
@@ -96,6 +105,12 @@ Norms, RoPE, SwiGLU and the residual adds are row-wise already. With these, a
 checked row and its decode step compute the same bits; `tests/test_spec.c`
 compares every kernel against the one-row version bit for bit (7B and 1.5B
 shapes, M 1..16, fa1/fa2/flashinfer, fp16 and tq4 caches, paged and slab).
+Other weight formats check with the kernels a decode step runs: dense FP16
+and ternary take up to 8 rows at once, NF4 and INT8 one row at a time
+(exact, slower), W8A8 any count (integer sums). W4A8 checks at most 8 rows:
+past what its GEMV takes, the activations go to the GEMM, which adds the
+weight groups up in another order, so a larger `--draft-block` is cut to 8
+(`vv_decoder_verify_rows_max`).
 
 What that costs is compute. The one-token GEMV is memory-bound with its FP16
 pipe mostly idle; the same arithmetic for M rows is M times the FP16 work
@@ -162,12 +177,18 @@ row 0 of a one-row buffer, which keeps it capturable as a graph of its own.
 How many drafts are kept depends on the audio. On speech like the drafter's
 corpus a block brings 2–3 tokens; on a language it barely saw, about 1, at
 the price of roughly two steps. So every decode position asks
-`vv_spec_want_block()`: the first two positions of a sequence are plain
-steps (the step's cost, measured), then blocks, while their running tokens
-per millisecond beat a step's; when they fall below, blocks pause for a run
-of plain steps (16, doubling up to 512 while blocks keep losing) and are
-tried again. The tokens are the same either way; `spec: …, N plain steps,
-M pauses` in the log says what happened.
+`vv_spec_want_block()`: the first three positions of a sequence are plain
+steps (the step's cost, measured; the first one captures the tapped step's
+graph and is not counted), then blocks, while their running tokens per
+millisecond beat a step's; when they fall below, blocks pause for a run of
+plain steps (16, doubling up to 512 while blocks keep losing) and are tried
+again. While blocks pay, one plain step every 64 blocks measures a step
+again, at the length the blocks are running at, and a step time 1.5× the
+estimate (a new capture, a hiccup) is set aside unless three in a row say
+the cost has moved. The tokens are the same either way; `spec: …, N plain
+steps, M pauses` in the log says what happened. A block that finds no
+pages in a shared pool (a live session does not wait for them) is plain
+steps for a while too: a step needs one page at most.
 
 On the 43 held-out clips with the Streaming-1.5B drafter this is what keeps
 the worst clips (Mandarin and Russian, which the drafter saw little of) near
@@ -200,6 +221,10 @@ timestamps and speaker ids included.
    next B-1 tokens with weights e^(−k/4), cross-entropy of the (subset) head
    plus the selector's cross-entropy over the top-16 candidates; AdamW 6e-4,
    β (0.9, 0.95), 4 % warm-up, cosine to 10 %, clip 1.0, BF16 autocast.
+   The cosine runs over the steps the traces actually make (`--steps` is
+   cut to what `--epochs` passes give): a schedule cut off by the data
+   leaves the last checkpoint at a high learning rate, as the first 7B
+   drafter found out (step 359 of 680, lr at 55 % of peak).
 4. **Check.** `tools/dflash/check_drafter.py` runs the trained model on a
    trace and compares its drafts with what the runtime drafted for the same
    positions (`VV_SPEC_LOG`); the C drafter agrees with PyTorch on 97–100 %
@@ -244,8 +269,9 @@ TBD.
 ## Not supported
 
 * The CPU path and Metal: the drafter and the multi-row check exist for CUDA
-  only; `--draft` there logs a warning and decodes without it
-  (`VV_ERR_UNSUPPORTED` from the device seam).
+  only; `--draft` there logs a warning and decodes without it (the device
+  seam declines the drafter's kernels with `VV_ERR_UNSUPPORTED`, asked once
+  before anything loads).
 * A model split across devices (`--split-mode layer`): the taps would have
   to cross devices.
 * Sampling (`temperature > 0`): the check is greedy.
