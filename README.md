@@ -343,6 +343,33 @@ vv_cli chat --model ./model_hf
 The model loads once and stays warm. Ten seconds of startup per file is
 absurd for short clips; this pays it once.
 
+### Speculative decoding (DFlash 2)
+
+```bash
+vv_cli --model ./model_hf --audio talk.wav --draft ./drafter
+vv_cli serve --model ./model_hf --draft ./drafter --slots 4
+```
+
+A [DFlash 2](https://inco.ai/blog/dflash2/) drafter — a few layers that
+read the model's own hidden states — proposes a block of tokens in one pass;
+the model checks the block in one pass and keeps the tokens it agrees with,
+plus one of its own. The check computes every row with the arithmetic of a
+one-token decode step, so **the transcript is byte-for-byte the one without
+`--draft`** — words, timestamps, speakers. What a drafter changes is only how
+many passes the transcript takes.
+
+| flag | |
+|---|---|
+| `--draft <dir>` | `config.json` + `model.safetensors` of a drafter trained for this model |
+| `--draft-block <n>` | rows of the drafted block the model checks per pass (default 4) |
+| `--draft-quant int4\|f16` | the drafter's weights (INT4 by default; it only proposes) |
+
+Works for one-shot transcription, streaming sessions (Streaming-7B and
+-1.5B), chat completions (greedy) and `serve` slots, on CUDA. Drafters are
+trained with `tools/dflash` on the target's own transcripts;
+[docs/DFLASH.md](docs/DFLASH.md) has the design, the training pipeline and
+the numbers.
+
 ---
 
 ## Quantization

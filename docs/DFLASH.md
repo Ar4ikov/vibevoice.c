@@ -53,11 +53,15 @@ plus `draft_vocab` (below).
   intermediate in range: `fc` is stored ÷64 with the RMSNorm's ε ÷64², `up`
   ÷32 and `down` ×32/64, `o` ÷64, the two sublayer outputs added ×64
   (`vv_fp16` in config.json overrides the factors).
-* **`VV_DRAFT_QUANT=int4`**: the projections are quantized at load into INT4
-  groups of 128 (round to nearest, exact zero point) and run on the W4A16
-  kernels — 532 MB instead of 1586 MB for the 7B drafter, and a draft pass
-  that reads a quarter of the bytes. A draft is only a proposal, so this
-  costs acceptance, never correctness.
+* **INT4 by default** (`--draft-quant int4`; `f16` keeps the trained
+  weights): the projections are quantized at load into INT4 groups of 128
+  (round to nearest, exact zero point) and run on the W4A16 kernels — 625 MB
+  instead of 1679 MB for the 7B drafter, a draft pass that reads a quarter
+  of the bytes, and the same drafts kept on test120 (1.39 against 1.40
+  tokens per cycle). A draft is only a proposal, so quantizing it costs
+  acceptance, never correctness. For the same reason the drafter's block
+  attends on flashinfer's tensor cores whatever backend the target uses
+  (0.21 ms a cycle less than the fa2 path on the 7B).
 * **Draft vocabulary.** The drafter scores only the `draft_vocab` ids — the
   N most frequent in the transcripts it was trained on (32768 at most; the
   whole training corpus uses ~26 K distinct ids and 99 % of occurrences fall
@@ -91,18 +95,32 @@ shapes, M 1..16, fa1/fa2/flashinfer, fp16 and tq4 caches, paged and slab).
 What that costs is compute. The one-token GEMV is memory-bound with its FP16
 pipe mostly idle; the same arithmetic for M rows is M times the FP16 work
 (HFMA2 chains and half→float flushes cannot be shared between rows), and from
-about 3 rows on it is the FP16 pipe, not the weights, that sets the time
-(3090, 7B shapes, one row = 1.0):
+about 3 rows on it is the FP16 pipe, not the weights, that sets the time.
+3090, 7B AWQ shapes, time of M rows over one row (`VV_SPEC_BENCH=1
+tests/test_spec`):
 
-| rows | q/k/v | o | gate/up | down |
-|---|---|---|---|---|
-| 2 | TBD | | | |
-| 4 | | | | |
-| 8 | | | | |
+| rows | q/k/v | o | gate/up | down | a layer |
+|---|---|---|---|---|---|
+| 2 | 1.18 | 1.23 | 1.05 | 1.12 | **1.09** |
+| 3 | 1.20 | 1.38 | 1.10 | 1.34 | **1.20** |
+| 4 | 1.41 | 1.63 | 1.23 | 1.54 | **1.36** |
+| 8 | 2.28 | 2.61 | 2.19 | 2.68 | **2.4** |
+
+Two kernels, one arithmetic: x in shared memory a tile at a time with each
+lane group carrying 4 weight rows (`w4a16_gemv_rows_kernel`), and for 3–4
+rows of a 3584-wide x a persistent one that loads all of x once per block
+and walks every projection's rows in turn (`w4a16_gemv_rows_persist_kernel`,
+3–8 % faster there, slower elsewhere). The head is 1.08× one row for 8 rows
+(1.32 against 1.23 ms) once it streams past L1 — read through L1 it evicted
+the x rows and took 1.75×. Decode attention is latency-bound, not
+bandwidth-bound: rows run as separate grid layers (8 rows at 1K positions
+2.05× one row; 4 rows at 24K 3.1×), and a variant that reads each cached
+position once for all rows, with the same slices, was slower at every size
+(fewer warps in flight) and was dropped.
 
 So the runtime checks fewer rows than it drafts when that pays: the drafter
 always drafts its whole block (it was trained on whole blocks), and
-`VV_SPEC_VERIFY=n` checks the anchor and the first n-1 drafts only.
+`--draft-block n` checks the anchor and the first n-1 drafts only.
 
 `VV_SPEC_EXACT=0` checks with the prefill kernels instead (tensor-core
 GEMMs): measurements only, since a near-tie can then flip.

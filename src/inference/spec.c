@@ -24,10 +24,11 @@
  * multiplied by mlp_div / out_div, `o_proj` divided by out_div, and the two
  * sublayer outputs are added into the residual times out_div.
  *
- * With VV_DRAFT_QUANT=int4 the projections are quantized at load into INT4
- * groups of 128 (round to nearest, exact zero point) and run on the W4A16
- * kernels, a quarter of the bytes per draft pass. The drafter's numbers
- * only decide what gets proposed; the target's check decides what is kept.
+ * By default (VV_DRAFTER_INT4) the projections are quantized at load into
+ * INT4 groups of 128 (round to nearest, exact zero point) and run on the
+ * W4A16 kernels, a quarter of the bytes per draft pass. The drafter's
+ * numbers only decide what gets proposed; the target's check decides what
+ * is kept.
  */
 
 #include "vibevoice/spec.h"
@@ -707,16 +708,12 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
     s->taps.rows = VV_SPEC_TAP_ROWS;
     /*
      * The drafter always drafts its whole block; the target may check fewer
-     * of the drafts (VV_SPEC_VERIFY=n rows, the anchor included). Checking
-     * costs about linearly in rows while the later drafts are the least
-     * likely to be kept, so the best n depends on the drafter and the card.
+     * of the drafts (--draft-block: rows, the anchor included). From three
+     * rows on a checked row costs about as much as a step while the later
+     * drafts are the least likely to be kept, so the best count depends on
+     * the drafter and the card.
      */
     s->Bv = verify_rows >= 2 ? verify_rows : 4;
-    {
-        const char* e = getenv("VV_SPEC_VERIFY");      /* measurements */
-        const int v = e ? atoi(e) : 0;
-        if (v >= 2) s->Bv = v;
-    }
     if (s->Bv > s->B) s->Bv = s->B;
     *out = s;
     return VV_OK;
