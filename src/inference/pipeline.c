@@ -3878,7 +3878,17 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
             }
         }
 
+        /* Greedy answers can go a drafted block at a time (spec.h): the
+         * drafter reads the prompt through the target's taps. */
+        bool spec_on = ctx->spec && !sampling && !embed_on_cpu &&
+                       !lm_head_on_cpu && ctx->n_shards == 0;
+        if (spec_on) {
+            vv_spec_reset(ctx->spec);
+            vv_spec_stats_reset(ctx->spec);
+            ctx->taps = vv_spec_prefill_taps(ctx->spec);
+        }
         if (s == VV_OK) s = prefill_all_shards(ctx, hidden_gpu, seq_len);
+        ctx->taps = NULL;
 
         /* The first token comes off the last prompt row. */
         if (s == VV_OK) {
@@ -3919,6 +3929,15 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
         }
         vv_dev_set_device(ctx->gpu_id);
 
+        /*
+         * A block returns several tokens at once, all but the last of them
+         * already fed. They wait here and come out one per iteration, so the
+         * text, the stop strings and the cap see each of them exactly as
+         * they would see a step's; only when none is left is anything fed.
+         */
+        int32_t queued[VV_SPEC_MAX_BLOCK];
+        int n_queued = 0, q_at = 0;
+
         while (s == VV_OK && n_generated < max_new &&
                !token_ends(ctx, token_id) && token_id != im_start) {
             char piece[256];
@@ -3947,6 +3966,31 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
                     cancelled = true; break;
                 }
                 emitted = text.n;
+            }
+
+            /* A token a block has fed already: the next one is known. */
+            if (q_at < n_queued) {
+                token_id = queued[q_at++];
+                continue;
+            }
+            if (spec_on) {
+                int n_out = 0;
+                s = vv_spec_cycle(ctx, ctx->spec, token_id, queued, &n_out);
+                if (s == VV_OK) {
+                    n_queued = n_out;
+                    q_at = 0;
+                    token_id = queued[q_at++];
+                    continue;
+                }
+                if (s != VV_ERR_OVERFLOW) break;
+                /* The window has no room for a block: plain steps from here,
+                 * which read the length and the token on the device. */
+                s = VV_OK;
+                spec_on = false;
+                vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+                s = vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
+                                      ctx->compute_stream);
+                if (s != VV_OK) break;
             }
 
             /* Embed the token that is already on the device, step, sample. */
@@ -3992,6 +4036,14 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
                                              params->top_p, params->top_k,
                                              &rng, &token_id);
             }
+        }
+
+        if (ctx->spec && !sampling) {
+            const vv_spec_stats_t* st = vv_spec_get_stats(ctx->spec);
+            if (st && st->cycles > 0)
+                VV_LOG_I("generate: %lld drafted blocks, %.2f tokens each",
+                         (long long)st->cycles,
+                         (double)st->tokens / (double)st->cycles);
         }
 
         for (int i = 0; i <= ctx->n_shards; i++)

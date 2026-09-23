@@ -143,7 +143,8 @@ static void test_w4a16_rows(const char* name, const int* Ns, int n, int K,
             p[i].packed = w[i].packed; p[i].sz = w[i].sz; p[i].bias = w[i].bias;
             p[i].N = Ns[i]; p[i].y = ya[i];
         }
-        double t1 = 0.0, t8 = 0.0;
+        const int bm[4] = { 2, 3, 4, 8 };
+        double t1 = 0.0, tm[4] = { 0.0, 0.0, 0.0, 0.0 };
         for (int rep = 0; rep < 2; rep++) {
             const int it = 50;
             double t0 = vv_time_ms();
@@ -151,14 +152,16 @@ static void test_w4a16_rows(const char* name, const int* Ns, int n, int K,
                 vv_w4a16_gemv_multi_dev(x, p, n, K, G, NULL);
             vv_dev_stream_sync(NULL);
             t1 = (vv_time_ms() - t0) * 1000.0 / it;
-            t0 = vv_time_ms();
-            for (int k = 0; k < it; k++)
-                vv_w4a16_gemv_rows_dev(x, 8, p, n, K, G, NULL);
-            vv_dev_stream_sync(NULL);
-            t8 = (vv_time_ms() - t0) * 1000.0 / it;
+            for (int b = 0; b < 4; b++) {
+                t0 = vv_time_ms();
+                for (int k = 0; k < it; k++)
+                    vv_w4a16_gemv_rows_dev(x, bm[b], p, n, K, G, NULL);
+                vv_dev_stream_sync(NULL);
+                tm[b] = (vv_time_ms() - t0) * 1000.0 / it;
+            }
         }
-        printf("  bench %s: 1 row %.1f us, 8 rows %.1f us (%.2fx)\n", name, t1,
-               t8, t8 / t1);
+        printf("  bench %s: 1 row %.1f us; rows 2/3/4/8: %.2fx %.2fx %.2fx %.2fx\n",
+               name, t1, tm[0] / t1, tm[1] / t1, tm[2] / t1, tm[3] / t1);
         vv_dev_event_destroy(e0);
         vv_dev_event_destroy(e1);
     }

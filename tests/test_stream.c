@@ -15,7 +15,8 @@
  * chunk's text, all taken from `tools/compare_ref.py dump-stream`, and with
  * VV_TEST_STREAM_REF=<dump dir>[:<dir>...] it rebuilds every chunk text of
  * those dumps from their token ids. VV_TEST_STREAM_E2E=1 on top loads the
- * model (VV_TEST_STREAM_QUANT, default none; VV_TEST_STREAM_CPU=1 for the
+ * model (VV_TEST_STREAM_DRAFT=<drafter dir> decodes in drafted blocks;
+ * VV_TEST_STREAM_QUANT, default none; VV_TEST_STREAM_CPU=1 for the
  * CPU path) and runs every reference clip through a real session, chunk
  * texts compared with upstream's.
  *
@@ -1092,6 +1093,10 @@ static void test_model_e2e(void) {
     ip.weight_quant = (int)vv_load_quant_parse(q && q[0] ? q : "none");
     const char* cpu = getenv("VV_TEST_STREAM_CPU");
     ip.cpu_only = cpu && cpu[0] == '1';
+    /* With a drafter the chunks go through drafted blocks, and must still
+     * be the reference's text for text. */
+    const char* draft = getenv("VV_TEST_STREAM_DRAFT");
+    if (draft && draft[0]) ip.draft_dir = draft;
     vv_inference_ctx_t* ctx = NULL;
     CHECK(vv_inference_init(dir, 0, &ip, &ctx) == VV_OK);
     if (!ctx) return;

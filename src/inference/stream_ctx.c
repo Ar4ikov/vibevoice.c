@@ -278,6 +278,7 @@ static vv_status_t gpu_prefill_prompt(void* self, const int32_t* ids, int n) {
     set_kv_no_wait(ctx, b->kv_no_wait);
     if (b->spec) {
         vv_spec_reset(b->spec);
+        vv_spec_stats_reset(b->spec);
         b->spec_live = true;
     }
     s = gpu_rows(b, n);
@@ -1117,6 +1118,14 @@ vv_status_t vv_stream_transcribe(vv_inference_ctx_t* ctx,
         perf->kv_cache_pct = ss.kv_capacity > 0
             ? 100.0f * (float)ss.kv_len / (float)ss.kv_capacity : 0.0f;
         vv_stream_close(st);
+    }
+    {
+        const vv_spec_stats_t* sp = vv_inference_spec_stats(ctx);
+        if (sp && sp->cycles > 0)
+            VV_LOG_I("stream: %lld drafted blocks, %.2f tokens each, %lld of "
+                     "%lld drafts kept", (long long)sp->cycles,
+                     (double)sp->tokens / (double)sp->cycles,
+                     (long long)sp->accepted, (long long)sp->drafted);
     }
     for (int i = 0; i < col.n; i++) vv_free(col.texts[i]);
     vv_free(col.texts);

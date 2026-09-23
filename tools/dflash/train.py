@@ -33,8 +33,10 @@ import glob
 import json
 import math
 import os
+import queue
 import random
 import struct
+import threading
 import time
 
 import numpy as np
@@ -100,6 +102,26 @@ def static_reader(d, epochs=1, seed=0):
         rng.shuffle(files)
         for f in files:
             yield read_vvdt(f)
+
+
+def prefetch(gen, depth=4):
+    """Run a trace reader in a thread, `depth` traces ahead: a trace is ~90
+    MB, and reading one from a disk takes about as long as training on it."""
+    q = queue.Queue(maxsize=depth)
+    end = object()
+
+    def run():
+        try:
+            for x in gen:
+                q.put(x)
+        finally:
+            q.put(end)
+    threading.Thread(target=run, daemon=True).start()
+    while True:
+        x = q.get()
+        if x is end:
+            return
+        yield x
 
 
 # ─── model ──────────────────────────────────────────────────────────────────
@@ -435,9 +457,20 @@ def step_loss(model, emb, head, t, dev, B, gamma, max_anchors, rng,
         def acc_len(pred):
             good = ((pred.view(N, B - 1) == lab.view(N, B - 1)) | ~m).long()
             return ((good.cumprod(1) * m.long()).sum(1).float() + 1.0).mean()
+
+        # Per depth: the pick right, given every one before it was.
+        good = (picked.view(N, B - 1) == lab.view(N, B - 1)) & m
+        prior = torch.ones(N, dtype=torch.bool, device=dev)
+        hit, seen = [], []
+        for k in range(B - 1):
+            live = prior & m[:, k]
+            seen.append(live.float().sum())
+            hit.append((live & good[:, k]).float().sum())
+            prior = prior & good[:, k]
         stats = {"n_blocks": N, "base_acc": acc_len(base_ids),
                  "sel_acc": acc_len(picked),
-                 "recall": (has & okm).float().sum() / okm.float().sum().clamp_min(1)}
+                 "recall": (has & okm).float().sum() / okm.float().sum().clamp_min(1),
+                 "depth_hit": torch.stack(hit), "depth_seen": torch.stack(seen)}
     return base_loss + sel_loss, base_loss.detach(), sel_loss.detach(), stats
 
 
@@ -487,7 +520,8 @@ def main():
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--accum-blocks", type=int, default=4096,
                     help="draft blocks per optimizer step")
-    ap.add_argument("--max-anchors", type=int, default=384)
+    ap.add_argument("--max-anchors", type=int, default=1024,
+                    help="blocks drawn from one trace per visit")
     ap.add_argument("--warmup", type=float, default=0.04)
     ap.add_argument("--eval-every", type=int, default=200)
     ap.add_argument("--save-every", type=int, default=500)
@@ -536,15 +570,21 @@ def main():
         },
     }
     vocab_ids = None
-    if a.draft_vocab > 0:
+    sd = None
+    if a.resume:
+        from safetensors.torch import load_file
+        sd = load_file(a.resume)
+    if sd is not None and "draft_vocab" in sd:
+        # A resumed drafter keeps the vocabulary its head was trained on.
+        vocab_ids = sd.pop("draft_vocab").numpy().astype(np.int64)
+        cfg["dflash_config"]["draft_vocab_size"] = int(len(vocab_ids))
+    elif a.draft_vocab > 0:
         if not a.vocab_from:
             raise SystemExit("--draft-vocab needs --vocab-from (a gen.jsonl)")
         vocab_ids = draft_vocab(a.vocab_from, a.draft_vocab, tc["vocab_size"])
         cfg["dflash_config"]["draft_vocab_size"] = int(len(vocab_ids))
     model = Drafter(cfg).to(dev)
-    if a.resume:
-        from safetensors.torch import load_file
-        sd = load_file(a.resume)
+    if sd is not None:
         own = {}
         for k, v in sd.items():
             k = k.replace(".self_attn.", ".").replace(".mlp.", ".")
@@ -574,9 +614,9 @@ def main():
         return a.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, p))))
 
     if a.ring_dir:
-        stream = ring_reader(a.ring_dir)
+        stream = prefetch(ring_reader(a.ring_dir))
     else:
-        stream = static_reader(a.train_dir, a.epochs, a.seed)
+        stream = prefetch(static_reader(a.train_dir, a.epochs, a.seed))
     evals = None
     if a.eval_dir:
         evals = [read_vvdt(f) for f in sorted(glob.glob(os.path.join(a.eval_dir, "*.vvdt")))]
@@ -586,6 +626,8 @@ def main():
         model.eval()
         tot = {"base_acc": 0.0, "sel_acc": 0.0, "recall": 0.0}
         nb, bl = 0, 0.0
+        dh = torch.zeros(a.block - 1, device=dev)
+        ds = torch.zeros(a.block - 1, device=dev)
         erng = np.random.default_rng(1234)
         with torch.no_grad():
             for t in evals:
@@ -599,7 +641,11 @@ def main():
                     tot[k] += float(st[k]) * n
                 bl += float(b) * n
                 nb += n
+                dh += st["depth_hit"]
+                ds += st["depth_seen"]
         model.train()
+        depth = " ".join(f"{float(h / max(float(c), 1.0)):.2f}" for h, c in zip(dh, ds))
+        print(f"EVAL depth acc (given all before right): {depth}", flush=True)
         return {k: v / max(nb, 1) for k, v in tot.items()} | {"base_loss": bl / max(nb, 1)}
 
     model.train()

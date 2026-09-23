@@ -237,7 +237,8 @@ size_t vv_drafter_weight_bytes(const vv_drafter_config_t* c) {
 size_t vv_spec_context_bytes(const vv_drafter_config_t* c, int max_pos) {
     const size_t H = (size_t)c->hidden_size;
     const size_t kd = (size_t)c->num_kv_heads * c->head_dim;
-    const size_t kv = (size_t)c->num_layers * 2 * (size_t)max_pos * kd * 2;
+    const size_t kv = (size_t)c->num_layers * 2 *
+                      ((size_t)max_pos + (size_t)c->block_size) * kd * 2;
     const size_t taps = (size_t)VV_SPEC_TAP_ROWS * c->n_taps * H * 2;
     const size_t ctx = (size_t)VV_SPEC_TAP_ROWS * (H + 2 * kd) * 2 * 2;
     const size_t ws = (size_t)16 * (8 * H + 2 * (size_t)c->intermediate_size +
@@ -570,6 +571,7 @@ size_t vv_drafter_device_bytes(const vv_drafter_t* d) {
 struct vv_spec {
     const vv_drafter_t* d;
     int B, H, nh, nkv, hd, I, V, rank, topk, G, n_taps, max_pos;
+    int Bv;                    /* rows a cycle checks: the anchor, Bv-1 drafts */
     int ctx_len;               /* drafter context: positions [0, ctx_len) */
     int backend;               /* attention backend for the draft pass */
     void** kc;                 /* [layers] K [max_pos][nkv][hd] FP16 */
@@ -659,9 +661,12 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
     s->kc = (void**)vv_alloc(sizeof(void*) * (size_t)c->num_layers);
     s->vc = (void**)vv_alloc(sizeof(void*) * (size_t)c->num_layers);
     if (!s->kc || !s->vc) st = VV_ERR_OUT_OF_MEMORY;
+    /* A block's worth past the window: the draft pass writes the whole
+     * block even when the target checks fewer rows. */
+    const size_t kv_rows = (size_t)max_pos + (size_t)s->B;
     for (int l = 0; st == VV_OK && l < c->num_layers; l++) {
-        st = salloc(s, &s->kc[l], (size_t)max_pos * kd * 2);
-        if (st == VV_OK) st = salloc(s, &s->vc[l], (size_t)max_pos * kd * 2);
+        st = salloc(s, &s->kc[l], kv_rows * kd * 2);
+        if (st == VV_OK) st = salloc(s, &s->vc[l], kv_rows * kd * 2);
     }
 #define A(p, n) if (st == VV_OK) st = salloc(s, (void**)&(p), (n))
     A(s->taps.buf, T * (size_t)s->n_taps * H * 2);
@@ -690,6 +695,18 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
     s->taps.n = s->n_taps;
     for (int i = 0; i < s->n_taps; i++) s->taps.layers[i] = c->target_layer_ids[i];
     s->taps.rows = VV_SPEC_TAP_ROWS;
+    /*
+     * The drafter always drafts its whole block; the target may check fewer
+     * of the drafts (VV_SPEC_VERIFY=n rows, the anchor included). Checking
+     * costs about linearly in rows while the later drafts are the least
+     * likely to be kept, so the best n depends on the drafter and the card.
+     */
+    s->Bv = s->B;
+    {
+        const char* e = getenv("VV_SPEC_VERIFY");
+        const int v = e ? atoi(e) : 0;
+        if (v >= 2 && v <= s->B) s->Bv = v;
+    }
     *out = s;
     return VV_OK;
 }
@@ -698,7 +715,7 @@ void vv_spec_reset(vv_spec_t* s) {
     if (s) s->ctx_len = 0;
 }
 
-int vv_spec_block(const vv_spec_t* s) { return s ? s->B : 0; }
+int vv_spec_block(const vv_spec_t* s) { return s ? s->Bv : 0; }
 
 int vv_spec_context_len(const vv_spec_t* s) { return s ? s->ctx_len : 0; }
 
@@ -720,8 +737,11 @@ void vv_spec_stats_reset(vv_spec_t* s) {
  *                      decode-exact ones: faster on some shapes, but a row's
  *                      logits then differ from its decode step's in the last
  *                      bits, so near-ties can flip. For measurements only.
+ *   VV_SPEC_LOG=path   append "p anchor drafts..." per cycle to `path`, for
+ *                      checking the drafter against its trainer.
  */
 static bool s_debug, s_profile, s_exact = true;
+static const char* s_log;
 static vv_once_t s_env_once = VV_ONCE_INIT;
 static void env_probe(void) {
     const char* e = getenv("VV_SPEC_DEBUG");
@@ -730,6 +750,8 @@ static void env_probe(void) {
     s_profile = e && e[0] == '1';
     e = getenv("VV_SPEC_EXACT");
     s_exact = !(e && e[0] == '0');
+    e = getenv("VV_SPEC_LOG");
+    s_log = e && e[0] ? e : NULL;
 }
 
 /* Absmax and non-finite count of a buffer, synchronously (VV_SPEC_DEBUG). */
@@ -841,7 +863,7 @@ static vv_status_t draft(vv_spec_t* s, const vv_inference_ctx_t* ctx,
     const int qd = s->nh * s->hd, kd = s->nkv * s->hd;
     const int dyn_ld = 2 * c->conv_kernel * s->G;
     const int half = c->conv_kernel * s->G;
-    if (p + B > s->max_pos) return VV_ERR_OVERFLOW;
+    if (p + B > s->max_pos + s->B) return VV_ERR_OVERFLOW;
 
     vv_status_t st = vv_dflash_block_ids_dev(s->anchor, c->mask_token_id, B,
                                              s->ids, stream);
@@ -945,7 +967,7 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
     if (!ctx || !s || !out || !n_out) return VV_ERR_NULL_PTR;
     *n_out = 0;
     vv_kv_cache_t* kv = ctx->kv_cache;
-    const int B = s->B, p = kv->current_len;
+    const int B = s->Bv, p = kv->current_len;     /* rows checked */
     const int Ht = ctx->model->config.llm.hidden_size;
     void* stream = ctx->compute_stream;
     if (p != s->ctx_len) {
@@ -1008,6 +1030,19 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
     s->ctx_len = p + n;
     for (int i = 0; i < n; i++) out[i] = s->h_pin[i];
     *n_out = n;
+    if (s_log) {
+        int32_t dr[VV_SPEC_MAX_BLOCK];
+        if (vv_dev_memcpy_d2h(dr, s->draft, (size_t)(s->B - 1) * 4, stream) ==
+                VV_OK && vv_dev_stream_sync(stream) == VV_OK) {
+            FILE* f = fopen(s_log, "a");
+            if (f) {
+                fprintf(f, "%d %d", p, anchor);
+                for (int i = 0; i < s->B - 1; i++) fprintf(f, " %d", dr[i]);
+                fprintf(f, "\n");
+                fclose(f);
+            }
+        }
+    }
     s->stats.cycles++;
     s->stats.drafted += B - 1;
     s->stats.accepted += n - 1;

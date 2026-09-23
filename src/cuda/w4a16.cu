@@ -260,14 +260,14 @@ w4a16_gemv_kernel(const half* __restrict__ x, const w4v_segs segs,
  * blocks to an SM. */
 #define W4R_TILE_MAX 64
 
-template <int LPR, int R>
+template <int LPR, int R, int MX>
 __global__ void __launch_bounds__(W4R_THREADS)
 w4a16_gemv_rows_kernel(const half* __restrict__ x, int M, const w4v_segs segs,
                        int K, int gshift, int tile_chunks)
 {
     constexpr int GPB = W4R_THREADS / LPR;
     constexpr int WIDTH = LPR < 32 ? LPR : 32;
-    extern __shared__ uint4 xs[];            /* [W4R_MX][4][tile_chunks] */
+    extern __shared__ uint4 xs[];            /* [MX][4][tile_chunks] */
 
     const int bx = (int)blockIdx.x;
     const int seg = bx >= segs.first_block[2] ? 2
@@ -298,16 +298,16 @@ w4a16_gemv_rows_kernel(const half* __restrict__ x, int M, const w4v_segs segs,
         szrow[r] = sz + (size_t)rr * ngroups;
     }
 
-    float acc[R][W4R_MX];
+    float acc[R][MX];
 #pragma unroll
     for (int r = 0; r < R; r++)
 #pragma unroll
-        for (int m = 0; m < W4R_MX; m++) acc[r][m] = 0.0f;
+        for (int m = 0; m < MX; m++) acc[r][m] = 0.0f;
 
     for (int t0 = 0; t0 < nch; t0 += tile_chunks) {
         const int tc = nch - t0 < tile_chunks ? nch - t0 : tile_chunks;
         if (t0 > 0) __syncthreads();              /* last tile is read */
-        for (int e = (int)threadIdx.x; e < W4R_MX * 4 * tc; e += W4R_THREADS) {
+        for (int e = (int)threadIdx.x; e < MX * 4 * tc; e += W4R_THREADS) {
             const int m = e / (4 * tc);
             const int j = (e / tc) & 3;
             const int cc = e % tc;
@@ -352,7 +352,7 @@ w4a16_gemv_rows_kernel(const half* __restrict__ x, int M, const w4v_segs segs,
             }
             const int cc = c - t0;
 #pragma unroll
-            for (int m = 0; m < W4R_MX; m++) {
+            for (int m = 0; m < MX; m++) {
                 if (m < M) {
                     uint4 xv[4];
 #pragma unroll
@@ -379,27 +379,27 @@ w4a16_gemv_rows_kernel(const half* __restrict__ x, int M, const w4v_segs segs,
 #pragma unroll
     for (int r = 0; r < R; r++)
 #pragma unroll
-        for (int m = 0; m < W4R_MX; m++)
+        for (int m = 0; m < MX; m++)
 #pragma unroll
             for (int off = WIDTH / 2; off > 0; off >>= 1)
                 acc[r][m] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][m], off, WIDTH);
     if (LPR > 32) {
         constexpr int WPG = LPR / 32;
-        __shared__ float red[R][W4R_MX][W4R_THREADS / 32];
+        __shared__ float red[R][MX][W4R_THREADS / 32];
         const int warp = (int)threadIdx.x >> 5;
         __syncthreads();
         if ((threadIdx.x & 31) == 0) {
 #pragma unroll
             for (int r = 0; r < R; r++)
 #pragma unroll
-                for (int m = 0; m < W4R_MX; m++) red[r][m][warp] = acc[r][m];
+                for (int m = 0; m < MX; m++) red[r][m][warp] = acc[r][m];
         }
         __syncthreads();
         if (lr == 0) {
 #pragma unroll
             for (int r = 0; r < R; r++)
 #pragma unroll
-                for (int m = 0; m < W4R_MX; m++) {
+                for (int m = 0; m < MX; m++) {
                     float v = 0.0f;
 #pragma unroll
                     for (int i = 0; i < WPG; i++) v += red[r][m][warp + i];
@@ -414,7 +414,7 @@ w4a16_gemv_rows_kernel(const half* __restrict__ x, int M, const w4v_segs segs,
             if (row >= N) break;
             const float b = bias ? __half2float(bias[row]) : 0.0f;
 #pragma unroll
-            for (int m = 0; m < W4R_MX; m++)
+            for (int m = 0; m < MX; m++)
                 if (m < M) y[(size_t)m * N + row] = __float2half(acc[r][m] + b);
         }
     }
@@ -878,7 +878,7 @@ vv_status_t launch_gemv(const void* x, const w4v_segs& segs, int n_segs,
     return launch_gemv_r<1>(xh, segs, n_segs, K, gshift, lpr, st);
 }
 
-template <int LPR, int R>
+template <int LPR, int R, int MX>
 vv_status_t launch_gemv_rows_lpr(const half* x, int M, w4v_segs segs,
                                  int n_segs, int K, int gshift,
                                  cudaStream_t st)
@@ -886,10 +886,10 @@ vv_status_t launch_gemv_rows_lpr(const half* x, int M, w4v_segs segs,
     constexpr int RPB = W4R_THREADS / LPR * R;
     /* Tiles of whole LPR-chunk strides: a lane's chunks stay in order. */
     constexpr int TILE_MAX = W4R_TILE_MAX > LPR ? W4R_TILE_MAX / LPR * LPR : LPR;
-    constexpr int SMEM_MAX = W4R_MX * 4 * TILE_MAX * (int)sizeof(uint4);
+    constexpr int SMEM_MAX = MX * 4 * TILE_MAX * (int)sizeof(uint4);
     const int nch = K >> 5;
     const int tile = TILE_MAX < nch ? TILE_MAX : nch;
-    const int SMEM = W4R_MX * 4 * tile * (int)sizeof(uint4);
+    const int SMEM = MX * 4 * tile * (int)sizeof(uint4);
     int blocks = 0;
     for (int i = 0; i < W4V_MAX_SEGS; i++) {
         if (i < n_segs) {
@@ -899,7 +899,7 @@ vv_status_t launch_gemv_rows_lpr(const half* x, int M, w4v_segs segs,
             segs.first_block[i] = INT_MAX;
         }
     }
-    auto kern = w4a16_gemv_rows_kernel<LPR, R>;
+    auto kern = w4a16_gemv_rows_kernel<LPR, R, MX>;
     if (SMEM > 48 * 1024) {
         static thread_local int set_dev = -1;
         int dev = 0;
@@ -916,17 +916,29 @@ vv_status_t launch_gemv_rows_lpr(const half* x, int M, w4v_segs segs,
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
-template <int R>
+template <int R, int MX>
 vv_status_t launch_gemv_rows_r(const half* x, int M, const w4v_segs& segs,
                                int n_segs, int K, int gshift, int lpr,
                                cudaStream_t st)
 {
     switch (lpr) {
-        case 16:  return launch_gemv_rows_lpr<16,  R>(x, M, segs, n_segs, K, gshift, st);
-        case 32:  return launch_gemv_rows_lpr<32,  R>(x, M, segs, n_segs, K, gshift, st);
-        case 64:  return launch_gemv_rows_lpr<64,  R>(x, M, segs, n_segs, K, gshift, st);
-        default:  return launch_gemv_rows_lpr<128, R>(x, M, segs, n_segs, K, gshift, st);
+        case 16:  return launch_gemv_rows_lpr<16,  R, MX>(x, M, segs, n_segs, K, gshift, st);
+        case 32:  return launch_gemv_rows_lpr<32,  R, MX>(x, M, segs, n_segs, K, gshift, st);
+        case 64:  return launch_gemv_rows_lpr<64,  R, MX>(x, M, segs, n_segs, K, gshift, st);
+        default:  return launch_gemv_rows_lpr<128, R, MX>(x, M, segs, n_segs, K, gshift, st);
     }
+}
+
+/* x rows per launch MX: registers (and so occupancy) follow MX, not M. */
+template <int R>
+vv_status_t launch_gemv_rows_mx(const half* x, int M, const w4v_segs& segs,
+                                int n_segs, int K, int gshift, int lpr,
+                                cudaStream_t st)
+{
+    if (M <= 2) return launch_gemv_rows_r<R, 2>(x, M, segs, n_segs, K, gshift, lpr, st);
+    if (M == 3) return launch_gemv_rows_r<R, 3>(x, M, segs, n_segs, K, gshift, lpr, st);
+    if (M <= 4) return launch_gemv_rows_r<R, 4>(x, M, segs, n_segs, K, gshift, lpr, st);
+    return launch_gemv_rows_r<R, W4R_MX>(x, M, segs, n_segs, K, gshift, lpr, st);
 }
 
 /*
@@ -1177,9 +1189,9 @@ vv_status_t vv_w4a16_gemv_rows_dev(const void* x, int M,
             sg.y[i] = segs.y[i] + (size_t)m0 * segs.n[i];
         const half* xh = (const half*)x + (size_t)m0 * K;
         vv_status_t s;
-        if (R == 4)      s = launch_gemv_rows_r<4>(xh, mm, sg, n_proj, K, gs, lpr, st);
-        else if (R == 2) s = launch_gemv_rows_r<2>(xh, mm, sg, n_proj, K, gs, lpr, st);
-        else             s = launch_gemv_rows_r<1>(xh, mm, sg, n_proj, K, gs, lpr, st);
+        if (R == 4)      s = launch_gemv_rows_mx<4>(xh, mm, sg, n_proj, K, gs, lpr, st);
+        else if (R == 2) s = launch_gemv_rows_mx<2>(xh, mm, sg, n_proj, K, gs, lpr, st);
+        else             s = launch_gemv_rows_mx<1>(xh, mm, sg, n_proj, K, gs, lpr, st);
         if (s != VV_OK) return s;
     }
     return VV_OK;
