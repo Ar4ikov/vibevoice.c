@@ -34,6 +34,34 @@ void vv_spec_free(vv_spec_t* s);
 /** @brief Empty the drafter's context (a new sequence). */
 void vv_spec_reset(vv_spec_t* s);
 
+/*
+ * Blocks or steps. A block pays only while its tokens per millisecond beat a
+ * plain step's, and how many drafts are kept depends on the audio: on
+ * speech like the drafter's corpus a block brings 2-3 tokens, on a language
+ * it barely saw ~1, at the price of about two steps. So the decode loops
+ * ask before every position, and tell afterwards what it cost:
+ *
+ *   vv_spec_want_block()   true: a block (vv_spec_cycle); false: a plain
+ *                          step through vv_spec_step_taps(), then
+ *                          vv_spec_push_step() so the drafter sees it too;
+ *   vv_spec_note_block() / vv_spec_note_step()   the wall time it took.
+ *
+ * The first positions of a sequence are plain steps (a measurement of the
+ * step); then blocks, while their running rate stays above the steps'; below
+ * it, a run of plain steps before blocks are tried again, the runs doubling
+ * while blocks keep losing. Either way the tokens are the same.
+ */
+bool vv_spec_want_block(vv_spec_t* s);
+void vv_spec_note_block(vv_spec_t* s, int tokens, double ms);
+void vv_spec_note_step(vv_spec_t* s, double ms);
+
+/** @brief Taps for a plain step: its one row lands in row 0. */
+const vv_taps_t* vv_spec_step_taps(vv_spec_t* s);
+
+/** @brief The plain step just taken (at the drafter's context length) into
+ *         the drafter's context, from vv_spec_step_taps()' row. */
+vv_status_t vv_spec_push_step(vv_spec_t* s);
+
 /** @brief Draft block rows B (the last token included). */
 int vv_spec_block(const vv_spec_t* s);
 

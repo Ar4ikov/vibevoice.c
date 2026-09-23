@@ -440,6 +440,25 @@ vv_status_t vv_decoder_step(
     int first_layer,
     int n_layers);
 
+/**
+ * @brief vv_decoder_step that also copies the tapped layers' outputs for its
+ *        one position into row 0 of `taps` (a speculative decoder's plain
+ *        step, which its drafter must see like any other). The destination
+ *        does not depend on the position, so the step stays capturable.
+ */
+vv_status_t vv_decoder_step_taps(
+    vv_model_t* model,
+    void* hidden_state,
+    vv_kv_cache_t* kv_cache,
+    vv_layer_pool_t* pool,
+    void* workspace,
+    size_t workspace_size,
+    void* compute_stream,
+    void* xfer_stream,
+    int first_layer,
+    int n_layers,
+    const vv_taps_t* taps);
+
 /* ─── CPU-mode decoder (Phase 3) ───────────────────────────────────────── */
 
 /**

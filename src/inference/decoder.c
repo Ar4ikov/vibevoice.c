@@ -1197,6 +1197,24 @@ vv_status_t vv_decoder_step(
     int first_layer,
     int n_layers)
 {
+    return vv_decoder_step_taps(model, hidden_state, kv_cache, pool, workspace,
+                                workspace_size, compute_stream, xfer_stream,
+                                first_layer, n_layers, NULL);
+}
+
+vv_status_t vv_decoder_step_taps(
+    vv_model_t* model,
+    void* hidden_state,
+    vv_kv_cache_t* kv_cache,
+    vv_layer_pool_t* pool,
+    void* workspace,
+    size_t workspace_size,
+    void* compute_stream,
+    void* xfer_stream,
+    int first_layer,
+    int n_layers,
+    const vv_taps_t* taps)
+{
     if (!model || !hidden_state || !kv_cache) return VV_ERR_NULL_PTR;
     const int last_layer = first_layer + n_layers;
     if (first_layer < 0 || n_layers <= 0 || last_layer > model->num_layers)
@@ -1240,7 +1258,7 @@ vv_status_t vv_decoder_step(
         vv_status_t s = decoder_layer_impl(
             &model->layers[i], &model->config.llm,
             hidden_state, kv_cache, i, position, 1,
-            workspace, workspace_size, compute_stream, NULL, 0, false);
+            workspace, workspace_size, compute_stream, taps, 0, false);
 
         if (streaming) vv_layer_prefetch_done(pool, i, compute_stream);
 

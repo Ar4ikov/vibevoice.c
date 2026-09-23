@@ -141,6 +141,8 @@ typedef struct vv_spec_stats {
     int64_t tokens;     /**< tokens produced (kept + the target's own)    */
     double  draft_ms;   /**< host wall time of the draft passes           */
     double  verify_ms;  /**< and of the verification and bookkeeping      */
+    int64_t steps;      /**< plain steps taken between blocks             */
+    int64_t fallbacks;  /**< times blocks lost to steps and were paused   */
 } vv_spec_stats_t;
 
 /** @brief The context's counters, or NULL when it has no drafter. */

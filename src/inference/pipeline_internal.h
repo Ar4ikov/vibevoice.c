@@ -32,6 +32,13 @@ vv_status_t vv_pipeline_prefill(vv_inference_ctx_t* ctx, void* hidden,
 vv_status_t vv_pipeline_step(vv_inference_ctx_t* ctx, void* hidden,
                              bool graph_ok, vv_graph_slot_t* graphs);
 
+/** @brief vv_pipeline_step that also leaves its row of the tapped layers in
+ *         row 0 of `taps` (a speculative context's plain step). Its captures
+ *         belong in their own `graphs`, apart from the untapped step's. */
+vv_status_t vv_pipeline_step_taps(vv_inference_ctx_t* ctx, void* hidden,
+                                  bool graph_ok, vv_graph_slot_t* graphs,
+                                  const vv_taps_t* taps);
+
 /** @brief Whether decode steps on `ctx` can be captured and replayed. */
 bool vv_pipeline_graph_ok(const vv_inference_ctx_t* ctx);
 

@@ -18,9 +18,10 @@
  *    survive every prefill in between: a session re-captures a couple of
  *    dozen times over half an hour of audio, not once per chunk;
  *  - with a drafter (ctx->spec) the steps go a block at a time instead
- *    (decode_block): the drafter's context follows every prefill through
- *    its taps, so the session has to keep it in step -- one plain step
- *    feeds a token the drafter never saw, and blocks are off from there.
+ *    (decode_block), whenever blocks are paying (vv_spec_want_block): the
+ *    drafter's context follows every prefill through its taps, and every
+ *    plain step taken between blocks through the step's own tap row, so
+ *    blocks and steps can alternate freely.
  *
  * All device buffers are allocated at open, sized for the prompt as well as
  * a chunk; nothing on the per-chunk path allocates on the device. A closed
@@ -88,6 +89,7 @@ typedef struct {
     bool     embed_on_cpu;
     bool     head_on_cpu;
     vv_graph_slot_t graphs[VV_MAX_GPUS];
+    vv_graph_slot_t graphs_taps[VV_MAX_GPUS];   /* steps that tap (spec) */
     bool     graph_ok;
     /* Windows encoded ahead of their prefill (encode_ahead). */
     void*    ahead;          /* [AHEAD_MAX][frames][hs] FP16 */
@@ -101,8 +103,7 @@ typedef struct {
     float*   one32;          /* [hs] */
     float*   norm32;         /* [hs] */
 
-    /* Speculative decoding: the context's drafter, live from the prompt
-     * until a plain step feeds a token it has not seen. */
+    /* Speculative decoding: the context's drafter, live from the prompt. */
     vv_spec_t*       spec;
     bool             spec_live;
 
@@ -470,12 +471,7 @@ static vv_status_t gpu_decode_step(void* self, int32_t token, int32_t* next) {
     vv_status_t s = bind(b);
     if (s != VV_OK) return s;
     if (token < 0 || token >= b->vocab) return VV_ERR_INVALID_ARG;
-    if (b->spec_live) {
-        /* The drafter will not see this token: blocks end here. */
-        b->spec_live = false;
-        VV_LOG_I("stream: a plain step at %d positions; no more drafted "
-                 "blocks in this session", ctx->kv_cache->current_len);
-    }
+    const double t0 = vv_time_ms();
 
     if (b->embed_on_cpu) {
         const size_t row = (size_t)b->hs * 2;
@@ -497,6 +493,15 @@ static vv_status_t gpu_decode_step(void* self, int32_t token, int32_t* next) {
     }
     if (s != VV_OK) return s;
 
+    if (b->spec_live) {
+        /* The drafter sees this token too: its tap row, then its context. */
+        s = vv_pipeline_step_taps(ctx, b->hidden_one, b->graph_ok,
+                                  b->graphs_taps, vv_spec_step_taps(b->spec));
+        if (s == VV_OK) s = gpu_head(b, b->hidden_one, next);
+        if (s == VV_OK) s = vv_spec_push_step(b->spec);
+        if (s == VV_OK) vv_spec_note_step(b->spec, vv_time_ms() - t0);
+        return s;
+    }
     s = vv_pipeline_step(ctx, b->hidden_one, b->graph_ok, b->graphs);
     if (s != VV_OK) return s;
     return gpu_head(b, b->hidden_one, next);
@@ -510,17 +515,23 @@ static vv_status_t gpu_decode_block(void* self, int32_t token, int32_t* out,
     if (s != VV_OK) return s;
     if (!b->spec_live) return VV_ERR_UNSUPPORTED;
     if (token < 0 || token >= b->vocab) return VV_ERR_INVALID_ARG;
+    const double t0 = vv_time_ms();
     s = vv_spec_cycle(ctx, b->spec, token, out, n);
     /* The step graphs read the length from the device, and the device's
      * token is no longer the one they would embed. */
     b->tok_dev_id = -1;
-    if (s == VV_OK) vv_pipeline_kv_publish(ctx);
+    if (s == VV_OK) {
+        vv_pipeline_kv_publish(ctx);
+        vv_spec_note_block(b->spec, *n, vv_time_ms() - t0);
+    }
     return s;
 }
 
+/* A block when blocks are paying, else 0: the session takes a step. */
 static int gpu_block_size(void* self) {
-    const sbe_t* b = (const sbe_t*)self;
-    return b->spec_live ? vv_spec_block(b->spec) : 0;
+    sbe_t* b = (sbe_t*)self;
+    return b->spec_live && vv_spec_want_block(b->spec) ? vv_spec_block(b->spec)
+                                                       : 0;
 }
 
 static vv_status_t gpu_truncate(void* self, int64_t len) {
@@ -598,6 +609,7 @@ static void gpu_destroy(void* self) {
     bind(b);
     vv_dev_stream_sync(ctx->compute_stream);
     vv_pipeline_graphs_free(ctx, b->graphs);
+    vv_pipeline_graphs_free(ctx, b->graphs_taps);
     /* An idle slot must not sit on pages another slot could use. */
     vv_pipeline_kv_release(ctx);
     set_kv_no_wait(ctx, false);
@@ -627,6 +639,8 @@ static vv_status_t gpu_open(sbe_t* b, int rows, bool ahead) {
     for (int i = 0; i < VV_MAX_GPUS; i++) {
         b->graphs[i].exec = NULL;
         b->graphs[i].shape = -1;
+        b->graphs_taps[i].exec = NULL;
+        b->graphs_taps[i].shape = -1;
     }
     b->graph_ok = vv_pipeline_graph_ok(ctx);
     b->tok_dev_id = -1;

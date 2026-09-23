@@ -607,6 +607,11 @@ struct vv_spec {
     void* vh;                  /* [B][Ht] the target's rows */
     void* vn;                  /* [B][Ht] normed */
     int32_t* h_pin;            /* pinned: out[B], n_out */
+    /* plain steps */
+    vv_taps_t step_taps;       /* one row */
+    /* blocks or steps (vv_spec_want_block) */
+    double ctl_blk_tok, ctl_blk_ms, ctl_step_ms;
+    int ctl_n_blk, ctl_plain_left, ctl_backoff;
     void** allocs;
     int n_allocs, cap_allocs;
     vv_spec_stats_t stats;
@@ -700,12 +705,17 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
     A(s->cx, T * H * 2); A(s->cxn, T * H * 2);
     A(s->ck, T * kd * 2); A(s->ckn, T * kd * 2); A(s->cv, T * kd * 2);
     A(s->vh, B * (size_t)target_hidden * 2); A(s->vn, B * (size_t)target_hidden * 2);
+    A(s->step_taps.buf, (size_t)s->n_taps * H * 2);
 #undef A
     if (st == VV_OK) st = vv_dev_alloc_pinned((void**)&s->h_pin, (B + 1) * 4);
     if (st != VV_OK) { vv_spec_free(s); return st; }
     s->taps.n = s->n_taps;
     for (int i = 0; i < s->n_taps; i++) s->taps.layers[i] = c->target_layer_ids[i];
     s->taps.rows = VV_SPEC_TAP_ROWS;
+    s->step_taps.n = s->n_taps;
+    for (int i = 0; i < s->n_taps; i++)
+        s->step_taps.layers[i] = c->target_layer_ids[i];
+    s->step_taps.rows = 1;
     /*
      * The drafter always drafts its whole block; the target may check fewer
      * of the drafts (--draft-block: rows, the anchor included). From three
@@ -715,12 +725,64 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
      */
     s->Bv = verify_rows >= 2 ? verify_rows : 4;
     if (s->Bv > s->B) s->Bv = s->B;
+    vv_spec_reset(s);
     *out = s;
     return VV_OK;
 }
 
+/* Plain steps a sequence starts with: the step's cost, measured. */
+#define CTL_WARM_STEPS 2
+/* Blocks seen before they are judged, and the first plain run after a loss
+ * (doubling up to CTL_RUN_MAX while blocks keep losing). */
+#define CTL_MIN_BLOCKS 4
+#define CTL_RUN_MIN 16
+#define CTL_RUN_MAX 512
+
 void vv_spec_reset(vv_spec_t* s) {
-    if (s) s->ctx_len = 0;
+    if (!s) return;
+    s->ctx_len = 0;
+    s->ctl_blk_tok = s->ctl_blk_ms = s->ctl_step_ms = 0.0;
+    s->ctl_n_blk = 0;
+    s->ctl_plain_left = CTL_WARM_STEPS;
+    s->ctl_backoff = CTL_RUN_MIN;
+}
+
+bool vv_spec_want_block(vv_spec_t* s) {
+    return s && s->ctl_plain_left <= 0;
+}
+
+void vv_spec_note_step(vv_spec_t* s, double ms) {
+    if (!s) return;
+    s->ctl_step_ms = s->ctl_step_ms > 0.0 ? 0.8 * s->ctl_step_ms + 0.2 * ms : ms;
+    if (s->ctl_plain_left > 0 && --s->ctl_plain_left == 0) {
+        /* Blocks again: judged on what they do from here. */
+        s->ctl_n_blk = 0;
+        s->ctl_blk_tok = s->ctl_blk_ms = 0.0;
+    }
+}
+
+void vv_spec_note_block(vv_spec_t* s, int tokens, double ms) {
+    if (!s) return;
+    if (s->ctl_n_blk == 0) {
+        s->ctl_blk_tok = tokens;
+        s->ctl_blk_ms = ms;
+    } else {
+        s->ctl_blk_tok = 0.8 * s->ctl_blk_tok + 0.2 * tokens;
+        s->ctl_blk_ms = 0.8 * s->ctl_blk_ms + 0.2 * ms;
+    }
+    if (++s->ctl_n_blk < CTL_MIN_BLOCKS || s->ctl_step_ms <= 0.0) return;
+    /* tokens per ms of blocks against a step's one token */
+    if (s->ctl_blk_tok * s->ctl_step_ms < s->ctl_blk_ms) {
+        s->ctl_plain_left = s->ctl_backoff;
+        if (s->ctl_backoff < CTL_RUN_MAX) s->ctl_backoff *= 2;
+        s->stats.fallbacks++;
+    } else if (s->ctl_n_blk >= 4 * CTL_MIN_BLOCKS) {
+        s->ctl_backoff = CTL_RUN_MIN;       /* blocks pay: forget the losses */
+    }
+}
+
+const vv_taps_t* vv_spec_step_taps(vv_spec_t* s) {
+    return s ? &s->step_taps : NULL;
 }
 
 int vv_spec_block(const vv_spec_t* s) { return s ? s->Bv : 0; }
@@ -830,6 +892,17 @@ static vv_status_t ctx_update(vv_spec_t* s, const void* rows, int pos0, int n,
         if (st == VV_OK)
             st = vv_dev_memcpy_d2d(kv_row(s->vc[l], pos0, kd), s->cv,
                                    (size_t)n * kd * 2, stream);
+    }
+    return st;
+}
+
+vv_status_t vv_spec_push_step(vv_spec_t* s) {
+    if (!s) return VV_ERR_NULL_PTR;
+    const vv_status_t st = ctx_update(s, s->step_taps.buf, s->ctx_len, 1,
+                                      s->stream);
+    if (st == VV_OK) {
+        s->ctx_len++;
+        s->stats.steps++;
     }
     return st;
 }

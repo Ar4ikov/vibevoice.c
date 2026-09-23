@@ -1725,11 +1725,12 @@ static vv_status_t step_slice(vv_model_t* model, void* hidden,
                               void* ws, size_t ws_size,
                               void* compute, void* xfer,
                               int first_layer, int n_layers,
-                              bool graph_ok, graph_slot_t* g)
+                              bool graph_ok, graph_slot_t* g,
+                              const vv_taps_t* taps)
 {
     #define VV_STEP_DIRECT()                                                 \
-        vv_decoder_step(model, hidden, kv, pool, ws, ws_size,                \
-                        compute, xfer, first_layer, n_layers)
+        vv_decoder_step_taps(model, hidden, kv, pool, ws, ws_size,           \
+                             compute, xfer, first_layer, n_layers, taps)
 
     /*
      * The capacity check lives in vv_kv_cache_append, and a replayed step
@@ -1796,14 +1797,18 @@ static vv_status_t step_slice(vv_model_t* model, void* hidden,
  * `graphs` holds one slot for the primary and one per shard. With no shards
  * this is exactly the single captured step it was before.
  */
-static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
-                                        bool graph_ok, graph_slot_t* graphs)
+static vv_status_t decoder_step_graphed_taps(vv_inference_ctx_t* ctx,
+                                             void* hidden, bool graph_ok,
+                                             graph_slot_t* graphs,
+                                             const vv_taps_t* taps)
 {
+    /* Taps are for a speculative context, which is never sharded. */
+    if (taps && ctx->n_shards > 0) return VV_ERR_UNSUPPORTED;
     vv_status_t s = step_slice(ctx->model, hidden, ctx->kv_cache,
                                ctx->layer_pool, ctx->workspace,
                                ctx->workspace_size, ctx->compute_stream,
                                ctx->transfer_stream, 0, ctx->primary_layers,
-                               graph_ok, &graphs[0]);
+                               graph_ok, &graphs[0], taps);
     if (s != VV_OK || ctx->n_shards == 0) return s;
 
     const size_t bytes = (size_t)ctx->model->config.llm.hidden_size * 2;
@@ -1820,7 +1825,7 @@ static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
                            sh->layer_pool, sh->workspace, sh->workspace_size,
                            sh->compute_stream, sh->transfer_stream,
                            sh->first_layer, sh->n_layers,
-                           graph_ok, &graphs[i + 1]);
+                           graph_ok, &graphs[i + 1], NULL);
         if (s != VV_OK) { vv_dev_set_device(ctx->gpu_id); return s; }
         src_gpu = sh->gpu_id; src = sh->hidden;
         src_stream = sh->compute_stream; src_done = sh->done;
@@ -1828,6 +1833,12 @@ static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
 
     return hand_off(ctx->gpu_id, hidden, ctx->compute_stream,
                     src_gpu, src, src_stream, src_done, bytes);
+}
+
+static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
+                                        bool graph_ok, graph_slot_t* graphs)
+{
+    return decoder_step_graphed_taps(ctx, hidden, graph_ok, graphs, NULL);
 }
 
 /**
@@ -2685,15 +2696,52 @@ static vv_status_t transcribe_gpu(
      */
     if (spec_on && !teacher.ids) {
         vv_spec_stats_reset(ctx->spec);
+        /* Plain steps between blocks tap their row for the drafter: their
+         * captures are not the untapped step's (graphs, below). */
+        graph_slot_t graphs_taps[VV_MAX_GPUS];
+        for (int i = 0; i < VV_MAX_GPUS; i++) { graphs_taps[i].exec = NULL;
+                                                graphs_taps[i].shape = -1; }
         while (n_generated < max_new_tokens && !token_ends(ctx, token_id)) {
             int32_t outs[VV_SPEC_MAX_BLOCK];
             int n_out = 0;
-            s = vv_spec_cycle(ctx, ctx->spec, token_id, outs, &n_out);
-            if (s == VV_ERR_OVERFLOW) { s = VV_OK; break; }
-            if (s != VV_OK) {
-                VV_LOG_E("inference: speculative step at %d failed: %s",
-                         n_generated, vv_status_str(s));
-                break;
+            const double t0 = vv_time_ms();
+            if (vv_spec_want_block(ctx->spec)) {
+                s = vv_spec_cycle(ctx, ctx->spec, token_id, outs, &n_out);
+                if (s == VV_ERR_OVERFLOW) { s = VV_OK; break; }
+                if (s != VV_OK) {
+                    VV_LOG_E("inference: speculative step at %d failed: %s",
+                             n_generated, vv_status_str(s));
+                    break;
+                }
+                vv_spec_note_block(ctx->spec, n_out, vv_time_ms() - t0);
+            } else {
+                /* A plain step, seen by the drafter as well. It reads the
+                 * length and the token on the device. */
+                vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+                s = vv_dev_memcpy_h2d(token_out_gpu, &token_id, sizeof(int32_t),
+                                      ctx->compute_stream);
+                if (s == VV_OK)
+                    s = vv_embedding_dev(ctx->embed_table_gpu,
+                                         (const int32_t*)token_out_gpu,
+                                         hidden_one_gpu, 1, hs,
+                                         ctx->compute_stream);
+                if (s == VV_OK)
+                    s = decoder_step_graphed_taps(ctx, hidden_one_gpu, graph_ok,
+                                                  graphs_taps,
+                                                  vv_spec_step_taps(ctx->spec));
+                if (s == VV_ERR_OVERFLOW) { s = VV_OK; break; }
+                if (s == VV_OK) {
+                    int32_t tok_host = 0;
+                    s = vv_pipeline_head_argmax(ctx, hidden_one_gpu, normed_gpu,
+                                                logits_f32_gpu, argmax_v_gpu,
+                                                argmax_i_gpu, token_out_gpu,
+                                                &tok_host, host_normed_h,
+                                                host_normed_f, &outs[0]);
+                }
+                if (s == VV_OK) s = vv_spec_push_step(ctx->spec);
+                if (s != VV_OK) break;
+                n_out = 1;
+                vv_spec_note_step(ctx->spec, vv_time_ms() - t0);
             }
             for (int i = 0; i < n_out; i++) {
                 token_id = outs[i];
@@ -2718,14 +2766,18 @@ static vv_status_t transcribe_gpu(
             }
             if (s != VV_OK) break;
         }
+        for (int i = 0; i < VV_MAX_GPUS; i++)
+            if (graphs_taps[i].exec) vv_dev_graph_destroy(graphs_taps[i].exec);
         {
             const vv_spec_stats_t* st = vv_spec_get_stats(ctx->spec);
             if (st && st->cycles > 0)
                 VV_LOG_I("spec: %lld cycles, %.2f tokens per cycle, %lld of "
-                         "%lld drafts kept (draft %.0f ms, verify %.0f ms)",
+                         "%lld drafts kept, %lld plain steps, %lld pauses "
+                         "(draft %.0f ms, verify %.0f ms)",
                          (long long)st->cycles,
                          (double)st->tokens / (double)st->cycles,
                          (long long)st->accepted, (long long)st->drafted,
+                         (long long)st->steps, (long long)st->fallbacks,
                          st->draft_ms, st->verify_ms);
         }
         /* The plain steps read the length and the token on the device. */
@@ -3515,6 +3567,12 @@ vv_status_t vv_pipeline_step(vv_inference_ctx_t* ctx, void* hidden,
     return decoder_step_graphed(ctx, hidden, graph_ok, graphs);
 }
 
+vv_status_t vv_pipeline_step_taps(vv_inference_ctx_t* ctx, void* hidden,
+                                  bool graph_ok, vv_graph_slot_t* graphs,
+                                  const vv_taps_t* taps) {
+    return decoder_step_graphed_taps(ctx, hidden, graph_ok, graphs, taps);
+}
+
 bool vv_pipeline_graph_ok(const vv_inference_ctx_t* ctx) {
     return decode_graph_enabled() && ctx->layer_pool &&
            ctx->layer_pool->all_resident && ctx->kv_cache &&
@@ -3940,6 +3998,9 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
          */
         int32_t queued[VV_SPEC_MAX_BLOCK];
         int n_queued = 0, q_at = 0;
+        graph_slot_t graphs_taps[VV_MAX_GPUS];
+        for (int i = 0; i < VV_MAX_GPUS; i++) { graphs_taps[i].exec = NULL;
+                                                graphs_taps[i].shape = -1; }
 
         while (s == VV_OK && n_generated < max_new &&
                !token_ends(ctx, token_id) && token_id != im_start) {
@@ -3976,10 +4037,12 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
                 token_id = queued[q_at++];
                 continue;
             }
-            if (spec_on) {
+            if (spec_on && vv_spec_want_block(ctx->spec)) {
                 int n_out = 0;
+                const double t0 = vv_time_ms();
                 s = vv_spec_cycle(ctx, ctx->spec, token_id, queued, &n_out);
                 if (s == VV_OK) {
+                    vv_spec_note_block(ctx->spec, n_out, vv_time_ms() - t0);
                     n_queued = n_out;
                     q_at = 0;
                     token_id = queued[q_at++];
@@ -3994,6 +4057,40 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
                 s = vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
                                       ctx->compute_stream);
                 if (s != VV_OK) break;
+            } else if (spec_on) {
+                /* Blocks are not paying here: a plain step the drafter sees
+                 * as well, so they can resume later. */
+                const double t0 = vv_time_ms();
+                vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+                s = vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
+                                      ctx->compute_stream);
+                if (s == VV_OK)
+                    s = vv_embedding_dev(ctx->embed_table_gpu,
+                                         (const int32_t*)tok_dev, one_gpu, 1,
+                                         hs, ctx->compute_stream);
+                if (s == VV_OK)
+                    s = decoder_step_graphed_taps(ctx, one_gpu, graph_ok,
+                                                  graphs_taps,
+                                                  vv_spec_step_taps(ctx->spec));
+                if (s == VV_ERR_OVERFLOW) {
+                    VV_LOG_W("generate: the KV window is full (%d positions); "
+                             "the answer stops here -- raise --max-seq-len",
+                             ctx->kv_cache->max_seq_len);
+                    s = VV_OK;
+                    g->finish_reason = "length";
+                    break;
+                }
+                if (s == VV_OK) {
+                    int32_t tok_host = 0;
+                    s = vv_pipeline_head_argmax(ctx, one_gpu, normed_gpu,
+                                                logits_gpu, am_v, am_i, tok_dev,
+                                                &tok_host, host_h, host_f,
+                                                &token_id);
+                }
+                if (s == VV_OK) s = vv_spec_push_step(ctx->spec);
+                if (s != VV_OK) break;
+                vv_spec_note_step(ctx->spec, vv_time_ms() - t0);
+                continue;
             }
 
             /* Embed the token that is already on the device, step, sample. */
@@ -4041,12 +4138,15 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
             }
         }
 
+        for (int i = 0; i < VV_MAX_GPUS; i++)
+            if (graphs_taps[i].exec) vv_dev_graph_destroy(graphs_taps[i].exec);
         if (ctx->spec && !sampling) {
             const vv_spec_stats_t* st = vv_spec_get_stats(ctx->spec);
             if (st && st->cycles > 0)
-                VV_LOG_I("generate: %lld drafted blocks, %.2f tokens each",
-                         (long long)st->cycles,
-                         (double)st->tokens / (double)st->cycles);
+                VV_LOG_I("generate: %lld drafted blocks, %.2f tokens each, "
+                         "%lld plain steps", (long long)st->cycles,
+                         (double)st->tokens / (double)st->cycles,
+                         (long long)st->steps);
         }
 
         for (int i = 0; i <= ctx->n_shards; i++)
