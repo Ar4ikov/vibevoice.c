@@ -657,7 +657,12 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
     s->n_taps = c->n_taps;
     s->max_pos = max_pos;
     s->stream = stream;
-    s->backend = vv_attn_resolve(attn_backend, VV_KV_FP16, false, s->nh,
+    /* The drafter's numbers need not match anything, so its block attends
+     * on tensor cores whatever the target uses: flashinfer reads each K/V
+     * once for all rows and heads (7B, test120: 0.21 ms a cycle less than
+     * the fa2 prefill path, the same drafts kept). */
+    (void)attn_backend;
+    s->backend = vv_attn_resolve(VV_ATTN_FLASHINFER, VV_KV_FP16, false, s->nh,
                                  s->nkv, s->hd);
     const size_t B = (size_t)s->B, H = (size_t)s->H;
     const size_t qd = (size_t)s->nh * s->hd, kd = (size_t)s->nkv * s->hd;
@@ -780,7 +785,8 @@ static void dbg(const char* what, const void* dev, size_t n, bool f32,
     vv_free(h);
 }
 
-/* y[M][N] = x[M][K] . W^T in W's format. */
+/* y[M][N] = x[M][K] . W^T in W's format. (The multi-row GEMV was slower
+ * for the 8-row draft pass: 7B test120 4.48 against 4.31 s of decode.) */
 static vv_status_t dlin(vv_spec_t* s, const void* x, const dlin_t* W, void* y,
                         int M, int N, int K, void* stream) {
     if (W->packed)

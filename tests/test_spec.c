@@ -12,6 +12,8 @@
  *     cross a split-count step inside the block, contiguous and paged;
  *   - vv_lm_head_rows_dev / vv_argmax_rows_dev against the one-row head.
  * Against CPU references: the in-block convolution, top-k, the selector walk.
+ * Without a GPU: the drafter's config.json is read and checked (what the
+ * runtime refuses, and why).
  *
  * With VV_TEST_MODEL (a checkpoint) and VV_TEST_DRAFT (a drafter for it)
  * set, the jfk clip (VV_TEST_AUDIO, else tests/data/jfk.wav) is transcribed
@@ -54,6 +56,76 @@ static void* dev_upload(const void* h, size_t n) {
 
 static void fill_half(uint16_t* p, size_t n, float scale) {
     for (size_t i = 0; i < n; i++) p[i] = vv_float_to_half(frand() * scale);
+}
+
+/* ─── Drafter config (no GPU) ────────────────────────────────────────────── */
+
+static const char* k_cfg =
+    "{\"architectures\":[\"DFlash2DraftModel\"],\"hidden_size\":1536,"
+    "\"intermediate_size\":4480,\"num_hidden_layers\":5,"
+    "\"num_attention_heads\":12,\"num_key_value_heads\":2,\"head_dim\":128,"
+    "\"rms_norm_eps\":1e-06,\"rope_theta\":1000000.0,\"vocab_size\":151936,"
+    "\"num_target_layers\":28,\"layer_types\":[\"%s\"],\"sliding_window\":64,"
+    "\"dflash_config\":{\"block_size\":8,\"mask_token_id\":151662,"
+    "\"target_layer_ids\":[1,7,13,19,25],\"conv_kernel_size\":2,"
+    "\"conv_group_size\":16,\"selector_rank\":256,\"selector_top_k\":16,"
+    "\"draft_vocab_size\":%s}%s}";
+
+static vv_status_t cfg_try(const char* dir, const char* vocab,
+                           const char* layers, vv_drafter_config_t* c) {
+    char path[1024], body[2048];
+    snprintf(path, sizeof(path), "%s/config.json", dir);
+    snprintf(body, sizeof(body), k_cfg, layers, vocab, "");
+    FILE* f = fopen(path, "wb");
+    if (!f) return VV_ERR_IO;
+    fputs(body, f);
+    fclose(f);
+    return vv_drafter_config_load(dir, c);
+}
+
+static void test_drafter_config(void) {
+    const char* tmp = getenv("TMPDIR");
+    char dir[1024];
+#ifdef _WIN32
+    snprintf(dir, sizeof(dir), "%s", getenv("TEMP") ? getenv("TEMP") : ".");
+#else
+    snprintf(dir, sizeof(dir), "%s", tmp && tmp[0] ? tmp : "/tmp");
+#endif
+    vv_drafter_config_t c;
+    vv_status_t s = cfg_try(dir, "28917", "full_attention", &c);
+    CHECK(s == VV_OK, "drafter config: %s", vv_status_str(s));
+    if (s == VV_OK) {
+        CHECK(c.hidden_size == 1536 && c.num_layers == 5 && c.num_heads == 12 &&
+              c.num_kv_heads == 2 && c.head_dim == 128 &&
+              c.intermediate_size == 4480 && c.vocab_size == 151936 &&
+              c.block_size == 8 && c.mask_token_id == 151662 &&
+              c.n_taps == 5 && c.target_layer_ids[4] == 25 &&
+              c.conv_kernel == 2 && c.conv_group == 16 &&
+              c.selector_rank == 256 && c.selector_top_k == 16 &&
+              c.draft_vocab_size == 28917 &&
+              c.weight_quant == VV_DRAFTER_INT4,
+              "drafter config: fields read back wrong");
+        /* INT4 holds a quarter of FP16's projection bytes, plus scales. */
+        const size_t b4 = vv_drafter_weight_bytes(&c);
+        c.weight_quant = VV_DRAFTER_F16;
+        const size_t b16 = vv_drafter_weight_bytes(&c);
+        CHECK(b4 < b16, "drafter bytes: int4 %zu !< f16 %zu", b4, b16);
+    }
+    /* What the kernels cannot run is refused at load, whole. */
+    CHECK(cfg_try(dir, "8", "full_attention", &c) == VV_ERR_MODEL_FORMAT,
+          "a draft vocabulary smaller than top_k must be refused");
+    CHECK(cfg_try(dir, "200000", "full_attention", &c) == VV_ERR_MODEL_FORMAT,
+          "a draft vocabulary larger than the vocabulary must be refused");
+    CHECK(cfg_try(dir, "0", "sliding_attention", &c) == VV_ERR_MODEL_FORMAT,
+          "a sliding-window drafter must be refused");
+    CHECK(vv_drafter_quant_parse("int4") == VV_DRAFTER_INT4 &&
+          vv_drafter_quant_parse("f16") == VV_DRAFTER_F16 &&
+          vv_drafter_quant_parse("int8") == VV_DRAFTER_QUANT_COUNT,
+          "--draft-quant names");
+    char path[1100];
+    snprintf(path, sizeof(path), "%s/config.json", dir);
+    remove(path);
+    if (!failures) printf("  ok   drafter config.json: read, sized, refused\n");
 }
 
 /* ─── W4A16 rows ─────────────────────────────────────────────────────────── */
@@ -523,9 +595,10 @@ static void test_transcript(void) {
 
 int main(void) {
     printf("test_spec\n");
+    test_drafter_config();
     if (vv_dev_device_count() <= 0) {
-        printf("  SKIP: no GPU\n");
-        return 0;
+        printf("  SKIP: the kernels (no GPU)\n");
+        return failures ? 1 : 0;
     }
     vv_dev_set_device(0);
     {
