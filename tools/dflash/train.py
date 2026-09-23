@@ -104,6 +104,38 @@ def static_reader(d, epochs=1, seed=0):
             yield read_vvdt(f)
 
 
+def trace_kind(path):
+    """A trace's per-position roles, read without its features."""
+    with open(path, "rb") as f:
+        magic, ver, n, nt, hs, idl = struct.unpack("<6I", f.read(24))
+        if magic != MAGIC or ver != 1:
+            raise ValueError(f"{path}: not a v1 trace")
+        f.seek(24 + 4 * nt + idl + (4 - idl % 4) % 4 + 4 * n)
+        return np.frombuffer(f.read(n), np.uint8)
+
+
+def steps_in(d, epochs, seed, max_anchors, accum):
+    """Optimizer steps `epochs` passes of static_reader over `d` make: the
+    same files in the same order, each giving make_blocks' block count, a
+    step whenever `accum` blocks have gathered (the rest is dropped)."""
+    files = sorted(glob.glob(os.path.join(d, "*.vvdt")))
+    per = {}
+    for f in files:
+        kind = trace_kind(f)
+        per[f] = min(int(np.count_nonzero(kind[:max(len(kind) - 1, 0)] == GEN)),
+                     max_anchors)
+    rng = random.Random(seed)
+    steps = blocks = 0
+    for _ in range(epochs):
+        rng.shuffle(files)
+        for f in files:
+            blocks += per[f]
+            if blocks >= accum:
+                steps += 1
+                blocks = 0
+    return steps
+
+
 def prefetch(gen, depth=4):
     """Run a trace reader in a thread, `depth` traces ahead: a trace is ~90
     MB, and reading one from a disk takes about as long as training on it."""
@@ -619,6 +651,15 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95),
                             weight_decay=0.0, fused=True)
+    if not a.ring_dir:
+        # The schedule has to end where the data does: a cosine cut off
+        # half-way leaves the learning rate high for the last checkpoint.
+        avail = steps_in(a.train_dir, a.epochs, a.seed, a.max_anchors,
+                         a.accum_blocks)
+        if avail < a.steps:
+            print(f"{a.epochs} epochs of {a.train_dir} make {avail} steps, "
+                  f"not {a.steps}: the schedule ends there", flush=True)
+            a.steps = max(1, avail)
     warm = max(1, int(a.warmup * a.steps))
 
     def lr_at(s):
