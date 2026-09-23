@@ -89,6 +89,7 @@ struct vv_drafter {
     float  mlp_div;       /* up_proj stored / mlp_div                    */
     float  out_div;       /* o_proj, down_proj outputs stored / out_div   */
     int    gpu_id;
+    int    n_prequant;    /* projections the checkpoint stores quantized */
     size_t bytes;
     void** allocs;        /* every device buffer, for free */
     int    n_allocs, cap_allocs;
@@ -337,21 +338,187 @@ static vv_status_t upload(vv_drafter_t* d, const wsrc_t* ws, const char* name,
     return s;
 }
 
+/* An INT4G row-major weight [N][K] (codes, FP16 scales, integer zeros per
+ * group of DRAFT_Q_GROUP) onto the device in the W4A16 GPU layout. */
+static vv_status_t put_int4g(vv_drafter_t* d, uint8_t* packed,
+                             const uint16_t* scales, const uint8_t* zeros,
+                             int64_t N, int64_t K, dlin_t* out) {
+    const size_t n = (size_t)N * (size_t)K, ng = n / DRAFT_Q_GROUP;
+    uint16_t* sz = (uint16_t*)vv_alloc(ng * 4);
+    vv_status_t s = sz ? VV_OK : VV_ERR_OUT_OF_MEMORY;
+    if (s == VV_OK)
+        s = vv_int4g_to_gpu_layout(packed, scales, zeros, (int)N, (int)K,
+                                   DRAFT_Q_GROUP, sz);
+    if (s == VV_OK) s = dalloc(d, &out->packed, n / 2);
+    if (s == VV_OK) s = vv_dev_memcpy_h2d(out->packed, packed, n / 2, NULL);
+    if (s == VV_OK) s = dalloc(d, &out->sz, ng * 4);
+    if (s == VV_OK) s = vv_dev_memcpy_h2d(out->sz, sz, ng * 4, NULL);
+    vv_free(sz);
+    return s;
+}
+
+/* A float of any stored width. */
+static float stored_float(const void* p, vv_dtype_t t, size_t i) {
+    if (t == VV_DTYPE_BF16) return vv_bf16_to_float(((const uint16_t*)p)[i]);
+    if (t == VV_DTYPE_F16) return vv_half_to_float(((const uint16_t*)p)[i]);
+    return ((const float*)p)[i];
+}
+
+/*
+ * A projection stored quantized already, the way compressed-tensors writes a
+ * pack-quantized INT4 Linear (tools/dflash/awq_drafter.py does):
+ *
+ *   <base>.weight_packed      I32 [N][K/8], element k in bits 4(k%8) of word
+ *                             k/8, stored as value + 8
+ *   <base>.weight_scale       float [N][K/G]
+ *   <base>.weight_zero_point  I32 [N/8][K/G] packed along N (z + 8), or
+ *                             I8 [N][K/G]; absent: symmetric
+ *
+ * with w = (q - z) * s and G = DRAFT_Q_GROUP. Read into INT4G (codes and
+ * zeros 0..15, FP16 scales times `mul`, a power of two, so exact down to
+ * FP16's subnormals). VV_ERR_WEIGHT_MISSING, quietly, when there is no
+ * `<base>.weight_packed`.
+ */
+static vv_status_t read_packed(const wsrc_t* ws, const char* base, int64_t N,
+                               int64_t K, float mul, uint8_t** packed_out,
+                               uint16_t** scales_out, uint8_t** zeros_out) {
+    char full[256];
+    vv_st_tensor_info_t pi, si, zi;
+    snprintf(full, sizeof(full), "%s%s.weight_packed", ws->prefix, base);
+    if (vv_safetensors_find(ws->st, full, &pi) != VV_OK)
+        return VV_ERR_WEIGHT_MISSING;
+    const int64_t ng = K / DRAFT_Q_GROUP;
+    if (pi.dtype != VV_DTYPE_I32 || pi.ndim != 2 || pi.shape[0] != N ||
+        pi.shape[1] != K / 8 || K % DRAFT_Q_GROUP || N % 8) {
+        VV_LOG_E("spec: '%s' is not the int32 [%lld, %lld] of a packed "
+                 "4-bit [%lld x %lld] weight", full, (long long)N,
+                 (long long)(K / 8), (long long)N, (long long)K);
+        return VV_ERR_SHAPE_MISMATCH;
+    }
+    snprintf(full, sizeof(full), "%s%s.weight_scale", ws->prefix, base);
+    if (vv_safetensors_find(ws->st, full, &si) != VV_OK ||
+        (si.dtype != VV_DTYPE_BF16 && si.dtype != VV_DTYPE_F16 &&
+         si.dtype != VV_DTYPE_F32) ||
+        si.ndim != 2 || si.shape[0] != N || si.shape[1] != ng) {
+        VV_LOG_E("spec: '%s' must be float [%lld, %lld]: groups of %d",
+                 full, (long long)N, (long long)ng, DRAFT_Q_GROUP);
+        return VV_ERR_SHAPE_MISMATCH;
+    }
+    snprintf(full, sizeof(full), "%s%s.weight_zero_point", ws->prefix, base);
+    const bool has_z = vv_safetensors_find(ws->st, full, &zi) == VV_OK;
+    const bool z_packed = has_z && zi.dtype == VV_DTYPE_I32 && zi.ndim == 2 &&
+                          zi.shape[0] == N / 8 && zi.shape[1] == ng;
+    const bool z_plain = has_z && zi.dtype == VV_DTYPE_I8 && zi.ndim == 2 &&
+                         zi.shape[0] == N && zi.shape[1] == ng;
+    if (has_z && !z_packed && !z_plain) {
+        VV_LOG_E("spec: '%s' is not a zero point the runtime reads", full);
+        return VV_ERR_SHAPE_MISMATCH;
+    }
+    const void *pd = NULL, *sd = NULL, *zd = NULL;
+    vv_status_t s = vv_safetensors_get_data(ws->st, &pi, &pd);
+    if (s == VV_OK) s = vv_safetensors_get_data(ws->st, &si, &sd);
+    if (s == VV_OK && has_z) s = vv_safetensors_get_data(ws->st, &zi, &zd);
+    if (s != VV_OK) return s;
+
+    const size_t n = (size_t)N * (size_t)K, nG = (size_t)N * (size_t)ng;
+    uint8_t* packed = (uint8_t*)vv_alloc(n / 2);
+    uint16_t* scales = (uint16_t*)vv_alloc(nG * 2);
+    uint8_t* zeros = (uint8_t*)vv_alloc(nG);
+    if (!packed || !scales || !zeros) {
+        vv_free(packed); vv_free(scales); vv_free(zeros);
+        return VV_ERR_OUT_OF_MEMORY;
+    }
+    const uint32_t* w = (const uint32_t*)pd;
+    for (int64_t r = 0; r < N; r++) {
+        const uint32_t* wr = w + (size_t)r * (size_t)(K / 8);
+        uint8_t* prow = packed + (size_t)r * (size_t)(K / 2);
+        for (int64_t k = 0; k < K; k += 2) {
+            const unsigned c0 = (wr[k >> 3] >> (4 * (k & 7))) & 15u;
+            const unsigned c1 = (wr[(k + 1) >> 3] >> (4 * ((k + 1) & 7))) & 15u;
+            prow[k >> 1] = (uint8_t)((c0 << 4) | c1);
+        }
+    }
+    int bad = 0;
+    for (int64_t r = 0; r < N; r++)
+        for (int64_t g = 0; g < ng; g++) {
+            const size_t i = (size_t)r * (size_t)ng + (size_t)g;
+            scales[i] = vv_float_to_half_rne(stored_float(sd, si.dtype, i) * mul);
+            int z = 8;
+            if (z_packed)
+                z = (int)((((const uint32_t*)zd)[(size_t)(r >> 3) * (size_t)ng + g]
+                           >> (4 * (r & 7))) & 15u);
+            else if (z_plain)
+                z = ((const int8_t*)zd)[i] + 8;
+            if (z < 0 || z > 15) { bad++; z = z < 0 ? 0 : 15; }
+            zeros[i] = (uint8_t)z;
+        }
+    if (bad) {
+        VV_LOG_E("spec: '%s%s' holds %d zero points outside 4 bits",
+                 ws->prefix, base, bad);
+        vv_free(packed); vv_free(scales); vv_free(zeros);
+        return VV_ERR_MODEL_FORMAT;
+    }
+    *packed_out = packed;
+    *scales_out = scales;
+    *zeros_out = zeros;
+    return VV_OK;
+}
+
 /*
  * A projection [N][K] (scaled by `mul`) in the drafter's format: FP16 as
  * upload() does it, or quantized here to INT4 groups and put in the GPU
  * layout the W4A16 kernels read. The FP16 value is what gets quantized, so
- * the INT4 drafter approximates the FP16 one.
+ * the INT4 drafter approximates the FP16 one. A checkpoint that stores the
+ * projection quantized (read_packed) keeps its codes: in the GPU layout, or
+ * dequantized to FP16 for an f16 drafter.
  */
 static vv_status_t upload_lin(vv_drafter_t* d, const wsrc_t* ws,
                               const char* name, int64_t N, int64_t K,
                               float mul, dlin_t* out) {
     memset(out, 0, sizeof(*out));
+    vv_status_t s;
+    {
+        char base[224];
+        const size_t nl = strlen(name);
+        if (nl > 7 && nl - 7 < sizeof(base) && !strcmp(name + nl - 7, ".weight")) {
+            memcpy(base, name, nl - 7);
+            base[nl - 7] = '\0';
+            uint8_t* packed = NULL;
+            uint16_t* scales = NULL;
+            uint8_t* zeros = NULL;
+            s = read_packed(ws, base, N, K, mul, &packed, &scales, &zeros);
+            if (s != VV_ERR_WEIGHT_MISSING) {
+                if (s == VV_OK) d->n_prequant++;
+                if (s == VV_OK && d->cfg.weight_quant == VV_DRAFTER_INT4 &&
+                    K % 64 == 0) {
+                    s = put_int4g(d, packed, scales, zeros, N, K, out);
+                } else if (s == VV_OK) {
+                    const size_t n = (size_t)N * (size_t)K;
+                    uint16_t* h = (uint16_t*)vv_alloc(n * 2);
+                    if (!h) s = VV_ERR_OUT_OF_MEMORY;
+                    for (size_t i = 0; h && i < n; i++) {
+                        const size_t r = i / (size_t)K, k = i % (size_t)K;
+                        const size_t g = r * (size_t)(K / DRAFT_Q_GROUP) +
+                                         k / DRAFT_Q_GROUP;
+                        const uint8_t b = packed[i >> 1];
+                        const int q = (i & 1) ? (b & 15) : (b >> 4);
+                        h[i] = vv_float_to_half_rne(
+                            (float)(q - zeros[g]) * vv_half_to_float(scales[g]));
+                    }
+                    if (s == VV_OK) s = dalloc(d, &out->w, n * 2);
+                    if (s == VV_OK) s = vv_dev_memcpy_h2d(out->w, h, n * 2, NULL);
+                    vv_free(h);
+                }
+                vv_free(packed); vv_free(scales); vv_free(zeros);
+                return s;
+            }
+        }
+    }
     if (d->cfg.weight_quant != VV_DRAFTER_INT4 || N % 8 || K % 64 ||
         K % DRAFT_Q_GROUP)
         return upload(d, ws, name, N, K, 0, false, mul, &out->w);
     float* f32 = NULL;
-    vv_status_t s = read_host(ws, name, N, K, 0, true, mul, (void**)&f32);
+    s = read_host(ws, name, N, K, 0, true, mul, (void**)&f32);
     if (s != VV_OK) return s;
     const size_t n = (size_t)N * (size_t)K;
     const size_t ng = n / DRAFT_Q_GROUP;
@@ -361,20 +528,13 @@ static vv_status_t upload_lin(vv_drafter_t* d, const wsrc_t* ws,
     uint16_t* scales = (uint16_t*)vv_alloc(ng * 2);
     uint16_t* mins = (uint16_t*)vv_alloc(ng * 2);
     uint8_t* zeros = (uint8_t*)vv_alloc(ng);
-    uint16_t* sz = (uint16_t*)vv_alloc(ng * 4);
-    if (!packed || !scales || !mins || !zeros || !sz) s = VV_ERR_OUT_OF_MEMORY;
+    if (!packed || !scales || !mins || !zeros) s = VV_ERR_OUT_OF_MEMORY;
     if (s == VV_OK)
         s = vv_int4g_quantize(f32, (int)N, (int)K, DRAFT_Q_GROUP, packed,
                               scales, mins, zeros);
-    if (s == VV_OK)
-        s = vv_int4g_to_gpu_layout(packed, scales, zeros, (int)N, (int)K,
-                                   DRAFT_Q_GROUP, sz);
-    if (s == VV_OK) s = dalloc(d, &out->packed, n / 2);
-    if (s == VV_OK) s = vv_dev_memcpy_h2d(out->packed, packed, n / 2, NULL);
-    if (s == VV_OK) s = dalloc(d, &out->sz, ng * 4);
-    if (s == VV_OK) s = vv_dev_memcpy_h2d(out->sz, sz, ng * 4, NULL);
+    if (s == VV_OK) s = put_int4g(d, packed, scales, zeros, N, K, out);
     vv_free(f32); vv_free(packed); vv_free(scales); vv_free(mins);
-    vv_free(zeros); vv_free(sz);
+    vv_free(zeros);
     return s;
 }
 
@@ -558,9 +718,10 @@ vv_status_t vv_drafter_load(const char* dir, const vv_model_t* target,
     d->hnorm_eps = c->rms_norm_eps / (VV_SPEC_FC_SCALE * VV_SPEC_FC_SCALE);
     if (s != VV_OK) { vv_drafter_free(d); return s; }
     VV_LOG_I("spec: DFlash 2 drafter from %s: %d layers, block %d, taps %d, "
-             "%d draft ids, %s, %.1f MB on gpu %d", dir, c->num_layers,
+             "%d draft ids, %s%s, %.1f MB on gpu %d", dir, c->num_layers,
              c->block_size, c->n_taps, d->Vd,
              c->weight_quant == VV_DRAFTER_INT4 ? "int4" : "f16",
+             d->n_prequant ? " (stored quantized)" : "",
              (double)d->bytes / (1024.0 * 1024.0), gpu_id);
     *out = d;
     return VV_OK;
