@@ -649,6 +649,7 @@ def main():
         return {k: v / max(nb, 1) for k, v in tot.items()} | {"base_loss": bl / max(nb, 1)}
 
     model.train()
+    best = -1.0
     step, blocks, t0 = 0, 0, time.time()
     run = {"loss": 0.0, "base": 0.0, "sel": 0.0, "base_acc": 0.0,
            "sel_acc": 0.0, "recall": 0.0, "n": 0}
@@ -696,12 +697,24 @@ def main():
             e = evaluate()
             print(f"EVAL step {step} " + " ".join(f"{k} {v:.3f}" for k, v in e.items()),
                   flush=True)
-        if step % a.save_every == 0 or step == a.steps:
+            # --out keeps the best drafter the held-out traces have seen; on
+            # a small corpus the last one is often past it.
+            if e["sel_acc"] > best:
+                best = e["sel_acc"]
+                export(model, cfg, a.out, vocab_ids)
+                print(f"BEST step {step} sel_acc {best:.3f}", flush=True)
+        if not evals and (step % a.save_every == 0 or step == a.steps):
             export(model, cfg, a.out, vocab_ids)
-    export(model, cfg, a.out, vocab_ids)
     if evals:
         e = evaluate()
         print("EVAL final " + " ".join(f"{k} {v:.3f}" for k, v in e.items()), flush=True)
+        if e["sel_acc"] > best:
+            best = e["sel_acc"]
+            export(model, cfg, a.out, vocab_ids)
+            print(f"BEST final sel_acc {best:.3f}", flush=True)
+        export(model, cfg, a.out + "-last", vocab_ids)
+    else:
+        export(model, cfg, a.out, vocab_ids)
 
 
 if __name__ == "__main__":

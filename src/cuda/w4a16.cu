@@ -420,6 +420,146 @@ w4a16_gemv_rows_kernel(const half* __restrict__ x, int M, const w4v_segs segs,
     }
 }
 
+/*
+ * The rows GEMV for short x (all of it fits in shared memory: 4 rows of a
+ * 3584-wide x are 28 KB) and at most 4 x rows -- a checked block of the
+ * sizes that pay. A few blocks per SM load x once and then walk the lane
+ * groups of every projection in turn, instead of every one of the ~1200
+ * blocks restaging x tile by tile behind a barrier. Each (weight row, x
+ * row) is summed exactly as in w4a16_gemv_rows_kernel, and so as in the
+ * one-row GEMV: same lanes, same chunks in the same order, same chains and
+ * flushes, same butterfly (LPR <= 32 only, whose reduction is one warp's).
+ */
+#define W4P_THREADS 256
+
+template <int LPR, int R, int MX>
+__global__ void __launch_bounds__(W4P_THREADS)
+w4a16_gemv_rows_persist_kernel(const half* __restrict__ x, int M,
+                               const w4v_segs segs, int K, int gshift,
+                               int total_groups)
+{
+    static_assert(LPR <= 32, "one warp per lane group's reduction");
+    constexpr int GPB = W4P_THREADS / LPR;
+    extern __shared__ uint4 xs[];            /* [MX][4][nch] */
+    const int nch = K >> 5;
+    const int ngroups = K >> gshift;
+
+    for (int e = (int)threadIdx.x; e < MX * 4 * nch; e += W4P_THREADS) {
+        const int m = e / (4 * nch);
+        const int j = (e / nch) & 3;
+        const int c = e % nch;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (m < M)
+            v = __ldg((const uint4*)(x + (size_t)m * K + ((size_t)c << 5)) + j);
+        xs[(m * 4 + j) * nch + c] = v;
+    }
+    __syncthreads();
+
+    const int lg = (int)threadIdx.x / LPR;
+    const int lr = (int)threadIdx.x % LPR;
+    /* Uniform trip count: a warp's lane groups shuffle together. */
+    for (int base = (int)blockIdx.x * GPB; base < total_groups;
+         base += (int)gridDim.x * GPB) {
+        const int g = base + lg;
+        const bool live = g < total_groups;
+        const int gg = live ? g : total_groups - 1;
+        const int seg = gg >= segs.first_block[2] ? 2
+                      : (gg >= segs.first_block[1] ? 1 : 0);
+        const uint4* w = seg == 0 ? segs.w[0] : (seg == 1 ? segs.w[1] : segs.w[2]);
+        const half2* sz = seg == 0 ? segs.sz[0]
+                        : (seg == 1 ? segs.sz[1] : segs.sz[2]);
+        const half* bias = seg == 0 ? segs.bias[0]
+                         : (seg == 1 ? segs.bias[1] : segs.bias[2]);
+        half* y = seg == 0 ? segs.y[0] : (seg == 1 ? segs.y[1] : segs.y[2]);
+        const int N = seg == 0 ? segs.n[0] : (seg == 1 ? segs.n[1] : segs.n[2]);
+        const int first = seg == 0 ? 0 : (seg == 1 ? segs.first_block[1]
+                                                   : segs.first_block[2]);
+        const int row0 = (gg - first) * R;
+
+        const uint4* wrow[R];
+        const half2* szrow[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const int rr = row0 + r < N ? row0 + r : N - 1;
+            wrow[r]  = w  + (size_t)rr * nch;
+            szrow[r] = sz + (size_t)rr * ngroups;
+        }
+        float acc[R][MX];
+#pragma unroll
+        for (int r = 0; r < R; r++)
+#pragma unroll
+            for (int m = 0; m < MX; m++) acc[r][m] = 0.0f;
+
+        int c = lr;
+        uint4 wv[R];
+        half2 sv[R];
+        if (c < nch) {
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                wv[r] = w4_ld_stream(wrow[r] + c);
+                sv[r] = szrow[r][(c << 5) >> gshift];
+            }
+        }
+        for (; c < nch; c += LPR) {
+            half2 wh[R][4][4];
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const w4_group gq = w4_make_group(sv[r]);
+                const uint32_t wd[4] = { wv[r].x, wv[r].y, wv[r].z, wv[r].w };
+#pragma unroll
+                for (int t = 0; t < 4; t++) w4_dequant_word(wd[t], gq, wh[r][t]);
+            }
+            const int cn = c + LPR;
+            if (cn < nch) {
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    wv[r] = w4_ld_stream(wrow[r] + cn);
+                    sv[r] = szrow[r][(cn << 5) >> gshift];
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < MX; m++) {
+                if (m < M) {
+                    uint4 xv[4];
+#pragma unroll
+                    for (int j = 0; j < 4; j++) xv[j] = xs[(m * 4 + j) * nch + c];
+                    const half2* xh = (const half2*)xv;
+#pragma unroll
+                    for (int r = 0; r < R; r++) {
+#pragma unroll
+                        for (int t = 0; t < 4; t++) {
+                            half2 pp = __hmul2(wh[r][t][0], xh[t]);
+                            pp = __hfma2(wh[r][t][1], xh[t + 4],  pp);
+                            pp = __hfma2(wh[r][t][2], xh[t + 8],  pp);
+                            pp = __hfma2(wh[r][t][3], xh[t + 12], pp);
+                            const float2 f = __half22float2(pp);
+                            acc[r][m] += f.x + f.y;
+                        }
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++)
+#pragma unroll
+            for (int m = 0; m < MX; m++)
+#pragma unroll
+                for (int off = LPR / 2; off > 0; off >>= 1)
+                    acc[r][m] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][m], off, LPR);
+        if (lr == 0 && live) {
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const int row = row0 + r;
+                if (row >= N) break;
+                const float b = bias ? __half2float(bias[row]) : 0.0f;
+#pragma unroll
+                for (int m = 0; m < MX; m++)
+                    if (m < M) y[(size_t)m * N + row] = __float2half(acc[r][m] + b);
+            }
+        }
+    }
+}
+
 /** @brief out[m][j] = x[m][perm[j]]: act-order activations, 8 columns/thread. */
 __global__ void w4a16_gather_kernel(const half* __restrict__ x,
                                     const int32_t* __restrict__ perm,
@@ -953,6 +1093,83 @@ int gemv_rows_r(long rows_total, int lpr, int sms) {
     return 1;
 }
 
+/*
+ * The persistent variant (w4a16_gemv_rows_persist_kernel), when it applies:
+ * lane groups of one warp or less, at most 4 x rows, and x within 64 KB of
+ * shared memory. Returns VV_ERR_UNSUPPORTED otherwise, for the tiled kernel.
+ */
+template <int LPR, int R, int MX>
+vv_status_t launch_rows_persist_lpr(const half* x, int M, w4v_segs segs,
+                                    int n_segs, int K, int gshift, int sms,
+                                    cudaStream_t st)
+{
+    int groups = 0;
+    for (int i = 0; i < W4V_MAX_SEGS; i++) {
+        if (i < n_segs) {
+            segs.first_block[i] = groups;
+            groups += (segs.n[i] + R - 1) / R;
+        } else {
+            segs.first_block[i] = INT_MAX;
+        }
+    }
+    const int smem = MX * 4 * (K >> 5) * (int)sizeof(uint4);
+    auto kern = w4a16_gemv_rows_persist_kernel<LPR, R, MX>;
+    if (smem > 48 * 1024) {
+        static thread_local int set_dev = -1;
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (set_dev != dev) {
+            if (cudaFuncSetAttribute(kern,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024)
+                    != cudaSuccess)
+                return VV_ERR_CUDA_LAUNCH;
+            set_dev = dev;
+        }
+    }
+    constexpr int GPB = W4P_THREADS / LPR;
+    int blocks = sms * 3;
+    const int need = (groups + GPB - 1) / GPB;
+    if (blocks > need) blocks = need;
+    kern<<<blocks, W4P_THREADS, smem, st>>>(x, M, segs, K, gshift, groups);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
+template <int R, int MX>
+vv_status_t launch_rows_persist(const half* x, int M, const w4v_segs& segs,
+                                int n_segs, int K, int gshift, int lpr,
+                                int sms, cudaStream_t st)
+{
+    switch (lpr) {
+        case 16: return launch_rows_persist_lpr<16, R, MX>(x, M, segs, n_segs, K, gshift, sms, st);
+        case 32: return launch_rows_persist_lpr<32, R, MX>(x, M, segs, n_segs, K, gshift, sms, st);
+        default: return VV_ERR_UNSUPPORTED;
+    }
+}
+
+vv_status_t gemv_rows_persist(const half* x, int M, const w4v_segs& segs,
+                              int n_segs, int K, int gshift, int lpr, int sms,
+                              cudaStream_t st)
+{
+    /*
+     * Where it pays (3090, one-row time = 1): 3 and 4 rows of the 7B's
+     * 3584-wide projections -- q/k/v 1.19/1.39 against 1.30/1.46 tiled, o
+     * 1.37/1.62 against 1.48/1.67, gate/up 1.11/1.22 against 1.10/1.30. At 2
+     * rows the tiled kernel is already at 1.05 on gate/up and this one is
+     * not, and on the 1.5B's 1536-wide shapes it loses at every size.
+     * VV_W4A16_ROWS_PERSIST=0 turns it off, =2 on wherever it can run.
+     */
+    static thread_local int env = -2;
+    const int mode = w4_env_int("VV_W4A16_ROWS_PERSIST", &env, 1);
+    if (mode == 0) return VV_ERR_UNSUPPORTED;
+    if (lpr > 32 || M > 4) return VV_ERR_UNSUPPORTED;
+    if (mode == 1 && (M < 3 || K < 2048)) return VV_ERR_UNSUPPORTED;
+    const int mx = M <= 2 ? 2 : (M == 3 ? 3 : 4);
+    if ((size_t)mx * 4 * (size_t)(K >> 5) * 16 > 64 * 1024) return VV_ERR_UNSUPPORTED;
+    if (mx == 2) return launch_rows_persist<2, 2>(x, M, segs, n_segs, K, gshift, lpr, sms, st);
+    if (mx == 3) return launch_rows_persist<2, 3>(x, M, segs, n_segs, K, gshift, lpr, sms, st);
+    return launch_rows_persist<2, 4>(x, M, segs, n_segs, K, gshift, lpr, sms, st);
+}
+
 vv_status_t gemv_one(const void* x, const void* packed, const void* sz,
                      const void* bias, void* y, int N, int K, int gshift,
                      cudaStream_t st)
@@ -1188,7 +1405,10 @@ vv_status_t vv_w4a16_gemv_rows_dev(const void* x, int M,
         for (int i = 0; i < n_proj; i++)
             sg.y[i] = segs.y[i] + (size_t)m0 * segs.n[i];
         const half* xh = (const half*)x + (size_t)m0 * K;
-        vv_status_t s;
+        vv_status_t s = gemv_rows_persist(xh, mm, sg, n_proj, K, gs, lpr,
+                                          info->sms, st);
+        if (s == VV_OK) continue;
+        if (s != VV_ERR_UNSUPPORTED) return s;
         if (R == 4)      s = launch_gemv_rows_mx<4>(xh, mm, sg, n_proj, K, gs, lpr, st);
         else if (R == 2) s = launch_gemv_rows_mx<2>(xh, mm, sg, n_proj, K, gs, lpr, st);
         else             s = launch_gemv_rows_mx<1>(xh, mm, sg, n_proj, K, gs, lpr, st);
