@@ -10,7 +10,9 @@
  *   - vv_attn_decode_rows against vv_attn_decode at each row's own length,
  *     for fa1, fa2 and flashinfer, FP16 and TurboQuant caches, lengths that
  *     cross a split-count step inside the block, contiguous and paged;
- *   - vv_lm_head_rows_dev / vv_argmax_rows_dev against the one-row head.
+ *   - vv_lm_head_rows_dev / vv_argmax_rows_dev against the one-row head;
+ *   - the BitNet projection a checked block runs (per-token int8
+ *     quantization, then the ternary product) against one row at a time.
  * Against CPU references: the in-block convolution, top-k, the selector walk.
  * Without a GPU: the drafter's config.json is read and checked (what the
  * runtime refuses, and why).
@@ -339,6 +341,77 @@ static void test_attn_rows(int backend, int fmt, bool paged, int n_q, int n_kv,
     free(pages); free(kh); free(vh); free(qh);
 }
 
+/* ─── Ternary rows (BitNet) ──────────────────────────────────────────────── */
+
+/*
+ * A BitNet projection of a checked block quantizes each row to int8 on its
+ * own and runs the dp4a product for up to 8 rows; its integers are exact in
+ * any order and the scaling is per element, so every row must come out as
+ * the one-row call gives it. Shapes of the 1.5B model's projections.
+ */
+static void test_ternary_rows(int N, int K) {
+    const int MAXM = 8;
+    uint8_t* codes = (uint8_t*)malloc((size_t)N * K / 4);
+    for (size_t i = 0; i < (size_t)N * K / 4; i++) {
+        uint8_t b = 0;
+        for (int j = 0; j < 4; j++) b |= (uint8_t)((urand() % 3) << (2 * j));
+        codes[i] = b;
+    }
+    uint16_t* xh = (uint16_t*)malloc((size_t)MAXM * K * 2);
+    fill_half(xh, (size_t)MAXM * K, 3.0f);
+    float* bias = (float*)malloc((size_t)N * 4);
+    for (int i = 0; i < N; i++) bias[i] = frand();
+    void* dc = dev_upload(codes, (size_t)N * K / 4);
+    void* dx = dev_upload(xh, (size_t)MAXM * K * 2);
+    void* db = dev_upload(bias, (size_t)N * 4);
+    void *q = NULL, *sc = NULL, *sum = NULL, *ya = NULL, *yb = NULL;
+    vv_dev_alloc(&q, (size_t)MAXM * K);
+    vv_dev_alloc(&sc, (size_t)MAXM * 4);
+    vv_dev_alloc(&sum, (size_t)MAXM * 4);
+    vv_dev_alloc(&ya, (size_t)MAXM * N * 2);
+    vv_dev_alloc(&yb, (size_t)MAXM * N * 2);
+    const float w_scale = 0.0123f;
+    int bad = 0;
+    vv_status_t s = VV_OK;
+    for (int M = 2; s == VV_OK && M <= MAXM; M++) {
+        s = vv_act_quant_i8_dev(dx, 1, M, K, (int8_t*)q, (float*)sc,
+                                (int32_t*)sum, NULL);
+        if (s == VV_OK)
+            s = vv_ternary_gemm_dev((const int8_t*)q, (const int32_t*)sum,
+                                    (const float*)sc, (const uint8_t*)dc,
+                                    w_scale, (const float*)db, NULL, ya, 1,
+                                    M, N, K, NULL);
+        for (int m = 0; s == VV_OK && m < M; m++) {
+            s = vv_act_quant_i8_dev((const uint8_t*)dx + (size_t)m * K * 2, 1,
+                                    1, K, (int8_t*)q, (float*)sc,
+                                    (int32_t*)sum, NULL);
+            if (s == VV_OK)
+                s = vv_ternary_gemm_dev((const int8_t*)q, (const int32_t*)sum,
+                                        (const float*)sc, (const uint8_t*)dc,
+                                        w_scale, (const float*)db, NULL,
+                                        (uint8_t*)yb + (size_t)m * N * 2, 1,
+                                        1, N, K, NULL);
+        }
+        vv_dev_stream_sync(NULL);
+        if (s == VV_OK) {
+            uint16_t* a = (uint16_t*)malloc((size_t)M * N * 2);
+            uint16_t* b = (uint16_t*)malloc((size_t)M * N * 2);
+            vv_dev_memcpy_d2h(a, ya, (size_t)M * N * 2, NULL);
+            vv_dev_memcpy_d2h(b, yb, (size_t)M * N * 2, NULL);
+            if (memcmp(a, b, (size_t)M * N * 2) != 0) bad++;
+            free(a); free(b);
+        }
+    }
+    CHECK(s == VV_OK, "ternary rows N%d K%d: %s", N, K, vv_status_str(s));
+    CHECK(bad == 0, "ternary rows N%d K%d: %d block sizes differ from one row "
+          "at a time", N, K, bad);
+    if (s == VV_OK && !bad)
+        printf("  ok   ternary rows N%d K%d == one-row, M 2..8\n", N, K);
+    vv_dev_free(dc); vv_dev_free(dx); vv_dev_free(db); vv_dev_free(q);
+    vv_dev_free(sc); vv_dev_free(sum); vv_dev_free(ya); vv_dev_free(yb);
+    free(codes); free(xh); free(bias);
+}
+
 /* ─── Head rows ──────────────────────────────────────────────────────────── */
 
 static void test_head_rows(int V, int K, int M) {
@@ -627,6 +700,9 @@ int main(void) {
         test_attn_rows(VV_ATTN_FA2, VV_KV_FP16, true, 28, 4, 700, 8);
         test_attn_rows(VV_ATTN_FLASHINFER, VV_KV_TQ4, true, 28, 4, 2040, 8);
     }
+    test_ternary_rows(1536, 1536);
+    test_ternary_rows(8960, 1536);
+    test_ternary_rows(1536, 8960);
     test_head_rows(152064, 3584, 8);
     test_head_rows(151936, 1536, 7);
     test_head_rows(152064, 3584, 16);
