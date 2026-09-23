@@ -159,11 +159,7 @@ vv_status_t vv_drafter_config_load(const char* dir, vv_drafter_config_t* c) {
     c->selector_rank = dc ? json_int(dc, "selector_rank", 0) : 0;
     c->selector_top_k = dc ? json_int(dc, "selector_top_k", 0) : 0;
     c->draft_vocab_size = dc ? json_int(dc, "draft_vocab_size", 0) : 0;
-    {
-        const char* q = getenv("VV_DRAFT_QUANT");
-        c->weight_quant = q && !strcmp(q, "int4") ? VV_DRAFTER_INT4
-                                                  : VV_DRAFTER_F16;
-    }
+    c->weight_quant = VV_DRAFTER_INT4;
     {
         const cJSON* f16 = cJSON_GetObjectItemCaseSensitive(j, "vv_fp16");
         c->fp16_mlp_div = f16 ? (float)json_num(f16, "mlp_div", 0.0) : 0.0f;
@@ -441,15 +437,24 @@ void vv_drafter_free(vv_drafter_t* d) {
     vv_free(d);
 }
 
+vv_drafter_quant_t vv_drafter_quant_parse(const char* name) {
+    if (!name) return VV_DRAFTER_QUANT_COUNT;
+    if (!strcmp(name, "int4")) return VV_DRAFTER_INT4;
+    if (!strcmp(name, "f16") || !strcmp(name, "fp16")) return VV_DRAFTER_F16;
+    return VV_DRAFTER_QUANT_COUNT;
+}
+
 vv_status_t vv_drafter_load(const char* dir, const vv_model_t* target,
-                            int gpu_id, vv_drafter_t** out) {
+                            int gpu_id, int quant, vv_drafter_t** out) {
     if (!dir || !target || !out) return VV_ERR_NULL_PTR;
+    if (quant < 0 || quant >= VV_DRAFTER_QUANT_COUNT) return VV_ERR_INVALID_ARG;
     *out = NULL;
     vv_drafter_t* d = (vv_drafter_t*)vv_alloc(sizeof(*d));
     if (!d) return VV_ERR_OUT_OF_MEMORY;
     memset(d, 0, sizeof(*d));
     d->gpu_id = gpu_id;
     vv_status_t s = vv_drafter_config_load(dir, &d->cfg);
+    d->cfg.weight_quant = quant;
     const vv_drafter_config_t* c = &d->cfg;
     const vv_llm_config_t* t = &target->config.llm;
     if (s == VV_OK) {
@@ -630,8 +635,8 @@ void vv_spec_free(vv_spec_t* s) {
 }
 
 vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
-                           int max_pos, int attn_backend, void* stream,
-                           vv_spec_t** out) {
+                           int max_pos, int attn_backend, int verify_rows,
+                           void* stream, vv_spec_t** out) {
     if (!d || !out) return VV_ERR_NULL_PTR;
     *out = NULL;
     const vv_drafter_config_t* c = &d->cfg;
@@ -701,12 +706,13 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
      * costs about linearly in rows while the later drafts are the least
      * likely to be kept, so the best n depends on the drafter and the card.
      */
-    s->Bv = s->B;
+    s->Bv = verify_rows >= 2 ? verify_rows : 4;
     {
-        const char* e = getenv("VV_SPEC_VERIFY");
+        const char* e = getenv("VV_SPEC_VERIFY");      /* measurements */
         const int v = e ? atoi(e) : 0;
-        if (v >= 2 && v <= s->B) s->Bv = v;
+        if (v >= 2) s->Bv = v;
     }
+    if (s->Bv > s->B) s->Bv = s->B;
     *out = s;
     return VV_OK;
 }

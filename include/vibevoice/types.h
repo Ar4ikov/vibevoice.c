@@ -485,6 +485,20 @@ typedef enum vv_head_format {
     VV_HEAD_COUNT
 } vv_head_format_t;
 
+/**
+ * @brief How a DFlash 2 drafter's projections are held on the device. A draft
+ *        is only a proposal -- the target checks every token -- so the drafter
+ *        may be quantized freely; what that costs is acceptance, not accuracy.
+ */
+typedef enum vv_drafter_quant {
+    VV_DRAFTER_INT4 = 0,    /**< INT4 groups of 128 on the W4A16 kernels    */
+    VV_DRAFTER_F16  = 1,    /**< as trained (BF16 -> FP16)                  */
+    VV_DRAFTER_QUANT_COUNT
+} vv_drafter_quant_t;
+
+/** @brief "int4" | "f16"; VV_DRAFTER_QUANT_COUNT if unknown. */
+vv_drafter_quant_t vv_drafter_quant_parse(const char* name);
+
 /** @brief "auto" | "gguf" | "safetensors"; VV_SOURCE_COUNT if unknown. */
 vv_weights_source_t vv_weights_source_parse(const char* name);
 const char* vv_weights_source_name(vv_weights_source_t s);
@@ -531,6 +545,15 @@ typedef struct vv_init_params {
      * the model. NULL: plain decoding.
      */
     const char* draft_dir;
+    int    draft_quant;   /**< vv_drafter_quant_t. Default: int4             */
+    /**
+     * Rows of a drafted block the model checks per pass: the last token and
+     * draft_block - 1 drafts (2..the drafter's block size). The drafter
+     * always drafts its whole block; checking a row costs about as much as
+     * a step once there are more than two, so fewer rows can be faster when
+     * the later drafts are rarely kept. 0: the default (4).
+     */
+    int    draft_block;
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -556,6 +579,8 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.vae_numerics = VV_VAE_AUTO;
     p.head_format = VV_HEAD_AUTO;
     p.draft_dir = NULL;
+    p.draft_quant = VV_DRAFTER_INT4;
+    p.draft_block = 0;
     return p;
 }
 

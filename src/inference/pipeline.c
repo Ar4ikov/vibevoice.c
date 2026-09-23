@@ -99,8 +99,8 @@ static vv_status_t upload_tensor_to_gpu(vv_tensor_t* t, void* stream) {
  * Used only for VV_PLACE_ALL_GPU mode.
  */
 static void attach_frontend(vv_inference_ctx_t* c);
-static void attach_spec(vv_inference_ctx_t* c, const char* dir,
-                        const vv_inference_ctx_t* parent);
+static void attach_spec(vv_inference_ctx_t* c, const char* dir, int quant,
+                        int verify_rows, const vv_inference_ctx_t* parent);
 
 /**
  * @brief Upload the first `n_layers` transformer layers to the GPU.
@@ -806,6 +806,7 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
         if (p.draft_dir && p.draft_dir[0]) {
             vv_drafter_config_t dc;
             if (vv_drafter_config_load(p.draft_dir, &dc) == VV_OK) {
+                dc.weight_quant = p.draft_quant;
                 const size_t sb = vv_drafter_weight_bytes(&dc) +
                                   (size_t)n_slots *
                                   vv_spec_context_bytes(&dc, max_seq);
@@ -1253,7 +1254,7 @@ fail_gpu:
 
 init_common:
     attach_frontend(c);
-    attach_spec(c, p.draft_dir, NULL);
+    attach_spec(c, p.draft_dir, p.draft_quant, p.draft_block, NULL);
 
     VV_LOG_I("inference: initialized (%s, workspace=%zu MB, tokenizer=%s)",
              placement_str(c->placement),
@@ -1270,9 +1271,10 @@ init_common:
  *        model, its embedding, head and final norm on one device; anything
  *        else decodes without it, with a warning, rather than failing.
  */
-static void attach_spec(vv_inference_ctx_t* c, const char* dir,
-                        const vv_inference_ctx_t* parent) {
+static void attach_spec(vv_inference_ctx_t* c, const char* dir, int quant,
+                        int verify_rows, const vv_inference_ctx_t* parent) {
     if (!parent && (!dir || !dir[0])) return;
+    c->draft_block = verify_rows;
     if (parent && !parent->drafter) return;
     const char* why = NULL;
     if (!c->use_gpu || c->placement == VV_PLACE_CPU_ONLY)
@@ -1290,11 +1292,12 @@ static void attach_spec(vv_inference_ctx_t* c, const char* dir,
         return;
     }
     vv_status_t s = VV_OK;
-    if (!parent) s = vv_drafter_load(dir, c->model, c->gpu_id, &c->drafter);
+    if (!parent)
+        s = vv_drafter_load(dir, c->model, c->gpu_id, quant, &c->drafter);
     if (s == VV_OK)
         s = vv_spec_create(c->drafter, c->model->config.llm.hidden_size,
                            c->kv_cache->max_seq_len, c->kv_cache->attn_backend,
-                           c->compute_stream, &c->spec);
+                           verify_rows, c->compute_stream, &c->spec);
     if (s != VV_OK) {
         VV_LOG_W("spec: no drafter (%s); decoding without it",
                  vv_status_str(s));
@@ -1492,7 +1495,7 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
 
     attach_frontend(c);
     c->drafter = parent->drafter;
-    attach_spec(c, NULL, parent);
+    attach_spec(c, NULL, 0, parent->draft_block, parent);
 
     if (c->kv_cache->pool)
         VV_LOG_I("inference: cloned context (workspace=%zu MB, kv shared "

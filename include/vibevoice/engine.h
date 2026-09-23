@@ -57,6 +57,8 @@ typedef struct vv_engine_params {
     int          vae_numerics;   /**< vv_vae_numerics_t. Default: auto       */
     int          head_format;    /**< vv_head_format_t (asr-bitnet)          */
     const char*  draft_dir;      /**< DFlash 2 drafter (spec.h), or NULL     */
+    int          draft_quant;    /**< vv_drafter_quant_t. Default: int4      */
+    int          draft_block;    /**< rows checked per block; 0: default     */
 } vv_engine_params_t;
 
 static inline vv_engine_params_t vv_engine_params_default(void) {
@@ -79,6 +81,8 @@ static inline vv_engine_params_t vv_engine_params_default(void) {
     p.vae_numerics = VV_VAE_AUTO;
     p.head_format = VV_HEAD_AUTO;
     p.draft_dir = NULL;
+    p.draft_quant = VV_DRAFTER_INT4;
+    p.draft_block = 0;
     return p;
 }
 

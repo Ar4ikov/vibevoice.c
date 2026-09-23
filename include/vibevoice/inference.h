@@ -706,6 +706,7 @@ typedef struct vv_inference_ctx {
      */
     struct vv_drafter* drafter;
     struct vv_spec*    spec;
+    int                draft_block;   /**< rows checked per block, for clones */
 } vv_inference_ctx_t;
 
 /** Bytes of joined hotwords a prompt takes, on every entry point. */

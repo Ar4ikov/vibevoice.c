@@ -104,16 +104,6 @@ typedef struct vv_drafter_config {
     float fp16_out_div;
 } vv_drafter_config_t;
 
-/**
- * @brief How the drafter's projections are held on the device. A draft is
- *        only a proposal -- the target checks every token -- so the drafter
- *        may be quantized freely; what it costs is acceptance, not accuracy.
- */
-typedef enum vv_drafter_quant {
-    VV_DRAFTER_F16  = 0,   /**< as trained (BF16 -> FP16)                   */
-    VV_DRAFTER_INT4 = 1,   /**< INT4 groups of 128, the W4A16 kernels       */
-} vv_drafter_quant_t;
-
 /** @brief A loaded drafter: its weights on one device, shared by every
  *         context (slot) of that device. */
 typedef struct vv_drafter vv_drafter_t;
@@ -121,7 +111,8 @@ typedef struct vv_drafter vv_drafter_t;
 /** @brief Read and check `dir`/config.json. */
 vv_status_t vv_drafter_config_load(const char* dir, vv_drafter_config_t* c);
 
-/** @brief Device bytes of a drafter's weights, from its config. */
+/** @brief Device bytes of a drafter's weights, from its config and its
+ *         `weight_quant` (set by the caller; config_load leaves int4). */
 size_t vv_drafter_weight_bytes(const vv_drafter_config_t* c);
 
 /** @brief Device bytes one context needs to run it: its KV cache for
@@ -131,10 +122,11 @@ size_t vv_spec_context_bytes(const vv_drafter_config_t* c, int max_pos);
 /**
  * @brief Load `dir` (config.json + model.safetensors, BF16/F16/F32) onto
  *        `gpu_id` for `target`, whose width, vocabulary and depth it must
- *        have been trained on.
+ *        have been trained on, its projections in `quant`
+ *        (vv_drafter_quant_t).
  */
 vv_status_t vv_drafter_load(const char* dir, const vv_model_t* target,
-                            int gpu_id, vv_drafter_t** out);
+                            int gpu_id, int quant, vv_drafter_t** out);
 
 void vv_drafter_free(vv_drafter_t* d);
 const vv_drafter_config_t* vv_drafter_get_config(const vv_drafter_t* d);

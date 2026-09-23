@@ -57,6 +57,9 @@ static void usage(void) {
         "  --draft <dir>         DFlash 2 drafter for this model: decode drafts\n"
         "                        a block of tokens and checks it in one pass\n"
         "                        (tools/dflash; same tokens, fewer passes)\n"
+        "  --draft-quant <fmt>   drafter weights: int4 (default) | f16\n"
+        "  --draft-block <n>     rows of a block checked per pass (2..block,\n"
+        "                        default 4)\n"
         "  --head <fmt>          BitNet head on the CPU: auto (exact, int8\n"
         "                        filter) | f16 (full scan) | int8 (approximate)\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
@@ -176,6 +179,23 @@ int vv_cmd_serve(int argc, char** argv) {
         }
         else if (strcmp(a, "--draft") == 0 && next) {
             ep.draft_dir = argv[++i];
+        }
+        else if (strcmp(a, "--draft-quant") == 0 && next) {
+            const vv_drafter_quant_t v = vv_drafter_quant_parse(argv[++i]);
+            if (v >= VV_DRAFTER_QUANT_COUNT) {
+                fprintf(stderr, "error: --draft-quant is int4 or f16, not "
+                                "'%s'\n", argv[i]);
+                return 1;
+            }
+            ep.draft_quant = (int)v;
+        }
+        else if (strcmp(a, "--draft-block") == 0 && next) {
+            ep.draft_block = atoi(argv[++i]);
+            if (ep.draft_block < 2) {
+                fprintf(stderr, "error: --draft-block is 2 or more, not '%s'\n",
+                        argv[i]);
+                return 1;
+            }
         }
         else if (strcmp(a, "--head") == 0 && next) {
             const vv_head_format_t v = vv_head_format_parse(argv[++i]);
