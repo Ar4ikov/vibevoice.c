@@ -8,6 +8,7 @@
 # row records decode tokens/s, RTF, tokens per drafted block and whether the
 # transcript is byte-for-byte the plain one. Run on a card nothing else uses.
 set -u
+export LC_ALL=C
 CLI=$1; MODEL=$2; DRAFT=$3; OUT=$4; shift 4
 AUDIO=(); EXTRA=()
 while [ $# -gt 0 ]; do

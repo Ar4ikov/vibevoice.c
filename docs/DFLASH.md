@@ -183,6 +183,38 @@ timestamps and speaker ids included.
    trace and compares its drafts with what the runtime drafted for the same
    positions (`VV_SPEC_LOG`); the C drafter agrees with PyTorch on 97–100 %
    of draft positions (the rest are BF16/FP16 near-ties).
+   `tools/dflash/eval_types.py` splits depth-1 accuracy by the kind of token
+   (JSON structure, digits, words), which is where a drafter's weakness shows.
+
+The whole pipeline for one target, as it was run for the drafters in this
+repository's release (paths are examples; `vv_dflash_data` is built with the
+CLI):
+
+```bash
+# clips: WAV + manifest (audio only; the datasets' own text is never used)
+python tools/dflash/build_corpus.py --src datasets/ --out clips/ --hours 140
+
+# the target's own transcripts (resumable; --shard i/n splits across cards)
+vv_dflash_data gen --model ./model_hf --list clips/train.tsv --out gen.jsonl
+vv_dflash_data gen --model ./model_hf --list clips/eval.tsv  --out eval.jsonl
+
+# traces: every position's token, role and five tapped layers (FP16)
+vv_dflash_data trace --model ./model_hf --gen eval.jsonl --dir traces/eval \
+    --layers 1,7,13,19,25
+vv_dflash_data trace --model ./model_hf --gen gen.jsonl --dir traces/train \
+    --layers 1,7,13,19,25          # or --ring 16 --epochs E next to a trainer
+
+# the drafter: --out keeps the best one on the held-out traces
+python tools/dflash/train.py --target ./model_hf --train-dir traces/train \
+    --eval-dir traces/eval --out drafter --layers 1,7,13,19,25 \
+    --epochs 5 --steps 700 --vocab-from gen.jsonl
+
+vv_cli --model ./model_hf --audio talk.wav --draft drafter
+```
+
+A 7B target's traces take ~87 MB per three-minute clip, so a full corpus
+is ~250 GB; `--ring` keeps only N of them on disk and replays the
+transcripts again each epoch instead.
 
 ## Results
 
