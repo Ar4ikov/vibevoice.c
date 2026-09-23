@@ -600,6 +600,14 @@ void vv_drafter_free(vv_drafter_t* d) {
     vv_free(d);
 }
 
+vv_draft_check_t vv_draft_check_parse(const char* name) {
+    if (!name) return VV_DRAFT_CHECK_COUNT;
+    if (!strcmp(name, "auto")) return VV_DRAFT_CHECK_AUTO;
+    if (!strcmp(name, "exact")) return VV_DRAFT_CHECK_EXACT;
+    if (!strcmp(name, "fast")) return VV_DRAFT_CHECK_FAST;
+    return VV_DRAFT_CHECK_COUNT;
+}
+
 vv_drafter_quant_t vv_drafter_quant_parse(const char* name) {
     if (!name) return VV_DRAFTER_QUANT_COUNT;
     if (!strcmp(name, "int4")) return VV_DRAFTER_INT4;
@@ -741,6 +749,7 @@ struct vv_spec {
     const vv_drafter_t* d;
     int B, H, nh, nkv, hd, I, V, rank, topk, G, n_taps, max_pos;
     int Bv;                    /* rows a cycle checks: the anchor, Bv-1 drafts */
+    bool exact;                /* rows with their decode steps' arithmetic */
     int ctx_len;               /* drafter context: positions [0, ctx_len) */
     int backend;               /* attention backend for the draft pass */
     void** kc;                 /* [layers] K [max_pos][nkv][hd] FP16 */
@@ -813,7 +822,7 @@ void vv_spec_free(vv_spec_t* s) {
 
 vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
                            int max_pos, int attn_backend, int verify_rows,
-                           void* stream, vv_spec_t** out) {
+                           int check, void* stream, vv_spec_t** out) {
     if (!d || !out) return VV_ERR_NULL_PTR;
     *out = NULL;
     const vv_drafter_config_t* c = &d->cfg;
@@ -896,6 +905,7 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
      */
     s->Bv = verify_rows >= 2 ? verify_rows : 4;
     if (s->Bv > s->B) s->Bv = s->B;
+    s->exact = check != VV_DRAFT_CHECK_FAST;
     /*
      * The INT4 drafter's GEMMs run on the W4A16 tensor-core kernels. A card
      * without them (below sm_80, or VV_W4A16_MMA=0) expands a weight into
@@ -1034,14 +1044,10 @@ void vv_spec_stats_reset(vv_spec_t* s) {
  *                      buffers, synchronously (dbg below);
  *   VV_SPEC_PROFILE=1  drain the stream after the draft so the cycle's time
  *                      splits into drafting and checking (costs a sync);
- *   VV_SPEC_EXACT=0    check blocks with the prefill kernels instead of the
- *                      decode-exact ones: faster on some shapes, but a row's
- *                      logits then differ from its decode step's in the last
- *                      bits, so near-ties can flip. For measurements only.
  *   VV_SPEC_LOG=path   append "p anchor drafts..." per cycle to `path`, for
  *                      checking the drafter against its trainer.
  */
-static bool s_debug, s_profile, s_exact = true;
+static bool s_debug, s_profile;
 static const char* s_log;
 static vv_once_t s_env_once = VV_ONCE_INIT;
 static void env_probe(void) {
@@ -1049,8 +1055,6 @@ static void env_probe(void) {
     s_debug = e && e[0] == '1';
     e = getenv("VV_SPEC_PROFILE");
     s_profile = e && e[0] == '1';
-    e = getenv("VV_SPEC_EXACT");
-    s_exact = !(e && e[0] == '0');
     e = getenv("VV_SPEC_LOG");
     s_log = e && e[0] ? e : NULL;
 }
@@ -1278,11 +1282,6 @@ static vv_status_t draft(vv_spec_t* s, const vv_inference_ctx_t* ctx,
     return st;
 }
 
-static bool verify_exact(void) {
-    vv_once(&s_env_once, env_probe);
-    return s_exact;
-}
-
 /*
  * One cycle on the GPU. The target's cache holds [0, p) and `anchor` is the
  * token at p, not yet fed. The drafter proposes B - 1 tokens; the target
@@ -1322,7 +1321,7 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
     if (st == VV_OK) {
         s->taps.on_chunk = NULL;
         s->taps.row_base = p;           /* position p lands at row 0 */
-        if (verify_exact()) {
+        if (s->exact) {
             /* Every row exactly as its own decode step: the same tokens. */
             st = vv_decoder_verify(ctx->model, s->vh, B, kv, ctx->layer_pool,
                                    ctx->workspace, ctx->workspace_size,

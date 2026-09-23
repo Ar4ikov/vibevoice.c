@@ -94,6 +94,10 @@ static void usage(const char* which) {
         "  --draft-quant <fmt>   drafter weights: int4 (default) | f16\n"
         "  --draft-block <n>     rows of a block checked per pass (2..block,\n"
         "                        default 4)\n"
+        "  --draft-check <how>   exact (default: the transcript is the one\n"
+        "                        without --draft, byte for byte) | fast (the\n"
+        "                        prefill kernels; a near-tie may go the\n"
+        "                        other way)\n"
         "  --head <fmt>          BitNet CPU head: auto | f16 | int8\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
@@ -202,6 +206,15 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
                 return -1;
             }
             a->ep.draft_quant = (int)v;
+        }
+        else if (strcmp(s, "--draft-check") == 0 && next) {
+            const vv_draft_check_t v = vv_draft_check_parse(argv[++i]);
+            if (v >= VV_DRAFT_CHECK_COUNT) {
+                fprintf(stderr, "error: --draft-check is exact or fast, not "
+                                "'%s'\n", argv[i]);
+                return -1;
+            }
+            a->ep.draft_check = (int)v;
         }
         else if (strcmp(s, "--draft-block") == 0 && next) {
             a->ep.draft_block = atoi(argv[++i]);

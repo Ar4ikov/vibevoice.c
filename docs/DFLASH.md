@@ -71,6 +71,18 @@ plus `draft_vocab` (below).
   drafter expands each weight into a scratch before its GEMM (122 MB for
   the 7B's drafter, said at load); `--draft-quant f16` reads them as they
   are.
+* **Stored INT4.** A drafter can also ship its projections quantized, the
+  way compressed-tensors stores a pack-quantized W4A16 Linear
+  (`weight_packed`, `weight_scale`, `weight_zero_point`, groups of 128):
+  those codes go into the GPU layout as they are, and the log says
+  `(stored quantized)`. `tools/dflash/awq_drafter.py` writes such a
+  checkpoint with AWQ — activation-aware scales where they fold into the
+  drafter without changing it (the MLP input, up → down, v → o per KV
+  channel; not the attention input, whose k/v projections also read the
+  context from the shared `hidden_norm`), then AWQ's clip search on every
+  projection. On the Streaming-1.5B drafter's eval traces the accepted
+  length is 3.094 in BF16, 3.080 with the runtime's round-to-nearest INT4
+  and 3.090 with AWQ; the checkpoint is 234 MB instead of 454.
 * **Draft vocabulary.** The drafter scores only the `draft_vocab` ids — the
   N most frequent in the transcripts it was trained on (32768 at most; the
   whole training corpus uses ~26 K distinct ids and 99 % of occurrences fall
@@ -142,8 +154,14 @@ So the runtime checks fewer rows than it drafts when that pays: the drafter
 always drafts its whole block (it was trained on whole blocks), and
 `--draft-block n` checks the anchor and the first n-1 drafts only.
 
-`VV_SPEC_EXACT=0` checks with the prefill kernels instead (tensor-core
-GEMMs): measurements only, since a near-tie can then flip.
+`--draft-check fast` checks with the prefill kernels instead (tensor-core
+GEMMs, the flash-attention prefill): a checked row then costs far less than
+a step, but its logits differ from its decode step's in the last bits, so a
+near-tie can go the other way than in a plain decode. What comes out is
+still the model's greedy transcript, computed with another rounding — the
+same trade the usual speculative decoders (vLLM, SGLang) make — but not
+byte for byte the one without `--draft`. `--draft-check exact` (the
+default) keeps that promise.
 
 ## One cycle
 
@@ -256,6 +274,10 @@ python tools/dflash/train.py --target ./model_hf --train-dir traces/train \
     --epochs 5 --steps 700 --vocab-from gen.jsonl
 
 vv_cli --model ./model_hf --audio talk.wav --draft drafter
+
+# optional: the same drafter stored as INT4 with AWQ scales
+python tools/dflash/awq_drafter.py --target ./model_hf --draft drafter \
+    --calib traces/train --eval traces/eval --out drafter-awq
 ```
 
 A 7B target's traces take ~87 MB per three-minute clip, so a full corpus

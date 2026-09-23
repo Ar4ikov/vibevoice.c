@@ -28,7 +28,7 @@ typedef struct vv_spec vv_spec_t;
  */
 vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
                            int max_pos, int attn_backend, int verify_rows,
-                           void* stream, vv_spec_t** out);
+                           int check, void* stream, vv_spec_t** out);
 void vv_spec_free(vv_spec_t* s);
 
 /** @brief Empty the drafter's context (a new sequence). */

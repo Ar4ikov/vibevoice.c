@@ -499,6 +499,21 @@ typedef enum vv_drafter_quant {
 /** @brief "int4" | "f16"; VV_DRAFTER_QUANT_COUNT if unknown. */
 vv_drafter_quant_t vv_drafter_quant_parse(const char* name);
 
+/** @brief How a drafted block is checked (--draft-check). */
+typedef enum vv_draft_check {
+    VV_DRAFT_CHECK_AUTO  = 0,  /**< the default: exact                     */
+    VV_DRAFT_CHECK_EXACT = 1,  /**< every row with its decode step's
+                                    arithmetic: the transcript is byte for
+                                    byte the one without a drafter        */
+    VV_DRAFT_CHECK_FAST  = 2,  /**< the prefill kernels (tensor cores):
+                                    cheaper per row, but a near-tie can go
+                                    the other way than in a plain decode  */
+    VV_DRAFT_CHECK_COUNT
+} vv_draft_check_t;
+
+/** @brief "auto" | "exact" | "fast"; VV_DRAFT_CHECK_COUNT if unknown. */
+vv_draft_check_t vv_draft_check_parse(const char* name);
+
 /** @brief "auto" | "gguf" | "safetensors"; VV_SOURCE_COUNT if unknown. */
 vv_weights_source_t vv_weights_source_parse(const char* name);
 const char* vv_weights_source_name(vv_weights_source_t s);
@@ -554,6 +569,7 @@ typedef struct vv_init_params {
      * the later drafts are rarely kept. 0: the default (4).
      */
     int    draft_block;
+    int    draft_check;   /**< vv_draft_check_t. Default: auto (exact)      */
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
@@ -581,6 +597,7 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.draft_dir = NULL;
     p.draft_quant = VV_DRAFTER_INT4;
     p.draft_block = 0;
+    p.draft_check = VV_DRAFT_CHECK_AUTO;
     return p;
 }
 

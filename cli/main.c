@@ -61,6 +61,7 @@ typedef struct {
     const char* draft;
     int         draft_quant;
     int         draft_block;
+    int         draft_check;
     const char* kv_paged;
     bool        cpu_only;
     float       vram_budget;
@@ -141,6 +142,10 @@ static void print_usage(const char* prog) {
         "  --draft-quant <fmt>   drafter weights: int4 (default) | f16\n"
         "  --draft-block <n>     rows of a block checked per pass (2..block,\n"
         "                        default 4)\n"
+        "  --draft-check <how>   exact (default: the transcript is the one\n"
+        "                        without --draft, byte for byte) | fast (the\n"
+        "                        prefill kernels; a near-tie may go the\n"
+        "                        other way)\n"
         "  --head <fmt>          BitNet LM head on the CPU: auto (default: the\n"
         "                        F16 head's exact argmax through an int8\n"
         "                        filter) | f16 (full scan) | int8 (int8 rows\n"
@@ -225,6 +230,13 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->draft_quant = vv_drafter_quant_parse(argv[++i]);
             if (args->draft_quant == VV_DRAFTER_QUANT_COUNT) {
                 fprintf(stderr, "Error: --draft-quant is int4 or f16, not "
+                                "'%s'\n", argv[i]);
+                return -1;
+            }
+        } else if (strcmp(argv[i], "--draft-check") == 0 && i + 1 < argc) {
+            args->draft_check = vv_draft_check_parse(argv[++i]);
+            if (args->draft_check == VV_DRAFT_CHECK_COUNT) {
+                fprintf(stderr, "Error: --draft-check is exact or fast, not "
                                 "'%s'\n", argv[i]);
                 return -1;
             }
@@ -467,6 +479,7 @@ int main(int argc, char** argv) {
     init_params.draft_dir = args.draft;
     init_params.draft_quant = args.draft_quant;
     init_params.draft_block = args.draft_block;
+    init_params.draft_check = args.draft_check;
     if (args.kv_cache) {
         vv_kv_format_t f = vv_kv_format_parse(args.kv_cache);
         if (f >= VV_KV_FORMAT_COUNT) {

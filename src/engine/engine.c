@@ -96,6 +96,7 @@ vv_status_t vv_engine_create(const vv_engine_params_t* params,
     ip.draft_dir = params->draft_dir;
     ip.draft_quant = params->draft_quant;
     ip.draft_block = params->draft_block;
+    ip.draft_check = params->draft_check;
     ip.gpus        = params->gpus;
     if (ip.gpus.n == 0) { ip.gpus.n = 1; ip.gpus.id[0] = params->gpu_id; }
 

@@ -59,6 +59,7 @@ typedef struct vv_engine_params {
     const char*  draft_dir;      /**< DFlash 2 drafter (spec.h), or NULL     */
     int          draft_quant;    /**< vv_drafter_quant_t. Default: int4      */
     int          draft_block;    /**< rows checked per block; 0: default     */
+    int          draft_check;    /**< vv_draft_check_t. Default: auto        */
 } vv_engine_params_t;
 
 static inline vv_engine_params_t vv_engine_params_default(void) {
@@ -83,6 +84,7 @@ static inline vv_engine_params_t vv_engine_params_default(void) {
     p.draft_dir = NULL;
     p.draft_quant = VV_DRAFTER_INT4;
     p.draft_block = 0;
+    p.draft_check = VV_DRAFT_CHECK_AUTO;
     return p;
 }
 
