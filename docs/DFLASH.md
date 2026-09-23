@@ -152,11 +152,32 @@ and caps landing inside blocks and checks tokens, text, stops, the fed
 sequence and the cache length against one step at a time.
 
 The drafter's context follows the target through the target's **taps**
-(`vv_taps_t`, inference.h): a prefill (the prompt, a streaming chunk) or a
-checked block copies the tapped layers' output rows aside, and the drafter
-turns them into its keys and values. A plain decode step does not tap, so a
-session that has to take one (the cache too full for a block) stops drafting
-for the rest of that session.
+(`vv_taps_t`, inference.h): a prefill (the prompt, a streaming chunk), a
+checked block, or a plain step copies the tapped layers' output rows aside,
+and the drafter turns them into its keys and values. A plain step taps into
+row 0 of a one-row buffer, which keeps it capturable as a graph of its own.
+
+## Blocks only while they pay
+
+How many drafts are kept depends on the audio. On speech like the drafter's
+corpus a block brings 2–3 tokens; on a language it barely saw, about 1, at
+the price of roughly two steps. So every decode position asks
+`vv_spec_want_block()`: the first two positions of a sequence are plain
+steps (the step's cost, measured), then blocks, while their running tokens
+per millisecond beat a step's; when they fall below, blocks pause for a run
+of plain steps (16, doubling up to 512 while blocks keep losing) and are
+tried again. The tokens are the same either way; `spec: …, N plain steps,
+M pauses` in the log says what happened.
+
+On the 43 held-out clips with the Streaming-1.5B drafter this is what keeps
+the worst clips (Mandarin and Russian, which the drafter saw little of) near
+plain speed — 0.93–0.95× — instead of paying for blocks that keep one token.
+
+A block is hundreds of small launches where a plain step is one captured
+graph, so on a card shared with other busy processes blocks lose far more
+to time slicing than steps do (the same clip measured 0.23× with a training
+run on the card and 0.95× without). The numbers below are from an otherwise
+idle card.
 
 ## Training
 
