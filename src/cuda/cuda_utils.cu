@@ -98,6 +98,17 @@ vv_status_t vv_dev_memcpy_d2d(void* dst, const void* src, size_t size,
     return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
 }
 
+vv_status_t vv_dev_memcpy2d_d2d(void* dst, size_t dpitch, const void* src,
+                                size_t spitch, size_t width, size_t height,
+                                void* stream) {
+    if (!dst || !src) return VV_ERR_NULL_PTR;
+    if (width == 0 || height == 0) return VV_OK;
+    const cudaError_t err = cudaMemcpy2DAsync(dst, dpitch, src, spitch, width,
+                                              height, cudaMemcpyDeviceToDevice,
+                                              (cudaStream_t)stream);
+    return (err == cudaSuccess) ? VV_OK : VV_ERR_CUDA;
+}
+
 /* ─── A position that lives on the device ────────────────────────────────── */
 
 __global__ void pos_add_kernel(int* dst, const int* src, int delta) {

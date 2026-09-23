@@ -428,6 +428,7 @@ struct vv_stream {
     sbuf_t              chunk_text;    /* current chunk, for the CHUNK event */
     sbuf_t              transcript;
     int32_t             pending_lead;  /* folded <|text_chunk_end|>, or -1 */
+    int64_t             force_off;     /* replay: ids consumed so far */
     vv_status_t         failed;
     bool                done;
     vv_atomic_int_t     cancel;        /* vv_stream_cancel(), any thread */
@@ -517,6 +518,43 @@ static void dump_chunk(const vv_stream_t* s, int64_t idx,
     vv_debug_dump(name, s->chunk_text.p, s->chunk_text.len);
 }
 
+/* A chunk's generated ids, on the stack until they outgrow it. */
+typedef struct {
+    int32_t  small[256];
+    int32_t* ids;
+    int      n, cap;
+} gen_ids_t;
+
+/*
+ * One generated token: into the chunk's ids and its text, and out as a
+ * delta. The caller has checked it is not a stop.
+ */
+static vv_status_t push_token(vv_stream_t* s, int64_t idx, gen_ids_t* g,
+                              int32_t tok) {
+    if (g->n == g->cap) {
+        const int nc = g->cap * 2;
+        int32_t* ng = (int32_t*)vv_alloc(sizeof(int32_t) * (size_t)nc);
+        if (!ng) return VV_ERR_OUT_OF_MEMORY;
+        memcpy(ng, g->ids, sizeof(int32_t) * (size_t)g->n);
+        if (g->ids != g->small) vv_free(g->ids);
+        g->ids = ng;
+        g->cap = nc;
+    }
+    g->ids[g->n++] = tok;
+    s->stats.tokens++;
+
+    char bytes[TOKEN_BYTES_MAX];
+    size_t nb = 0;
+    vv_status_t st = s->be.token_bytes(s->be.self, tok, bytes, sizeof(bytes),
+                                       &nb);
+    if (st != VV_OK) return st;
+    const char* d = NULL;
+    size_t dn = 0;
+    st = vv_stream_text_push(s->text, bytes, nb, &d, &dn);
+    if (st == VV_OK) st = emit_delta(s, idx, d, dn);
+    return st;
+}
+
 /* One window: prefill, greedy decode to a stop, then the chunk end. */
 static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
                              const float* window, double encoded_ms) {
@@ -561,35 +599,42 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
     s->chunk_text.len = 0;
     if (s->chunk_text.p) s->chunk_text.p[0] = '\0';
 
-    int32_t gen_ids_small[256];
-    int32_t* gen = gen_ids_small;
-    int gen_cap = 256, n_gen = 0;
+    gen_ids_t g;
+    g.ids = g.small;
+    g.n = 0;
+    g.cap = (int)(sizeof(g.small) / sizeof(g.small[0]));
+    int32_t* gen = NULL;
+    int n_gen = 0;
     vv_stream_stop_t stop = VV_STREAM_STOP_MAX_TOKENS;
-    char bytes[TOKEN_BYTES_MAX];
 
-    for (int step = 0; step < s->p.max_new_tokens; step++) {
-        if (tok == s->p.ids.text_chunk_end) { stop = VV_STREAM_STOP_CHUNK_END; break; }
-        if (tok == s->p.ids.eos) { stop = VV_STREAM_STOP_EOS; break; }
-
-        if (n_gen == gen_cap) {
-            const int nc = gen_cap * 2;
-            int32_t* ng = (int32_t*)vv_alloc(sizeof(int32_t) * (size_t)nc);
-            if (!ng) { st = VV_ERR_OUT_OF_MEMORY; break; }
-            memcpy(ng, gen, sizeof(int32_t) * (size_t)n_gen);
-            if (gen != gen_ids_small) vv_free(gen);
-            gen = ng;
-            gen_cap = nc;
+    /* Replay: the chunk's known ids in one prefill, nothing decoded. */
+    const bool replay = s->p.force_chunks > 0;
+    if (replay) {
+        if (idx >= s->p.force_chunks || !s->be.prefill_tokens)
+            return fail(s, VV_ERR_INVALID_ARG, idx);
+        const int fn = s->p.force_n[idx];
+        const int32_t* f = s->p.force_ids + s->force_off;
+        s->force_off += fn;
+        if (fn > 0) {
+            if (!kv_fits(s, (int64_t)fn + 1)) return fail(s, VV_ERR_OVERFLOW, idx);
+            st = s->be.prefill_tokens(s->be.self, f, fn);
+            if (st != VV_OK) return fail(s, st, idx);
         }
-        gen[n_gen++] = tok;
-        s->stats.tokens++;
+        gen = (int32_t*)f;
+        n_gen = fn;
+        s->stats.tokens += fn;
+        tok = -1;
+    }
 
-        size_t nb = 0;
-        st = s->be.token_bytes(s->be.self, tok, bytes, sizeof(bytes), &nb);
-        if (st != VV_OK) break;
-        const char* d = NULL;
-        size_t dn = 0;
-        st = vv_stream_text_push(s->text, bytes, nb, &d, &dn);
-        if (st == VV_OK) st = emit_delta(s, idx, d, dn);
+    const int32_t tce = s->p.ids.text_chunk_end;
+    const int32_t eos = s->p.ids.eos;
+    int32_t blk[VV_STREAM_BLOCK_MAX];
+    int step = 0;
+    while (!replay && step < s->p.max_new_tokens) {
+        if (tok == tce) { stop = VV_STREAM_STOP_CHUNK_END; break; }
+        if (tok == eos) { stop = VV_STREAM_STOP_EOS; break; }
+        st = push_token(s, idx, &g, tok);
+        step++;
         if (st != VV_OK) break;
 
         /* The token is fed even when it is the last one the cap allows,
@@ -602,11 +647,51 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
             st = VV_ERR_OVERFLOW;
             break;
         }
-        st = s->be.decode_step(s->be.self, tok, &tok);
+        const int bs = s->be.decode_block && s->be.block_size
+                     ? s->be.block_size(s->be.self) : 0;
+        if (bs < 2 || bs > VV_STREAM_BLOCK_MAX || !kv_fits(s, (int64_t)bs + 1)) {
+            st = s->be.decode_step(s->be.self, tok, &tok);
+            if (st != VV_OK) break;
+            continue;
+        }
+        /*
+         * A block: tok and the drafts after it are fed, and blk[] is what
+         * the steps would have returned one by one. Each of blk[0..n-2] was
+         * fed as well, which is right only for a token the loop would have
+         * fed -- not a stop, and not one past the cap. The first that is
+         * neither is where the cache is cut back to, and it becomes `tok`
+         * for the checks at the top.
+         */
+        const int64_t p0 = kv_len(s);
+        int n = 0;
+        st = s->be.decode_block(s->be.self, tok, blk, &n);
         if (st != VV_OK) break;
+        if (n < 1 || n > bs) { st = VV_ERR_INVALID_ARG; break; }
+        int i = 0;
+        for (; i < n - 1; i++) {
+            if (blk[i] == tce || blk[i] == eos || step >= s->p.max_new_tokens)
+                break;
+            st = push_token(s, idx, &g, blk[i]);
+            step++;
+            if (st != VV_OK) break;
+        }
+        if (st != VV_OK) break;
+        if (i < n - 1) {
+            st = s->be.truncate ? s->be.truncate(s->be.self, p0 + 1 + i)
+                                : VV_ERR_UNSUPPORTED;
+            if (st != VV_OK) break;
+        }
+        tok = blk[i];
+        if (cancelled(s)) { st = VV_ERR_CANCELLED; break; }
     }
+    if (!replay) {
+        gen = g.ids;
+        n_gen = g.n;
+    }
+    /* Replayed ids belong to the caller. */
+    const bool own_gen = !replay && gen != g.small;
     if (st != VV_OK) {
-        if (gen != gen_ids_small) vv_free(gen);
+        if (own_gen) vv_free(gen);
         return fail(s, st, idx);
     }
 
@@ -616,25 +701,28 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
     st = vv_stream_text_flush(s->text, &d, &dn);
     if (st == VV_OK) st = emit_delta(s, idx, d, dn);
     if (st != VV_OK) {
-        if (gen != gen_ids_small) vv_free(gen);
+        if (own_gen) vv_free(gen);
         return fail(s, st, idx);
     }
     dump_chunk(s, idx, gen, n_gen);
-    if (gen != gen_ids_small) vv_free(gen);
 
     /* Upstream feeds <|text_chunk_end|> after every chunk, whatever stopped
      * it. Either now, or folded into the next prefill as its first row. */
-    const int32_t tce = s->p.ids.text_chunk_end;
     if (s->p.fold_chunk_end || !s->be.append_tokens) {
         s->pending_lead = tce;
     } else {
         st = s->be.append_tokens(s->be.self, &tce, 1);
-        if (st != VV_OK) return fail(s, st, idx);
+        if (st != VV_OK) {
+            if (own_gen) vv_free(gen);
+            return fail(s, st, idx);
+        }
     }
 
     if (!sb_put(&s->transcript, s->chunk_text.p ? s->chunk_text.p : "",
-                s->chunk_text.len))
+                s->chunk_text.len)) {
+        if (own_gen) vv_free(gen);
         return fail(s, VV_ERR_OUT_OF_MEMORY, idx);
+    }
     s->stats.chunks++;
     s->stats.prefill_ms += t1 - t0 + encoded_ms;
     s->stats.encode_ms += encode_ms;
@@ -657,7 +745,10 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
     ev.encode_ms = encode_ms;
     ev.decode_ms = t2 - t1;
     ev.kv_len = kv_len(s);
+    ev.ids = gen;
+    ev.stop_id = stop == VV_STREAM_STOP_MAX_TOKENS ? -1 : tok;
     emit(s, &ev);
+    if (own_gen) vv_free(gen);
     return cancelled(s) ? fail(s, VV_ERR_CANCELLED, idx) : VV_OK;
 }
 

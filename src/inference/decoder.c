@@ -527,6 +527,103 @@ static vv_status_t quant_linear_group(
     return VV_OK;
 }
 
+/* ─── Verified blocks: M rows, each exactly as its own decode step ────────── */
+
+/*
+ * A drafted block is checked by running its M rows through the model at
+ * once, and the tokens that come out have to be the ones M decode steps
+ * would have produced. So every op here computes each row exactly as the
+ * one-token op does:
+ *
+ *   W4A16 (GPU layout)   the multi-row GEMV, the one-token GEMV's arithmetic
+ *   FP16 dense           the M <= 8 CUDA-core kernel one decode step runs
+ *   ternary, W8A8/W4A8   integer sums, exact in any order, for M <= 8
+ *   NF4, INT8, legacy    the one-token GEMV once per row (exact, slower)
+ *
+ * and attention is vv_attn_decode_rows: every row its own decode.
+ */
+#define VERIFY_M_MAX 16
+
+static vv_status_t linear_rows(const vv_weight_t* w, const void* x, void* y,
+                               void* scratch, size_t scratch_bytes, int M,
+                               int N, int K, void* stream)
+{
+    vv_status_t s;
+    if (w->perm.data) {
+        /* The gather is a copy per row: exact. The kernels read its copy. */
+        const size_t xb = ((size_t)M * K * 2 + 255) & ~(size_t)255;
+        if (!scratch || scratch_bytes < xb) return VV_ERR_OVERFLOW;
+        s = vv_w4a16_gather_dev(x, (const int32_t*)w->perm.data, scratch, M,
+                                K, stream);
+        if (s != VV_OK) return s;
+        x = scratch;
+        scratch = (uint8_t*)scratch + xb;
+        scratch_bytes -= xb;
+    }
+    if (w->quant_kind == VV_QUANT_INT4G && w->int4g_layout == VV_INT4G_GPU) {
+        vv_w4a16_proj_t p;
+        p.packed = w->tensor.data;
+        p.sz = w->quant.scales.data;
+        p.bias = w->bias.data;
+        p.y = y;
+        p.N = N;
+        return vv_w4a16_gemv_rows_dev(x, M, &p, 1, K, w->group_size, stream);
+    }
+    if (w->quant_kind == VV_QUANT_TERNARY || w->quant_kind == VV_QUANT_NONE) {
+        /* Up to 8 rows these are the kernels a decode step runs. */
+        for (int m0 = 0; m0 < M; m0 += 8) {
+            const int mm = M - m0 < 8 ? M - m0 : 8;
+            s = quant_linear(w, (const uint8_t*)x + (size_t)m0 * K * 2,
+                             (uint8_t*)y + (size_t)m0 * N * 2, scratch,
+                             scratch_bytes, mm, N, K, stream);
+            if (s != VV_OK) return s;
+        }
+        return VV_OK;
+    }
+    for (int m = 0; m < M; m++) {
+        s = quant_linear(w, (const uint8_t*)x + (size_t)m * K * 2,
+                         (uint8_t*)y + (size_t)m * N * 2, scratch,
+                         scratch_bytes, 1, N, K, stream);
+        if (s != VV_OK) return s;
+    }
+    return VV_OK;
+}
+
+static vv_status_t linear_rows_group(
+    const vv_weight_t* const* ws, void* const* ys, const int* Ns, int n,
+    const void* x, void* scratch, size_t scratch_bytes, int M, int K,
+    void* stream)
+{
+    bool fuse = n <= 3;
+    for (int i = 0; i < n && fuse; i++)
+        fuse = ws[i]->quant_kind == VV_QUANT_INT4G &&
+               ws[i]->int4g_layout == VV_INT4G_GPU && !ws[i]->perm.data &&
+               ws[i]->group_size == ws[0]->group_size;
+    if (fuse) {
+        vv_w4a16_proj_t p[3];
+        for (int i = 0; i < n; i++) {
+            p[i].packed = ws[i]->tensor.data;
+            p[i].sz = ws[i]->quant.scales.data;
+            p[i].bias = ws[i]->bias.data;
+            p[i].y = ys[i];
+            p[i].N = Ns[i];
+        }
+        return vv_w4a16_gemv_rows_dev(x, M, p, n, K, ws[0]->group_size,
+                                      stream);
+    }
+    bool tern = true;
+    for (int i = 0; i < n; i++) tern = tern && ws[i]->quant_kind == VV_QUANT_TERNARY;
+    if (tern && M <= 8)
+        return quant_linear_group(ws, ys, Ns, n, x, scratch, scratch_bytes, M,
+                                  K, stream);
+    for (int i = 0; i < n; i++) {
+        vv_status_t s = linear_rows(ws[i], x, ys[i], scratch, scratch_bytes,
+                                    M, Ns[i], K, stream);
+        if (s != VV_OK) return s;
+    }
+    return VV_OK;
+}
+
 /* ─── Int8 activations (W8A8, W4A8) ─────────────────────────────────────── */
 
 /**
@@ -703,6 +800,31 @@ static size_t decode_scratch_bytes(const vv_llm_config_t* cfg) {
                                  cfg->num_key_value_heads, cfg->head_dim);
 }
 
+/** @brief Buffer slot of `layer` in `t`, or -1 when it is not tapped. */
+static int tap_slot(const vv_taps_t* t, int layer) {
+    if (!t || !t->buf) return -1;
+    for (int i = 0; i < t->n; i++)
+        if (t->layers[i] == layer) return i;
+    return -1;
+}
+
+static vv_status_t decoder_layer_body(
+    const vv_layer_weights_t* layer,
+    const vv_llm_config_t* config,
+    void* hidden_states,
+    vv_kv_cache_t* kv_cache,
+    int layer_idx,
+    int position_offset,
+    int seq_len,
+    void* temp_workspace,
+    size_t workspace_size,
+    void* stream,
+    bool verify);
+
+/**
+ * @brief One layer, then its output rows into their slot of `taps` (rows
+ *        `tap_row0`..) when the layer is tapped.
+ */
 static vv_status_t decoder_layer_impl(
     const vv_layer_weights_t* layer,
     const vv_llm_config_t* config,
@@ -713,7 +835,37 @@ static vv_status_t decoder_layer_impl(
     int seq_len,
     void* temp_workspace,
     size_t workspace_size,
-    void* stream)
+    void* stream,
+    const vv_taps_t* taps,
+    int tap_row0,
+    bool verify)
+{
+    vv_status_t s = decoder_layer_body(layer, config, hidden_states, kv_cache,
+                                       layer_idx, position_offset, seq_len,
+                                       temp_workspace, workspace_size, stream,
+                                       verify);
+    const int slot = tap_slot(taps, layer_idx);
+    if (s != VV_OK || slot < 0) return s;
+    if (tap_row0 < 0 || tap_row0 + seq_len > taps->rows) return VV_ERR_OVERFLOW;
+    const size_t row = (size_t)config->hidden_size * 2;
+    return vv_dev_memcpy2d_d2d(
+        (uint8_t*)taps->buf + ((size_t)tap_row0 * taps->n + slot) * row,
+        row * (size_t)taps->n, hidden_states, row, row, (size_t)seq_len,
+        stream);
+}
+
+static vv_status_t decoder_layer_body(
+    const vv_layer_weights_t* layer,
+    const vv_llm_config_t* config,
+    void* hidden_states,
+    vv_kv_cache_t* kv_cache,
+    int layer_idx,
+    int position_offset,
+    int seq_len,
+    void* temp_workspace,
+    size_t workspace_size,
+    void* stream,
+    bool verify)
 {
     if (!layer || !config || !hidden_states || !kv_cache ||
         !temp_workspace) {
@@ -753,7 +905,8 @@ static vv_status_t decoder_layer_impl(
     size_t offset = 0;
 
     void* decode_scratch = wp;
-    offset += decode_scratch_bytes(config);
+    offset += verify ? vv_attn_rows_scratch_bytes(n_heads, head_dim, seq_len)
+                     : decode_scratch_bytes(config);
 
     void* norm_out = wp + offset;
     offset += (size_t)seq_len * hs * 2;
@@ -827,8 +980,10 @@ static vv_status_t decoder_layer_impl(
         void* ys[3] = { q_buf, k_buf, v_buf };
         const int ns[3] = { n_heads * head_dim, n_kv_heads * head_dim,
                             n_kv_heads * head_dim };
-        s = quant_linear_group(ws, ys, ns, 3, norm_out, temp_weight,
-                               temp_bytes, seq_len, hs, stream);
+        s = verify ? linear_rows_group(ws, ys, ns, 3, norm_out, temp_weight,
+                                       temp_bytes, seq_len, hs, stream)
+                   : quant_linear_group(ws, ys, ns, 3, norm_out, temp_weight,
+                                        temp_bytes, seq_len, hs, stream);
         if (s != VV_OK) return s;
     }
 
@@ -887,7 +1042,11 @@ static vv_status_t decoder_layer_impl(
             s = vv_kv_rotate_dev(q_buf, n_heads, head_dim, seq_len, stream);
             if (s != VV_OK) return s;
         }
-        if (seq_len > 1)
+        if (verify)
+            s = vv_attn_decode_rows(backend, q_buf, &view, attn_out, n_heads,
+                                    seq_len, position_offset + 1, NULL,
+                                    decode_scratch, stream);
+        else if (seq_len > 1)
             s = vv_attn_prefill(backend, q_buf, &view, attn_out, n_heads,
                                 seq_len, position_offset, actual_cache_len,
                                 true, decode_scratch, stream);
@@ -944,8 +1103,10 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 6. O projection + bias + residual */
-    s = quant_linear(&layer->attn.o_proj, attn_out, norm_out, temp_weight, temp_bytes,
-                     seq_len, hs, hs, stream);
+    s = verify ? linear_rows(&layer->attn.o_proj, attn_out, norm_out,
+                             temp_weight, temp_bytes, seq_len, hs, hs, stream)
+               : quant_linear(&layer->attn.o_proj, attn_out, norm_out,
+                              temp_weight, temp_bytes, seq_len, hs, hs, stream);
     if (s != VV_OK) return s;
     s = vv_residual_add_dev(hidden_states, norm_out,
                               seq_len * hs, stream);
@@ -968,8 +1129,10 @@ static vv_status_t decoder_layer_impl(
                                      &layer->mlp.up_proj };
         void* ys[2] = { gate_buf, up_buf };
         const int ns[2] = { inter_size, inter_size };
-        s = quant_linear_group(ws, ys, ns, 2, norm_out, temp_weight,
-                               temp_bytes, seq_len, hs, stream);
+        s = verify ? linear_rows_group(ws, ys, ns, 2, norm_out, temp_weight,
+                                       temp_bytes, seq_len, hs, stream)
+                   : quant_linear_group(ws, ys, ns, 2, norm_out, temp_weight,
+                                        temp_bytes, seq_len, hs, stream);
         if (s != VV_OK) return s;
     }
 
@@ -982,8 +1145,12 @@ static vv_status_t decoder_layer_impl(
     if (s != VV_OK) return s;
 
     /* 10. Down projection + bias + residual */
-    s = quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out, temp_weight, temp_bytes,
-                     seq_len, hs, inter_size, stream);
+    s = verify ? linear_rows(&layer->mlp.down_proj, gate_buf, mlp_out,
+                             temp_weight, temp_bytes, seq_len, hs, inter_size,
+                             stream)
+               : quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out,
+                              temp_weight, temp_bytes, seq_len, hs, inter_size,
+                              stream);
     if (s != VV_OK) return s;
     s = vv_residual_add_dev(hidden_states, mlp_out,
                               seq_len * hs, stream);
@@ -1014,7 +1181,8 @@ vv_status_t vv_decoder_layer_forward(
 {
     return decoder_layer_impl(layer, config, hidden_states, kv_cache,
                                layer_idx, position_offset, 1,
-                               temp_workspace, workspace_size, stream);
+                               temp_workspace, workspace_size, stream,
+                               NULL, 0, false);
 }
 
 vv_status_t vv_decoder_step(
@@ -1072,7 +1240,7 @@ vv_status_t vv_decoder_step(
         vv_status_t s = decoder_layer_impl(
             &model->layers[i], &model->config.llm,
             hidden_state, kv_cache, i, position, 1,
-            workspace, workspace_size, compute_stream);
+            workspace, workspace_size, compute_stream, NULL, 0, false);
 
         if (streaming) vv_layer_prefetch_done(pool, i, compute_stream);
 
@@ -1104,6 +1272,26 @@ vv_status_t vv_decoder_prefill(
     void* xfer_stream,
     int first_layer,
     int n_layers)
+{
+    return vv_decoder_prefill_taps(model, hidden_states, seq_len, kv_cache,
+                                   pool, workspace, workspace_size,
+                                   compute_stream, xfer_stream, first_layer,
+                                   n_layers, NULL);
+}
+
+vv_status_t vv_decoder_prefill_taps(
+    vv_model_t* model,
+    void* hidden_states,
+    int seq_len,
+    vv_kv_cache_t* kv_cache,
+    vv_layer_pool_t* pool,
+    void* workspace,
+    size_t workspace_size,
+    void* compute_stream,
+    void* xfer_stream,
+    int first_layer,
+    int n_layers,
+    const vv_taps_t* taps)
 {
     if (!model || !hidden_states || !kv_cache) return VV_ERR_NULL_PTR;
     const int last_layer = first_layer + n_layers;
@@ -1172,6 +1360,9 @@ vv_status_t vv_decoder_prefill(
         if ((int)budget < chunk) chunk = (int)budget;
     }
     if (chunk < 1) chunk = 1;
+    /* Handed over chunk by chunk, the taps only have to hold one chunk. */
+    if (taps && taps->on_chunk && chunk > taps->rows) chunk = taps->rows;
+    if (chunk < 1) return VV_ERR_INVALID_ARG;
     if (chunk < seq_len)
         VV_LOG_I("decoder: prefill in %d chunks of %d tokens",
                  (seq_len + chunk - 1) / chunk, chunk);
@@ -1207,7 +1398,10 @@ vv_status_t vv_decoder_prefill(
         vv_status_t s = decoder_layer_impl(
             &model->layers[i], &model->config.llm,
             chunk_hidden, kv_cache, i, base + start, len,
-            workspace, workspace_size, compute_stream);
+            workspace, workspace_size, compute_stream, taps,
+            (taps && taps->on_chunk) ? 0
+                                     : (taps ? base + start - taps->row_base : 0),
+            false);
 
         if (streaming) vv_layer_prefetch_done(pool, i, compute_stream);
 
@@ -1235,8 +1429,54 @@ vv_status_t vv_decoder_prefill(
             }
         }
       }
+      if (taps && taps->on_chunk) {
+          vv_status_t s = taps->on_chunk(taps->user, base + start, len,
+                                         compute_stream);
+          if (s != VV_OK) return s;
+      }
     }
 
+    return VV_OK;
+}
+
+vv_status_t vv_decoder_verify(
+    vv_model_t* model,
+    void* hidden_states,
+    int rows,
+    vv_kv_cache_t* kv_cache,
+    vv_layer_pool_t* pool,
+    void* workspace,
+    size_t workspace_size,
+    void* compute_stream,
+    void* xfer_stream,
+    const vv_taps_t* taps)
+{
+    if (!model || !hidden_states || !kv_cache) return VV_ERR_NULL_PTR;
+    if (rows < 1 || rows > VERIFY_M_MAX) return VV_ERR_INVALID_ARG;
+    const int base = kv_cache->current_len;
+    if (base + rows > kv_cache->max_seq_len) return VV_ERR_OVERFLOW;
+    vv_status_t s = vv_kv_cache_reserve(kv_cache, base + rows, compute_stream);
+    if (s != VV_OK) return s;
+    const bool streaming = pool && !pool->all_resident;
+    if (streaming)
+        vv_layer_prefetch_begin(pool, model, 0, xfer_stream);
+    for (int i = 0; i < model->num_layers; i++) {
+        if (streaming) {
+            vv_layer_prefetch_wait(pool, model, i, compute_stream);
+            if (i + 1 < model->num_layers)
+                vv_layer_prefetch_begin(pool, model, i + 1, xfer_stream);
+        }
+        s = decoder_layer_impl(&model->layers[i], &model->config.llm,
+                               hidden_states, kv_cache, i, base, rows,
+                               workspace, workspace_size, compute_stream,
+                               taps, taps ? base - taps->row_base : 0, true);
+        if (streaming) vv_layer_prefetch_done(pool, i, compute_stream);
+        if (s != VV_OK) {
+            VV_LOG_E("decoder: verify layer %d failed: %s", i,
+                     vv_status_str(s));
+            return s;
+        }
+    }
     return VV_OK;
 }
 
@@ -1329,7 +1569,47 @@ static bool model_has_act_order(vv_model_t* model) {
  * weight and every scale vector on every call, which is 13 GB of traffic and
  * 200-odd mallocs per token.
  */
+static vv_status_t decoder_layer_cpu_body(
+    const vv_layer_weights_t* layer,
+    const vv_llm_config_t* config,
+    float* hidden_states,
+    vv_kv_cache_t* kv_cache,
+    int layer_idx,
+    int position_offset,
+    int seq_len,
+    float* workspace,
+    size_t workspace_size);
+
+/** @brief One CPU layer, then its output rows into `taps` when tapped. */
 static vv_status_t decoder_layer_cpu(
+    const vv_layer_weights_t* layer,
+    const vv_llm_config_t* config,
+    float* hidden_states,
+    vv_kv_cache_t* kv_cache,
+    int layer_idx,
+    int position_offset,
+    int seq_len,
+    float* workspace,
+    size_t workspace_size,
+    const vv_taps_t* taps,
+    int tap_row0)
+{
+    vv_status_t s = decoder_layer_cpu_body(layer, config, hidden_states,
+                                           kv_cache, layer_idx,
+                                           position_offset, seq_len,
+                                           workspace, workspace_size);
+    const int slot = tap_slot(taps, layer_idx);
+    if (s != VV_OK || slot < 0) return s;
+    if (tap_row0 < 0 || tap_row0 + seq_len > taps->rows) return VV_ERR_OVERFLOW;
+    const size_t hs = (size_t)config->hidden_size;
+    float* dst = (float*)taps->buf;
+    for (int r = 0; r < seq_len; r++)
+        memcpy(dst + ((size_t)(tap_row0 + r) * taps->n + slot) * hs,
+               hidden_states + (size_t)r * hs, hs * sizeof(float));
+    return VV_OK;
+}
+
+static vv_status_t decoder_layer_cpu_body(
     const vv_layer_weights_t* layer,
     const vv_llm_config_t* config,
     float* hidden_states,
@@ -1491,6 +1771,20 @@ vv_status_t vv_decoder_prefill_cpu(
     float* workspace,
     size_t workspace_size)
 {
+    return vv_decoder_prefill_cpu_taps(model, hidden_states, seq_len,
+                                       kv_cache, workspace, workspace_size,
+                                       NULL);
+}
+
+vv_status_t vv_decoder_prefill_cpu_taps(
+    vv_model_t* model,
+    float* hidden_states,
+    int seq_len,
+    vv_kv_cache_t* kv_cache,
+    float* workspace,
+    size_t workspace_size,
+    const vv_taps_t* taps)
+{
     if (!model || !hidden_states || !kv_cache || !workspace)
         return VV_ERR_NULL_PTR;
     if (seq_len <= 0) return VV_ERR_INVALID_ARG;
@@ -1532,6 +1826,9 @@ vv_status_t vv_decoder_prefill_cpu(
     }
     if (fit < 1) return VV_ERR_OUT_OF_MEMORY;
     if (fit > 2048) fit = 2048;
+    if (taps && taps->on_chunk && fit > (size_t)taps->rows)
+        fit = (size_t)taps->rows;
+    if (fit < 1) return VV_ERR_INVALID_ARG;
     const int chunk = (int)fit < seq_len ? (int)fit : seq_len;
 
     const int base = kv_cache->current_len;
@@ -1558,12 +1855,18 @@ vv_status_t vv_decoder_prefill_cpu(
         for (int i = 0; i < model->num_layers; i++) {
             vv_status_t s = decoder_layer_cpu(
                 &model->layers[i], cfg, h, kv_cache, i, base + start, len,
-                workspace, workspace_size);
+                workspace, workspace_size, taps,
+                (taps && taps->on_chunk) ? 0
+                                         : (taps ? base + start - taps->row_base : 0));
             if (s != VV_OK) {
                 VV_LOG_E("decoder: CPU prefill layer %d failed: %s",
                          i, vv_status_str(s));
                 return s;
             }
+        }
+        if (taps && taps->on_chunk) {
+            vv_status_t s = taps->on_chunk(taps->user, base + start, len, NULL);
+            if (s != VV_OK) return s;
         }
     }
     return VV_OK;
@@ -1584,7 +1887,7 @@ vv_status_t vv_decoder_step_cpu(
         vv_status_t s = decoder_layer_cpu(
             &model->layers[i], &model->config.llm,
             hidden_state, kv_cache, i, position, 1,
-            workspace, workspace_size);
+            workspace, workspace_size, NULL, 0);
         if (s != VV_OK) {
             VV_LOG_E("decoder: CPU step layer %d failed: %s",
                      i, vv_status_str(s));

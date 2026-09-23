@@ -525,11 +525,19 @@ typedef struct vv_init_params {
     int    weights_source; /**< vv_weights_source_t (asr-bitnet). Default: auto */
     int    vae_numerics;   /**< vv_vae_numerics_t. Default: auto             */
     int    head_format;    /**< vv_head_format_t (asr-bitnet). Default: auto */
+    /**
+     * Directory of a DFlash 2 drafter for this model (spec.h): decode then
+     * drafts a block of tokens in one pass and checks it with one pass of
+     * the model. NULL: plain decoding.
+     */
+    const char* draft_dir;
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
 static inline vv_init_params_t vv_init_params_default(void) {
-    vv_init_params_t p;
+    /* Zeroed first: a field left out below (the per-device caps of an empty
+     * `gpus`, say) must read as "not asked for", not as stack garbage. */
+    vv_init_params_t p = {0};
     p.vram_budget = 1.0f;
     p.kv_format = 0;
     p.cpu_only = false;
@@ -547,6 +555,7 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.weights_source = VV_SOURCE_AUTO;
     p.vae_numerics = VV_VAE_AUTO;
     p.head_format = VV_HEAD_AUTO;
+    p.draft_dir = NULL;
     return p;
 }
 
@@ -581,6 +590,18 @@ typedef struct vv_transcription {
     const char*   full_text;
     float         duration;
     const char*   language;
+    /**
+     * The ids the model generated, every chunk's back to back (one chunk
+     * for a one-shot model), without the tokens that stopped them. What a
+     * tool that retraces a transcription needs (tools/dflash); may be NULL.
+     */
+    int32_t*      tokens;
+    int           num_tokens;
+    /** Per chunk: how many of `tokens` it produced, and the id that
+     *  stopped it (-1 when the token cap did). */
+    int*          chunk_tokens;
+    int32_t*      chunk_stops;
+    int           num_chunks;
 } vv_transcription_t;
 
 /* ─── Performance metrics ───────────────────────────────────────────────── */

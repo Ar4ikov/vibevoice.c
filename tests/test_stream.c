@@ -358,6 +358,8 @@ typedef struct {
     int     feat_ok;
     bool    destroyed;
     bool    overflowed;  /* the backend saw a write past the capacity */
+    int     bs;          /* decode_block size, 0: none */
+    int     n_blocks, n_truncs;
 } mock_t;
 
 static vv_status_t m_encode(void* self, const char* text, int32_t** ids, int* n) {
@@ -440,6 +442,43 @@ static vv_status_t m_append(void* self, const int32_t* ids, int n) {
     return VV_OK;
 }
 
+/*
+ * A drafted block: `token` and the k drafts after it are fed, k cycling
+ * through a pattern (all wrong, some right, all right), and the outputs are
+ * what the steps would have returned one at a time.
+ */
+static vv_status_t m_block(void* self, int32_t token, int32_t* out, int* n) {
+    static const int kept[] = { 3, 0, 7, 1, 2, 5, 6 };
+    mock_t* m = (mock_t*)self;
+    int k = kept[m->n_blocks++ % 7];
+    if (k > m->bs - 1) k = m->bs - 1;
+    if (m->kv + m->bs > m->cap) m->overflowed = true;   /* the whole block */
+    if (m->n_fed < 512) m->fed[m->n_fed++] = token;
+    const int c = m->chunk;
+    for (int i = 0; i <= k; i++) {
+        m->pos++;
+        out[i] = (c < m->n_script && m->pos < m->script_len[c])
+               ? m->script[c][m->pos] : 'z';
+        if (i < k && m->n_fed < 512) m->fed[m->n_fed++] = out[i];
+    }
+    m_grow(m, k + 1);
+    *n = k + 1;
+    return VV_OK;
+}
+
+static int m_bsize(void* self) { return ((mock_t*)self)->bs; }
+
+static vv_status_t m_truncate(void* self, int64_t len) {
+    mock_t* m = (mock_t*)self;
+    const int64_t drop = m->kv - len;
+    if (drop < 0 || drop > m->n_fed || drop > m->pos) return VV_ERR_INVALID_ARG;
+    m->n_truncs++;
+    m->kv = len;
+    m->n_fed -= (int)drop;
+    m->pos -= (int)drop;
+    return VV_OK;
+}
+
 static int64_t m_len(void* self) { return ((mock_t*)self)->kv; }
 static int64_t m_cap(void* self) { return ((mock_t*)self)->cap; }
 static void m_destroy(void* self) { ((mock_t*)self)->destroyed = true; }
@@ -454,6 +493,11 @@ static vv_stream_backend_t mock_backend(mock_t* m, bool with_append) {
     b.prefill_chunk = m_chunk;
     b.decode_step = m_step;
     b.append_tokens = with_append ? m_append : NULL;
+    if (m->bs > 0) {
+        b.decode_block = m_block;
+        b.block_size = m_bsize;
+        b.truncate = m_truncate;
+    }
     b.kv_len = m_len;
     b.kv_capacity = m_cap;
     b.destroy = m_destroy;
@@ -676,6 +720,78 @@ static void test_session_cap_and_overflow(void) {
     memset(&empty, 0, sizeof(empty));
     CHECK(vv_stream_open(&empty, &p, &s) == VV_ERR_MODEL_FORMAT && !s);
     free(x);
+}
+
+/*
+ * Blocks of drafted tokens change nothing a session produces: the same
+ * text, the same tokens and stops, the same tokens fed and the same cache
+ * length as one step at a time -- also when a stop, EOS or the per-chunk cap
+ * lands inside a block, which has fed past it and must be cut back.
+ */
+static void run_blocks(int bs, int max_new, bool fold, events_t* ev,
+                       mock_t* m) {
+    static const int32_t c0[] = { ' ', 'H', 'i', ',', TCE };
+    static const int32_t c1[] = { 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
+                                  'j', 'k', 'l', 'm', TCE };
+    static const int32_t c2[] = { SPECIAL_TOKEN, ' ', 'o', 'k', EOS };
+    static const int32_t c3[] = { 'x', 'y', TCE };
+    memset(m, 0, sizeof(*m));
+    m->script[0] = c0; m->script_len[0] = 5;
+    m->script[1] = c1; m->script_len[1] = 14;
+    m->script[2] = c2; m->script_len[2] = 5;
+    m->script[3] = c3; m->script_len[3] = 3;
+    m->n_script = 4;
+    m->cap = 100000;
+    m->feat_ok = 1;
+    m->bs = bs;
+    memset(ev, 0, sizeof(*ev));
+    vv_stream_params_t p;
+    vv_stream_params_default(&p);
+    p.fold_chunk_end = fold;
+    p.max_new_tokens = max_new;
+    p.on_event = on_event;
+    p.user = ev;
+    vv_stream_backend_t b = mock_backend(m, true);
+    vv_stream_t* s = NULL;
+    CHECK(vv_stream_open_backend(&b, &p, &s) == VV_OK);
+    if (!s) return;
+    float* x = ramp(264000);
+    CHECK(push_ramp(s, x, 264000, 8192) == VV_OK);
+    CHECK(vv_stream_finish(s) == VV_OK);
+    vv_stream_close(s);
+    free(x);
+}
+
+static void test_session_blocks(void) {
+    static const int sizes[] = { 2, 4, 8, 16 };
+    static const int caps[] = { 256, 5, 1 };
+    for (int f = 0; f < 2; f++)
+        for (int ci = 0; ci < 3; ci++) {
+            events_t e0, e1;
+            mock_t m0, m1;
+            run_blocks(0, caps[ci], f == 1, &e0, &m0);
+            CHECK(e0.n_chunks == 4 && e0.n_error == 0 && m0.n_blocks == 0);
+            for (int si = 0; si < 4; si++) {
+                run_blocks(sizes[si], caps[ci], f == 1, &e1, &m1);
+                CHECK(e1.n_chunks == 4 && e1.n_error == 0 && e1.n_done == 1);
+                CHECK(m1.n_blocks > 0 && !m1.overflowed);
+                CHECK(strcmp(e1.done, e0.done) == 0);
+                for (int c = 0; c < 4; c++) {
+                    CHECK(strcmp(e1.chunks[c], e0.chunks[c]) == 0);
+                    CHECK(strcmp(e1.deltas[c], e0.deltas[c]) == 0);
+                    CHECK(e1.n_tokens[c] == e0.n_tokens[c]);
+                    CHECK(e1.stop[c] == e0.stop[c]);
+                }
+                CHECK(m1.kv == m0.kv && m1.n_fed == m0.n_fed);
+                CHECK(memcmp(m1.fed, m0.fed, sizeof(int32_t) * (size_t)m0.n_fed) == 0);
+            }
+        }
+    /* The cases the cut exists for did come up. */
+    events_t e;
+    mock_t m;
+    run_blocks(8, 256, true, &e, &m);
+    CHECK(m.n_truncs > 0);
+    CHECK(strcmp(e.done, " Hi,abcdefghijklm okxy") == 0);
 }
 
 /* ─── Real tokenizer (optional) ─────────────────────────────────────────── */
@@ -1050,6 +1166,7 @@ int main(void) {
     test_session(true);
     test_session(false);
     test_session_cap_and_overflow();
+    test_session_blocks();
     test_tokenizer();
     test_segments();
     test_resampler();

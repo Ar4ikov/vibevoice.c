@@ -306,6 +306,35 @@ vv_status_t vv_layer_pool_pin_host(vv_model_t* model, int first_streamed);
  */
 vv_status_t vv_layer_pool_pin_range(vv_model_t* model, int first, int count);
 
+/* ─── Hidden-state taps ─────────────────────────────────────────────────── */
+
+/** @brief Most layers one set of taps copies. */
+#define VV_TAPS_MAX 8
+
+/**
+ * @brief Copies of chosen layers' outputs, taken as a forward pass goes by.
+ *
+ * A speculative drafter (spec.h) reads the target model's hidden states at a
+ * few layers; the layers write them here as they finish. The buffer holds
+ * `rows` positions of `n` interleaved layer outputs: position r, slot i at
+ * element (r * n + i) * hidden_size -- FP16 on the device, FP32 on the CPU
+ * -- which is the drafter's input layout. `layers[i]` fills slot i.
+ *
+ * A prefill larger than the buffer is handed over chunk by chunk: with
+ * `on_chunk` set, each chunk's rows land at 0.. and `on_chunk` runs once the
+ * chunk is through every layer (`pos0` is its first cache position);
+ * without it, cache position p lands at row p - `row_base`, which must fit.
+ */
+typedef struct vv_taps {
+    void* buf;
+    int   n;
+    int   layers[VV_TAPS_MAX];
+    int   rows;
+    int   row_base;
+    vv_status_t (*on_chunk)(void* user, int pos0, int n_rows, void* stream);
+    void* user;
+} vv_taps_t;
+
 /* ─── Decoder ───────────────────────────────────────────────────────────── */
 
 /**
@@ -354,6 +383,47 @@ vv_status_t vv_decoder_prefill(
     int n_layers);
 
 /**
+ * @brief vv_decoder_prefill that also fills `taps` (NULL: none) with the
+ *        outputs of the tapped layers in [first_layer, first_layer +
+ *        n_layers) for every row it prefills.
+ */
+vv_status_t vv_decoder_prefill_taps(
+    vv_model_t* model,
+    void* hidden_states,
+    int seq_len,
+    vv_kv_cache_t* kv_cache,
+    vv_layer_pool_t* pool,
+    void* workspace,
+    size_t workspace_size,
+    void* compute_stream,
+    void* xfer_stream,
+    int first_layer,
+    int n_layers,
+    const vv_taps_t* taps);
+
+/**
+ * @brief `rows` (<= 16) tokens at the cache's current length, every row
+ *        computed exactly as the decode step at its position would.
+ *
+ * What checks a drafted block (spec.h): the rows go through the same kernels
+ * a decode step runs -- multi-row versions where a weight should be read
+ * once -- so their logits carry the bits `rows` decode steps would have.
+ * The whole model on one device (no shards). Appends `rows` positions;
+ * `taps` (NULL: none) receive them at position - taps->row_base.
+ */
+vv_status_t vv_decoder_verify(
+    vv_model_t* model,
+    void* hidden_states,       /**< [rows, hidden_size] FP16, in/out */
+    int rows,
+    vv_kv_cache_t* kv_cache,
+    vv_layer_pool_t* pool,
+    void* workspace,
+    size_t workspace_size,
+    void* compute_stream,
+    void* xfer_stream,
+    const vv_taps_t* taps);
+
+/**
  * @brief One decode step through layers [first_layer, first_layer+n_layers).
  * @param pool  Optional layer pool for streaming (NULL = weights on GPU).
  * @param xfer  Transfer stream for async upload (NULL = use compute).
@@ -386,6 +456,16 @@ vv_status_t vv_decoder_prefill_cpu(
     vv_kv_cache_t* kv_cache,
     float* workspace,
     size_t workspace_size);
+
+/** @brief vv_decoder_prefill_cpu that also fills `taps` (FP32 rows). */
+vv_status_t vv_decoder_prefill_cpu_taps(
+    vv_model_t* model,
+    float* hidden_states,
+    int seq_len,
+    vv_kv_cache_t* kv_cache,
+    float* workspace,
+    size_t workspace_size,
+    const vv_taps_t* taps);
 
 vv_status_t vv_decoder_step_cpu(
     vv_model_t* model,
@@ -611,6 +691,21 @@ typedef struct vv_inference_ctx {
      * turns it off.
      */
     bool           quiet;
+
+    /*
+     * Hidden-state taps every prefill of this context fills while set: the
+     * drafter's context features, or a trace (spec.h). NULL otherwise. Not
+     * supported on a model split across devices.
+     */
+    const vv_taps_t* taps;
+
+    /*
+     * Speculative decoding (spec.h): the drafter's weights, loaded by the
+     * parent and borrowed by its clones, and this context's own drafter
+     * state. Both NULL without --draft.
+     */
+    struct vv_drafter* drafter;
+    struct vv_spec*    spec;
 } vv_inference_ctx_t;
 
 /** Bytes of joined hotwords a prompt takes, on every entry point. */
@@ -654,6 +749,17 @@ vv_status_t vv_inference_transcribe(
     vv_transcription_t** result);
 vv_status_t vv_inference_free(vv_inference_ctx_t* ctx);
 vv_status_t vv_transcription_free(vv_transcription_t* result);
+
+/**
+ * @brief Attach the generated ids to a transcription (copied): `n` ids in
+ *        `n_chunks` runs of `chunk_n[i]`, run i stopped by `chunk_stop[i]`
+ *        (-1: by the token cap).
+ */
+vv_status_t vv_transcription_set_tokens(vv_transcription_t* tr,
+                                        const int32_t* ids, int n,
+                                        const int* chunk_n,
+                                        const int32_t* chunk_stop,
+                                        int n_chunks);
 
 /* ─── Text generation (the LM without the audio) ────────────────────────── */
 

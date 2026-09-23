@@ -32,6 +32,7 @@
 #include <stdint.h>
 
 #include "kv_codec.cuh"
+#include "decode_split.h"
 
 /* ─── Geometry shared by every tensor-core attention kernel ─────────────── */
 
@@ -566,6 +567,48 @@ static __global__ void att_combine_kernel(
         }
     }
     out[(size_t)row * ATT_D + d] = __float2half(den > 1e-20f ? num / den : 0.0f);
+}
+
+/*
+ * att_combine_kernel for the rows of a verified block: head blockIdx.x of
+ * row blockIdx.y, which saw cache_len + row positions in the split count
+ * its one-row decode would have used (fa2's, or flashinfer's when
+ * fi_n_kv > 0), from partials of its own. Same arithmetic, same bits.
+ */
+static __global__ void att_combine_rows_kernel(
+    const float* __restrict__ part_o, const float* __restrict__ part_m,
+    const float* __restrict__ part_l, half* __restrict__ out,
+    int n_q_heads, int cache_len, const int* __restrict__ d_cache_len,
+    int fi_n_kv)
+{
+    const int r = blockIdx.y;
+    const int row = blockIdx.x;
+    const int d = threadIdx.x;
+    const int L = (d_cache_len ? *d_cache_len : cache_len) + r;
+    const int n_parts = fi_n_kv > 0 ? vv_fi_decode_parts(fi_n_kv, L)
+                                    : vv_decode_n_parts(L);
+    const size_t rows = (size_t)n_q_heads * VV_DECODE_MAX_PARTS;
+    part_o += (size_t)r * rows * ATT_D;
+    part_m += (size_t)r * rows;
+    part_l += (size_t)r * rows;
+    const float* pm = part_m + (size_t)row * n_parts;
+    const float* pl = part_l + (size_t)row * n_parts;
+
+    float gmax = -FLT_MAX;
+    for (int i = 0; i < n_parts; ++i) gmax = fmaxf(gmax, pm[i]);
+
+    float num = 0.0f, den = 0.0f;
+    if (gmax > -FLT_MAX) {
+        for (int i = 0; i < n_parts; ++i) {
+            const float mi = pm[i];
+            if (mi <= -FLT_MAX) continue;
+            const float w = __expf(mi - gmax);
+            num += w * part_o[((size_t)row * n_parts + i) * ATT_D + d];
+            den += w * pl[i];
+        }
+    }
+    out[((size_t)r * n_q_heads + row) * ATT_D + d] =
+        __float2half(den > 1e-20f ? num / den : 0.0f);
 }
 
 #endif /* VV_CUDA_ATTN_COMMON_CUH */

@@ -56,6 +56,7 @@ typedef struct vv_engine_params {
     int          weights_source; /**< vv_weights_source_t (asr-bitnet)       */
     int          vae_numerics;   /**< vv_vae_numerics_t. Default: auto       */
     int          head_format;    /**< vv_head_format_t (asr-bitnet)          */
+    const char*  draft_dir;      /**< DFlash 2 drafter (spec.h), or NULL     */
 } vv_engine_params_t;
 
 static inline vv_engine_params_t vv_engine_params_default(void) {
@@ -77,6 +78,7 @@ static inline vv_engine_params_t vv_engine_params_default(void) {
     p.weights_source = VV_SOURCE_AUTO;
     p.vae_numerics = VV_VAE_AUTO;
     p.head_format = VV_HEAD_AUTO;
+    p.draft_dir = NULL;
     return p;
 }
 

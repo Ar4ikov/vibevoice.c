@@ -427,7 +427,40 @@ vv_status_t vv_transcription_free(vv_transcription_t* tr) {
         vv_free(tr->segments);
     }
     if (tr->full_text) vv_free((void*)tr->full_text);
+    vv_free(tr->tokens);
+    vv_free(tr->chunk_tokens);
+    vv_free(tr->chunk_stops);
 
     vv_free(tr);
+    return VV_OK;
+}
+
+vv_status_t vv_transcription_set_tokens(vv_transcription_t* tr,
+                                        const int32_t* ids, int n,
+                                        const int* chunk_n,
+                                        const int32_t* chunk_stop,
+                                        int n_chunks) {
+    if (!tr || n < 0 || n_chunks < 0 || (n > 0 && !ids)) return VV_ERR_NULL_PTR;
+    vv_free(tr->tokens);
+    vv_free(tr->chunk_tokens);
+    vv_free(tr->chunk_stops);
+    tr->tokens = NULL;
+    tr->chunk_tokens = NULL;
+    tr->chunk_stops = NULL;
+    tr->num_tokens = tr->num_chunks = 0;
+    tr->tokens = (int32_t*)vv_alloc(sizeof(int32_t) * (size_t)(n > 0 ? n : 1));
+    tr->chunk_tokens = (int*)vv_alloc(sizeof(int) *
+                                      (size_t)(n_chunks > 0 ? n_chunks : 1));
+    tr->chunk_stops = (int32_t*)vv_alloc(sizeof(int32_t) *
+                                         (size_t)(n_chunks > 0 ? n_chunks : 1));
+    if (!tr->tokens || !tr->chunk_tokens || !tr->chunk_stops)
+        return VV_ERR_OUT_OF_MEMORY;
+    if (n > 0) memcpy(tr->tokens, ids, sizeof(int32_t) * (size_t)n);
+    for (int i = 0; i < n_chunks; i++) {
+        tr->chunk_tokens[i] = chunk_n[i];
+        tr->chunk_stops[i] = chunk_stop[i];
+    }
+    tr->num_tokens = n;
+    tr->num_chunks = n_chunks;
     return VV_OK;
 }

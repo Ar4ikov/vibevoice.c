@@ -46,6 +46,13 @@ vv_status_t vv_attn_gqa_decode_dev(
     const void* q, const vv_kv_view_t* kv, void* out, int n_q_heads,
     int cache_len, const int* d_cache_len, void* scratch, void* stream);
 
+/** @brief vv_attn_gqa_decode_dev for `rows` consecutive positions (a
+ *         verified block), row r at cache_len + r, each bit for bit. */
+vv_status_t vv_attn_gqa_decode_rows_dev(
+    const void* q, const vv_kv_view_t* kv, void* out, int n_q_heads,
+    int rows, int cache_len, const int* d_cache_len, void* scratch,
+    void* stream);
+
 /** @brief Compute capability of the current device as major*10+minor. */
 int vv_attn_device_sm(void);
 

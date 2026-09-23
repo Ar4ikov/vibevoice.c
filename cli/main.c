@@ -58,6 +58,7 @@ typedef struct {
     const char* source;
     const char* vae;
     const char* head;
+    const char* draft;
     const char* kv_paged;
     bool        cpu_only;
     float       vram_budget;
@@ -132,6 +133,9 @@ static void print_usage(const char* prog) {
         "                        default)\n"
         "  --source <from>       BitNet weights: auto (default: the GGUF pair\n"
         "                        when present) | gguf | safetensors\n"
+        "  --draft <dir>         DFlash 2 drafter for this model: decode drafts\n"
+        "                        a block of tokens and checks it in one pass\n"
+        "                        (tools/dflash; same tokens, fewer passes)\n"
         "  --head <fmt>          BitNet LM head on the CPU: auto (default: the\n"
         "                        F16 head's exact argmax through an int8\n"
         "                        filter) | f16 (full scan) | int8 (int8 rows\n"
@@ -210,6 +214,8 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->source = argv[++i];
         } else if (strcmp(argv[i], "--head") == 0 && i + 1 < argc) {
             args->head = argv[++i];
+        } else if (strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
+            args->draft = argv[++i];
         } else if (strcmp(argv[i], "--vram-budget") == 0 && i + 1 < argc) {
             args->vram_budget = (float)atof(argv[++i]);
             if (args->vram_budget < 0.0f) args->vram_budget = 0.0f;
@@ -439,6 +445,7 @@ int main(int argc, char** argv) {
         }
         init_params.head_format = (int)v;
     }
+    init_params.draft_dir = args.draft;
     if (args.kv_cache) {
         vv_kv_format_t f = vv_kv_format_parse(args.kv_cache);
         if (f >= VV_KV_FORMAT_COUNT) {

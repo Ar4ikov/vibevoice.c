@@ -16,7 +16,11 @@
  *  - greedy steps run on the captured decode step. The captures read the
  *    position from the device, so they are made once per launch shape and
  *    survive every prefill in between: a session re-captures a couple of
- *    dozen times over half an hour of audio, not once per chunk.
+ *    dozen times over half an hour of audio, not once per chunk;
+ *  - with a drafter (ctx->spec) the steps go a block at a time instead
+ *    (decode_block): the drafter's context follows every prefill through
+ *    its taps, so the session has to keep it in step -- one plain step
+ *    feeds a token the drafter never saw, and blocks are off from there.
  *
  * All device buffers are allocated at open, sized for the prompt as well as
  * a chunk; nothing on the per-chunk path allocates on the device. A closed
@@ -40,8 +44,10 @@
 #include "vibevoice/text_tokenizer.h"
 #include "vibevoice/device.h"
 #include "vibevoice/vibevoice.h"
+#include "vibevoice/spec.h"
 
 #include "pipeline_internal.h"
+#include "spec_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,7 +100,35 @@ typedef struct {
     float*   hid32;          /* [rows_cap][hs] */
     float*   one32;          /* [hs] */
     float*   norm32;         /* [hs] */
+
+    /* Speculative decoding: the context's drafter, live from the prompt
+     * until a plain step feeds a token it has not seen. */
+    vv_spec_t*       spec;
+    bool             spec_live;
+
+    /* A replay for vv_spec_trace(): every prefilled row's token and role,
+     * and what stopped each chunk of the run being replayed. */
+    vv_spec_trace_t* trace;
+    const int32_t*   trace_stops;
+    int              trace_chunks;
+    vv_status_t      trace_err;
 } sbe_t;
+
+/* Record `n` prefilled rows in the trace, positions kv_len - n .. */
+static void trace_rows(sbe_t* b, const int32_t* ids, int n, int kind_first,
+                       int kind_rest) {
+    vv_spec_trace_t* t = b->trace;
+    if (!t || b->trace_err != VV_OK) return;
+    if (t->n + n > t->cap) { b->trace_err = VV_ERR_OVERFLOW; return; }
+    for (int i = 0; i < n; i++) {
+        t->ids[t->n + i] = ids[i];
+        t->kind[t->n + i] = (uint8_t)(i == 0 ? kind_first : kind_rest);
+    }
+    t->n += n;
+    /* The taps put position p at row p; the two counts must agree. */
+    if (b->ctx->kv_cache && t->n != b->ctx->kv_cache->current_len)
+        b->trace_err = VV_ERR_SHAPE_MISMATCH;
+}
 
 /* ─── helpers ───────────────────────────────────────────────────────────── */
 
@@ -218,6 +252,16 @@ static vv_status_t gpu_head(sbe_t* b, const void* row, int32_t* tok) {
     return s;
 }
 
+/* A prefill at the cache's length, the drafter following it when live. */
+static vv_status_t prefill_rows(sbe_t* b, int n) {
+    vv_inference_ctx_t* ctx = b->ctx;
+    if (!b->spec_live) return vv_pipeline_prefill(ctx, b->hidden, n);
+    ctx->taps = vv_spec_prefill_taps(b->spec);
+    const vv_status_t s = vv_pipeline_prefill(ctx, b->hidden, n);
+    ctx->taps = NULL;
+    return s;
+}
+
 /* Every cache of the context (primary and shards) waits for pages or not. */
 static void set_kv_no_wait(vv_inference_ctx_t* ctx, bool on) {
     if (ctx->kv_cache) ctx->kv_cache->no_wait = on;
@@ -232,6 +276,10 @@ static vv_status_t gpu_prefill_prompt(void* self, const int32_t* ids, int n) {
     if (s != VV_OK) return s;
     vv_pipeline_kv_reset(ctx);
     set_kv_no_wait(ctx, b->kv_no_wait);
+    if (b->spec) {
+        vv_spec_reset(b->spec);
+        b->spec_live = true;
+    }
     s = gpu_rows(b, n);
     if (s == VV_OK) {
         /* Admission: the reservation now, all of it, or no session. */
@@ -242,9 +290,29 @@ static vv_status_t gpu_prefill_prompt(void* self, const int32_t* ids, int n) {
                      "for another session; refusing it", want);
     }
     if (s == VV_OK) s = gpu_embed_rows(b, ids, n);
+    if (s == VV_OK) s = prefill_rows(b, n);
+    if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
+    if (s == VV_OK) trace_rows(b, ids, n, VV_TRACE_CONTEXT, VV_TRACE_CONTEXT);
+    return s;
+}
+
+/* Known tokens at the current length, no head: a replay's chunk text. */
+static vv_status_t gpu_prefill_tokens(void* self, const int32_t* ids, int n) {
+    sbe_t* b = (sbe_t*)self;
+    vv_inference_ctx_t* ctx = b->ctx;
+    vv_status_t s = bind(b);
+    if (s != VV_OK || n <= 0) return s;
+    if (b->trace_err != VV_OK) return b->trace_err;
+    s = gpu_rows(b, n);
+    if (s == VV_OK)
+        s = vv_pipeline_kv_reserve(ctx, ctx->kv_cache->current_len + n + 1);
+    if (s == VV_OK) s = gpu_embed_rows(b, ids, n);
     if (s == VV_OK) s = vv_pipeline_prefill(ctx, b->hidden, n);
     if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
-    return s;
+    if (s == VV_OK) trace_rows(b, ids, n, VV_TRACE_GEN, VV_TRACE_GEN);
+    /* The next chunk's token rows must not be mistaken for these. */
+    b->tok_dev_id = -1;
+    return s == VV_OK ? b->trace_err : s;
 }
 
 static vv_status_t gpu_prefill_chunk(void* self, const vv_stream_chunk_t* ch,
@@ -319,11 +387,24 @@ static vv_status_t gpu_prefill_chunk(void* self, const vv_stream_chunk_t* ch,
         dump_f16_rows(name, b, rows, ch->n_frames);
     }
 
-    s = vv_pipeline_prefill(ctx, b->hidden, n);
+    s = prefill_rows(b, n);
     if (s != VV_OK) return s;
     s = gpu_head(b, (const uint8_t*)b->hidden + (size_t)(n - 1) * b->hs * 2,
                  first);
     if (s != VV_OK) return s;
+    /*
+     * A folded chunk end is what the previous chunk predicted last -- a
+     * label -- when that chunk did stop on it (not on EOS or the cap).
+     */
+    {
+        const int32_t tce = ctx->family.tok.text_chunk_end;
+        const bool label = ch->rows[0] == tce && b->trace_stops &&
+                           ch->index > 0 && ch->index <= b->trace_chunks &&
+                           b->trace_stops[ch->index - 1] == tce;
+        trace_rows(b, ids, n, label ? VV_TRACE_LABEL : VV_TRACE_CONTEXT,
+                   VV_TRACE_CONTEXT);
+    }
+    if (b->trace_err != VV_OK) return b->trace_err;
     dump_logits_dev(b, ch->index);
     /* Decode reads the length on the device. */
     vv_pipeline_kv_publish(ctx);
@@ -388,6 +469,12 @@ static vv_status_t gpu_decode_step(void* self, int32_t token, int32_t* next) {
     vv_status_t s = bind(b);
     if (s != VV_OK) return s;
     if (token < 0 || token >= b->vocab) return VV_ERR_INVALID_ARG;
+    if (b->spec_live) {
+        /* The drafter will not see this token: blocks end here. */
+        b->spec_live = false;
+        VV_LOG_I("stream: a plain step at %d positions; no more drafted "
+                 "blocks in this session", ctx->kv_cache->current_len);
+    }
 
     if (b->embed_on_cpu) {
         const size_t row = (size_t)b->hs * 2;
@@ -412,6 +499,37 @@ static vv_status_t gpu_decode_step(void* self, int32_t token, int32_t* next) {
     s = vv_pipeline_step(ctx, b->hidden_one, b->graph_ok, b->graphs);
     if (s != VV_OK) return s;
     return gpu_head(b, b->hidden_one, next);
+}
+
+static vv_status_t gpu_decode_block(void* self, int32_t token, int32_t* out,
+                                    int* n) {
+    sbe_t* b = (sbe_t*)self;
+    vv_inference_ctx_t* ctx = b->ctx;
+    vv_status_t s = bind(b);
+    if (s != VV_OK) return s;
+    if (!b->spec_live) return VV_ERR_UNSUPPORTED;
+    if (token < 0 || token >= b->vocab) return VV_ERR_INVALID_ARG;
+    s = vv_spec_cycle(ctx, b->spec, token, out, n);
+    /* The step graphs read the length from the device, and the device's
+     * token is no longer the one they would embed. */
+    b->tok_dev_id = -1;
+    if (s == VV_OK) vv_pipeline_kv_publish(ctx);
+    return s;
+}
+
+static int gpu_block_size(void* self) {
+    const sbe_t* b = (const sbe_t*)self;
+    return b->spec_live ? vv_spec_block(b->spec) : 0;
+}
+
+static vv_status_t gpu_truncate(void* self, int64_t len) {
+    sbe_t* b = (sbe_t*)self;
+    vv_status_t s = bind(b);
+    if (s != VV_OK) return s;
+    if (!b->spec_live) return VV_ERR_UNSUPPORTED;
+    s = vv_spec_rewind(b->ctx, b->spec, (int)len);
+    if (s == VV_OK) vv_pipeline_kv_publish(b->ctx);
+    return s;
 }
 
 /* The device buffers a session leaves on its context for the next one. */
@@ -511,6 +629,11 @@ static vv_status_t gpu_open(sbe_t* b, int rows, bool ahead) {
     }
     b->graph_ok = vv_pipeline_graph_ok(ctx);
     b->tok_dev_id = -1;
+    /* Blocks need the head and the embedding on the device, one shard,
+     * and no replay (a trace owns the taps). */
+    b->spec = ctx->spec && !b->trace && !b->embed_on_cpu && !b->head_on_cpu &&
+              ctx->n_shards == 0 ? ctx->spec : NULL;
+    b->spec_live = false;
     const size_t row = (size_t)b->hs * 2;
 
     /* What the previous session on this slot left: the same model, so the
@@ -699,9 +822,23 @@ vv_status_t vv_stream_params_for(const vv_inference_ctx_t* ctx,
     return VV_OK;
 }
 
+static vv_status_t stream_open_impl(vv_inference_ctx_t* ctx,
+                                    const vv_stream_params_t* params,
+                                    vv_spec_trace_t* trace,
+                                    const vv_transcription_t* replayed,
+                                    vv_stream_t** out);
+
 vv_status_t vv_stream_open(vv_inference_ctx_t* ctx,
                            const vv_stream_params_t* params,
                            vv_stream_t** out) {
+    return stream_open_impl(ctx, params, NULL, NULL, out);
+}
+
+static vv_status_t stream_open_impl(vv_inference_ctx_t* ctx,
+                                    const vv_stream_params_t* params,
+                                    vv_spec_trace_t* trace,
+                                    const vv_transcription_t* replayed,
+                                    vv_stream_t** out) {
     if (!ctx || !params || !out) return VV_ERR_NULL_PTR;
     *out = NULL;
     if (!ctx->tokenizer || !ctx->family_ok) {
@@ -727,6 +864,10 @@ vv_status_t vv_stream_open(vv_inference_ctx_t* ctx,
     memset(b, 0, sizeof(*b));
     b->ctx = ctx;
     b->gpu = ctx->use_gpu && ctx->placement != VV_PLACE_CPU_ONLY;
+    b->trace = trace;
+    b->trace_stops = replayed ? replayed->chunk_stops : NULL;
+    b->trace_chunks = replayed ? replayed->num_chunks : 0;
+    b->trace_err = VV_OK;
     b->hs = ctx->model->config.llm.hidden_size;
     b->vocab = ctx->model->config.llm.vocab_size;
     b->pad_id = ctx->family.tok.speech_pad >= 0 ? ctx->family.tok.speech_pad
@@ -775,6 +916,10 @@ vv_status_t vv_stream_open(vv_inference_ctx_t* ctx,
         be.prefill_prompt = gpu_prefill_prompt;
         be.prefill_chunk = gpu_prefill_chunk;
         be.decode_step = gpu_decode_step;
+        be.decode_block = gpu_decode_block;
+        be.block_size = gpu_block_size;
+        be.truncate = gpu_truncate;
+        be.prefill_tokens = gpu_prefill_tokens;
         be.destroy = gpu_destroy;
         if (ahead) be.encode_ahead = gpu_encode_ahead;
     } else {
@@ -806,11 +951,62 @@ vv_status_t vv_stream_open(vv_inference_ctx_t* ctx,
     return s;
 }
 
+/* ─── replay (vv_spec_trace) ────────────────────────────────────────────── */
+
+vv_status_t vv_stream_trace(vv_inference_ctx_t* ctx, const float* pcm24k,
+                            int n_samples, const char* context_info,
+                            const vv_transcription_t* tr,
+                            vv_spec_trace_t* t) {
+    if (tr->num_chunks <= 0 || !tr->chunk_tokens) return VV_ERR_INVALID_ARG;
+    vv_stream_params_t p;
+    vv_status_t s = vv_stream_params_for(ctx, &p);
+    if (s != VV_OK) return s;
+    p.context_info = context_info;
+    p.force_ids = tr->tokens;
+    p.force_n = tr->chunk_tokens;
+    p.force_chunks = tr->num_chunks;
+
+    t->n = 0;
+    ctx->taps = &t->taps;
+    vv_stream_t* st = NULL;
+    s = stream_open_impl(ctx, &p, t, tr, &st);
+    if (s == VV_OK) s = vv_stream_push(st, pcm24k, (size_t)n_samples);
+    if (s == VV_OK) s = vv_stream_finish(st);
+    if (s == VV_OK) {
+        vv_stream_stats_t ss;
+        vv_stream_get_stats(st, &ss);
+        /* The same audio in the same windows: as many chunks as the run. */
+        if (ss.chunks != tr->num_chunks) {
+            VV_LOG_E("trace: the replay made %lld chunks, the run %d",
+                     (long long)ss.chunks, tr->num_chunks);
+            s = VV_ERR_SHAPE_MISMATCH;
+        }
+    }
+    vv_stream_close(st);
+    ctx->taps = NULL;
+
+    /* The last chunk's stop follows it as a label with no features. */
+    const int32_t stop = tr->chunk_stops ? tr->chunk_stops[tr->num_chunks - 1]
+                                         : -1;
+    if (s == VV_OK && stop >= 0) {
+        if (t->n + 1 > t->cap) return VV_ERR_OVERFLOW;
+        t->ids[t->n] = stop;
+        t->kind[t->n] = VV_TRACE_LABEL;
+        t->n++;
+    }
+    return s;
+}
+
 /* ─── whole clip ────────────────────────────────────────────────────────── */
 
 typedef struct {
     char**   texts;
     int      n, cap;
+    /* Every chunk's ids back to back, and per chunk its count and stop. */
+    int32_t* ids;
+    int      n_ids, cap_ids;
+    int*     chunk_n;
+    int32_t* chunk_stop;
     vv_stream_event_fn user_fn;
     void*    user;
     vv_status_t oom;
@@ -822,14 +1018,34 @@ static void collect_event(void* user, const vv_stream_event_t* ev) {
         if (c->n == c->cap) {
             const int nc = c->cap ? c->cap * 2 : 64;
             char** nt = (char**)vv_realloc(c->texts, sizeof(char*) * (size_t)nc);
-            if (!nt) { c->oom = VV_ERR_OUT_OF_MEMORY; goto fwd; }
-            c->texts = nt;
+            int* nn = (int*)vv_realloc(c->chunk_n, sizeof(int) * (size_t)nc);
+            if (nn) c->chunk_n = nn;
+            int32_t* ns = (int32_t*)vv_realloc(c->chunk_stop,
+                                               sizeof(int32_t) * (size_t)nc);
+            if (ns) c->chunk_stop = ns;
+            if (nt) c->texts = nt;
+            if (!nt || !nn || !ns) { c->oom = VV_ERR_OUT_OF_MEMORY; goto fwd; }
             c->cap = nc;
+        }
+        if (c->n_ids + ev->n_tokens > c->cap_ids) {
+            int nc = c->cap_ids ? c->cap_ids : 1024;
+            while (nc < c->n_ids + ev->n_tokens) nc *= 2;
+            int32_t* ni = (int32_t*)vv_realloc(c->ids,
+                                               sizeof(int32_t) * (size_t)nc);
+            if (!ni) { c->oom = VV_ERR_OUT_OF_MEMORY; goto fwd; }
+            c->ids = ni;
+            c->cap_ids = nc;
         }
         char* t = (char*)vv_alloc(ev->text_len + 1);
         if (!t) { c->oom = VV_ERR_OUT_OF_MEMORY; goto fwd; }
         memcpy(t, ev->text, ev->text_len);
         t[ev->text_len] = '\0';
+        if (ev->n_tokens > 0 && ev->ids)
+            memcpy(c->ids + c->n_ids, ev->ids,
+                   sizeof(int32_t) * (size_t)ev->n_tokens);
+        c->n_ids += ev->ids ? ev->n_tokens : 0;
+        c->chunk_n[c->n] = ev->ids ? ev->n_tokens : 0;
+        c->chunk_stop[c->n] = ev->stop_id;
         c->texts[c->n++] = t;
     }
 fwd:
@@ -879,6 +1095,10 @@ vv_status_t vv_stream_transcribe(vv_inference_ctx_t* ctx,
         s = vv_stream_build_transcription((const char* const*)col.texts,
                                           col.n, chunk_sec,
                                           perf->audio_duration_sec, result);
+        if (s == VV_OK && *result)
+            s = vv_transcription_set_tokens(*result, col.ids, col.n_ids,
+                                            col.chunk_n, col.chunk_stop,
+                                            col.n);
     }
 
     if (st) {
@@ -900,6 +1120,9 @@ vv_status_t vv_stream_transcribe(vv_inference_ctx_t* ctx,
     }
     for (int i = 0; i < col.n; i++) vv_free(col.texts[i]);
     vv_free(col.texts);
+    vv_free(col.ids);
+    vv_free(col.chunk_n);
+    vv_free(col.chunk_stop);
 
     perf->total_ms = vv_time_ms() - t_start;
     perf->ttft_ms = ss.prompt_ms;

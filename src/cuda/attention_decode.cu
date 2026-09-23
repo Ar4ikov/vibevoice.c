@@ -140,11 +140,29 @@ void gqa_decode_kernel(
     const int part    = (H == 1) ? (int)blockIdx.y
                                  : (int)(blockIdx.y * GD_WARPS + threadIdx.y);
     const int head0   = kv_head * G + ((H == 1) ? (int)threadIdx.y : 0);
-    if (part >= n_parts) return;
 
     /* A replayed graph keeps its arguments: the length comes from device
      * memory, and n_parts only sizes the grid within a shape bucket. */
     if (d_cache_len) cache_len = *d_cache_len;
+
+    /*
+     * Rows of a verified block (gridDim.z > 1): row r is the decode of the
+     * position after r more tokens, so it attends to cache_len + r
+     * positions over the slices a one-row decode at that length would cut,
+     * into partials of its own.
+     */
+    if (gridDim.z > 1) {
+        const int r = (int)blockIdx.z;
+        const int n_q_heads = n_kv_heads * G;
+        cache_len += r;
+        n_parts = vv_decode_n_parts(cache_len);
+        q += (size_t)r * n_q_heads * ATT_D;
+        const size_t rows = (size_t)n_q_heads * VV_DECODE_MAX_PARTS;
+        part_o += (size_t)r * rows * ATT_D;
+        part_m += (size_t)r * rows;
+        part_l += (size_t)r * rows;
+    }
+    if (part >= n_parts) return;
 
     const int chunk = (cache_len + n_parts - 1) / n_parts;
     const int begin = part * chunk;
@@ -303,6 +321,77 @@ vv_status_t vv_attn_gqa_decode_dev(
 
     att_combine_kernel<<<n_q_heads, ATT_D, 0, st>>>(pt.o, pt.m, pt.l,
                                                    (half*)out, n_parts);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
+/*
+ * `rows` consecutive decodes in one launch: row r (q and out row r) attends
+ * to cache_len + r positions, each exactly as vv_attn_gqa_decode_dev would
+ * at that length. The layout choice is the one of the longest row; layouts
+ * share their arithmetic, so it changes nothing.
+ */
+vv_status_t vv_attn_gqa_decode_rows_dev(
+    const void* q, const vv_kv_view_t* kv, void* out, int n_q_heads,
+    int rows, int cache_len, const int* d_cache_len, void* scratch,
+    void* stream)
+{
+    if (!q || !kv || !kv->k || !kv->v || !out || !scratch)
+        return VV_ERR_NULL_PTR;
+    if (rows < 1 || cache_len <= 0) return VV_ERR_INVALID_ARG;
+    if (!vv_attn_gqa_decode_ok(n_q_heads, kv->n_kv_heads, kv->head_dim))
+        return VV_ERR_UNSUPPORTED;
+    if (rows == 1)
+        return vv_attn_gqa_decode_dev(q, kv, out, n_q_heads, cache_len,
+                                      d_cache_len, scratch, stream);
+
+    const int n_kv = kv->n_kv_heads;
+    const int G = n_q_heads / n_kv;
+    const int n_parts = vv_decode_n_parts(cache_len + rows - 1);
+    const vv_decode_parts_t pt = vv_decode_parts_rows(scratch, n_q_heads,
+                                                      ATT_D, rows);
+    const int bpv = vv_kv_bytes_per_vec((vv_kv_format_t)kv->format, ATT_D);
+    const float scale = 1.0f / sqrtf((float)ATT_D);
+    cudaStream_t st = (cudaStream_t)stream;
+    const uint8_t* K = (const uint8_t*)kv->k;
+    const uint8_t* V = (const uint8_t*)kv->v;
+    const half* Km = (const half*)kv->k_meta;
+    const half* Vm = (const half*)kv->v_meta;
+
+    const int sm_count = vv_attn_device_sm_count();
+    const bool packed = G == 1 ||
+        (kv->format != VV_KV_FP16 &&
+         n_kv * n_parts >= GD_PACKED_WARPS_PER_SM * sm_count);
+    const dim3 grid = packed ? dim3(n_kv, n_parts / GD_WARPS, rows)
+                             : dim3(n_kv, n_parts, rows);
+    const dim3 block = packed ? dim3(32, GD_WARPS) : dim3(32, G);
+#define GD_LAUNCH(F, HH)                                                       \
+    gqa_decode_kernel<F, HH><<<grid, block, 0, st>>>(                          \
+        (const half*)q, K, V, Km, Vm, kv->page_table, pt.o, pt.m, pt.l,        \
+        n_kv, G, cache_len, d_cache_len, n_parts, bpv, scale)
+#define GD_FMT(F)                                                              \
+    if (!packed) { GD_LAUNCH(F, 1); } else switch (G) {                        \
+        case 1: GD_LAUNCH(F, 1); break;                                        \
+        case 2: GD_LAUNCH(F, 2); break;                                        \
+        case 4: GD_LAUNCH(F, 4); break;                                        \
+        case 6: GD_LAUNCH(F, 6); break;                                        \
+        case 7: GD_LAUNCH(F, 7); break;                                        \
+        default: GD_LAUNCH(F, 8); break;                                       \
+    }
+    switch (kv->format) {
+        case VV_KV_FP16:     GD_FMT(VV_KV_FP16);     break;
+        case VV_KV_FP8_E4M3: GD_FMT(VV_KV_FP8_E4M3); break;
+        case VV_KV_FP8_E5M2: GD_FMT(VV_KV_FP8_E5M2); break;
+        case VV_KV_TQ4:      GD_FMT(VV_KV_TQ4);      break;
+        case VV_KV_TQ3:      GD_FMT(VV_KV_TQ3);      break;
+        case VV_KV_TQ2:      GD_FMT(VV_KV_TQ2);      break;
+        case VV_KV_TQ1_5:    GD_FMT(VV_KV_TQ1_5);    break;
+        default: return VV_ERR_UNSUPPORTED;
+    }
+#undef GD_FMT
+#undef GD_LAUNCH
+
+    att_combine_rows_kernel<<<dim3(n_q_heads, rows), ATT_D, 0, st>>>(
+        pt.o, pt.m, pt.l, (half*)out, n_q_heads, cache_len, d_cache_len, 0);
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 

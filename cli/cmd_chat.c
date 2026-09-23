@@ -88,6 +88,9 @@ static void usage(const char* which) {
         "                        w8a8 | w4a8\n"
         "  --vae <numerics>      auto (default) | float | int8 (BitNet)\n"
         "  --source <from>       BitNet weights: auto | gguf | safetensors\n"
+        "  --draft <dir>         DFlash 2 drafter for this model: decode drafts\n"
+        "                        a block of tokens and checks it in one pass\n"
+        "                        (tools/dflash; same tokens, fewer passes)\n"
         "  --head <fmt>          BitNet CPU head: auto | f16 | int8\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
         "                        attention kernels; VV_ATTN= does the same\n"
@@ -184,6 +187,9 @@ static int parse_common(int argc, char** argv, chat_args_t* a,
                 return -1;
             }
             a->ep.weights_source = (int)v;
+        }
+        else if (strcmp(s, "--draft") == 0 && next) {
+            a->ep.draft_dir = argv[++i];
         }
         else if (strcmp(s, "--head") == 0 && next) {
             const vv_head_format_t v = vv_head_format_parse(argv[++i]);

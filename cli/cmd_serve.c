@@ -54,6 +54,9 @@ static void usage(void) {
         "  --vae <numerics>      auto (default) | float | int8 — speech encoder\n"
         "                        (int8: VibeVoice-ASR-BitNet, VibeASR.cpp's)\n"
         "  --source <from>       BitNet weights: auto | gguf | safetensors\n"
+        "  --draft <dir>         DFlash 2 drafter for this model: decode drafts\n"
+        "                        a block of tokens and checks it in one pass\n"
+        "                        (tools/dflash; same tokens, fewer passes)\n"
         "  --head <fmt>          BitNet head on the CPU: auto (exact, int8\n"
         "                        filter) | f16 (full scan) | int8 (approximate)\n"
         "  --attn <backend>      auto (default) | fa1 | fa2 | flashinfer —\n"
@@ -170,6 +173,9 @@ int vv_cmd_serve(int argc, char** argv) {
                 return 1;
             }
             ep.weights_source = (int)v;
+        }
+        else if (strcmp(a, "--draft") == 0 && next) {
+            ep.draft_dir = argv[++i];
         }
         else if (strcmp(a, "--head") == 0 && next) {
             const vv_head_format_t v = vv_head_format_parse(argv[++i]);

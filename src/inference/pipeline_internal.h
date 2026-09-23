@@ -59,6 +59,16 @@ void vv_pipeline_kv_release(vv_inference_ctx_t* ctx);
  *         `ctx` (stream_ctx.c). Called by vv_inference_free(). */
 void vv_stream_ctx_drop_cache(vv_inference_ctx_t* ctx);
 
+struct vv_spec_trace;
+struct vv_transcription;
+
+/** @brief vv_spec_trace() for a chunked model: a replayed session
+ *         (stream_ctx.c). The device is bound and `t` checked. */
+vv_status_t vv_stream_trace(vv_inference_ctx_t* ctx, const float* pcm24k,
+                            int n_samples, const char* context_info,
+                            const struct vv_transcription* tr,
+                            struct vv_spec_trace* t);
+
 /** @brief Partials the device argmax reduces through, per call. */
 #define VV_ARGMAX_PARTIALS 256
 

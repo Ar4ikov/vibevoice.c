@@ -46,6 +46,16 @@ vv_status_t vv_dev_memcpy_d2h(void* dst, const void* src, size_t size, void* s) 
 vv_status_t vv_dev_memcpy_d2d(void* dst, const void* src, size_t size, void* s) {
     return vv_dev_memcpy_h2d(dst, src, size, s);
 }
+vv_status_t vv_dev_memcpy2d_d2d(void* dst, size_t dpitch, const void* src,
+                                size_t spitch, size_t width, size_t height,
+                                void* s) {
+    (void)s;
+    if (!dst || !src) return VV_ERR_NULL_PTR;
+    for (size_t r = 0; r < height; r++)
+        memcpy((unsigned char*)dst + r * dpitch,
+               (const unsigned char*)src + r * spitch, width);
+    return VV_OK;
+}
 vv_status_t vv_dev_memset_async(void* p, int v, size_t n, void* s) {
     (void)s;
     if (!p) return VV_ERR_NULL_PTR;
@@ -480,6 +490,67 @@ vv_status_t vv_i8_head_argmax_dev(const int8_t* q, const float* sc,
                                   void* s) {
     U(q) U(sc) U(w) U(ws) U(V) U(K) U(tok) U(val) U(scr) U(s)
     return VV_ERR_UNSUPPORTED;
+}
+
+/* Speculative decoding (dflash.cu): no kernels here, so no drafter. */
+vv_status_t vv_lm_head_rows_dev(const void* x, const void* W, void* l, int M,
+                                int V, int K, void* s) {
+    U(x) U(W) U(l) U(M) U(V) U(K) U(s) return VV_ERR_UNSUPPORTED;
+}
+size_t vv_argmax_rows_scratch_bytes(int M) { U(M) return 0; }
+vv_status_t vv_argmax_rows_dev(const void* l, int M, int V, void* scr,
+                               int32_t* t, void* s) {
+    U(l) U(M) U(V) U(scr) U(t) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_topk_rows_dev(const float* l, int M, int V, int k, float* v,
+                             int32_t* i, void* s) {
+    U(l) U(M) U(V) U(k) U(v) U(i) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_dflash_conv_dev(const void* x, const void* d, int ld,
+                               const float* b, void* o, int M, int H, int t,
+                               int g, int bl, void* s) {
+    U(x) U(d) U(ld) U(b) U(o) U(M) U(H) U(t) U(g) U(bl) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_dflash_walk_dev(const void* h, const float* u,
+                               const int32_t* c, const void* p,
+                               const void* q, const int32_t* a, int M, int k,
+                               int r, int32_t* o, void* s) {
+    U(h) U(u) U(c) U(p) U(q) U(a) U(M) U(k) U(r) U(o) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_w4a16_gemv_rows_dev(const void* x, int M,
+                                   const vv_w4a16_proj_t* p, int n, int K,
+                                   int g, void* s) {
+    U(x) U(M) U(p) U(n) U(K) U(g) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_attn_decode_rows(int b, const void* q, const vv_kv_view_t* kv,
+                                void* o, int h, int r, int c, const int* dc,
+                                void* scr, void* s) {
+    U(b) U(q) U(kv) U(o) U(h) U(r) U(c) U(dc) U(scr) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+size_t vv_attn_rows_scratch_bytes(int h, int d, int r) {
+    U(h) U(d) U(r) return 0;
+}
+vv_status_t vv_rmsnorm_f32in_dev(const float* x, const void* w, void* y,
+                                 int r, int H, float e, void* s) {
+    U(x) U(w) U(y) U(r) U(H) U(e) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_add_scaled_f16_dev(float* h, const void* y, float sc, int n,
+                                  bool set, void* s) {
+    U(h) U(y) U(sc) U(n) U(set) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_gather_i32_dev(const int32_t* m, int32_t* i, int n, void* s) {
+    U(m) U(i) U(n) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_dflash_block_ids_dev(const int32_t* a, int m, int n,
+                                    int32_t* i, void* s) {
+    U(a) U(m) U(n) U(i) U(s) return VV_ERR_UNSUPPORTED;
+}
+vv_status_t vv_dflash_accept_dev(const int32_t* d, const int32_t* p, int n,
+                                 int32_t* o, int32_t* c, void* s) {
+    U(d) U(p) U(n) U(o) U(c) U(s) return VV_ERR_UNSUPPORTED;
 }
 
 #undef U

@@ -56,6 +56,17 @@ vv_status_t vv_dev_memcpy_d2d_at(void* dst_base, const void* src, size_t size,
 vv_status_t vv_dev_memset(void* ptr, int value, size_t size);
 
 /**
+ * @brief `height` rows of `width` bytes, row r from `src + r * spitch` to
+ *        `dst + r * dpitch`, device to device, ordered on `stream`.
+ *
+ * What scatters one layer's hidden rows into a buffer that interleaves
+ * several layers per position (the drafter's context features).
+ */
+vv_status_t vv_dev_memcpy2d_d2d(void* dst, size_t dpitch, const void* src,
+                                size_t spitch, size_t width, size_t height,
+                                void* stream);
+
+/**
  * @brief vv_dev_memset, ordered on a stream rather than device-wide.
  *
  * The unstreamed form runs on the legacy default stream, which synchronises
@@ -266,6 +277,19 @@ typedef struct vv_w4a16_proj {
 vv_status_t vv_w4a16_gemv_multi_dev(
     const void* x, const vv_w4a16_proj_t* projs, int n_proj,
     int K, int group_size, void* stream);
+
+/**
+ * @brief vv_w4a16_gemv_multi_dev for M <= 16 rows of x at once: row m of
+ *        projection i lands at projs[i].y + m * N_i.
+ *
+ * Every row is computed exactly as the one-token GEMV computes it -- the
+ * same lanes over the same chunks, the same chains, the same reduction --
+ * with the weights read once for all rows. That is what makes a drafted
+ * block checked in one pass produce a token-by-token decode's bits.
+ */
+vv_status_t vv_w4a16_gemv_rows_dev(const void* x, int M,
+                                   const vv_w4a16_proj_t* projs, int n_proj,
+                                   int K, int group_size, void* stream);
 
 /**
  * @brief out[m][j] = x[m][perm[j]] (FP16, K % 8 == 0, perm 16-byte aligned).
@@ -589,6 +613,24 @@ vv_status_t vv_attn_decode(int backend, const void* q, const vv_kv_view_t* kv,
                            void* stream);
 
 /**
+ * @brief `rows` decodes at consecutive positions in one launch: row r of `q`
+ *        (and of `out`) is the query of position cache_len - 1 + r and sees
+ *        cache_len + r positions -- a drafted block checked in one pass.
+ *
+ * Every row is computed exactly as vv_attn_decode computes it at that
+ * length: same split, same slices, same merge. The cache already holds the
+ * block's own K and V. `scratch`: vv_attn_rows_scratch_bytes().
+ */
+vv_status_t vv_attn_decode_rows(int backend, const void* q,
+                                const vv_kv_view_t* kv, void* out,
+                                int n_q_heads, int rows, int cache_len,
+                                const int* d_cache_len, void* scratch,
+                                void* stream);
+
+/** @brief Scratch vv_attn_decode_rows needs for `rows` rows. */
+size_t vv_attn_rows_scratch_bytes(int n_q_heads, int head_dim, int rows);
+
+/**
  * @brief Quantize (or copy, for FP16) K/V vectors into a cache layer, at
  *        rows from `page_table` when it is set.
  *
@@ -711,6 +753,81 @@ vv_status_t vv_lm_head_gemv_dev(
 vv_status_t vv_argmax_dev(
     const void* logits, int V, void* scratch_v, void* scratch_i,
     void* out_token, void* out_value, void* stream);
+
+/* ─── Speculative decoding (dflash.cu) ───────────────────────────────────── */
+
+/**
+ * @brief logits[m][:] = W . x[m] for M <= 16 rows, W read once.
+ *
+ * Each row is computed exactly as vv_lm_head_gemv_dev computes one: a block
+ * of drafted tokens checked in one pass gets the logits a token-by-token
+ * decode would have. x [M][K] FP16, W [V][K] FP16, logits [M][V] FP32.
+ */
+vv_status_t vv_lm_head_rows_dev(const void* x, const void* W, void* logits,
+                                int M, int V, int K, void* stream);
+
+/** @brief Scratch bytes vv_argmax_rows_dev needs for M rows. */
+size_t vv_argmax_rows_scratch_bytes(int M);
+
+/** @brief vv_argmax_dev on each of M rows of [M][V] FP32 logits; the tokens
+ *         land in `out_tokens` [M] (device int32). Same ties, same bits. */
+vv_status_t vv_argmax_rows_dev(const void* logits, int M, int V,
+                               void* scratch, int32_t* out_tokens,
+                               void* stream);
+
+/** @brief The `k` (<= 32) largest logits of each row, descending, ties to
+ *         the lower id: values [M][k] FP32, ids [M][k] int32. */
+vv_status_t vv_topk_rows_dev(const float* logits, int M, int V, int k,
+                             float* out_vals, int32_t* out_ids, void* stream);
+
+/**
+ * @brief The drafter's two-tap dynamic convolution over rows cut into blocks
+ *        of `block`: out[t][c] = sum_o (base[o][c] + dyn[t][o*G + c/gs]) *
+ *        x[t-o][c], taps never reaching into the previous block.
+ * @param dyn  FP16 [M][dyn_ld], this conv's `taps * H/group_size` columns
+ * @param base FP32 [taps][H]
+ */
+vv_status_t vv_dflash_conv_dev(const void* x, const void* dyn, int dyn_ld,
+                               const float* base, void* out, int M, int H,
+                               int taps, int group_size, int block,
+                               void* stream);
+
+/**
+ * @brief The drafter's path selector: from `*anchor`, each of M positions
+ *        takes its best candidate under unary[t][j] + <pred_cb[prev] *
+ *        hproj[t], succ_cb[cand[t][j]]>. hproj [M][rank] FP16, unary and
+ *        cand [M][k], codebooks [V][rank] FP16; out [M] device int32.
+ */
+vv_status_t vv_dflash_walk_dev(const void* hproj, const float* unary,
+                               const int32_t* cand, const void* pred_cb,
+                               const void* succ_cb, const int32_t* anchor,
+                               int M, int k, int rank, int32_t* out,
+                               void* stream);
+
+/** @brief RMSNorm of FP32 rows into FP16: y = x rsqrt(mean(x^2) + eps) w. */
+vv_status_t vv_rmsnorm_f32in_dev(const float* x, const void* w, void* y,
+                                 int rows, int H, float eps, void* stream);
+
+/** @brief h[i] += scale * y[i] for FP32 h and FP16 y (`set`: h = scale y). */
+vv_status_t vv_add_scaled_f16_dev(float* h, const void* y, float scale, int n,
+                                  bool set, void* stream);
+
+/** @brief idx[i] = map[idx[i]] for i < n, in place (device). */
+vv_status_t vv_gather_i32_dev(const int32_t* map, int32_t* idx, int n,
+                              void* stream);
+
+/** @brief ids[0] = *anchor, ids[1..n) = mask_id (device). */
+vv_status_t vv_dflash_block_ids_dev(const int32_t* anchor, int mask_id,
+                                    int n, int32_t* ids, void* stream);
+
+/**
+ * @brief Compare a drafted block with the target's tokens for it: out gets
+ *        the drafts the target agrees with, then the target's next token,
+ *        and *n_out their count (device).
+ */
+vv_status_t vv_dflash_accept_dev(const int32_t* draft, const int32_t* post,
+                                 int n_draft, int32_t* out, int32_t* n_out,
+                                 void* stream);
 
 /* ─── Conversions ──────────────────────────────────────────────────────────── */
 
