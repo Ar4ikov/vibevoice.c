@@ -675,6 +675,10 @@ def main():
     evals = None
     if a.eval_dir:
         evals = [read_vvdt(f) for f in sorted(glob.glob(os.path.join(a.eval_dir, "*.vvdt")))]
+        if not evals:
+            # --out keeps the best checkpoint on these; without any, the
+            # first one would be kept for good.
+            raise SystemExit(f"no traces in --eval-dir {a.eval_dir}")
         print(f"eval: {len(evals)} traces", flush=True)
 
     def evaluate():
