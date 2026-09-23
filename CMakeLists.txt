@@ -367,8 +367,9 @@ endif()
 
 # ─── DFlash training data (tools/dflash) ─────────────────────────────────────
 # The target's transcripts and its hidden states along them, for training a
-# drafter (tools/dflash/README.md). Built with the CLI; nothing links it.
-if(VV_BUILD_CLI)
+# drafter (docs/DFLASH.md). Built with the CLI where its source is there; the
+# container copies only what the runtime needs, and nothing links it.
+if(VV_BUILD_CLI AND EXISTS "${CMAKE_SOURCE_DIR}/tools/dflash/dflash_data.c")
     add_executable(vv_dflash_data tools/dflash/dflash_data.c)
     target_link_libraries(vv_dflash_data PRIVATE vibevoice_core)
     if(VV_ACCEL_LIB)
