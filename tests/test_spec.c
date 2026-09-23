@@ -709,9 +709,9 @@ int main(void) {
     }
     {
         const int backends[3] = { VV_ATTN_FA1, VV_ATTN_FA2, VV_ATTN_FLASHINFER };
-        const int fmts[2] = { VV_KV_FP16, VV_KV_TQ4 };
+        const int fmts[3] = { VV_KV_FP16, VV_KV_FP8_E4M3, VV_KV_TQ4 };
         for (int bi = 0; bi < 3; bi++)
-            for (int fi = 0; fi < 2; fi++) {
+            for (int fi = 0; fi < 3; fi++) {
                 /* 1020 + 8 crosses a flashinfer split step; 250 + 8 an fa2 one */
                 test_attn_rows(backends[bi], fmts[fi], false, 28, 4, 1020, 8);
                 test_attn_rows(backends[bi], fmts[fi], false, 28, 4, 250, 8);

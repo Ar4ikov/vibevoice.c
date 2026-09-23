@@ -430,6 +430,9 @@ typedef struct {
     double  encode_ms;      /**< sum of the chunks' encode_ms */
     double  decode_ms;      /**< sum of the chunks' decode_ms */
     double  max_chunk_ms;   /**< slowest chunk, prefill + decode */
+    int64_t blocks;         /**< drafted blocks decoded (decode_block) */
+    int64_t blocks_cut;     /**< of those, fed past a stop or the cap and
+                                 cut back (truncate) */
 } vv_stream_stats_t;
 
 typedef struct vv_stream vv_stream_t;

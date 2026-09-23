@@ -1123,11 +1123,12 @@ vv_status_t vv_stream_transcribe(vv_inference_ctx_t* ctx,
         const vv_spec_stats_t* sp = vv_inference_spec_stats(ctx);
         if (sp && sp->cycles > 0)
             VV_LOG_I("stream: %lld drafted blocks, %.2f tokens each, %lld of "
-                     "%lld drafts kept (draft %.0f ms, check %.0f ms)",
+                     "%lld drafts kept, %lld cut at a stop (draft %.0f ms, "
+                     "check %.0f ms)",
                      (long long)sp->cycles,
                      (double)sp->tokens / (double)sp->cycles,
                      (long long)sp->accepted, (long long)sp->drafted,
-                     sp->draft_ms, sp->verify_ms);
+                     (long long)ss.blocks_cut, sp->draft_ms, sp->verify_ms);
     }
     for (int i = 0; i < col.n; i++) vv_free(col.texts[i]);
     vv_free(col.texts);

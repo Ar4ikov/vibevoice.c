@@ -730,7 +730,7 @@ static void test_session_cap_and_overflow(void) {
  * lands inside a block, which has fed past it and must be cut back.
  */
 static void run_blocks(int bs, int max_new, bool fold, events_t* ev,
-                       mock_t* m) {
+                       mock_t* m, vv_stream_stats_t* stats) {
     static const int32_t c0[] = { ' ', 'H', 'i', ',', TCE };
     static const int32_t c1[] = { 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
                                   'j', 'k', 'l', 'm', TCE };
@@ -759,6 +759,7 @@ static void run_blocks(int bs, int max_new, bool fold, events_t* ev,
     float* x = ramp(264000);
     CHECK(push_ramp(s, x, 264000, 8192) == VV_OK);
     CHECK(vv_stream_finish(s) == VV_OK);
+    vv_stream_get_stats(s, stats);
     vv_stream_close(s);
     free(x);
 }
@@ -770,12 +771,16 @@ static void test_session_blocks(void) {
         for (int ci = 0; ci < 3; ci++) {
             events_t e0, e1;
             mock_t m0, m1;
-            run_blocks(0, caps[ci], f == 1, &e0, &m0);
+            vv_stream_stats_t s0, s1;
+            run_blocks(0, caps[ci], f == 1, &e0, &m0, &s0);
             CHECK(e0.n_chunks == 4 && e0.n_error == 0 && m0.n_blocks == 0);
+            CHECK(s0.blocks == 0 && s0.blocks_cut == 0);
             for (int si = 0; si < 4; si++) {
-                run_blocks(sizes[si], caps[ci], f == 1, &e1, &m1);
+                run_blocks(sizes[si], caps[ci], f == 1, &e1, &m1, &s1);
                 CHECK(e1.n_chunks == 4 && e1.n_error == 0 && e1.n_done == 1);
                 CHECK(m1.n_blocks > 0 && !m1.overflowed);
+                CHECK(s1.blocks == m1.n_blocks && s1.blocks_cut == m1.n_truncs);
+                CHECK(s1.tokens == s0.tokens);
                 CHECK(strcmp(e1.done, e0.done) == 0);
                 for (int c = 0; c < 4; c++) {
                     CHECK(strcmp(e1.chunks[c], e0.chunks[c]) == 0);
@@ -790,7 +795,8 @@ static void test_session_blocks(void) {
     /* The cases the cut exists for did come up. */
     events_t e;
     mock_t m;
-    run_blocks(8, 256, true, &e, &m);
+    vv_stream_stats_t st;
+    run_blocks(8, 256, true, &e, &m, &st);
     CHECK(m.n_truncs > 0);
     CHECK(strcmp(e.done, " Hi,abcdefghijklm okxy") == 0);
 }

@@ -666,6 +666,7 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
         int n = 0;
         st = s->be.decode_block(s->be.self, tok, blk, &n);
         if (st != VV_OK) break;
+        s->stats.blocks++;
         if (n < 1 || n > bs) { st = VV_ERR_INVALID_ARG; break; }
         int i = 0;
         for (; i < n - 1; i++) {
@@ -680,6 +681,7 @@ static vv_status_t run_chunk(vv_stream_t* s, const vv_stream_window_t* w,
             st = s->be.truncate ? s->be.truncate(s->be.self, p0 + 1 + i)
                                 : VV_ERR_UNSUPPORTED;
             if (st != VV_OK) break;
+            s->stats.blocks_cut++;
         }
         tok = blk[i];
         if (cancelled(s)) { st = VV_ERR_CANCELLED; break; }
