@@ -68,8 +68,13 @@ const vv_taps_t* vv_spec_step_taps(vv_spec_t* s);
  *         the drafter's context, from vv_spec_step_taps()' row. */
 vv_status_t vv_spec_push_step(vv_spec_t* s);
 
-/** @brief Draft block rows B (the last token included). */
+/** @brief Rows the next block checks (the anchor included). Without
+ *         --draft-block it moves between half the drafter's block and all
+ *         of it, whichever keeps more tokens per ms (vv_spec_note_block). */
 int vv_spec_block(const vv_spec_t* s);
+
+/** @brief Check at most `rows` rows (what the model keeps exact: W4A8). */
+void vv_spec_limit_rows(vv_spec_t* s, int rows);
 
 /** @brief Positions the drafter's context holds. */
 int vv_spec_context_len(const vv_spec_t* s);

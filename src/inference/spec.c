@@ -781,9 +781,16 @@ struct vv_spec {
     /* A cycle reads its positions on the device (cycle_body), so one
      * capture replays for every cycle of a shape (vv_spec_cycle). */
     int32_t* d_in;             /* [IN_N] device copy of h_pin + IN_PIN */
-    void* graph;               /* the captured cycle, or NULL */
-    int graph_key[4];          /* rows, check, rows' attention, block's */
+    void* graph[2];            /* the captured cycle per row count, or NULL */
+    int graph_key[2][4];       /* rows, check, rows' attention, block's */
     bool graph_off;            /* no capture here: launch every kernel */
+    /* Rows checked when --draft-block did not say: half the block or all
+     * of it, whichever keeps more tokens per ms (vv_spec_note_block). */
+    bool bv_auto;
+    int bv_cand[2];            /* B / 2, B */
+    double bv_tok[2];          /* tokens a block of that many rows keeps */
+    double bv_ms[2];           /* ms such a block takes, 0: not seen yet */
+    int bv_full_ago;           /* blocks since the last full-width one */
     bool block_attn;           /* the draft pass attends on flashinfer with
                                   its length on the device (else the host's,
                                   and no capture) */
@@ -830,7 +837,8 @@ void vv_spec_free(vv_spec_t* s) {
     if (!s) return;
     for (int i = 0; i < s->n_allocs; i++) vv_dev_free(s->allocs[i]);
     vv_free(s->allocs);
-    if (s->graph) vv_dev_graph_destroy(s->graph);
+    for (int i = 0; i < 2; i++)
+        if (s->graph[i]) vv_dev_graph_destroy(s->graph[i]);
     if (s->h_pin) vv_dev_free_pinned(s->h_pin);
     vv_free(s->kc);
     vv_free(s->vc);
@@ -925,8 +933,11 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
      * drafts are the least likely to be kept, so the best count depends on
      * the drafter and the card.
      */
-    s->Bv = verify_rows >= 2 ? verify_rows : 4;
+    s->Bv = verify_rows >= 2 ? verify_rows : s->B;
     if (s->Bv > s->B) s->Bv = s->B;
+    s->bv_auto = verify_rows < 2 && s->B >= 4;
+    s->bv_cand[0] = s->B / 2;
+    s->bv_cand[1] = s->B;
     s->exact = check != VV_DRAFT_CHECK_FAST;
     /*
      * The INT4 drafter's GEMMs run on the W4A16 tensor-core kernels. A card
@@ -980,6 +991,14 @@ void vv_spec_reset(vv_spec_t* s) {
     s->ctl_step_high = 0;
     s->ctl_skip_step = true;
     s->ctl_remeasure = false;
+    if (s->bv_auto) {
+        /* A sequence starts wide: a full block tells what every narrower
+         * one would have kept too. */
+        s->Bv = s->bv_cand[1];
+        s->bv_tok[0] = s->bv_tok[1] = 0.0;
+        s->bv_ms[0] = s->bv_ms[1] = 0.0;
+        s->bv_full_ago = 0;
+    }
 }
 
 bool vv_spec_want_block(vv_spec_t* s) {
@@ -1011,8 +1030,47 @@ void vv_spec_note_step(vv_spec_t* s, double ms) {
     }
 }
 
+/* Blocks between two full-width ones while narrower ones pay better: what
+ * the rows past the narrow width would keep is only seen in a full one. */
+#define BV_REFRESH 32
+
+/*
+ * Half the block or all of it. A checked row costs little next to a step
+ * where the projections read the weights once for every row (W4A16), and
+ * more where each row is its own GEMV (NF4, INT8) or its own walk over a
+ * long fa2 cache -- so the better width depends on the model, the card and
+ * the length, and is measured: a full block of n tokens says a half one
+ * would have kept min(n, B/2), and each width's time is its own EMA.
+ */
+static void bv_choose(vv_spec_t* s, int tokens, double ms) {
+    const int i = s->Bv == s->bv_cand[1] ? 1 : 0;
+    s->bv_ms[i] = s->bv_ms[i] > 0.0 ? 0.8 * s->bv_ms[i] + 0.2 * ms : ms;
+    if (i == 1) {
+        for (int k = 0; k < 2; k++) {
+            const int kept = tokens < s->bv_cand[k] ? tokens : s->bv_cand[k];
+            s->bv_tok[k] = s->bv_tok[k] > 0.0 ? 0.8 * s->bv_tok[k] + 0.2 * kept
+                                              : kept;
+        }
+        s->bv_full_ago = 0;
+    } else {
+        s->bv_tok[0] = 0.8 * s->bv_tok[0] + 0.2 * tokens;
+        s->bv_full_ago++;
+    }
+    if (s->ctl_n_blk < CTL_MIN_BLOCKS) return;
+    int next;
+    if (s->bv_ms[0] <= 0.0) {
+        next = 0;                          /* the narrow one's time, once */
+    } else if (i == 0 && s->bv_full_ago >= BV_REFRESH) {
+        next = 1;
+    } else {
+        next = s->bv_tok[0] * s->bv_ms[1] > s->bv_tok[1] * s->bv_ms[0] ? 0 : 1;
+    }
+    s->Bv = s->bv_cand[next];
+}
+
 void vv_spec_note_block(vv_spec_t* s, int tokens, double ms) {
     if (!s) return;
+    if (s->bv_auto) bv_choose(s, tokens, ms);
     if (s->ctl_n_blk == 0) {
         s->ctl_blk_tok = tokens;
         s->ctl_blk_ms = ms;
@@ -1049,6 +1107,14 @@ const vv_taps_t* vv_spec_step_taps(vv_spec_t* s) {
 }
 
 int vv_spec_block(const vv_spec_t* s) { return s ? s->Bv : 0; }
+
+void vv_spec_limit_rows(vv_spec_t* s, int rows) {
+    if (!s || rows < 2) return;
+    for (int i = 0; i < 2; i++)
+        if (s->bv_cand[i] > rows) s->bv_cand[i] = rows;
+    if (s->Bv > rows) s->Bv = rows;
+    if (s->bv_cand[0] == s->bv_cand[1]) s->bv_auto = false;
+}
 
 int vv_spec_context_len(const vv_spec_t* s) { return s ? s->ctx_len : 0; }
 
@@ -1490,6 +1556,7 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
     vv_once(&s_graph_once, graph_probe);
     const bool graph = !s_graph_off && !s->graph_off && !s_debug &&
                        !s_profile && vv_pipeline_graph_ok(ctx);
+    const int slot = B == s->bv_cand[1] ? 1 : 0;
     if (graph) {
         const int key[4] = {
             B, backend,
@@ -1497,8 +1564,12 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
                                  llm->num_key_value_heads, p + B),
             vv_attn_block_shape(s->nh, s->nkv, s->B, s->ctx_len + s->B)
         };
-        if (!s->graph || memcmp(key, s->graph_key, sizeof(key)) != 0) {
-            if (s->graph) { vv_dev_graph_destroy(s->graph); s->graph = NULL; }
+        if (!s->graph[slot] ||
+            memcmp(key, s->graph_key[slot], sizeof(key)) != 0) {
+            if (s->graph[slot]) {
+                vv_dev_graph_destroy(s->graph[slot]);
+                s->graph[slot] = NULL;
+            }
             void* g = NULL;
             vv_status_t cs = vv_dev_graph_begin(stream);
             if (cs == VV_OK) {
@@ -1508,8 +1579,8 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
             }
             kv->current_len = p;        /* a capture runs nothing */
             if (cs == VV_OK && g) {
-                s->graph = g;
-                memcpy(s->graph_key, key, sizeof(key));
+                s->graph[slot] = g;
+                memcpy(s->graph_key[slot], key, sizeof(key));
             } else {
                 if (g) vv_dev_graph_destroy(g);
                 VV_LOG_W("spec: cannot capture a cycle (%s), launching each "
@@ -1519,8 +1590,8 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
         }
     }
     double draft_ms = 0.0;
-    if (s->graph && !s->graph_off && graph)
-        st = vv_dev_graph_launch(s->graph, stream);
+    if (s->graph[slot] && !s->graph_off && graph)
+        st = vv_dev_graph_launch(s->graph[slot], stream);
     else
         st = cycle_body(ctx, s, backend, s_profile ? &draft_ms : NULL, stream);
     if (st == VV_OK) st = vv_dev_stream_sync(stream);

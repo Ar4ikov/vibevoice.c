@@ -1323,7 +1323,9 @@ static void attach_spec(vv_inference_ctx_t* c, const char* dir, int quant,
         if (!parent && c->drafter) vv_drafter_free(c->drafter);
         c->drafter = NULL;
         c->spec = NULL;
+        return;
     }
+    vv_spec_limit_rows(c->spec, rows_max);
 }
 
 const vv_spec_stats_t* vv_inference_spec_stats(const vv_inference_ctx_t* ctx) {
