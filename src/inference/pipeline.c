@@ -735,6 +735,17 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     if (attn_want == VV_ATTN_AUTO &&
         c->model->config.family == VV_FAMILY_ASR_STREAMING_7B)
         attn_want = VV_ATTN_FLASHINFER;
+    /*
+     * With a drafter `auto` is flashinfer as well. A checked block runs each
+     * row's attention as its own decode step; fa2's walk over the cache is
+     * one dependent reduction per position, so eight rows cost eight walks,
+     * while flashinfer packs two or three rows to a fragment (AWQ 7B,
+     * 32-minute file: drafted 1.06x the plain decode with fa2, 1.47x with
+     * flashinfer). The drafted transcript is then byte for byte that of
+     * `--attn flashinfer` without a drafter; `--attn fa2 --draft` keeps fa2.
+     */
+    if (attn_want == VV_ATTN_AUTO && p.draft_dir && p.draft_dir[0])
+        attn_want = VV_ATTN_FLASHINFER;
     const int attn_slab = vv_attn_resolve(
         (int)attn_want, p.kv_format, false, llm->num_attention_heads,
         llm->num_key_value_heads, llm->head_dim);
