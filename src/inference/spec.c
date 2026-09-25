@@ -793,8 +793,8 @@ struct vv_spec {
     vv_spec_stats_t stats;
 };
 
-static vv_status_t dlin(vv_spec_t* s, const void* x, const dlin_t* W, void* y,
-                        int M, int N, int K, void* stream);
+static vv_status_t dlin_gemm(vv_spec_t* s, const void* x, const dlin_t* W,
+                             void* y, int M, int N, int K, void* stream);
 static size_t largest_packed(const vv_drafter_t* d);
 
 static vv_status_t salloc(vv_spec_t* s, void** p, size_t n) {
@@ -914,7 +914,7 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
      */
     if (d->fc.packed) {
         const int K = s->n_taps * s->H;
-        st = dlin(s, s->cx, &d->fc, s->cxn, 2, s->H, K, stream);
+        st = dlin_gemm(s, s->cx, &d->fc, s->cxn, 2, s->H, K, stream);
         if (st == VV_ERR_OVERFLOW) {
             const size_t need = largest_packed(d) * 2;
             VV_LOG_W("spec: no tensor-core W4A16 GEMM here; the INT4 drafter "
@@ -924,7 +924,7 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
             s->gemm_ws_bytes = need;
             st = salloc(s, &s->gemm_ws, need);
             if (st == VV_OK)
-                st = dlin(s, s->cx, &d->fc, s->cxn, 2, s->H, K, stream);
+                st = dlin_gemm(s, s->cx, &d->fc, s->cxn, 2, s->H, K, stream);
         }
         if (st == VV_OK) st = vv_dev_stream_sync(stream);
         if (st != VV_OK) { vv_spec_free(s); return st; }
@@ -1079,14 +1079,32 @@ static void dbg(const char* what, const void* dev, size_t n, bool f32,
     vv_free(h);
 }
 
-/* y[M][N] = x[M][K] . W^T in W's format. (The multi-row GEMV was slower
- * for the 8-row draft pass: 7B test120 4.48 against 4.31 s of decode.) */
+/* An INT4 projection of M rows on the tensor-core GEMM. */
+static vv_status_t dlin_gemm(vv_spec_t* s, const void* x, const dlin_t* W,
+                             void* y, int M, int N, int K, void* stream) {
+    return vv_w4a16_gemm_dev(x, W->packed, W->sz, NULL, y, s->gemm_ws,
+                             s->gemm_ws_bytes, M, N, K, DRAFT_Q_GROUP, stream);
+}
+
+/* y[M][N] = x[M][K] . W^T in W's format. A block's rows (and a few context
+ * rows) of INT4 go through the tensor-core GEMV, which reads the weight once
+ * for up to 16 rows; more rows, or where it declines, the GEMM. */
 static vv_status_t dlin(vv_spec_t* s, const void* x, const dlin_t* W, void* y,
                         int M, int N, int K, void* stream) {
-    if (W->packed)
-        return vv_w4a16_gemm_dev(x, W->packed, W->sz, NULL, y, s->gemm_ws,
-                                 s->gemm_ws_bytes, M, N, K, DRAFT_Q_GROUP,
-                                 stream);
+    if (W->packed) {
+        if (M <= VV_W4A16_MV_MAX_ROWS) {
+            vv_w4a16_proj_t p;
+            p.packed = W->packed;
+            p.sz = W->sz;
+            p.bias = NULL;
+            p.y = y;
+            p.N = N;
+            const vv_status_t st = vv_w4a16_mv_dev(x, M, &p, 1, K,
+                                                   DRAFT_Q_GROUP, stream);
+            if (st != VV_ERR_UNSUPPORTED) return st;
+        }
+        return dlin_gemm(s, x, W, y, M, N, K, stream);
+    }
     return vv_gemm_fp16_dev(x, W->w, y, M, N, K, 1.0f, 0.0f, stream);
 }
 

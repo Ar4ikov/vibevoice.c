@@ -524,6 +524,10 @@ vv_status_t vv_w4a16_gemv_rows_dev(const void* x, int M,
                                    int g, void* s) {
     U(x) U(M) U(p) U(n) U(K) U(g) U(s) return VV_ERR_UNSUPPORTED;
 }
+vv_status_t vv_w4a16_mv_dev(const void* x, int M, const vv_w4a16_proj_t* p,
+                            int n, int K, int g, void* s) {
+    U(x) U(M) U(p) U(n) U(K) U(g) U(s) return VV_ERR_UNSUPPORTED;
+}
 vv_status_t vv_attn_decode_rows(int b, const void* q, const vv_kv_view_t* kv,
                                 void* o, int h, int r, int c, const int* dc,
                                 void* scr, void* s) {

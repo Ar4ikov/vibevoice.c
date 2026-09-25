@@ -364,6 +364,17 @@ static vv_skinny_proj_t skinny_proj(const vv_weight_t* w, void* y, int N) {
     return p;
 }
 
+/** @brief A W4A16 (GPU layout) weight as the kernels take it. */
+static vv_w4a16_proj_t w4a16_proj(const vv_weight_t* w, void* y, int N) {
+    vv_w4a16_proj_t p;
+    p.packed = w->tensor.data;
+    p.sz     = w->quant.scales.data;
+    p.bias   = w->bias.data;
+    p.y      = y;
+    p.N      = N;
+    return p;
+}
+
 static vv_status_t quant_linear(
     const vv_weight_t* w, const void* x, void* y,
     void* scratch, size_t scratch_bytes, int M, int N, int K, void* stream)
@@ -412,7 +423,14 @@ static vv_status_t quant_linear(
 
     if (w->quant_kind == VV_QUANT_INT4G &&
         w->int4g_layout == VV_INT4G_GPU) {
-        /* W4A16 kernels: bias fused, no dequantized copy of the weight. */
+        /* W4A16 kernels: bias fused, no dequantized copy of the weight. Up
+         * to 16 rows the tensor-core GEMV, a row's bits its own (see
+         * linear_rows); where it declines, the FP16-chain GEMV. */
+        if (M <= VV_W4A16_MV_MAX_ROWS) {
+            const vv_w4a16_proj_t p = w4a16_proj(w, y, N);
+            s = vv_w4a16_mv_dev(x, M, &p, 1, K, w->group_size, stream);
+            if (s != VV_ERR_UNSUPPORTED) return s;
+        }
         if (M == 1)
             return vv_w4a16_gemv_dev(x, w->tensor.data,
                                      w->quant.scales.data, w->bias.data,
@@ -468,7 +486,7 @@ static vv_status_t quant_linear(
 /**
  * @brief Several projections of the same x: y_i = x @ W_i^T + b_i.
  *
- * For one token, W4A16 weights of one group size go through a single GEMV
+ * Up to 16 rows, W4A16 weights of one group size go through a single GEMV
  * launch (q/k/v, gate/up): the 512-row k and v projections are too short
  * to get past the kernel's ramp-up on their own and ride along behind q
  * instead. So do 9..64 rows of dense, INT8 or NF4 weights, through the
@@ -503,21 +521,20 @@ static vv_status_t quant_linear_group(
             if (s != VV_ERR_UNSUPPORTED) return s;
         }
     }
-    bool fuse = M == 1 && n <= 3;
+    bool fuse = M <= VV_W4A16_MV_MAX_ROWS && n <= 3;
     for (int i = 0; i < n && fuse; i++)
         fuse = ws[i]->quant_kind == VV_QUANT_INT4G &&
                ws[i]->int4g_layout == VV_INT4G_GPU && !ws[i]->perm.data &&
                ws[i]->group_size == ws[0]->group_size;
     if (fuse) {
         vv_w4a16_proj_t p[3];
-        for (int i = 0; i < n; i++) {
-            p[i].packed = ws[i]->tensor.data;
-            p[i].sz     = ws[i]->quant.scales.data;
-            p[i].bias   = ws[i]->bias.data;
-            p[i].y      = ys[i];
-            p[i].N      = Ns[i];
-        }
-        return vv_w4a16_gemv_multi_dev(x, p, n, K, ws[0]->group_size, stream);
+        for (int i = 0; i < n; i++) p[i] = w4a16_proj(ws[i], ys[i], Ns[i]);
+        vv_status_t s = vv_w4a16_mv_dev(x, M, p, n, K, ws[0]->group_size,
+                                        stream);
+        if (s != VV_ERR_UNSUPPORTED) return s;
+        if (M == 1)
+            return vv_w4a16_gemv_multi_dev(x, p, n, K, ws[0]->group_size,
+                                           stream);
     }
     for (int i = 0; i < n; i++) {
         vv_status_t s = quant_linear(ws[i], x, ys[i], scratch, scratch_bytes,
@@ -535,7 +552,9 @@ static vv_status_t quant_linear_group(
  * would have produced. So every op here computes each row exactly as the
  * one-token op does:
  *
- *   W4A16 (GPU layout)   the multi-row GEMV, the one-token GEMV's arithmetic
+ *   W4A16 (GPU layout)   the tensor-core GEMV a step runs too, whose rows
+ *                        are independent (vv_w4a16_mv_dev); where it
+ *                        declines, the multi-row twin of the FP16-chain GEMV
  *   FP16 dense           the M <= 8 CUDA-core kernel one decode step runs
  *   ternary, W8A8/W4A8   integer sums, exact in any order, for M <= 8
  *   NF4, INT8, legacy    the one-token GEMV once per row (exact, slower)
@@ -561,12 +580,10 @@ static vv_status_t linear_rows(const vv_weight_t* w, const void* x, void* y,
         scratch_bytes -= xb;
     }
     if (w->quant_kind == VV_QUANT_INT4G && w->int4g_layout == VV_INT4G_GPU) {
-        vv_w4a16_proj_t p;
-        p.packed = w->tensor.data;
-        p.sz = w->quant.scales.data;
-        p.bias = w->bias.data;
-        p.y = y;
-        p.N = N;
+        /* Declines for the step exactly when it declines here. */
+        const vv_w4a16_proj_t p = w4a16_proj(w, y, N);
+        s = vv_w4a16_mv_dev(x, M, &p, 1, K, w->group_size, stream);
+        if (s != VV_ERR_UNSUPPORTED) return s;
         return vv_w4a16_gemv_rows_dev(x, M, &p, 1, K, w->group_size, stream);
     }
     if (w->quant_kind == VV_QUANT_TERNARY || w->quant_kind == VV_QUANT_NONE) {
@@ -601,13 +618,10 @@ static vv_status_t linear_rows_group(
                ws[i]->group_size == ws[0]->group_size;
     if (fuse) {
         vv_w4a16_proj_t p[3];
-        for (int i = 0; i < n; i++) {
-            p[i].packed = ws[i]->tensor.data;
-            p[i].sz = ws[i]->quant.scales.data;
-            p[i].bias = ws[i]->bias.data;
-            p[i].y = ys[i];
-            p[i].N = Ns[i];
-        }
+        for (int i = 0; i < n; i++) p[i] = w4a16_proj(ws[i], ys[i], Ns[i]);
+        vv_status_t s = vv_w4a16_mv_dev(x, M, p, n, K, ws[0]->group_size,
+                                        stream);
+        if (s != VV_ERR_UNSUPPORTED) return s;
         return vv_w4a16_gemv_rows_dev(x, M, p, n, K, ws[0]->group_size,
                                       stream);
     }

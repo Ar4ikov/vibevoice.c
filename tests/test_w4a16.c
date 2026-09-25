@@ -24,6 +24,7 @@
 #include "vibevoice/device.h"
 #include "vibevoice/quant.h"
 #include "vibevoice/cpu_kernels.h"
+#include "vv_thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -652,6 +653,166 @@ out:
     for (int i = 0; i < ok_n; i++) qweight_free(&w[i]);
 }
 
+/*
+ * The mv kernel reads its launch shape (VV_W4A16_MV_CFG) once per thread, so
+ * another shape runs on a thread of its own.
+ */
+typedef struct {
+    const void* x;
+    int M, n, K, G;
+    vv_w4a16_proj_t p[3];
+    vv_status_t s;
+} mv_job_t;
+
+static VV_THREAD_RET mv_job(void* arg) {
+    mv_job_t* j = (mv_job_t*)arg;
+    j->s = vv_w4a16_mv_dev(j->x, j->M, j->p, j->n, j->K, j->G, g_stream);
+    if (j->s == VV_OK) vv_dev_stream_sync(g_stream);
+    VV_THREAD_RETURN;
+}
+
+static void set_env(const char* k, const char* v) {
+#ifdef _WIN32
+    _putenv_s(k, v ? v : "");
+#else
+    if (v) setenv(k, v, 1); else unsetenv(k);
+#endif
+}
+
+static vv_status_t mv_with_cfg(const char* cfg, mv_job_t* j) {
+    set_env("VV_W4A16_MV_CFG", cfg);
+    vv_thread_t th;
+    const bool started = vv_thread_start(&th, (vv_thread_fn)mv_job, j);
+    if (started) vv_thread_join(th);
+    set_env("VV_W4A16_MV_CFG", NULL);
+    return started ? j->s : VV_ERR_OUT_OF_MEMORY;
+}
+
+/**
+ * @brief vv_w4a16_mv_dev (tensor cores, M <= 16): every row of an M-row
+ *        launch is the one-row launch's bits for that row of x, for M = 1..16
+ *        and projections fused as the decoder fuses them; the launch shape
+ *        and the fusing move no bits; and the outputs match the reference
+ *        like any other W4A16 path.
+ */
+static void run_mv(const int* Ns, int n, int K, int G) {
+    const int MX = 16;
+    qweight_t w[3];
+    dweight_t d[3];
+    uint16_t* bias[3] = { NULL, NULL, NULL };
+    int ok_n = 0;
+    for (int i = 0; i < n; i++) {
+        if (make_weight(&w[i], Ns[i], K, G, false)) goto out;
+        bias[i] = (uint16_t*)malloc((size_t)Ns[i] * 2);
+        for (int r = 0; r < Ns[i]; r++)
+            bias[i][r] = vv_float_to_half(frand() * 0.5f);
+        if (upload_weight(&w[i], bias[i], &d[i])) {
+            printf("  FAIL mv: allocation\n");
+            failures++;
+            ok_n = i + 1;
+            goto out;
+        }
+        ok_n = i + 1;
+    }
+    {
+        uint16_t* hx; float* fx;
+        make_x(MX, K, &hx, &fx);
+        void* dx = NULL;
+        vv_dev_alloc(&dx, (size_t)MX * K * 2);
+        vv_dev_memcpy_h2d(dx, hx, (size_t)MX * K * 2, NULL);
+        void* dy[3] = { NULL, NULL, NULL };
+        uint16_t* one[3] = { NULL, NULL, NULL };  /* row m alone, [MX][N] */
+        uint16_t* got[3] = { NULL, NULL, NULL };
+        vv_w4a16_proj_t p[3];
+        for (int i = 0; i < n; i++) {
+            vv_dev_alloc(&dy[i], (size_t)MX * Ns[i] * 2);
+            one[i] = (uint16_t*)malloc((size_t)MX * Ns[i] * 2);
+            got[i] = (uint16_t*)malloc((size_t)MX * Ns[i] * 2);
+            p[i].packed = d[i].gp; p[i].sz = d[i].gsz; p[i].bias = d[i].bias;
+            p[i].y = dy[i]; p[i].N = Ns[i];
+        }
+        vv_status_t s = VV_OK;
+        for (int m = 0; m < MX && s == VV_OK; m++) {
+            s = vv_w4a16_mv_dev((const uint16_t*)dx + (size_t)m * K, 1, p, n,
+                                K, G, g_stream);
+            vv_dev_stream_sync(g_stream);
+            for (int i = 0; s == VV_OK && i < n; i++)
+                vv_dev_memcpy_d2h(one[i] + (size_t)m * Ns[i], dy[i],
+                                  (size_t)Ns[i] * 2, NULL);
+        }
+        int bad_m = 0;
+        for (int M = 2; M <= MX && s == VV_OK; M++) {
+            s = vv_w4a16_mv_dev(dx, M, p, n, K, G, g_stream);
+            vv_dev_stream_sync(g_stream);
+            for (int i = 0; s == VV_OK && i < n; i++) {
+                vv_dev_memcpy_d2h(got[i], dy[i], (size_t)M * Ns[i] * 2, NULL);
+                if (memcmp(got[i], one[i], (size_t)M * Ns[i] * 2) != 0) bad_m++;
+            }
+        }
+        /* Other launch shapes, and each projection on its own. */
+        static const char* const cfgs[] = { "4,1", "4,4", "16,2", "8,4" };
+        int bad_cfg = 0, bad_alone = 0;
+        int nmax = 0;
+        for (int i = 0; i < n; i++) nmax = Ns[i] > nmax ? Ns[i] : nmax;
+        uint16_t* alt = (uint16_t*)malloc((size_t)MX * nmax * 2);
+        for (int c = 0; c < 4 && s == VV_OK; c++) {
+            mv_job_t j;
+            memset(&j, 0, sizeof(j));
+            j.x = dx; j.M = MX; j.n = n; j.K = K; j.G = G;
+            memcpy(j.p, p, sizeof(p));
+            s = mv_with_cfg(cfgs[c], &j);
+            for (int i = 0; s == VV_OK && i < n; i++) {
+                vv_dev_memcpy_d2h(alt, dy[i], (size_t)MX * Ns[i] * 2, NULL);
+                if (memcmp(alt, got[i], (size_t)MX * Ns[i] * 2) != 0) bad_cfg++;
+            }
+        }
+        for (int i = 0; n > 1 && i < n && s == VV_OK; i++) {
+            s = vv_w4a16_mv_dev(dx, MX, &p[i], 1, K, G, g_stream);
+            vv_dev_stream_sync(g_stream);
+            if (s != VV_OK) break;
+            vv_dev_memcpy_d2h(alt, dy[i], (size_t)MX * Ns[i] * 2, NULL);
+            if (memcmp(alt, got[i], (size_t)MX * Ns[i] * 2) != 0) bad_alone++;
+        }
+        free(alt);
+        char tag[64];
+        snprintf(tag, sizeof(tag), "mv %d proj %dx%d g%d", n, Ns[0], K, G);
+        if (s != VV_OK) {
+            printf("  FAIL %s: kernel returned %d\n", tag, s);
+            failures++;
+        } else {
+            if (bad_m) {
+                printf("  FAIL %s: %d (M, projection) pairs are not the one-row "
+                       "bits\n", tag, bad_m);
+                failures++;
+            } else {
+                printf("  ok   %s: rows of M = 2..16 == M = 1, bit for bit\n", tag);
+            }
+            if (bad_cfg || bad_alone) {
+                printf("  FAIL %s: %d launch shapes, %d projections alone "
+                       "moved bits\n", tag, bad_cfg, bad_alone);
+                failures++;
+            } else {
+                printf("  ok   %s: 4 other launch shapes%s, same bits\n", tag,
+                       n > 1 ? " and each projection alone" : "");
+            }
+            for (int i = 0; i < n; i++) {
+                snprintf(tag, sizeof(tag), "mv %d/%d %dx%d g%d", i + 1, n,
+                         Ns[i], K, G);
+                verify_out(&w[i], bias[i], fx, got[i], MX, tag);
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            vv_dev_free(dy[i]); free(one[i]); free(got[i]);
+        }
+        vv_dev_free(dx);
+        free(hx); free(fx);
+    }
+out:
+    for (int i = 0; i < ok_n; i++) free_dweight(&d[i]);
+    for (int i = 0; i < n; i++) free(bias[i]);
+    for (int i = 0; i < ok_n; i++) qweight_free(&w[i]);
+}
+
 /* ─── Benchmark ──────────────────────────────────────────────────────────── */
 
 /** @brief Time `iters` launches captured into one graph; ms per launch. */
@@ -837,6 +998,81 @@ static void bench_multi(const char* name, const int* Ns, int n, int K) {
     vv_dev_free(c.x);
 }
 
+typedef struct {
+    int n, K, G, M, reps, mode;           /* mode 0: the FP16 paths, 1: mv */
+    int N[3];
+    void **gp[3], **gsz[3];
+    void *x, *y[3];
+} bench_mv_ctx_t;
+
+static vv_status_t launch_bench_mv(void* p, int rep) {
+    bench_mv_ctx_t* c = (bench_mv_ctx_t*)p;
+    vv_w4a16_proj_t pr[3];
+    for (int i = 0; i < c->n; i++) {
+        pr[i].packed = c->gp[i][rep]; pr[i].sz = c->gsz[i][rep];
+        pr[i].bias = NULL; pr[i].y = c->y[i]; pr[i].N = c->N[i];
+    }
+    if (c->mode == 1)
+        return vv_w4a16_mv_dev(c->x, c->M, pr, c->n, c->K, c->G, g_stream);
+    if (c->M == 1)
+        return vv_w4a16_gemv_multi_dev(c->x, pr, c->n, c->K, c->G, g_stream);
+    return vv_w4a16_gemv_rows_dev(c->x, c->M, pr, c->n, c->K, c->G, g_stream);
+}
+
+/**
+ * @brief M rows through n projections of the same x: the tensor-core mv
+ *        against the FP16 paths a decode step (M = 1) and a checked block
+ *        (the exact rows GEMV) take today.
+ */
+static void bench_mv(const char* name, const int* Ns, int n, int K) {
+    bench_mv_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.n = n; c.K = K; c.G = 128;
+    double bytes = 0;
+    for (int i = 0; i < n; i++) {
+        c.N[i] = Ns[i];
+        bytes += (double)Ns[i] * K / 2 + (double)Ns[i] * (K / c.G) * 4;
+    }
+    int reps = (int)((256u << 20) / bytes) + 1;
+    if (reps > 64) reps = 64;
+    c.reps = reps;
+    for (int i = 0; i < n; i++) {
+        const size_t pb = (size_t)Ns[i] * K / 2;
+        const size_t sb = (size_t)Ns[i] * (K / c.G) * 4;
+        c.gp[i] = (void**)calloc(reps, sizeof(void*));
+        c.gsz[i] = (void**)calloc(reps, sizeof(void*));
+        for (int r = 0; r < reps; r++) {
+            vv_dev_alloc(&c.gp[i][r], pb);  vv_dev_memset(c.gp[i][r], 0x5A, pb);
+            vv_dev_alloc(&c.gsz[i][r], sb); vv_dev_memset(c.gsz[i][r], 0x11, sb);
+        }
+        vv_dev_alloc(&c.y[i], (size_t)16 * Ns[i] * 2);
+    }
+    vv_dev_alloc(&c.x, (size_t)16 * K * 2);
+    vv_dev_memset(c.x, 0x11, (size_t)16 * K * 2);
+    const int ms[5] = { 1, 2, 4, 8, 16 };
+    double base1 = 0.0;
+    for (int j = 0; j < 5; j++) {
+        c.M = ms[j];
+        c.mode = 0;
+        const double to = time_graph(launch_bench_mv, &c, reps, 200);
+        c.mode = 1;
+        const double tn = time_graph(launch_bench_mv, &c, reps, 200);
+        if (j == 0) base1 = to;
+        printf("  %-10s M=%-2d  %s %7.1f us (%5.2fx one step)   mv %7.1f us "
+               "%6.1f GB/s (%5.2fx one step)\n", name, c.M,
+               c.M == 1 ? "gemv     " : "exact rows", to * 1e3, to / base1,
+               tn * 1e3, bytes / (tn * 1e-3) / 1e9, tn / base1);
+    }
+    for (int i = 0; i < n; i++) {
+        for (int r = 0; r < reps; r++) {
+            vv_dev_free(c.gp[i][r]); vv_dev_free(c.gsz[i][r]);
+        }
+        free(c.gp[i]); free(c.gsz[i]);
+        vv_dev_free(c.y[i]);
+    }
+    vv_dev_free(c.x);
+}
+
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
 #ifndef VV_HAS_ACCEL
@@ -901,6 +1137,29 @@ int main(int argc, char** argv) {
     { const int n3[3] = { 3584, 512, 512 }; run_multi(n3, 3, 3584, 128); }
     { const int n2[2] = { 18944, 18944 }; run_multi(n2, 2, 3584, 128); }
     { const int n3[3] = { 1536, 256, 256 }; run_multi(n3, 3, 1536, 64); }
+    /* tensor-core mv for 1..16 rows: rows independent of the batch */
+    { const int n3[3] = { 3584, 512, 512 }; run_mv(n3, 3, 3584, 128); }
+    { const int n1[1] = { 3584 }; run_mv(n1, 1, 3584, 128); }
+    { const int n2[2] = { 18944, 18944 }; run_mv(n2, 2, 3584, 128); }
+    { const int n1[1] = { 3584 }; run_mv(n1, 1, 18944, 128); }
+    { const int n3[3] = { 1536, 256, 256 }; run_mv(n3, 3, 1536, 128); }
+    { const int n2[2] = { 8960, 8960 }; run_mv(n2, 2, 1536, 128); }
+    { const int n1[1] = { 1536 }; run_mv(n1, 1, 8960, 128); }
+    { const int n1[1] = { 512 }; run_mv(n1, 1, 3584, 32); }
+    }
+    if (bench) {
+        printf("\n--- tensor-core mv vs today's paths (M rows, weights past L2) ---\n");
+        const int qkv[3] = { 3584, 512, 512 }, gu[2] = { 18944, 18944 };
+        const int o7[1] = { 3584 }, qkv15[3] = { 1536, 256, 256 };
+        const int gu15[2] = { 8960, 8960 }, o15[1] = { 1536 };
+        bench_mv("q+k+v", qkv, 3, 3584);
+        bench_mv("o", o7, 1, 3584);
+        bench_mv("gate+up", gu, 2, 3584);
+        bench_mv("down", o7, 1, 18944);
+        bench_mv("1.5B qkv", qkv15, 3, 1536);
+        bench_mv("1.5B o", o15, 1, 1536);
+        bench_mv("1.5B g+u", gu15, 2, 1536);
+        bench_mv("1.5B down", o15, 1, 8960);
     }
 
     /* VV_W4A16_BENCH_M=16,28 restricts the GEMM sweep (0 = GEMV only). */

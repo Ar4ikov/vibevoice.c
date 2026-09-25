@@ -936,6 +936,252 @@ bool w4_mma_allowed(void) {
     return w4_env_int("VV_W4A16_MMA", &v, 1) != 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Tensor-core GEMV for 1..16 rows of x whose rows do not depend on each other
+ *
+ * Y^T = W . X^T on mma.m16n8k16: the weights are the A operand, 16 output
+ * rows to a warp tile; the rows of x are the columns of B (8 to an n8 tile,
+ * a second tile past 8 rows). The GPU layout hands both over as they are:
+ * word s of a chunk holds the pairs s, s+4, s+8, s+12, which are one lane's
+ * A registers for two k16 steps (rows g and g + 8), and x's pairs s and s+4
+ * of the same chunk are its B registers for column g.
+ *
+ * A column of an mma depends on its own B values only, and the way K is cut
+ * and summed is fixed by K (below), so a row of x gets the same bits
+ * whatever else is in the batch -- a decode step (M = 1) and the check of a
+ * drafted block (M rows) agree exactly, and the check costs about one step,
+ * since the weights are read once for all rows and the tensor cores do the
+ * arithmetic the FP16 pipe cannot (3070, 7B layer at 8 rows: 1.00x the
+ * one-row GEMV, where the FP16-chain rows kernel takes 1.6x).
+ *
+ * Products are summed in FP32 inside the mma, so the result is not the
+ * FP16-chain GEMV's bits (w4a16_gemv_kernel); it is closer to the exact sum.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+__device__ __forceinline__ void w4m_mma(float d[4], uint32_t a0, uint32_t a1,
+                                        uint32_t a2, uint32_t a3, uint32_t b0,
+                                        uint32_t b1) {
+#ifdef W4G_SM80
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    (void)d; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+#endif
+}
+
+/*
+ * The k axis of an mma is a sum, so which physical k sits in which k slot
+ * is free as long as A and B agree. Lane (g, t) therefore owns a whole
+ * chunk: chunk 4b + t of rows g and g + 8 (two 16-byte loads; the four lanes
+ * of a row read 64 contiguous bytes) and the same 32 k of the x rows. Step
+ * s of four takes word s of that chunk -- pairs s, s+4, s+8, s+12 -- as its
+ * two k16 slices. A warp's step is a 128-k block, one group of an AWQ
+ * weight.
+ *
+ * The sum over K is fixed apart from the launch: block b goes to slice
+ * b % 16, a slice adds its blocks in order, and the 16 slices meet in a
+ * halving tree (slice s takes s + 8, then s + 4, s + 2, s + 1). A warp owns
+ * the slices congruent to it mod WARPS and does the tree's levels among them
+ * itself; the warps finish it in shared memory. So WARPS and UNROLL -- how
+ * many warps share a tile, how many blocks a lane has in flight -- move
+ * nothing but time, and can follow M, the shape and the card.
+ */
+#define W4M_SLICES 16
+
+template <int WARPS, int UNROLL, bool TWO>
+__global__ void __launch_bounds__(WARPS * 32)
+w4a16_mv_kernel(const half* __restrict__ x, int M, const w4v_segs segs,
+                int K, int gshift)
+{
+    constexpr int L = W4M_SLICES / WARPS;            /* slices a warp owns */
+    constexpr int J = UNROLL > L ? UNROLL : L;       /* blocks a round     */
+
+    const int bx = (int)blockIdx.x;
+    const int seg = bx >= segs.first_block[2] ? 2
+                  : (bx >= segs.first_block[1] ? 1 : 0);
+    const uint4* w = seg == 0 ? segs.w[0] : (seg == 1 ? segs.w[1] : segs.w[2]);
+    const half2* sz = seg == 0 ? segs.sz[0]
+                    : (seg == 1 ? segs.sz[1] : segs.sz[2]);
+    const half* bias = seg == 0 ? segs.bias[0]
+                     : (seg == 1 ? segs.bias[1] : segs.bias[2]);
+    half* y = seg == 0 ? segs.y[0] : (seg == 1 ? segs.y[1] : segs.y[2]);
+    const int N = seg == 0 ? segs.n[0] : (seg == 1 ? segs.n[1] : segs.n[2]);
+    const int row0 = (bx - (seg == 0 ? 0 : (seg == 1 ? segs.first_block[1]
+                                                    : segs.first_block[2]))) * 16;
+
+    const int lane = (int)threadIdx.x & 31, warp = (int)threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int cpr = K >> 5;                          /* 16-byte chunks a row */
+    const int ngroups = K >> gshift;
+    const uint4* w0 = w + (size_t)(row0 + g) * cpr + t;
+    const uint4* w1 = w0 + (size_t)8 * cpr;
+    const half2* s0 = sz + (size_t)(row0 + g) * ngroups;
+    const half2* s1 = s0 + (size_t)8 * ngroups;
+    /* Column g of B is row g of x (and g + 8 of the second tile). */
+    const bool x0ok = g < M, x1ok = TWO && g + 8 < M;
+    const uint4* x0 = (const uint4*)(x + (size_t)(x0ok ? g : 0) * K) + 4 * t;
+    const uint4* x1 = (const uint4*)(x + (size_t)(x1ok ? g + 8 : 0) * K) + 4 * t;
+
+    float d0[L][4], d1[L][4];
+#pragma unroll
+    for (int i = 0; i < L; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) { d0[i][j] = 0.0f; d1[i][j] = 0.0f; }
+
+    const int nblk = K >> 7;                         /* 128-k blocks */
+    for (int b0 = warp; b0 < nblk; b0 += WARPS * J) {
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += UNROLL) {
+            uint4 wa[UNROLL], wb[UNROLL];
+#pragma unroll
+            for (int u = 0; u < UNROLL; u++) {
+                const int b = b0 + (j0 + u) * WARPS;
+                if (b < nblk) {
+                    wa[u] = w4_ld_stream(w0 + (size_t)b * 4);
+                    wb[u] = w4_ld_stream(w1 + (size_t)b * 4);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < UNROLL; u++) {
+                const int b = b0 + (j0 + u) * WARPS;
+                if (b >= nblk) break;
+                float* a0 = d0[(j0 + u) % L];
+                float* a1 = d1[(j0 + u) % L];
+                const int grp = ((b * 4 + t) << 5) >> gshift;
+                const w4_group ga = w4_make_group(s0[grp]);
+                const w4_group gb = w4_make_group(s1[grp]);
+                uint4 xv[4], xe[4];
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    xv[i] = x0ok ? __ldg(x0 + (size_t)b * 16 + i)
+                                 : make_uint4(0, 0, 0, 0);
+                    xe[i] = TWO && x1ok ? __ldg(x1 + (size_t)b * 16 + i)
+                                        : make_uint4(0, 0, 0, 0);
+                }
+                const uint32_t* xw = (const uint32_t*)xv;   /* pairs 0..15 */
+                const uint32_t* xz = (const uint32_t*)xe;
+                const uint32_t wda[4] = { wa[u].x, wa[u].y, wa[u].z, wa[u].w };
+                const uint32_t wdb[4] = { wb[u].x, wb[u].y, wb[u].z, wb[u].w };
+#pragma unroll
+                for (int s = 0; s < 4; s++) {
+                    half2 ha[4], hb[4];
+                    w4_dequant_word(wda[s], ga, ha);  /* pairs s + 4j, row g */
+                    w4_dequant_word(wdb[s], gb, hb);  /* row g + 8           */
+                    w4m_mma(a0, w4_h2u(ha[0]), w4_h2u(hb[0]), w4_h2u(ha[1]),
+                            w4_h2u(hb[1]), xw[s], xw[s + 4]);
+                    w4m_mma(a0, w4_h2u(ha[2]), w4_h2u(hb[2]), w4_h2u(ha[3]),
+                            w4_h2u(hb[3]), xw[s + 8], xw[s + 12]);
+                    if (TWO) {
+                        w4m_mma(a1, w4_h2u(ha[0]), w4_h2u(hb[0]), w4_h2u(ha[1]),
+                                w4_h2u(hb[1]), xz[s], xz[s + 4]);
+                        w4m_mma(a1, w4_h2u(ha[2]), w4_h2u(hb[2]), w4_h2u(ha[3]),
+                                w4_h2u(hb[3]), xz[s + 8], xz[s + 12]);
+                    }
+                }
+            }
+        }
+    }
+
+    /* The tree's levels within the warp: slice warp + WARPS * i is d[i]. */
+#pragma unroll
+    for (int h = L / 2; h >= 1; h /= 2)
+#pragma unroll
+        for (int i = 0; i < h; i++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                d0[i][j] += d0[i + h][j];
+                d1[i][j] += d1[i + h][j];
+            }
+
+    /* ... and across the warps. */
+    constexpr int NT = TWO ? 16 : 8;                 /* columns (x rows) */
+    __shared__ float red[WARPS][16][NT];
+    red[warp][g][2 * t]         = d0[0][0];
+    red[warp][g][2 * t + 1]     = d0[0][1];
+    red[warp][g + 8][2 * t]     = d0[0][2];
+    red[warp][g + 8][2 * t + 1] = d0[0][3];
+    if (TWO) {
+        red[warp][g][8 + 2 * t]         = d1[0][0];
+        red[warp][g][8 + 2 * t + 1]     = d1[0][1];
+        red[warp][g + 8][8 + 2 * t]     = d1[0][2];
+        red[warp][g + 8][8 + 2 * t + 1] = d1[0][3];
+    }
+    __syncthreads();
+    for (int i = (int)threadIdx.x; i < 16 * NT; i += WARPS * 32) {
+        const int r = i / NT, m = i % NT;
+        if (m >= M || row0 + r >= N) continue;
+        float v[WARPS];
+#pragma unroll
+        for (int k = 0; k < WARPS; k++) v[k] = red[k][r][m];
+#pragma unroll
+        for (int h = WARPS / 2; h >= 1; h /= 2)
+#pragma unroll
+            for (int k = 0; k < h; k++) v[k] += v[k + h];
+        float o = v[0];
+        if (bias) o += __half2float(bias[row0 + r]);
+        y[(size_t)m * N + row0 + r] = __float2half(o);
+    }
+}
+
+template <int WARPS, int UNROLL>
+vv_status_t launch_mv_cfg(const half* x, int M, const w4v_segs& segs, int blocks,
+                          int K, int gshift, cudaStream_t st)
+{
+    if (M > 8)
+        w4a16_mv_kernel<WARPS, UNROLL, true><<<blocks, WARPS * 32, 0, st>>>(
+            x, M, segs, K, gshift);
+    else
+        w4a16_mv_kernel<WARPS, UNROLL, false><<<blocks, WARPS * 32, 0, st>>>(
+            x, M, segs, K, gshift);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
+/*
+ * Warps a tile and blocks in flight. Neither changes a bit (see the kernel),
+ * so they may follow M: 8 warps for one tile of x rows, 4 for two, whose
+ * doubled accumulators and x loads go further on fewer warps (swept on a
+ * 3070 over the 7B and 1.5B shapes, M = 1..16). VV_W4A16_MV_CFG=W,U (warps
+ * 4/8/16, unroll 1/2/4) overrides it for tuning.
+ */
+vv_status_t launch_mv(const half* x, int M, w4v_segs segs, int n_segs, int K,
+                      int gshift, cudaStream_t st)
+{
+    if ((K & 127) != 0) return VV_ERR_UNSUPPORTED;
+    int blocks = 0;
+    for (int i = 0; i < W4V_MAX_SEGS; i++) {
+        if (i < n_segs) {
+            segs.first_block[i] = blocks;
+            blocks += segs.n[i] / 16;
+        } else {
+            segs.first_block[i] = INT_MAX;
+        }
+    }
+    static thread_local int wenv = -2, uenv = -2;
+    if (wenv == -2) {
+        const char* e = getenv("VV_W4A16_MV_CFG");
+        wenv = uenv = 0;
+        if (e && e[0]) {
+            wenv = atoi(e);
+            const char* c = strchr(e, ',');
+            if (c) uenv = atoi(c + 1);
+        }
+    }
+    int W = wenv, U = uenv;
+    if (W != 4 && W != 8 && W != 16) W = M > 8 ? 4 : 8;
+    if (U != 1 && U != 2 && U != 4) U = 1;
+    const half* xh = x;
+#define MV(w, u) if (W == w && U == u) \
+        return launch_mv_cfg<w, u>(xh, M, segs, blocks, K, gshift, st)
+    MV(4, 1); MV(4, 2); MV(4, 4);
+    MV(8, 1); MV(8, 2); MV(8, 4);
+    MV(16, 1); MV(16, 2); MV(16, 4);
+#undef MV
+    return VV_ERR_INVALID_ARG;
+}
+
 template <int LPR, int R>
 vv_status_t launch_gemv_lpr(const half* x, w4v_segs segs, int n_segs,
                             int K, int gshift, cudaStream_t st)
@@ -1415,6 +1661,35 @@ vv_status_t vv_w4a16_gemv_rows_dev(const void* x, int M,
         if (s != VV_OK) return s;
     }
     return VV_OK;
+}
+
+vv_status_t vv_w4a16_mv_dev(const void* x, int M, const vv_w4a16_proj_t* projs,
+                            int n_proj, int K, int group_size, void* stream)
+{
+    if (!x || !projs) return VV_ERR_NULL_PTR;
+    if (n_proj < 1 || n_proj > W4V_MAX_SEGS || M < 1 ||
+        M > VV_W4A16_MV_MAX_ROWS)
+        return VV_ERR_INVALID_ARG;
+    static thread_local int off_env = -2;
+    if (w4_env_int("VV_W4A16_MV", &off_env, 1) == 0) return VV_ERR_UNSUPPORTED;
+    const int gs = w4_gshift(group_size);
+    if (gs < 0 || (K & 127) != 0) return VV_ERR_UNSUPPORTED;
+    w4_dev_info* info = w4_info();
+    if (!info) return VV_ERR_CUDA_LAUNCH;
+    if (info->major < 8) return VV_ERR_UNSUPPORTED;     /* mma.m16n8k16 */
+    w4v_segs segs;
+    memset(&segs, 0, sizeof(segs));
+    for (int i = 0; i < n_proj; i++) {
+        if (!projs[i].packed || !projs[i].sz || !projs[i].y)
+            return VV_ERR_NULL_PTR;
+        if (projs[i].N <= 0 || (projs[i].N & 15) != 0) return VV_ERR_UNSUPPORTED;
+        segs.w[i] = (const uint4*)projs[i].packed;
+        segs.sz[i] = (const half2*)projs[i].sz;
+        segs.bias[i] = (const half*)projs[i].bias;
+        segs.y[i] = (half*)projs[i].y;
+        segs.n[i] = projs[i].N;
+    }
+    return launch_mv((const half*)x, M, segs, n_proj, K, gs, (cudaStream_t)stream);
 }
 
 vv_status_t vv_w4a16_gather_dev(const void* x, const int32_t* perm, void* out,

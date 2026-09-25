@@ -291,6 +291,30 @@ vv_status_t vv_w4a16_gemv_rows_dev(const void* x, int M,
                                    const vv_w4a16_proj_t* projs, int n_proj,
                                    int K, int group_size, void* stream);
 
+/** @brief Most rows of x one vv_w4a16_mv_dev call takes. */
+#define VV_W4A16_MV_MAX_ROWS 16
+
+/**
+ * @brief Up to 3 W4A16 projections of 1..VV_W4A16_MV_MAX_ROWS rows of x on
+ *        tensor cores (mma.m16n8k16), each row's bits its own.
+ *
+ * Row m of projection i lands at projs[i].y + m * N_i, bias added. How K is
+ * split and summed is fixed by K alone -- 16 slices of 128-k blocks, a
+ * halving tree over them -- and an mma's column depends only on its own
+ * inputs, so a row's result does not depend on M, on which projections share
+ * the launch, or on the launch shape the kernel picks: a decode step (M = 1)
+ * and the check of a drafted block (M rows) agree exactly, and the check
+ * reads the weights once, at about a step's cost. Products and sums are
+ * FP32, so the bits are not vv_w4a16_gemv_multi_dev's (FP16 chains of four);
+ * they are closer to the exact sum.
+ *
+ * VV_ERR_UNSUPPORTED below sm_80, for N % 16 or K % 128, and when
+ * VV_W4A16_MV=0; the decoder then runs the GEMV and its multi-row twin for
+ * both, as before. Graph-capturable.
+ */
+vv_status_t vv_w4a16_mv_dev(const void* x, int M, const vv_w4a16_proj_t* projs,
+                            int n_proj, int K, int group_size, void* stream);
+
 /**
  * @brief out[m][j] = x[m][perm[j]] (FP16, K % 8 == 0, perm 16-byte aligned).
  *        Puts activations in the column order of an act-order (desc_act)
