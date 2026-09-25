@@ -400,9 +400,15 @@ test120: 123.9 → 112.3), so the drafter is declined there in exact mode;
 INT8 test30 98.2 → 176.9 (1.80×), test120 95.6 → 174.7 (1.83×) -- the
 transcripts happened to come out the same, which fast does not promise.
 
-**BitNet**: 0.99× on the 20 clips -- its drafter does not learn (held-out
-depth-1 accuracy 0.24 against 0.80 for the others) and the controller keeps
-the blocks paused. Not published.
+**BitNet**: not published. Its greedy transcripts loop a lot (57 % of the
+training tokens sat in repetition loops), and the first drafter learned the
+loops: held-out depth-1 accuracy 0.24 against 0.80 for the others. Trained
+again with the loops capped (`--loop-cap`), it reaches 0.48 and 1.93 tokens
+per block (from 1.58), and the 20 clips run 1.52× -- all of it one clip that
+loops for 11854 tokens, which the drafter copies at 7.97 tokens a block; the
+other 19 run 3-8 % slower than plain decoding. The ternary model's hidden
+states seem to say less about the token after next than Qwen2's do; not
+pursued further.
 
 Where the numbers come from: the 7B's check costs 1.3 steps at 8 rows (the
 projections 1.13, then the head, the rows' attention and the drafter's own
