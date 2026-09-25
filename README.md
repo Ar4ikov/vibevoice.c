@@ -382,16 +382,20 @@ which never pays, so there the drafter is declined unless you ask for
 | ASR-7B, test120 (2 speakers) | 143 tok/s | 310 tok/s (2.17x) |
 | ASR-7B, 32-minute file | 106 tok/s | 184 tok/s (1.73x) |
 | ASR-7B, 20 held-out clips | 138 tok/s | 373 tok/s (2.70x) |
+| Streaming-7B, test120 | 151 tok/s | 391 tok/s (2.59x) |
+| Streaming-7B, 32-minute file | 131 tok/s | 275 tok/s (2.10x) |
 | Streaming-1.5B, test120 | 416 tok/s | 1040 tok/s (2.50x) |
 | Streaming-1.5B, 32-minute file | 341 tok/s | 729 tok/s (2.13x) |
 
 The AWQ checkpoints with their drafter in one download (`drafter/` is used
 without `--draft`):
-[VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2)
+[VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2),
+[VibeVoice-ASR-Streaming-7B-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-AWQ-W4A16-ASYM-DFlash2)
 and
 [VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2).
 The drafters alone, for the other checkpoints of the same models:
-[VibeVoice-ASR-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2-Drafter)
+[VibeVoice-ASR-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2-Drafter),
+[VibeVoice-ASR-Streaming-7B-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-DFlash2-Drafter)
 and
 [VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter),
 each also stored as INT4 (`-AWQ-W4A16-ASYM`).

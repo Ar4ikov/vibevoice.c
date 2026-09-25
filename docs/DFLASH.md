@@ -364,6 +364,19 @@ traces against the BF16 one's 3.741 and runs the same: clips 375.0, test120
 | 32-minute file | 341.4 | 728.6 (**2.13×**) | 4.06 |
 | 20 held-out clips | 409.2 | 869.4 (**2.12×**) | 3.52 |
 
+**VibeVoice-ASR-Streaming-7B, AWQ W4A16** (`Ar4ikov/VibeVoice-ASR-Streaming-7B-DFlash2-Drafter`,
+drafter v4, held-out 3.52 tokens per block; b72be15; flashinfer):
+
+| | plain | drafted, 8 rows | drafted, 4 rows | tokens per block (8) |
+|---|---|---|---|---|
+| test120 | 150.8 | 390.5 (**2.59×**) | 316.0 (2.10×) | 3.72 |
+| 32-minute file | 131.1 | 275.0 (**2.10×**) | 251.6 (1.92×) | 3.54 |
+| 20 held-out clips | 148.8 | 364.8 (**2.45×**) | | 3.56 |
+
+Its v3 (1500 training clips; v4 has 2872 and three more epochs) kept 2.27 tokens
+per block on test120 and made 1.58× there -- data, again. The INT4 drafter
+runs the same (clips 363.6).
+
 **Other weights of the 7B, the same drafter**, test30, 7d7d43e, fa2, 8 rows:
 BF16 56.5 → 90.6 (1.60×), W8A8 98.6 → 237.8 (2.41×), W4A8 146.3 → 232.4
 (1.59×). NF4 and INT8 check exactly only one row at a time and lost (NF4,

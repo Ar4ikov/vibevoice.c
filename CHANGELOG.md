@@ -35,12 +35,15 @@ Write the entry for a change under Unreleased in the same pull request.
   drafter's context -- reads its positions on the device and runs as one
   captured graph. Blocks run only while they beat plain steps (measured).
   RTX 3090, AWQ 7B against its default decode: jfk 2.57x, test120 2.17x,
-  a 32-minute file 1.73x, 20 held-out clips 2.70x; Streaming-1.5B: test120
-  2.50x, 32 minutes 2.13x. Drafters for the AWQ checkpoints are on the Hub
+  a 32-minute file 1.73x, 20 held-out clips 2.70x; Streaming-7B: test120
+  2.59x, 32 minutes 2.10x, clips 2.45x; Streaming-1.5B: test120 2.50x,
+  32 minutes 2.13x. Drafters for the AWQ checkpoints are on the Hub
   ([ASR-7B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2-Drafter),
+  [Streaming-7B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-DFlash2-Drafter),
   [Streaming-1.5B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter),
   each also as `-AWQ-W4A16-ASYM`), and bundled with their models
   ([ASR-7B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2),
+  [Streaming-7B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-AWQ-W4A16-ASYM-DFlash2),
   [Streaming-1.5B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2)):
   a model directory's `drafter/` is used without `--draft` (`--draft none`
   turns it off). They are trained on the target's own
