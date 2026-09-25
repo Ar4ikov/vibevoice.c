@@ -762,6 +762,12 @@ int main(void) {
         /* A long file's cache (32 min: ~24K positions, 49 MB a layer). */
         test_attn_rows(VV_ATTN_FA2, VV_KV_FP16, false, 28, 4, 24000, 4);
         test_attn_rows(VV_ATTN_FA2, VV_KV_FP16, true, 28, 4, 24000, 4);
+        test_attn_rows(VV_ATTN_FA2, VV_KV_FP16, false, 28, 4, 24000, 8);
+        test_attn_rows(VV_ATTN_FA2, VV_KV_FP8_E4M3, false, 28, 4, 14000, 8);
+        test_attn_rows(VV_ATTN_FA2, VV_KV_FP16, false, 28, 4, 5000, 16);
+        test_attn_rows(VV_ATTN_FLASHINFER, VV_KV_FP16, false, 28, 4, 24000, 8);
+        test_attn_rows(VV_ATTN_FLASHINFER, VV_KV_FP16, false, 28, 4, 24000, 4);
+        test_attn_rows(VV_ATTN_FLASHINFER, VV_KV_FP16, false, 28, 4, 5000, 16);
     }
     test_ternary_rows(1536, 1536);
     test_ternary_rows(8960, 1536);

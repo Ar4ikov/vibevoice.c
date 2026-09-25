@@ -42,6 +42,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "attn_common.cuh"
 #include "decode_split.h"
@@ -202,7 +203,7 @@ void att_split_kernel(
     float* __restrict__ part_l,
     int n_q_heads, int n_kv_heads, int q_len, int q_offset,
     int kv_len, const int* __restrict__ d_kv_len, int n_parts,
-    int bpv, float scale, bool causal, int verify_rows)
+    int bpv, float scale, bool causal, int verify_rows, int row_base)
 {
 #if ATT_HAS_MMA
     /* A replayed graph keeps its arguments, so the length comes from device
@@ -371,7 +372,12 @@ void att_split_kernel(
         const int pos = row / G;
         const int head = kv_head * G + (row - pos * G);
         const size_t out_row = (size_t)pos * n_q_heads + head;
-        const size_t pi = out_row * n_parts + part;
+        /* row_base >= 0: position pos is row row_base + pos of a verified
+         * block, whose partials go where that row's own decode puts them. */
+        const size_t pi = row_base >= 0
+            ? (size_t)(row_base + pos) * n_q_heads * VV_DECODE_MAX_PARTS
+              + (size_t)head * n_parts + part
+            : out_row * n_parts + part;
         part_o[pi * ATT_D + d] = acc;
         if (d == 0) { part_m[pi] = mx; part_l[pi] = l; }
     }
@@ -486,7 +492,7 @@ vv_status_t vv_attn_fi_prefill_dev(
             att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(    \
                 (const half*)q, K, V, Km, Vm, kv->page_table,                  \
                 pt.o, pt.m, pt.l, n_q_heads, n_kv, q_len, q_offset, kv_len,    \
-                NULL, parts, bpv, scale, causal, 0);
+                NULL, parts, bpv, scale, causal, 0, -1);
             ATT_DISPATCH(fmt, SPLIT_CALL)
 #undef SPLIT_CALL
             att_combine_kernel<<<q_len * n_q_heads, ATT_D, 0, st>>>(
@@ -532,7 +538,7 @@ vv_status_t vv_attn_fi_decode_dev(
     att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(            \
         (const half*)q, K, V, Km, Vm, kv->page_table, pt.o, pt.m, pt.l,        \
         n_q_heads, n_kv, 1, 0, cache_len, d_cache_len, parts, bpv,             \
-        scale, false, 0);
+        scale, false, 0, -1);
     ATT_DISPATCH(kv->format, DEC_CALL)
 #undef DEC_CALL
     att_combine_kernel<<<n_q_heads, ATT_D, 0, st>>>(pt.o, pt.m, pt.l,
@@ -540,7 +546,23 @@ vv_status_t vv_attn_fi_decode_dev(
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
-/* `rows` consecutive flashinfer decodes in one launch (a verified block). */
+/*
+ * `rows` consecutive flashinfer decodes (a verified block): row r is the
+ * decode at cache_len + r positions.
+ *
+ * A decode fills G of a fragment's 16 rows. Rows whose split count and
+ * (tile-rounded) slice length agree -- all of them, but where the block
+ * straddles a change -- cut the cache the same way, so they go in as the
+ * causal prefill they are: position p of the run at cache_len - 1 + p, its
+ * G heads the fragment rows p * G.., two or three rows' heads to a fragment
+ * sharing every K/V tile. A row's scores and its P . V are its own rows of
+ * each mma; the tiles past a row's end that the fragment's later rows still
+ * need are masked out whole, which leaves its state as it was (max and
+ * factor unchanged, P zero); and its partials go where its own decode puts
+ * them. So each row is its one-row decode, bit for bit, at about half the
+ * tiles and MMAs (VV_ATTN_FI_ROWS_PACKED=0: a fragment per row, as before;
+ * a length known only on the device, in a replayed graph, does the same).
+ */
 static vv_status_t vv_attn_fi_decode_rows_dev(
     const void* q, const vv_kv_view_t* kv, void* out, int n_q_heads,
     int rows, int cache_len, const int* d_cache_len, void* scratch,
@@ -567,12 +589,49 @@ static vv_status_t vv_attn_fi_decode_rows_dev(
     const half* Km = (const half*)kv->k_meta;
     const half* Vm = (const half*)kv->v_meta;
 
+    static thread_local int packed_env = -2;
+    if (packed_env == -2) {
+        const char* e = getenv("VV_ATTN_FI_ROWS_PACKED");
+        packed_env = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (packed_env && !d_cache_len) {
+        const int G = n_q_heads / n_kv;
+        int ra = 0;
+        while (ra < rows) {
+            /* The run of rows that slice the cache as row ra does. */
+            const int P = att_fi_decode_parts(n_kv, cache_len + ra);
+            const int c0 = ((cache_len + ra + P - 1) / P + ATT_BC - 1) / ATT_BC;
+            int rb = ra + 1;
+            while (rb < rows) {
+                const int L = cache_len + rb;
+                const int Pb = att_fi_decode_parts(n_kv, L);
+                if (Pb != P || ((L + Pb - 1) / Pb + ATT_BC - 1) / ATT_BC != c0)
+                    break;
+                ++rb;
+            }
+            const int q_len = rb - ra;
+            const dim3 grid_p(n_kv, (q_len * G + 15) / 16, P);
+#define PACK_CALL(F)                                                           \
+            att_split_kernel<F><<<grid_p, ATT_THREADS, ATT_SMEM_BYTES, st>>>(  \
+                (const half*)q + (size_t)ra * n_q_heads * ATT_D, K, V, Km, Vm, \
+                kv->page_table, pt.o, pt.m, pt.l, n_q_heads, n_kv, q_len,      \
+                cache_len - 1 + ra, cache_len + rb - 1, NULL, P, bpv, scale,   \
+                true, 0, ra);
+            ATT_DISPATCH(kv->format, PACK_CALL)
+#undef PACK_CALL
+            ra = rb;
+        }
+        att_combine_rows_kernel<<<dim3(n_q_heads, rows), ATT_D, 0, st>>>(
+            pt.o, pt.m, pt.l, (half*)out, n_q_heads, cache_len, NULL, n_kv);
+        return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+    }
+
     dim3 grid(n_kv, rows, parts);
 #define DEC_CALL(F)                                                            \
     att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(            \
         (const half*)q, K, V, Km, Vm, kv->page_table, pt.o, pt.m, pt.l,        \
         n_q_heads, n_kv, 1, 0, cache_len, d_cache_len, parts, bpv,             \
-        scale, false, rows);
+        scale, false, rows, -1);
     ATT_DISPATCH(kv->format, DEC_CALL)
 #undef DEC_CALL
     att_combine_rows_kernel<<<dim3(n_q_heads, rows), ATT_D, 0, st>>>(
