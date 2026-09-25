@@ -192,6 +192,11 @@ void att_rows_kernel(
  * Decode and small-q prefill: 16 packed rows per block, split KV
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/** @brief Tiles in each slice of a split over `len` positions in `parts`. */
+__device__ __forceinline__ int att_chunk_tiles(int len, int parts) {
+    return ((len + parts - 1) / parts + ATT_BC - 1) / ATT_BC;
+}
+
 template <int FMT>
 __global__ __launch_bounds__(ATT_THREADS)
 void att_split_kernel(
@@ -203,7 +208,8 @@ void att_split_kernel(
     float* __restrict__ part_l,
     int n_q_heads, int n_kv_heads, int q_len, int q_offset,
     int kv_len, const int* __restrict__ d_kv_len, int n_parts,
-    int bpv, float scale, bool causal, int verify_rows, int row_base)
+    int bpv, float scale, bool causal, int verify_rows, int frag_rows,
+    int row_base)
 {
 #if ATT_HAS_MMA
     /* A replayed graph keeps its arguments, so the length comes from device
@@ -211,21 +217,38 @@ void att_split_kernel(
     if (d_kv_len) kv_len = *d_kv_len;
 
     /*
-     * The rows of a verified block (verify_rows > 1, one query row each):
-     * blockIdx.y is the row r, a decode at kv_len + r with the split count
-     * and partials that decode would have had.
+     * The rows of a verified block (verify_rows > 1): row r is the decode at
+     * kv_len + r. Runs of up to frag_rows rows that cut the cache the same
+     * way -- split count, tile-rounded slice -- share a fragment; blockIdx.y
+     * is the fragment, found here from the length alone. Its rows go in as
+     * the causal prefill they are (row ra at position kv_len - 1 + ra), and
+     * their partials where their own decodes put them (row_base).
      */
-    int vr = 0;
     if (verify_rows > 1) {
-        vr = (int)blockIdx.y;
-        kv_len += vr;
-        n_parts = vv_fi_decode_parts(n_kv_heads, kv_len);
-        Q += (size_t)vr * n_q_heads * ATT_D;
-        const size_t per = (size_t)n_q_heads * VV_DECODE_MAX_PARTS;
-        part_o += (size_t)vr * per * ATT_D;
-        part_m += (size_t)vr * per;
-        part_l += (size_t)vr * per;
-        if ((int)blockIdx.z >= n_parts) return;
+        const int L = kv_len;
+        const int f = (int)blockIdx.y;
+        int ra = 0, rb = 0, idx = 0, P = 0;
+        bool found = false;
+        while (ra < verify_rows) {
+            P = vv_fi_decode_parts(n_kv_heads, L + ra);
+            const int ct = att_chunk_tiles(L + ra, P);
+            rb = ra + 1;
+            while (rb < verify_rows && rb - ra < frag_rows &&
+                   vv_fi_decode_parts(n_kv_heads, L + rb) == P &&
+                   att_chunk_tiles(L + rb, P) == ct)
+                ++rb;
+            if (idx == f) { found = true; break; }
+            ++idx;
+            ra = rb;
+        }
+        if (!found || (int)blockIdx.z >= P) return;
+        n_parts = P;
+        Q += (size_t)ra * n_q_heads * ATT_D;
+        q_len = rb - ra;
+        q_offset = L - 1 + ra;
+        kv_len = L + rb - 1;
+        causal = true;
+        row_base = ra;
     }
 
     const int kv_head = blockIdx.x;
@@ -492,7 +515,7 @@ vv_status_t vv_attn_fi_prefill_dev(
             att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(    \
                 (const half*)q, K, V, Km, Vm, kv->page_table,                  \
                 pt.o, pt.m, pt.l, n_q_heads, n_kv, q_len, q_offset, kv_len,    \
-                NULL, parts, bpv, scale, causal, 0, -1);
+                NULL, parts, bpv, scale, causal, 0, 0, -1);
             ATT_DISPATCH(fmt, SPLIT_CALL)
 #undef SPLIT_CALL
             att_combine_kernel<<<q_len * n_q_heads, ATT_D, 0, st>>>(
@@ -538,7 +561,7 @@ vv_status_t vv_attn_fi_decode_dev(
     att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(            \
         (const half*)q, K, V, Km, Vm, kv->page_table, pt.o, pt.m, pt.l,        \
         n_q_heads, n_kv, 1, 0, cache_len, d_cache_len, parts, bpv,             \
-        scale, false, 0, -1);
+        scale, false, 0, 0, -1);
     ATT_DISPATCH(kv->format, DEC_CALL)
 #undef DEC_CALL
     att_combine_kernel<<<n_q_heads, ATT_D, 0, st>>>(pt.o, pt.m, pt.l,
@@ -550,18 +573,17 @@ vv_status_t vv_attn_fi_decode_dev(
  * `rows` consecutive flashinfer decodes (a verified block): row r is the
  * decode at cache_len + r positions.
  *
- * A decode fills G of a fragment's 16 rows. Rows whose split count and
- * (tile-rounded) slice length agree -- all of them, but where the block
- * straddles a change -- cut the cache the same way, so they go in as the
- * causal prefill they are: position p of the run at cache_len - 1 + p, its
- * G heads the fragment rows p * G.., two or three rows' heads to a fragment
- * sharing every K/V tile. A row's scores and its P . V are its own rows of
- * each mma; the tiles past a row's end that the fragment's later rows still
- * need are masked out whole, which leaves its state as it was (max and
- * factor unchanged, P zero); and its partials go where its own decode puts
- * them. So each row is its one-row decode, bit for bit, at about half the
- * tiles and MMAs (VV_ATTN_FI_ROWS_PACKED=0: a fragment per row, as before;
- * a length known only on the device, in a replayed graph, does the same).
+ * A decode fills G of a fragment's 16 rows. Rows that cut the cache the same
+ * way -- all of them, but where the block straddles a change of split count
+ * or slice -- go in two or three to a fragment (att_split_kernel finds its
+ * rows from the length), sharing every K/V tile. A row's scores and its
+ * P . V are its own rows of each mma; the tiles past a row's end that its
+ * fragment's later rows still need are masked out whole, which leaves its
+ * state as it was (max and factor unchanged, P zero); and its partials go
+ * where its own decode puts them. So each row is its one-row decode, bit for
+ * bit, at about half the tiles and MMAs (3070, 24K positions: 8 rows 1.64x
+ * one row, a fragment each 3.33x). VV_ATTN_FI_ROWS_PACKED=0 gives every row
+ * its own fragment.
  */
 static vv_status_t vv_attn_fi_decode_rows_dev(
     const void* q, const vv_kv_view_t* kv, void* out, int n_q_heads,
@@ -594,44 +616,14 @@ static vv_status_t vv_attn_fi_decode_rows_dev(
         const char* e = getenv("VV_ATTN_FI_ROWS_PACKED");
         packed_env = (e && e[0] == '0') ? 0 : 1;
     }
-    if (packed_env && !d_cache_len) {
-        const int G = n_q_heads / n_kv;
-        int ra = 0;
-        while (ra < rows) {
-            /* The run of rows that slice the cache as row ra does. */
-            const int P = att_fi_decode_parts(n_kv, cache_len + ra);
-            const int c0 = ((cache_len + ra + P - 1) / P + ATT_BC - 1) / ATT_BC;
-            int rb = ra + 1;
-            while (rb < rows) {
-                const int L = cache_len + rb;
-                const int Pb = att_fi_decode_parts(n_kv, L);
-                if (Pb != P || ((L + Pb - 1) / Pb + ATT_BC - 1) / ATT_BC != c0)
-                    break;
-                ++rb;
-            }
-            const int q_len = rb - ra;
-            const dim3 grid_p(n_kv, (q_len * G + 15) / 16, P);
-#define PACK_CALL(F)                                                           \
-            att_split_kernel<F><<<grid_p, ATT_THREADS, ATT_SMEM_BYTES, st>>>(  \
-                (const half*)q + (size_t)ra * n_q_heads * ATT_D, K, V, Km, Vm, \
-                kv->page_table, pt.o, pt.m, pt.l, n_q_heads, n_kv, q_len,      \
-                cache_len - 1 + ra, cache_len + rb - 1, NULL, P, bpv, scale,   \
-                true, 0, ra);
-            ATT_DISPATCH(kv->format, PACK_CALL)
-#undef PACK_CALL
-            ra = rb;
-        }
-        att_combine_rows_kernel<<<dim3(n_q_heads, rows), ATT_D, 0, st>>>(
-            pt.o, pt.m, pt.l, (half*)out, n_q_heads, cache_len, NULL, n_kv);
-        return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
-    }
+    const int frag_rows = packed_env ? 16 / (n_q_heads / n_kv) : 1;
 
     dim3 grid(n_kv, rows, parts);
 #define DEC_CALL(F)                                                            \
     att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(            \
         (const half*)q, K, V, Km, Vm, kv->page_table, pt.o, pt.m, pt.l,        \
         n_q_heads, n_kv, 1, 0, cache_len, d_cache_len, parts, bpv,             \
-        scale, false, rows, -1);
+        scale, false, rows, frag_rows, -1);
     ATT_DISPATCH(kv->format, DEC_CALL)
 #undef DEC_CALL
     att_combine_rows_kernel<<<dim3(n_q_heads, rows), ATT_D, 0, st>>>(

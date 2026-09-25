@@ -314,6 +314,16 @@ static void test_attn_rows(int backend, int fmt, bool paged, int n_q, int n_kv,
         s = vv_attn_decode(b, (const uint8_t*)q + (size_t)r * n_q * D * 2,
                            &view, (uint8_t*)ob + (size_t)r * n_q * D * 2, n_q,
                            L0 + 1 + r, NULL, scr, NULL);
+    /* The length read from the device, as a replayed graph reads it. */
+    void* od = NULL;
+    int* dlen = NULL;
+    vv_dev_alloc(&od, (size_t)M * n_q * D * 2);
+    vv_dev_alloc((void**)&dlen, sizeof(int));
+    const int len1 = L0 + 1;
+    vv_dev_memcpy_h2d(dlen, &len1, sizeof(int), NULL);
+    vv_status_t sd = VV_ERR_UNSUPPORTED;
+    if (s == VV_OK && b != VV_ATTN_FA1)
+        sd = vv_attn_decode_rows(b, q, &view, od, n_q, M, L0 + 1, dlen, scr, NULL);
     vv_dev_stream_sync(NULL);
     if (s != VV_OK) {
         printf("  SKIP %s: %s\n", name, vv_status_str(s));
@@ -330,6 +340,11 @@ static void test_attn_rows(int backend, int fmt, bool paged, int n_q, int n_kv,
         CHECK(bad_rows == 0, "%s: %d of %d rows differ from their own decode",
               name, bad_rows, M);
         if (!bad_rows) printf("  ok   %s\n", name);
+        if (sd == VV_OK) {
+            vv_dev_memcpy_d2h(c, od, (size_t)M * n_q * D * 2, NULL);
+            CHECK(memcmp(a, c, (size_t)M * n_q * D * 2) == 0,
+                  "%s: rows from a device-side length differ", name);
+        }
         free(a); free(c);
         /* VV_SPEC_BENCH=1: the block against one decode of the same length. */
         if (getenv("VV_SPEC_BENCH") && getenv("VV_SPEC_BENCH")[0] == '1') {
@@ -356,6 +371,7 @@ static void test_attn_rows(int backend, int fmt, bool paged, int n_q, int n_kv,
     if (km) vv_dev_free(km);
     if (vm) vv_dev_free(vm);
     vv_dev_free(kref); vv_dev_free(q); vv_dev_free(oa); vv_dev_free(ob);
+    vv_dev_free(od); vv_dev_free(dlen);
     vv_dev_free(scr);
     if (table) vv_dev_free(table);
     free(pages); free(kh); free(vh); free(qh);
