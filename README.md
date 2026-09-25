@@ -392,7 +392,14 @@ without `--draft`):
 [VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2),
 [VibeVoice-ASR-Streaming-7B-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-AWQ-W4A16-ASYM-DFlash2)
 and
-[VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2).
+[VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2);
+Microsoft's BF16 checkpoints the same way with the BF16 drafters:
+[VibeVoice-ASR-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2)
+(1.89x on test120),
+[VibeVoice-ASR-Streaming-7B-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-DFlash2)
+(2.08x) and
+[VibeVoice-ASR-Streaming-1.5B-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2)
+(1.96x).
 The drafters alone, for the other checkpoints of the same models:
 [VibeVoice-ASR-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2-Drafter),
 [VibeVoice-ASR-Streaming-7B-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-DFlash2-Drafter)

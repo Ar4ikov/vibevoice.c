@@ -377,6 +377,20 @@ Its v3 (1500 training clips; v4 has 2872 and three more epochs) kept 2.27 tokens
 per block on test120 and made 1.58× there -- data, again. The INT4 drafter
 runs the same (clips 363.6).
 
+**Microsoft's BF16 checkpoints** (dense FP16 on the card; b72be15; the BF16
+drafters, held as INT4; flashinfer on both sides for the 7B):
+
+| | test120 | 32-minute file |
+|---|---|---|
+| ASR-7B | 56.9 → 105.4 (1.85×) | 52.5 → 84.7 (1.61×) |
+| Streaming-7B | 57.0 → 118.6 (2.08×) | 53.8 → 108.7 (2.02×) |
+| Streaming-1.5B | 208.3 → 408.4 (1.96×) | 186.5 → 358.5 (1.92×) |
+
+All six drafted transcripts were the plain ones. The drafts keep about as
+many tokens as on AWQ (ASR-7B test120: 2.59 per block against 2.74), the
+gain is smaller -- a dense check of 8 rows costs more steps than the
+tensor-core W4A16 one; not profiled further.
+
 **Other weights of the 7B, the same drafter**, test30, 7d7d43e, fa2, 8 rows:
 BF16 56.5 → 90.6 (1.60×), W8A8 98.6 → 237.8 (2.41×), W4A8 146.3 → 232.4
 (1.59×). NF4 and INT8 check exactly only one row at a time and lost (NF4,

@@ -44,7 +44,11 @@ Write the entry for a change under Unreleased in the same pull request.
   each also as `-AWQ-W4A16-ASYM`), and bundled with their models
   ([ASR-7B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2),
   [Streaming-7B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-AWQ-W4A16-ASYM-DFlash2),
-  [Streaming-1.5B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2)):
+  [Streaming-1.5B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2);
+  Microsoft's BF16 checkpoints with the BF16 drafters as
+  [VibeVoice-ASR-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2),
+  [-Streaming-7B-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-DFlash2),
+  [-Streaming-1.5B-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2)):
   a model directory's `drafter/` is used without `--draft` (`--draft none`
   turns it off). They are trained on the target's own
   transcripts (`tools/dflash`: corpus, `vv_dflash_data gen|trace`,
