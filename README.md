@@ -385,7 +385,12 @@ which never pays, so there the drafter is declined unless you ask for
 | Streaming-1.5B, test120 | 416 tok/s | 1040 tok/s (2.50x) |
 | Streaming-1.5B, 32-minute file | 341 tok/s | 729 tok/s (2.13x) |
 
-Drafters for the AWQ checkpoints:
+The AWQ checkpoints with their drafter in one download (`drafter/` is used
+without `--draft`):
+[VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2)
+and
+[VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2).
+The drafters alone, for the other checkpoints of the same models:
 [VibeVoice-ASR-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2-Drafter)
 and
 [VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter),
