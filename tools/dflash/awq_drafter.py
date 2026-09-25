@@ -225,10 +225,17 @@ def main():
         return res
 
     base = evaluate("bf16")
-    rtn = {k: dequant(*int4_codes(w)) for k, w in orig.items()}
-    set_weights(rtn)
+    # One projection at a time from here on: the 7B drafter's projections
+    # are 2.6 GB in FP32, and each whole-model copy held at once (the RTN
+    # weights, the codes as floats, their dequantized weights) took a card
+    # the captured inputs already half fill.
+    with torch.no_grad():
+        for k, m in lin.items():
+            m.weight.copy_(dequant(*int4_codes(orig[k])))
     evaluate("rtn int4")
     set_weights(orig)
+    del orig
+    torch.cuda.empty_cache()
 
     # ── activation-aware scales where they fold ─────────────────────────────
     nkv, nh, hd = cfg["num_key_value_heads"], cfg["num_attention_heads"], cfg["head_dim"]
@@ -278,8 +285,13 @@ def main():
         for k, w in scaled.items():
             x = xin[k][:1024]
             r = clip_search(w, x)
-            codes[k] = int4_codes(w, r)
-    set_weights({k: dequant(*c) for k, c in codes.items()})
+            q, s, z = int4_codes(w, r)
+            codes[k] = (q.to(torch.uint8), s, z)
+    del X, xin, scaled
+    torch.cuda.empty_cache()
+    with torch.no_grad():
+        for k, m in lin.items():
+            m.weight.copy_(dequant(*codes[k]))
     res = evaluate("awq int4")
 
     # ── write it: compressed-tensors pack-quantized, the rest as it was ─────
