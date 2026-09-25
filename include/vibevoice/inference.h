@@ -136,6 +136,16 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
                                 void* stream);
 
 /**
+ * @brief vv_kv_cache_append at the position held in `d_pos` (a device int;
+ *        NULL: the host's current_len), for any number of positions on a
+ *        GPU cache -- a verified block in a replayed graph.
+ */
+vv_status_t vv_kv_cache_append_at(vv_kv_cache_t* cache, int layer,
+                                  const void* k, const void* v,
+                                  int seq_len, const int* d_pos,
+                                  void* stream);
+
+/**
  * @brief Publish the host's `current_len` to the device copy.
  *
  * Prefill advances the length on the host; decode reads it on the device.
@@ -411,6 +421,21 @@ vv_status_t vv_decoder_prefill_taps(
  * The whole model on one device (no shards). Appends `rows` positions;
  * `taps` (NULL: none) receive them at position - taps->row_base.
  */
+/**
+ * @brief Where a verified block's positions come from, and which attention
+ *        its rows take (vv_decoder_verify).
+ */
+typedef struct vv_verify_opts {
+    const int* d_pos;   /**< device int: row 0's position (NULL: the host's
+                             current_len), so a graph can replay the block */
+    const int* d_next;  /**< device int: row 0's cache length, d_pos + 1 */
+    int attn_backend;   /**< vv_attn_backend_t for the rows, -1: the cache's */
+    bool fast;          /**< the prefill's projections for the rows, not
+                             each row's decode arithmetic (--draft-check
+                             fast): the same for W4A16, a GEMM for NF4 and
+                             INT8 where exact runs a GEMV per row */
+} vv_verify_opts_t;
+
 vv_status_t vv_decoder_verify(
     vv_model_t* model,
     void* hidden_states,       /**< [rows, hidden_size] FP16, in/out */
@@ -421,7 +446,8 @@ vv_status_t vv_decoder_verify(
     size_t workspace_size,
     void* compute_stream,
     void* xfer_stream,
-    const vv_taps_t* taps);
+    const vv_taps_t* taps,
+    const vv_verify_opts_t* opts);
 
 /**
  * @brief The most rows vv_decoder_verify keeps exact on `model`.

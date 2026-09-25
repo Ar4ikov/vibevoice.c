@@ -631,6 +631,69 @@ static vv_status_t vv_attn_fi_decode_rows_dev(
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
+/*
+ * A drafted block over its context: every row sees the first *d_kv_len
+ * positions. The split kernel reads the length on the device; the host's
+ * `kv_len` only sizes the split, so a replay holds for every length up to
+ * the next 1024 above it (block_parts rounds up to that).
+ */
+static int block_parts(int n_kv, int G, int q_len, int kv_len, int n_sm) {
+    const int tiles16 = (q_len * G + 15) / 16;
+    const int base = n_kv * tiles16;
+    int parts = (2 * n_sm + base - 1) / base;
+    int cap = VV_DECODE_MAX_PARTS / (q_len > 0 ? q_len : 1);
+    const int span = (kv_len + 1023) / 1024 * 1024;
+    const int by_len = (span + 4 * ATT_BC - 1) / (4 * ATT_BC);
+    if (cap > by_len) cap = by_len;
+    if (parts > cap) parts = cap;
+    return parts > 0 ? parts : 1;
+}
+
+int vv_attn_block_shape(int n_q_heads, int n_kv_heads, int q_len, int kv_len) {
+    int sm = 0, n_sm = 0;
+    att_device(&sm, &n_sm);
+    if (n_kv_heads <= 0) return 0;
+    return block_parts(n_kv_heads, n_q_heads / n_kv_heads, q_len, kv_len, n_sm);
+}
+
+vv_status_t vv_attn_block_dev(const void* q, const vv_kv_view_t* kv,
+                              void* out, int n_q_heads, int q_len, int kv_len,
+                              const int* d_kv_len, void* scratch,
+                              void* stream)
+{
+    if (!q || !kv || !kv->k || !kv->v || !out || !scratch)
+        return VV_ERR_NULL_PTR;
+    if (q_len <= 0 || kv_len <= 0) return VV_ERR_INVALID_ARG;
+    if (kv->head_dim != ATT_D) return VV_ERR_UNSUPPORTED;
+    const int n_kv = kv->n_kv_heads;
+    if (n_kv <= 0 || n_q_heads % n_kv || n_q_heads / n_kv > 16)
+        return VV_ERR_UNSUPPORTED;
+    int sm = 0, n_sm = 0;
+    att_device(&sm, &n_sm);
+    if (sm < 75) return VV_ERR_UNSUPPORTED;
+    const int G = n_q_heads / n_kv;
+    const int parts = block_parts(n_kv, G, q_len, kv_len, n_sm);
+    const int bpv = vv_kv_bytes_per_vec((vv_kv_format_t)kv->format, ATT_D);
+    const float scale = 1.0f / sqrtf((float)ATT_D);
+    cudaStream_t st = (cudaStream_t)stream;
+    const vv_decode_parts_t pt = vv_decode_parts(scratch, n_q_heads, ATT_D);
+    const uint8_t* K = (const uint8_t*)kv->k;
+    const uint8_t* V = (const uint8_t*)kv->v;
+    const half* Km = (const half*)kv->k_meta;
+    const half* Vm = (const half*)kv->v_meta;
+    const dim3 grid(n_kv, (q_len * G + 15) / 16, parts);
+#define BLOCK_CALL(F)                                                          \
+    att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(            \
+        (const half*)q, K, V, Km, Vm, kv->page_table, pt.o, pt.m, pt.l,        \
+        n_q_heads, n_kv, q_len, 0, kv_len, d_kv_len, parts, bpv, scale,        \
+        false, 0, 0, -1);
+    ATT_DISPATCH(kv->format, BLOCK_CALL)
+#undef BLOCK_CALL
+    att_combine_kernel<<<q_len * n_q_heads, ATT_D, 0, st>>>(
+        pt.o, pt.m, pt.l, (half*)out, parts);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
 /* ─── The dispatch point ─────────────────────────────────────────────────── */
 
 /*

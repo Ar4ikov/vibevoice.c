@@ -758,7 +758,6 @@ struct vv_spec {
     void* stream;              /* the context's compute stream */
     /* draft pass */
     int32_t* ids;              /* [B]: anchor, then MASK / the drafts */
-    int32_t* anchor;           /* [1] */
     int32_t* draft;            /* [B-1] */
     int32_t* post;             /* [B] the target's tokens */
     int32_t* out;              /* [B] accepted drafts + the target's next */
@@ -778,7 +777,16 @@ struct vv_spec {
     /* verify */
     void* vh;                  /* [B][Ht] the target's rows */
     void* vn;                  /* [B][Ht] normed */
-    int32_t* h_pin;            /* pinned: out[B], n_out */
+    int32_t* h_pin;            /* pinned: out[B], n_out, then the inputs */
+    /* A cycle reads its positions on the device (cycle_body), so one
+     * capture replays for every cycle of a shape (vv_spec_cycle). */
+    int32_t* d_in;             /* [IN_N] device copy of h_pin + IN_PIN */
+    void* graph;               /* the captured cycle, or NULL */
+    int graph_key[4];          /* rows, check, rows' attention, block's */
+    bool graph_off;            /* no capture here: launch every kernel */
+    bool block_attn;           /* the draft pass attends on flashinfer with
+                                  its length on the device (else the host's,
+                                  and no capture) */
     /* plain steps */
     vv_taps_t step_taps;       /* one row */
     /* blocks or steps (vv_spec_want_block) */
@@ -797,6 +805,14 @@ static vv_status_t dlin_gemm(vv_spec_t* s, const void* x, const dlin_t* W,
                              void* y, int M, int N, int K, void* stream);
 static size_t largest_packed(const vv_drafter_t* d);
 
+/*
+ * A cycle's inputs, in d_in (device) from the pinned h_pin + IN_PIN: the
+ * anchor token, the target's length (row 0's position) and one more (row
+ * 0's cache length), the drafter's context length and it plus the block.
+ */
+enum { IN_ANCHOR, IN_POS, IN_NEXT, IN_CTX, IN_CTX_END, IN_N };
+#define IN_PIN (VV_SPEC_MAX_BLOCK + 1)
+
 static vv_status_t salloc(vv_spec_t* s, void** p, size_t n) {
     if (s->n_allocs == s->cap_allocs) {
         const int nc = s->cap_allocs ? s->cap_allocs * 2 : 64;
@@ -814,6 +830,7 @@ void vv_spec_free(vv_spec_t* s) {
     if (!s) return;
     for (int i = 0; i < s->n_allocs; i++) vv_dev_free(s->allocs[i]);
     vv_free(s->allocs);
+    if (s->graph) vv_dev_graph_destroy(s->graph);
     if (s->h_pin) vv_dev_free_pinned(s->h_pin);
     vv_free(s->kc);
     vv_free(s->vc);
@@ -866,7 +883,7 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
     }
 #define A(p, n) if (st == VV_OK) st = salloc(s, (void**)&(p), (n))
     A(s->taps.buf, T * (size_t)s->n_taps * H * 2);
-    A(s->ids, B * 4); A(s->anchor, 4); A(s->draft, B * 4); A(s->post, B * 4);
+    A(s->ids, B * 4); A(s->draft, B * 4); A(s->post, B * 4);
     A(s->out, B * 4); A(s->n_out, 4);
     A(s->h, B * H * 4); A(s->xe, B * H * 2);
     A(s->xn, B * H * 2); A(s->xc, B * H * 2);
@@ -886,8 +903,13 @@ vv_status_t vv_spec_create(const vv_drafter_t* d, int target_hidden,
     A(s->ck, T * kd * 2); A(s->ckn, T * kd * 2); A(s->cv, T * kd * 2);
     A(s->vh, B * (size_t)target_hidden * 2); A(s->vn, B * (size_t)target_hidden * 2);
     A(s->step_taps.buf, (size_t)s->n_taps * H * 2);
+    A(s->d_in, IN_N * 4);
 #undef A
-    if (st == VV_OK) st = vv_dev_alloc_pinned((void**)&s->h_pin, (B + 1) * 4);
+    s->block_attn = s->backend == VV_ATTN_FLASHINFER &&
+                    vv_attn_block_shape(s->nh, s->nkv, s->B, s->B) > 0;
+    s->graph_off = !s->block_attn;
+    if (st == VV_OK)
+        st = vv_dev_alloc_pinned((void**)&s->h_pin, (IN_PIN + IN_N) * 4);
     if (st != VV_OK) { vv_spec_free(s); return st; }
     s->taps.n = s->n_taps;
     for (int i = 0; i < s->n_taps; i++) s->taps.layers[i] = c->target_layer_ids[i];
@@ -1158,9 +1180,11 @@ static void* kv_row(void* base, int pos, int kd) {
 /*
  * Context positions [pos0, pos0 + n) from their tap rows: fc, hidden_norm,
  * then every layer's k/v projection, k_norm and RoPE, into the cache.
+ * `d_pos` set: the positions start at *d_pos instead (a cycle's rows, in a
+ * replayed graph); pos0 only bounds them.
  */
-static vv_status_t ctx_update(vv_spec_t* s, const void* rows, int pos0, int n,
-                              void* stream) {
+static vv_status_t ctx_update_at(vv_spec_t* s, const void* rows, int pos0,
+                                 int n, const int* d_pos, void* stream) {
     const vv_drafter_t* d = s->d;
     const int H = s->H, kd = s->nkv * s->hd;
     if (n <= 0) return VV_OK;
@@ -1181,16 +1205,27 @@ static vv_status_t ctx_update(vv_spec_t* s, const void* rows, int pos0, int n,
             st = vv_rmsnorm_dev(s->ck, L->kn, s->ckn, n * s->nkv, s->hd,
                                 d->cfg.rms_norm_eps, stream);
         if (st == VV_OK)
-            st = vv_rope_dev(s->ckn, n, s->nkv, s->hd, pos0, NULL,
+            st = vv_rope_dev(s->ckn, n, s->nkv, s->hd, pos0, d_pos,
                              d->cfg.rope_theta, stream);
         if (st == VV_OK)
-            st = vv_dev_memcpy_d2d(kv_row(s->kc[l], pos0, kd), s->ckn,
-                                   (size_t)n * kd * 2, stream);
+            st = d_pos ? vv_dev_memcpy_d2d_rows_at(s->kc[l], s->ckn,
+                                                   (size_t)kd * 2, n, d_pos,
+                                                   stream)
+                       : vv_dev_memcpy_d2d(kv_row(s->kc[l], pos0, kd), s->ckn,
+                                           (size_t)n * kd * 2, stream);
         if (st == VV_OK)
-            st = vv_dev_memcpy_d2d(kv_row(s->vc[l], pos0, kd), s->cv,
-                                   (size_t)n * kd * 2, stream);
+            st = d_pos ? vv_dev_memcpy_d2d_rows_at(s->vc[l], s->cv,
+                                                   (size_t)kd * 2, n, d_pos,
+                                                   stream)
+                       : vv_dev_memcpy_d2d(kv_row(s->vc[l], pos0, kd), s->cv,
+                                           (size_t)n * kd * 2, stream);
     }
     return st;
+}
+
+static vv_status_t ctx_update(vv_spec_t* s, const void* rows, int pos0, int n,
+                              void* stream) {
+    return ctx_update_at(s, rows, pos0, n, NULL, stream);
 }
 
 vv_status_t vv_spec_push_step(vv_spec_t* s) {
@@ -1232,7 +1267,8 @@ vv_status_t vv_spec_truncate(vv_spec_t* s, int len) {
  * The draft pass: B rows [anchor, MASK...] at positions p.. over the
  * context [0, p). The block's own keys and values go into the cache at
  * [p, p + B) for the attention and are overwritten by the next context
- * update, which starts at p.
+ * update, which starts at p. Positions, the length and the anchor are read
+ * on the device (d_in), so a capture of it replays for any p of its shape.
  */
 static vv_status_t draft(vv_spec_t* s, const vv_inference_ctx_t* ctx,
                          void* stream) {
@@ -1242,9 +1278,11 @@ static vv_status_t draft(vv_spec_t* s, const vv_inference_ctx_t* ctx,
     const int qd = s->nh * s->hd, kd = s->nkv * s->hd;
     const int dyn_ld = 2 * c->conv_kernel * s->G;
     const int half = c->conv_kernel * s->G;
+    const int32_t* anchor = s->d_in + IN_ANCHOR;
+    const int* d_ctx = s->d_in + IN_CTX;
     if (p + B > s->max_pos + s->B) return VV_ERR_OVERFLOW;
 
-    vv_status_t st = vv_dflash_block_ids_dev(s->anchor, c->mask_token_id, B,
+    vv_status_t st = vv_dflash_block_ids_dev(anchor, c->mask_token_id, B,
                                              s->ids, stream);
     if (st == VV_OK)
         st = vv_embedding_dev(ctx->embed_table_gpu, s->ids, s->xe, B, H, stream);
@@ -1273,12 +1311,18 @@ static vv_status_t draft(vv_spec_t* s, const vv_inference_ctx_t* ctx,
         }
         OK(vv_rmsnorm_dev(s->q, L->qn, s->qn, B * s->nh, s->hd, c->rms_norm_eps, stream));
         OK(vv_rmsnorm_dev(s->kk, L->kn, s->kn, B * s->nkv, s->hd, c->rms_norm_eps, stream));
-        OK(vv_rope_dev(s->qn, B, s->nh, s->hd, p, NULL, c->rope_theta, stream));
-        OK(vv_rope_dev(s->kn, B, s->nkv, s->hd, p, NULL, c->rope_theta, stream));
-        OK(vv_dev_memcpy_d2d(kv_row(s->kc[l], p, kd), s->kn, (size_t)B * kd * 2, stream));
-        OK(vv_dev_memcpy_d2d(kv_row(s->vc[l], p, kd), s->vv, (size_t)B * kd * 2, stream));
-        OK(vv_attn_prefill(s->backend, s->qn, &view, s->att, s->nh, B, p,
-                           p + B, false, s->attn_ws, stream));
+        OK(vv_rope_dev(s->qn, B, s->nh, s->hd, p, d_ctx, c->rope_theta, stream));
+        OK(vv_rope_dev(s->kn, B, s->nkv, s->hd, p, d_ctx, c->rope_theta, stream));
+        OK(vv_dev_memcpy_d2d_rows_at(s->kc[l], s->kn, (size_t)kd * 2, B, d_ctx,
+                                     stream));
+        OK(vv_dev_memcpy_d2d_rows_at(s->vc[l], s->vv, (size_t)kd * 2, B, d_ctx,
+                                     stream));
+        if (s->block_attn)
+            OK(vv_attn_block_dev(s->qn, &view, s->att, s->nh, B, p + B,
+                                 s->d_in + IN_CTX_END, s->attn_ws, stream));
+        else
+            OK(vv_attn_prefill(s->backend, s->qn, &view, s->att, s->nh, B, p,
+                               p + B, false, s->attn_ws, stream));
         if (l == 0) {
             dbg("draft.emb", s->xn, (size_t)B * H, false, stream);
             dbg("draft.q", s->qn, (size_t)B * qd, false, stream);
@@ -1331,7 +1375,7 @@ static vv_status_t draft(vv_spec_t* s, const vv_inference_ctx_t* ctx,
     OK(vv_gemm_fp16_dev((const uint8_t*)s->xn + row, d->hproj, s->hp, B - 1,
                         s->rank, H, 1.0f, 0.0f, stream));
     OK(vv_dflash_walk_dev(s->hp, s->tk_v, s->tk_i, d->pred, d->succ,
-                          s->anchor, B - 1, s->topk, s->rank, s->draft,
+                          anchor, B - 1, s->topk, s->rank, s->draft,
                           stream));
 #undef OK
     return st;
@@ -1340,17 +1384,82 @@ static vv_status_t draft(vv_spec_t* s, const vv_inference_ctx_t* ctx,
 /*
  * One cycle on the GPU. The target's cache holds [0, p) and `anchor` is the
  * token at p, not yet fed. The drafter proposes B - 1 tokens; the target
- * runs the B rows [anchor, drafts] as one prefill and gives its own token
- * after each; the drafts it agrees with are kept, then its next token. Both
- * caches end at p + kept + 1, the last produced token the new anchor.
+ * runs the B rows [anchor, drafts] -- each exactly as its decode step would
+ * (exact), or with tensor-core attention (fast) -- and gives its own token
+ * after each; the drafts it agrees with are kept, then its next token. The
+ * B rows' taps go into the drafter's context at p..p+B-1 at once: the kept
+ * ones are its new context, the rest lie past it and the next draft pass
+ * writes over them. Both caches end at p + kept + 1, the last produced token
+ * the new anchor.
+ *
+ * Everything that moves from one cycle to the next -- the anchor, both
+ * lengths -- the body reads from d_in, which it fills from pinned memory
+ * first; the tokens and their count go back to pinned memory last. So the
+ * body can be captured once and replayed until the attention launches
+ * change shape (every 1024 positions), and a cycle is one graph launch
+ * instead of ~600 kernel launches: eager launches cost a Windows (WDDM)
+ * 3070 about 1.7x the GPU time of a 1.5B step, a Linux 3090 about 6%.
  */
+static vv_status_t cycle_body(vv_inference_ctx_t* ctx, vv_spec_t* s,
+                              int backend, double* draft_ms, void* stream) {
+    vv_kv_cache_t* kv = ctx->kv_cache;
+    const int B = s->Bv, p = kv->current_len;
+    const int Ht = ctx->model->config.llm.hidden_size;
+    int32_t* in_pin = s->h_pin + IN_PIN;
+    const double t0 = vv_time_ms();
+#define OK(x) if (st == VV_OK) st = (x)
+    vv_status_t st = vv_dev_memcpy_h2d(s->d_in, in_pin, IN_N * 4, stream);
+    OK(draft(s, ctx, stream));
+    /* VV_SPEC_PROFILE (launched, never captured): the draft pass alone. */
+    if (draft_ms) {
+        OK(vv_dev_stream_sync(stream));
+        *draft_ms = vv_time_ms() - t0;
+    }
+    /* The block to verify: [anchor, drafts]. */
+    OK(vv_dev_memcpy_d2d(s->ids, s->d_in + IN_ANCHOR, 4, stream));
+    OK(vv_dev_memcpy_d2d(s->ids + 1, s->draft, (size_t)(B - 1) * 4, stream));
+    OK(vv_embedding_dev(ctx->embed_table_gpu, s->ids, s->vh, B, Ht, stream));
+    if (st == VV_OK) {
+        s->taps.on_chunk = NULL;
+        s->taps.row_base = p;           /* position p lands at row 0 */
+        vv_verify_opts_t vo;
+        vo.d_pos = s->d_in + IN_POS;
+        vo.d_next = s->d_in + IN_NEXT;
+        vo.attn_backend = backend;
+        vo.fast = !s->exact;
+        st = vv_decoder_verify(ctx->model, s->vh, B, kv, ctx->layer_pool,
+                               ctx->workspace, ctx->workspace_size, stream,
+                               ctx->transfer_stream, &s->taps, &vo);
+    }
+    OK(vv_rmsnorm_dev(s->vh, ctx->final_norm_gpu, s->vn, B, Ht,
+                      ctx->model->config.llm.rms_norm_eps, stream));
+    OK(vv_lm_head_rows_dev(s->vn, ctx->lm_head_gpu, s->logits, B, s->V, Ht,
+                           stream));
+    OK(vv_argmax_rows_dev(s->logits, B, s->V, s->am, s->post, stream));
+    OK(vv_dflash_accept_dev(s->draft, s->post, B - 1, s->out, s->n_out,
+                            stream));
+    OK(ctx_update_at(s, s->taps.buf, s->ctx_len, B, s->d_in + IN_CTX, stream));
+    OK(vv_dev_memcpy_d2h(s->h_pin, s->out, (size_t)B * 4, stream));
+    OK(vv_dev_memcpy_d2h(s->h_pin + B, s->n_out, 4, stream));
+#undef OK
+    return st;
+}
+
+/* VV_SPEC_GRAPH=0: every cycle launches its kernels, for comparison. */
+static bool s_graph_off;
+static vv_once_t s_graph_once = VV_ONCE_INIT;
+static void graph_probe(void) {
+    const char* e = getenv("VV_SPEC_GRAPH");
+    s_graph_off = e && e[0] == '0';
+}
+
 vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
                           int32_t anchor, int32_t* out, int* n_out) {
     if (!ctx || !s || !out || !n_out) return VV_ERR_NULL_PTR;
     *n_out = 0;
     vv_kv_cache_t* kv = ctx->kv_cache;
     const int B = s->Bv, p = kv->current_len;     /* rows checked */
-    const int Ht = ctx->model->config.llm.hidden_size;
+    const vv_llm_config_t* llm = &ctx->model->config.llm;
     void* stream = ctx->compute_stream;
     if (p != s->ctx_len) {
         VV_LOG_E("spec: drafter context at %d, target cache at %d",
@@ -1359,56 +1468,71 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
     }
     if (p + B > kv->max_seq_len || p + B > s->max_pos) return VV_ERR_OVERFLOW;
     const double t0 = vv_time_ms();
+    vv_status_t st = VV_OK;
+    if (kv->pool) st = vv_kv_cache_reserve_wait(kv, p + B, stream);
+    if (st != VV_OK) return st;
 
-    s->h_pin[0] = anchor;
-    vv_status_t st = vv_dev_memcpy_h2d(s->anchor, s->h_pin, 4, stream);
-    if (st == VV_OK) st = draft(s, ctx, stream);
+    /* The rows' attention: the cache's own (exact), or flashinfer's, which
+     * reads each K/V tile once for two or three rows (fast). */
+    const int backend = s->exact
+        ? kv->attn_backend
+        : vv_attn_resolve(VV_ATTN_FLASHINFER, kv->format, kv->pool != NULL,
+                          llm->num_attention_heads, llm->num_key_value_heads,
+                          llm->head_dim);
+    int32_t* in_pin = s->h_pin + IN_PIN;
+    in_pin[IN_ANCHOR] = anchor;
+    in_pin[IN_POS] = p;
+    in_pin[IN_NEXT] = p + 1;
+    in_pin[IN_CTX] = s->ctx_len;
+    in_pin[IN_CTX_END] = s->ctx_len + s->B;
+
     vv_once(&s_env_once, env_probe);
-    if (st == VV_OK && s_profile) st = vv_dev_stream_sync(stream);
-    /* The block to verify: [anchor, drafts]. */
-    if (st == VV_OK) st = vv_dev_memcpy_d2d(s->ids, s->anchor, 4, stream);
-    if (st == VV_OK)
-        st = vv_dev_memcpy_d2d(s->ids + 1, s->draft, (size_t)(B - 1) * 4, stream);
-    if (st == VV_OK && kv->pool) st = vv_kv_cache_reserve_wait(kv, p + B, stream);
-    if (st == VV_OK)
-        st = vv_embedding_dev(ctx->embed_table_gpu, s->ids, s->vh, B, Ht, stream);
-    const double t1 = vv_time_ms();
-    if (st == VV_OK) {
-        s->taps.on_chunk = NULL;
-        s->taps.row_base = p;           /* position p lands at row 0 */
-        if (s->exact) {
-            /* Every row exactly as its own decode step: the same tokens. */
-            st = vv_decoder_verify(ctx->model, s->vh, B, kv, ctx->layer_pool,
-                                   ctx->workspace, ctx->workspace_size,
-                                   stream, ctx->transfer_stream, &s->taps);
-        } else {
-            ctx->taps = &s->taps;
-            st = vv_pipeline_prefill(ctx, s->vh, B);
-            ctx->taps = NULL;
+    vv_once(&s_graph_once, graph_probe);
+    const bool graph = !s_graph_off && !s->graph_off && !s_debug &&
+                       !s_profile && vv_pipeline_graph_ok(ctx);
+    if (graph) {
+        const int key[4] = {
+            B, backend,
+            vv_attn_decode_shape(backend, llm->num_attention_heads,
+                                 llm->num_key_value_heads, p + B),
+            vv_attn_block_shape(s->nh, s->nkv, s->B, s->ctx_len + s->B)
+        };
+        if (!s->graph || memcmp(key, s->graph_key, sizeof(key)) != 0) {
+            if (s->graph) { vv_dev_graph_destroy(s->graph); s->graph = NULL; }
+            void* g = NULL;
+            vv_status_t cs = vv_dev_graph_begin(stream);
+            if (cs == VV_OK) {
+                cs = cycle_body(ctx, s, backend, NULL, stream);
+                const vv_status_t es = vv_dev_graph_end(stream, &g);
+                if (cs == VV_OK) cs = es;
+            }
+            kv->current_len = p;        /* a capture runs nothing */
+            if (cs == VV_OK && g) {
+                s->graph = g;
+                memcpy(s->graph_key, key, sizeof(key));
+            } else {
+                if (g) vv_dev_graph_destroy(g);
+                VV_LOG_W("spec: cannot capture a cycle (%s), launching each "
+                         "kernel", vv_status_str(cs));
+                s->graph_off = true;
+            }
         }
     }
-    if (st == VV_OK)
-        st = vv_rmsnorm_dev(s->vh, ctx->final_norm_gpu, s->vn, B, Ht,
-                            ctx->model->config.llm.rms_norm_eps, stream);
-    if (st == VV_OK)
-        st = vv_lm_head_rows_dev(s->vn, ctx->lm_head_gpu, s->logits, B, s->V,
-                                 Ht, stream);
-    if (st == VV_OK) st = vv_argmax_rows_dev(s->logits, B, s->V, s->am, s->post,
-                                             stream);
-    if (st == VV_OK)
-        st = vv_dflash_accept_dev(s->draft, s->post, B - 1, s->out, s->n_out,
-                                  stream);
-    if (st == VV_OK) st = vv_dev_memcpy_d2h(s->h_pin, s->out, (size_t)B * 4, stream);
-    if (st == VV_OK) st = vv_dev_memcpy_d2h(s->h_pin + B, s->n_out, 4, stream);
+    double draft_ms = 0.0;
+    if (s->graph && !s->graph_off && graph)
+        st = vv_dev_graph_launch(s->graph, stream);
+    else
+        st = cycle_body(ctx, s, backend, s_profile ? &draft_ms : NULL, stream);
     if (st == VV_OK) st = vv_dev_stream_sync(stream);
-    if (st != VV_OK) return st;
+    if (st != VV_OK) {
+        kv->current_len = p;
+        return st;
+    }
 
     const int n = s->h_pin[B];
     if (n < 1 || n > B) return VV_ERR_INVALID_ARG;
     /* Fed: anchor and the n - 1 kept drafts, positions p .. p + n - 1. */
     kv->current_len = p + n;
-    st = ctx_update(s, s->taps.buf, p, n, stream);
-    if (st != VV_OK) return st;
     s->ctx_len = p + n;
     for (int i = 0; i < n; i++) out[i] = s->h_pin[i];
     *n_out = n;
@@ -1429,8 +1553,8 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
     s->stats.drafted += B - 1;
     s->stats.accepted += n - 1;
     s->stats.tokens += n;
-    s->stats.draft_ms += t1 - t0;
-    s->stats.verify_ms += vv_time_ms() - t1;
+    s->stats.draft_ms += draft_ms;
+    s->stats.verify_ms += vv_time_ms() - t0 - draft_ms;
     return VV_OK;
 }
 

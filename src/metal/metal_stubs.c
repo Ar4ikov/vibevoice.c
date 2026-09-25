@@ -76,6 +76,19 @@ vv_status_t vv_attn_decode_rows(int b, const void* q, const vv_kv_view_t* kv,
 size_t vv_attn_rows_scratch_bytes(int h, int d, int r) {
     U(h) U(d) U(r) return 0;
 }
+vv_status_t vv_attn_block_dev(const void* q, const vv_kv_view_t* kv, void* o,
+                              int h, int n, int L, const int* dL, void* scr,
+                              void* s) {
+    U(q) U(kv) U(o) U(h) U(n) U(L) U(dL) U(scr) U(s)
+    return VV_ERR_UNSUPPORTED;
+}
+int vv_attn_block_shape(int h, int kvh, int n, int L) {
+    U(h) U(kvh) U(n) U(L) return 0;
+}
+vv_status_t vv_dev_memcpy_d2d_rows_at(void* d, const void* src, size_t rb,
+                                      int n, const int* dr, void* s) {
+    U(d) U(src) U(rb) U(n) U(dr) U(s) return VV_ERR_UNSUPPORTED;
+}
 vv_status_t vv_rmsnorm_f32in_dev(const float* x, const void* w, void* y,
                                  int r, int H, float e, void* s) {
     U(x) U(w) U(y) U(r) U(H) U(e) U(s) return VV_ERR_UNSUPPORTED;

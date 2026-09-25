@@ -202,13 +202,22 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
                                 const void* k, const void* v,
                                 int seq_len, bool use_device_pos,
                                 void* stream) {
+    if (!cache) return VV_ERR_NULL_PTR;
+    if (use_device_pos && (cache->on_cpu || !cache->d_len || seq_len != 1))
+        return VV_ERR_INVALID_ARG;
+    return vv_kv_cache_append_at(cache, layer, k, v, seq_len,
+                                 use_device_pos ? (const int*)cache->d_len
+                                                : NULL, stream);
+}
+
+vv_status_t vv_kv_cache_append_at(vv_kv_cache_t* cache, int layer,
+                                  const void* k, const void* v,
+                                  int seq_len, const int* d_pos,
+                                  void* stream) {
     if (!cache || !k || !v) return VV_ERR_NULL_PTR;
     if (layer < 0 || layer >= cache->num_layers) return VV_ERR_INVALID_ARG;
     if (cache->current_len + seq_len > cache->max_seq_len) return VV_ERR_OVERFLOW;
-    if (use_device_pos && (cache->on_cpu || !cache->d_len || seq_len != 1))
-        return VV_ERR_INVALID_ARG;
-
-    const int* d_pos = use_device_pos ? (const int*)cache->d_len : NULL;
+    if (d_pos && cache->on_cpu) return VV_ERR_INVALID_ARG;
 
     vv_status_t s;
     if (cache->pool) {
@@ -234,11 +243,17 @@ vv_status_t vv_kv_cache_append(vv_kv_cache_t* cache, int layer,
             memcpy((uint8_t*)cache->k_cache[layer] + off, k, n);
             memcpy((uint8_t*)cache->v_cache[layer] + off, v, n);
             s = VV_OK;
-        } else if (d_pos) {
+        } else if (d_pos && seq_len == 1) {
             s = vv_dev_memcpy_d2d_at(cache->k_cache[layer], k, n, d_pos, stream);
             if (s == VV_OK)
                 s = vv_dev_memcpy_d2d_at(cache->v_cache[layer], v, n, d_pos,
                                          stream);
+        } else if (d_pos) {
+            s = vv_dev_memcpy_d2d_rows_at(cache->k_cache[layer], k, row,
+                                          seq_len, d_pos, stream);
+            if (s == VV_OK)
+                s = vv_dev_memcpy_d2d_rows_at(cache->v_cache[layer], v, row,
+                                              seq_len, d_pos, stream);
         } else {
             s = vv_dev_memcpy_d2d((uint8_t*)cache->k_cache[layer] + off, k, n, stream);
             if (s == VV_OK)

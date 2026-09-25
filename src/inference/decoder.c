@@ -833,11 +833,12 @@ static vv_status_t decoder_layer_body(
     void* temp_workspace,
     size_t workspace_size,
     void* stream,
-    bool verify);
+    const vv_verify_opts_t* vo);
 
 /**
  * @brief One layer, then its output rows into their slot of `taps` (rows
- *        `tap_row0`..) when the layer is tapped.
+ *        `tap_row0`..) when the layer is tapped. `vo` set: the rows of a
+ *        verified block (vv_decoder_verify).
  */
 static vv_status_t decoder_layer_impl(
     const vv_layer_weights_t* layer,
@@ -852,12 +853,12 @@ static vv_status_t decoder_layer_impl(
     void* stream,
     const vv_taps_t* taps,
     int tap_row0,
-    bool verify)
+    const vv_verify_opts_t* vo)
 {
     vv_status_t s = decoder_layer_body(layer, config, hidden_states, kv_cache,
                                        layer_idx, position_offset, seq_len,
                                        temp_workspace, workspace_size, stream,
-                                       verify);
+                                       vo);
     const int slot = tap_slot(taps, layer_idx);
     if (s != VV_OK || slot < 0) return s;
     if (tap_row0 < 0 || tap_row0 + seq_len > taps->rows) return VV_ERR_OVERFLOW;
@@ -879,12 +880,15 @@ static vv_status_t decoder_layer_body(
     void* temp_workspace,
     size_t workspace_size,
     void* stream,
-    bool verify)
+    const vv_verify_opts_t* vo)
 {
     if (!layer || !config || !hidden_states || !kv_cache ||
         !temp_workspace) {
         return VV_ERR_NULL_PTR;
     }
+    const bool verify = vo != NULL;
+    /* Each row with its decode step's arithmetic, or the prefill's. */
+    const bool rows_exact = verify && !vo->fast;
 
     int hs = config->hidden_size;
     int n_heads = config->num_attention_heads;
@@ -897,10 +901,15 @@ static vv_status_t decoder_layer_body(
      * A decode step is captured once and replayed for every token, so nothing
      * in it may carry the position as a kernel argument. One row means decode;
      * prefill keeps the host-side scalars, which is what its chunking needs.
+     * A verified block brings its own device positions when it is replayed
+     * (vo->d_pos: row 0's, rows follow it).
      */
-    const bool dev_pos = (seq_len == 1) && !kv_cache->on_cpu && kv_cache->d_len;
-    const int* d_pos  = dev_pos ? (const int*)kv_cache->d_len : NULL;
-    const int* d_next = dev_pos ? (const int*)kv_cache->d_len_next : NULL;
+    const bool dev_pos = !verify && (seq_len == 1) && !kv_cache->on_cpu &&
+                         kv_cache->d_len;
+    const int* d_pos  = dev_pos ? (const int*)kv_cache->d_len
+                                : (verify ? vo->d_pos : NULL);
+    const int* d_next = dev_pos ? (const int*)kv_cache->d_len_next
+                                : (verify ? vo->d_next : NULL);
 
     /*
      * Workspace layout:
@@ -994,10 +1003,11 @@ static vv_status_t decoder_layer_body(
         void* ys[3] = { q_buf, k_buf, v_buf };
         const int ns[3] = { n_heads * head_dim, n_kv_heads * head_dim,
                             n_kv_heads * head_dim };
-        s = verify ? linear_rows_group(ws, ys, ns, 3, norm_out, temp_weight,
-                                       temp_bytes, seq_len, hs, stream)
-                   : quant_linear_group(ws, ys, ns, 3, norm_out, temp_weight,
-                                        temp_bytes, seq_len, hs, stream);
+        s = rows_exact ? linear_rows_group(ws, ys, ns, 3, norm_out,
+                                           temp_weight, temp_bytes, seq_len,
+                                           hs, stream)
+                       : quant_linear_group(ws, ys, ns, 3, norm_out, temp_weight,
+                                            temp_bytes, seq_len, hs, stream);
         if (s != VV_OK) return s;
     }
 
@@ -1031,8 +1041,8 @@ static vv_status_t decoder_layer_body(
     }
 
     /* 4. KV-cache append */
-    s = vv_kv_cache_append(kv_cache, layer_idx, k_buf, v_buf,
-                            seq_len, dev_pos, stream);
+    s = vv_kv_cache_append_at(kv_cache, layer_idx, k_buf, v_buf, seq_len,
+                              d_pos, stream);
     if (s != VV_OK) return s;
 
     /* 5. GQA attention over the cache (queries of this chunk see all of it) */
@@ -1057,8 +1067,10 @@ static vv_status_t decoder_layer_body(
             if (s != VV_OK) return s;
         }
         if (verify)
-            s = vv_attn_decode_rows(backend, q_buf, &view, attn_out, n_heads,
-                                    seq_len, position_offset + 1, NULL,
+            s = vv_attn_decode_rows(vo->attn_backend >= 0 ? vo->attn_backend
+                                                          : backend,
+                                    q_buf, &view, attn_out, n_heads, seq_len,
+                                    position_offset + 1, d_next,
                                     decode_scratch, stream);
         else if (seq_len > 1)
             s = vv_attn_prefill(backend, q_buf, &view, attn_out, n_heads,
@@ -1117,10 +1129,12 @@ static vv_status_t decoder_layer_body(
     if (s != VV_OK) return s;
 
     /* 6. O projection + bias + residual */
-    s = verify ? linear_rows(&layer->attn.o_proj, attn_out, norm_out,
-                             temp_weight, temp_bytes, seq_len, hs, hs, stream)
-               : quant_linear(&layer->attn.o_proj, attn_out, norm_out,
-                              temp_weight, temp_bytes, seq_len, hs, hs, stream);
+    s = rows_exact ? linear_rows(&layer->attn.o_proj, attn_out, norm_out,
+                                 temp_weight, temp_bytes, seq_len, hs, hs,
+                                 stream)
+                   : quant_linear(&layer->attn.o_proj, attn_out, norm_out,
+                                  temp_weight, temp_bytes, seq_len, hs, hs,
+                                  stream);
     if (s != VV_OK) return s;
     s = vv_residual_add_dev(hidden_states, norm_out,
                               seq_len * hs, stream);
@@ -1143,10 +1157,11 @@ static vv_status_t decoder_layer_body(
                                      &layer->mlp.up_proj };
         void* ys[2] = { gate_buf, up_buf };
         const int ns[2] = { inter_size, inter_size };
-        s = verify ? linear_rows_group(ws, ys, ns, 2, norm_out, temp_weight,
-                                       temp_bytes, seq_len, hs, stream)
-                   : quant_linear_group(ws, ys, ns, 2, norm_out, temp_weight,
-                                        temp_bytes, seq_len, hs, stream);
+        s = rows_exact ? linear_rows_group(ws, ys, ns, 2, norm_out,
+                                           temp_weight, temp_bytes, seq_len,
+                                           hs, stream)
+                       : quant_linear_group(ws, ys, ns, 2, norm_out, temp_weight,
+                                            temp_bytes, seq_len, hs, stream);
         if (s != VV_OK) return s;
     }
 
@@ -1159,12 +1174,12 @@ static vv_status_t decoder_layer_body(
     if (s != VV_OK) return s;
 
     /* 10. Down projection + bias + residual */
-    s = verify ? linear_rows(&layer->mlp.down_proj, gate_buf, mlp_out,
-                             temp_weight, temp_bytes, seq_len, hs, inter_size,
-                             stream)
-               : quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out,
-                              temp_weight, temp_bytes, seq_len, hs, inter_size,
-                              stream);
+    s = rows_exact ? linear_rows(&layer->mlp.down_proj, gate_buf, mlp_out,
+                                 temp_weight, temp_bytes, seq_len, hs,
+                                 inter_size, stream)
+                   : quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out,
+                                  temp_weight, temp_bytes, seq_len, hs,
+                                  inter_size, stream);
     if (s != VV_OK) return s;
     s = vv_residual_add_dev(hidden_states, mlp_out,
                               seq_len * hs, stream);
@@ -1196,7 +1211,7 @@ vv_status_t vv_decoder_layer_forward(
     return decoder_layer_impl(layer, config, hidden_states, kv_cache,
                                layer_idx, position_offset, 1,
                                temp_workspace, workspace_size, stream,
-                               NULL, 0, false);
+                               NULL, 0, NULL);
 }
 
 vv_status_t vv_decoder_step(
@@ -1272,7 +1287,7 @@ vv_status_t vv_decoder_step_taps(
         vv_status_t s = decoder_layer_impl(
             &model->layers[i], &model->config.llm,
             hidden_state, kv_cache, i, position, 1,
-            workspace, workspace_size, compute_stream, taps, 0, false);
+            workspace, workspace_size, compute_stream, taps, 0, NULL);
 
         if (streaming) vv_layer_prefetch_done(pool, i, compute_stream);
 
@@ -1433,7 +1448,7 @@ vv_status_t vv_decoder_prefill_taps(
             workspace, workspace_size, compute_stream, taps,
             (taps && taps->on_chunk) ? 0
                                      : (taps ? base + start - taps->row_base : 0),
-            false);
+            NULL);
 
         if (streaming) vv_layer_prefetch_done(pool, i, compute_stream);
 
@@ -1481,11 +1496,16 @@ vv_status_t vv_decoder_verify(
     size_t workspace_size,
     void* compute_stream,
     void* xfer_stream,
-    const vv_taps_t* taps)
+    const vv_taps_t* taps,
+    const vv_verify_opts_t* opts)
 {
+    /* No options: the host's positions and the cache's attention. */
+    static const vv_verify_opts_t host_pos = { NULL, NULL, -1, false };
+    const vv_verify_opts_t* vo = opts ? opts : &host_pos;
     if (!model || !hidden_states || !kv_cache) return VV_ERR_NULL_PTR;
     if (rows < 1 || rows > vv_decoder_verify_rows_max(model))
         return VV_ERR_INVALID_ARG;
+    if ((vo->d_pos != NULL) != (vo->d_next != NULL)) return VV_ERR_INVALID_ARG;
     const int base = kv_cache->current_len;
     if (base + rows > kv_cache->max_seq_len) return VV_ERR_OVERFLOW;
     vv_status_t s = vv_kv_cache_reserve(kv_cache, base + rows, compute_stream);
@@ -1502,7 +1522,7 @@ vv_status_t vv_decoder_verify(
         s = decoder_layer_impl(&model->layers[i], &model->config.llm,
                                hidden_states, kv_cache, i, base, rows,
                                workspace, workspace_size, compute_stream,
-                               taps, taps ? base - taps->row_base : 0, true);
+                               taps, taps ? base - taps->row_base : 0, vo);
         if (streaming) vv_layer_prefetch_done(pool, i, compute_stream);
         if (s != VV_OK) {
             VV_LOG_E("decoder: verify layer %d failed: %s", i,

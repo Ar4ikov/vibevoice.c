@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <limits.h>
 
 extern "C" {
 
@@ -142,6 +143,21 @@ __global__ void copy_at_tail_kernel(unsigned char* dst_base,
     if (i < bytes) dst_base[(size_t)(*d_index) * bytes + i] = src[i];
 }
 
+/** @brief Rows into `dst_base + (*d_row) * row_vecs`, 16 bytes a thread. */
+__global__ void copy_rows_at_kernel(uint4* dst_base, const uint4* src,
+                                    const int* d_row, int row_vecs, int vecs) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < vecs) dst_base[(size_t)(*d_row) * row_vecs + i] = src[i];
+}
+
+__global__ void copy_rows_at_tail_kernel(unsigned char* dst_base,
+                                         const unsigned char* src,
+                                         const int* d_row, int row_bytes,
+                                         int bytes) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < bytes) dst_base[(size_t)(*d_row) * row_bytes + i] = src[i];
+}
+
 vv_status_t vv_pos_add_dev(int* dst, const int* src, int delta, void* stream) {
     if (!dst || !src) return VV_ERR_NULL_PTR;
     pos_add_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(dst, src, delta);
@@ -168,6 +184,31 @@ vv_status_t vv_dev_memcpy_d2d_at(void* dst_base, const void* src, size_t bytes,
                               0, st>>>(
             (unsigned char*)dst_base, (const unsigned char*)src, d_index,
             (int)bytes);
+    }
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
+vv_status_t vv_dev_memcpy_d2d_rows_at(void* dst_base, const void* src,
+                                      size_t row_bytes, int n_rows,
+                                      const int* d_row, void* stream) {
+    if (!dst_base || !src || !d_row) return VV_ERR_NULL_PTR;
+    if (row_bytes == 0 || n_rows <= 0) return VV_OK;
+    const size_t bytes = row_bytes * (size_t)n_rows;
+    if (bytes > (size_t)INT_MAX) return VV_ERR_INVALID_ARG;
+    cudaStream_t st = (cudaStream_t)stream;
+    const int threads = 128;
+    if ((row_bytes % sizeof(uint4)) == 0 &&
+        ((uintptr_t)dst_base % sizeof(uint4)) == 0 &&
+        ((uintptr_t)src % sizeof(uint4)) == 0) {
+        const int vecs = (int)(bytes / sizeof(uint4));
+        copy_rows_at_kernel<<<(vecs + threads - 1) / threads, threads, 0, st>>>(
+            (uint4*)dst_base, (const uint4*)src, d_row,
+            (int)(row_bytes / sizeof(uint4)), vecs);
+    } else {
+        copy_rows_at_tail_kernel<<<((int)bytes + threads - 1) / threads,
+                                   threads, 0, st>>>(
+            (unsigned char*)dst_base, (const unsigned char*)src, d_row,
+            (int)row_bytes, (int)bytes);
     }
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }

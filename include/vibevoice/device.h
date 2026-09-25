@@ -53,6 +53,15 @@ vv_status_t vv_dev_memcpy_d2d(void* dst, const void* src, size_t size, void* str
  */
 vv_status_t vv_dev_memcpy_d2d_at(void* dst_base, const void* src, size_t size,
                                  const int* d_index, void* stream);
+
+/**
+ * @brief Copy `n_rows` rows of `row_bytes` into `dst_base + (*d_row) *
+ *        row_bytes`: vv_dev_memcpy_d2d_at for a block of rows, whose first
+ *        row index is read on the device.
+ */
+vv_status_t vv_dev_memcpy_d2d_rows_at(void* dst_base, const void* src,
+                                      size_t row_bytes, int n_rows,
+                                      const int* d_row, void* stream);
 vv_status_t vv_dev_memset(void* ptr, int value, size_t size);
 
 /**
@@ -653,6 +662,25 @@ vv_status_t vv_attn_decode_rows(int backend, const void* q,
 
 /** @brief Scratch vv_attn_decode_rows needs for `rows` rows. */
 size_t vv_attn_rows_scratch_bytes(int n_q_heads, int head_dim, int rows);
+
+/**
+ * @brief `q_len` query rows that all see the first *d_kv_len positions of a
+ *        cache (no causal mask): a drafted block over its context, on tensor
+ *        cores (flashinfer's split kernel), the length read on the device.
+ *
+ * `kv_len` sizes the split; a replay may see any length from it up to the
+ * next multiple of 1024 above it (vv_attn_block_shape() tells when to
+ * capture again). `scratch`: vv_attn_scratch_bytes(). VV_ERR_UNSUPPORTED
+ * where flashinfer does not run (before sm_75, head_dim != 128).
+ */
+vv_status_t vv_attn_block_dev(const void* q, const vv_kv_view_t* kv,
+                              void* out, int n_q_heads, int q_len, int kv_len,
+                              const int* d_kv_len, void* scratch,
+                              void* stream);
+
+/** @brief The launch shape of vv_attn_block_dev at `kv_len` (a capture
+ *         holds while it is unchanged). */
+int vv_attn_block_shape(int n_q_heads, int n_kv_heads, int q_len, int kv_len);
 
 /**
  * @brief Quantize (or copy, for FP16) K/V vectors into a cache layer, at
