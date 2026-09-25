@@ -412,6 +412,24 @@ vv_status_t vv_decoder_prefill_taps(
     const vv_taps_t* taps);
 
 /**
+ * @brief Where a verified block's positions come from, and which attention
+ *        its rows take (vv_decoder_verify).
+ */
+typedef struct vv_verify_opts {
+    const int* d_pos;   /**< device int: row 0's position (NULL: the host's
+                             current_len), so a graph can replay the block */
+    const int* d_next;  /**< device int: row 0's cache length, d_pos + 1;
+                             NULL with d_pos set: the rows' attention takes
+                             the host's lengths (fa1 reads none from the
+                             device, so its blocks are not replayed) */
+    int attn_backend;   /**< vv_attn_backend_t for the rows, -1: the cache's */
+    bool fast;          /**< the prefill's projections for the rows, not
+                             each row's decode arithmetic (--draft-check
+                             fast): the same for W4A16, a GEMM for NF4 and
+                             INT8 where exact runs a GEMV per row */
+} vv_verify_opts_t;
+
+/**
  * @brief `rows` (<= 16) tokens at the cache's current length, every row
  *        computed exactly as the decode step at its position would.
  *
@@ -421,21 +439,6 @@ vv_status_t vv_decoder_prefill_taps(
  * The whole model on one device (no shards). Appends `rows` positions;
  * `taps` (NULL: none) receive them at position - taps->row_base.
  */
-/**
- * @brief Where a verified block's positions come from, and which attention
- *        its rows take (vv_decoder_verify).
- */
-typedef struct vv_verify_opts {
-    const int* d_pos;   /**< device int: row 0's position (NULL: the host's
-                             current_len), so a graph can replay the block */
-    const int* d_next;  /**< device int: row 0's cache length, d_pos + 1 */
-    int attn_backend;   /**< vv_attn_backend_t for the rows, -1: the cache's */
-    bool fast;          /**< the prefill's projections for the rows, not
-                             each row's decode arithmetic (--draft-check
-                             fast): the same for W4A16, a GEMM for NF4 and
-                             INT8 where exact runs a GEMV per row */
-} vv_verify_opts_t;
-
 vv_status_t vv_decoder_verify(
     vv_model_t* model,
     void* hidden_states,       /**< [rows, hidden_size] FP16, in/out */

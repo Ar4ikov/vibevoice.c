@@ -783,6 +783,8 @@ struct vv_spec {
     int32_t* d_in;             /* [IN_N] device copy of h_pin + IN_PIN */
     void* graph[2];            /* the captured cycle per row count, or NULL */
     int graph_key[2][4];       /* rows, check, rows' attention, block's */
+    bool graph_bad[2];         /* the capture for graph_key failed: launch
+                                  kernels until the key or sequence changes */
     bool graph_off;            /* no capture here: launch every kernel */
     /* Rows checked when --draft-block did not say: half the block or all
      * of it, whichever keeps more tokens per ms (vv_spec_note_block). */
@@ -991,6 +993,7 @@ void vv_spec_reset(vv_spec_t* s) {
     s->ctl_step_high = 0;
     s->ctl_skip_step = true;
     s->ctl_remeasure = false;
+    s->graph_bad[0] = s->graph_bad[1] = false;
     if (s->bv_auto) {
         /* A sequence starts wide: a full block tells what every narrower
          * one would have kept too. */
@@ -1490,7 +1493,9 @@ static vv_status_t cycle_body(vv_inference_ctx_t* ctx, vv_spec_t* s,
         s->taps.row_base = p;           /* position p lands at row 0 */
         vv_verify_opts_t vo;
         vo.d_pos = s->d_in + IN_POS;
-        vo.d_next = s->d_in + IN_NEXT;
+        /* fa1's rows run its one-row kernel row after row, on the host's
+         * lengths: its cycles are launched, never replayed (below). */
+        vo.d_next = backend == VV_ATTN_FA1 ? NULL : s->d_in + IN_NEXT;
         vo.attn_backend = backend;
         vo.fast = !s->exact;
         st = vv_decoder_verify(ctx->model, s->vh, B, kv, ctx->layer_pool,
@@ -1555,7 +1560,8 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
     vv_once(&s_env_once, env_probe);
     vv_once(&s_graph_once, graph_probe);
     const bool graph = !s_graph_off && !s->graph_off && !s_debug &&
-                       !s_profile && vv_pipeline_graph_ok(ctx);
+                       !s_profile && backend != VV_ATTN_FA1 &&
+                       vv_pipeline_graph_ok(ctx);
     const int slot = B == s->bv_cand[1] ? 1 : 0;
     if (graph) {
         const int key[4] = {
@@ -1564,8 +1570,11 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
                                  llm->num_key_value_heads, p + B),
             vv_attn_block_shape(s->nh, s->nkv, s->B, s->ctx_len + s->B)
         };
-        if (!s->graph[slot] ||
-            memcmp(key, s->graph_key[slot], sizeof(key)) != 0) {
+        const bool same_key = memcmp(key, s->graph_key[slot], sizeof(key)) == 0;
+        /* A capture that failed is tried again at the next key or the next
+         * sequence, not every cycle: another slot freeing memory mid-capture
+         * (vv_dev_graph_end) should not cost this one its graphs for good. */
+        if (!(same_key && (s->graph[slot] || s->graph_bad[slot]))) {
             if (s->graph[slot]) {
                 vv_dev_graph_destroy(s->graph[slot]);
                 s->graph[slot] = NULL;
@@ -1578,19 +1587,19 @@ vv_status_t vv_spec_cycle(vv_inference_ctx_t* ctx, vv_spec_t* s,
                 if (cs == VV_OK) cs = es;
             }
             kv->current_len = p;        /* a capture runs nothing */
-            if (cs == VV_OK && g) {
+            memcpy(s->graph_key[slot], key, sizeof(key));
+            s->graph_bad[slot] = !(cs == VV_OK && g);
+            if (!s->graph_bad[slot]) {
                 s->graph[slot] = g;
-                memcpy(s->graph_key[slot], key, sizeof(key));
             } else {
                 if (g) vv_dev_graph_destroy(g);
                 VV_LOG_W("spec: cannot capture a cycle (%s), launching each "
                          "kernel", vv_status_str(cs));
-                s->graph_off = true;
             }
         }
     }
     double draft_ms = 0.0;
-    if (s->graph[slot] && !s->graph_off && graph)
+    if (graph && s->graph[slot])
         st = vv_dev_graph_launch(s->graph[slot], stream);
     else
         st = cycle_body(ctx, s, backend, s_profile ? &draft_ms : NULL, stream);

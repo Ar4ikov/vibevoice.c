@@ -743,8 +743,12 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
      * 32-minute file: drafted 1.06x the plain decode with fa2, 1.47x with
      * flashinfer). The drafted transcript is then byte for byte that of
      * `--attn flashinfer` without a drafter; `--attn fa2 --draft` keeps fa2.
+     * Not where the drafter is declined for sure (CPU, layer shards); where
+     * it is declined later, a slab goes back to `auto`'s choice (below).
      */
-    if (attn_want == VV_ATTN_AUTO && p.draft_dir && p.draft_dir[0])
+    const bool attn_for_draft = attn_want == VV_ATTN_AUTO && !cpu_only &&
+                                !sharding && p.draft_dir && p.draft_dir[0];
+    if (attn_for_draft)
         attn_want = VV_ATTN_FLASHINFER;
     const int attn_slab = vv_attn_resolve(
         (int)attn_want, p.kv_format, false, llm->num_attention_heads,
@@ -1268,6 +1272,21 @@ init_common:
     attach_frontend(c);
     attach_spec(c, p.draft_dir, p.draft_quant, p.draft_block, p.draft_check,
                 NULL);
+    /* `--draft` made `auto` flashinfer for the rows the drafter's blocks
+     * check. Without the drafter, decode as `auto` does: a slab's backend is
+     * only which kernels read it (the scratch fits every backend); a paged
+     * pool keeps the backend its layout was chosen for. */
+    if (attn_for_draft && !c->drafter && c->kv_cache && !paged) {
+        const int plain = vv_attn_resolve(VV_ATTN_AUTO, p.kv_format, false,
+                                          llm->num_attention_heads,
+                                          llm->num_key_value_heads,
+                                          llm->head_dim);
+        if (plain != c->kv_cache->attn_backend) {
+            c->kv_cache->attn_backend = plain;
+            VV_LOG_I("inference: no drafter; attention %s",
+                     vv_attn_backend_name((vv_attn_backend_t)plain));
+        }
+    }
 
     VV_LOG_I("inference: initialized (%s, workspace=%zu MB, tokenizer=%s)",
              placement_str(c->placement),

@@ -1505,7 +1505,7 @@ vv_status_t vv_decoder_verify(
     if (!model || !hidden_states || !kv_cache) return VV_ERR_NULL_PTR;
     if (rows < 1 || rows > vv_decoder_verify_rows_max(model))
         return VV_ERR_INVALID_ARG;
-    if ((vo->d_pos != NULL) != (vo->d_next != NULL)) return VV_ERR_INVALID_ARG;
+    if (vo->d_next && !vo->d_pos) return VV_ERR_INVALID_ARG;
     const int base = kv_cache->current_len;
     if (base + rows > kv_cache->max_seq_len) return VV_ERR_OVERFLOW;
     vv_status_t s = vv_kv_cache_reserve(kv_cache, base + rows, compute_stream);
