@@ -710,7 +710,7 @@ int vv_cmd_chat(int argc, char** argv) {
     vv_inference_params_t ip;
     build_params(&ip, hot_csv, hot_scratch, sizeof(hot_scratch), hot_list, 32);
 
-    printf("vibevoice.c %s — model ready, %d slot(s).\n"
+    printf("TurboQwen %s — model ready, %d slot(s).\n"
            "Type a file path, `rec <seconds>`, `devices`, `device <sel>`, "
            "`hotwords a,b`, `stats`, or `quit`.\n",
            vv_version(), vv_engine_slots(engine));

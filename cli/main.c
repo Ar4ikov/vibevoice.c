@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief CLI executable for vibevoice.c — VibeVoice-ASR inference.
+ * @brief CLI executable for TurboQwen — VibeVoice-ASR inference.
  *
  * Usage:
  *   vv_cli --model <path> --audio <file.wav> [--output <file.json>]
@@ -97,7 +97,7 @@ static int split_hotwords(const char* csv, char* scratch, size_t scratch_size,
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
-        "vibevoice.c v%s — Pure C VibeVoice-ASR runtime\n\n"
+        "TurboQwen v%s — C and CUDA VibeVoice-ASR runtime\n\n"
         "Usage: %s --model <dir> --audio <wav> [options]\n\n"
         "Required:\n"
         "  --model <dir>         Model directory (safetensors + config.json)\n"
@@ -303,7 +303,7 @@ int main(int argc, char** argv) {
      */
     if (argc > 1 && (strcmp(argv[1], "--version") == 0 ||
                      strcmp(argv[1], "-V") == 0)) {
-        printf("vibevoice.c %s (%s) [%s]\n",
+        printf("TurboQwen %s (%s) [%s]\n",
                vv_version(), vv_build_ref(), vv_build_features());
         return 0;
     }
@@ -338,7 +338,7 @@ int main(int argc, char** argv) {
     /* Configure logging */
     vv_log_set_level(args.verbose ? VV_LOG_DEBUG : VV_LOG_INFO);
 
-    VV_LOG_I("vibevoice.c %s (%s)", vv_version(), vv_build_ref());
+    VV_LOG_I("TurboQwen %s (%s)", vv_version(), vv_build_ref());
     if (args.trt_flag_seen)
         VV_LOG_W("--trt-acoustic/--trt-semantic are deprecated and ignored: "
                  "the speech encoder runs on its own CUDA kernels. The flags "

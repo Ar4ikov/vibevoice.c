@@ -199,7 +199,7 @@ static void handle_models(vv_server_t* sv, vv_http_res_t* res, bool single) {
     sb_puts(&b, "{\"id\":\"");
     sb_json_escaped(&b, sv->model_name);
     sb_printf(&b, "\",\"object\":\"model\",\"created\":%llu,"
-                  "\"owned_by\":\"vibevoice.c\"}",
+                  "\"owned_by\":\"turboqwen\"}",
               (unsigned long long)sv->started_at);
     if (!single) sb_puts(&b, "]}");
     vv_http_respond_json(res, 200, b.buf ? b.buf : "{}");
@@ -1267,7 +1267,7 @@ static void route(const vv_http_req_t* req, vv_http_res_t* res, void* user) {
     if (strcmp(p, "/") == 0) {
         char buf[768];
         const int n = snprintf(buf, sizeof(buf),
-            "vibevoice.c server\n\n"
+            "TurboQwen server\n\n"
             "model: %s\nslots: %d\n\n"
             "POST /v1/audio/transcriptions   multipart: file, "
             "[response_format=json|verbose_json|text|srt|vtt], [prompt], "

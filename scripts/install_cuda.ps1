@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    vibevoice.c -- CUDA Toolkit Installer and Environment Configurator
+    TurboQwen -- CUDA Toolkit Installer and Environment Configurator
 
 .DESCRIPTION
     Downloads and installs the NVIDIA CUDA Toolkit with a selected version,
     configures PATH, CUDA_PATH, and verifies the installation.
-    Designed for the vibevoice.c project (minimum: CUDA 12.2, Ampere GPUs).
+    Designed for the TurboQwen project (minimum: CUDA 12.2, Ampere GPUs).
 
-    Installs only the components needed for vibevoice.c development:
+    Installs only the components needed for TurboQwen development:
     nvcc, cudart, cublas, cufft, cusparse, cusolver, nvtx, cupti,
     nsight_systems, nsight_compute, visual_studio_integration, Display.Driver
 
@@ -101,7 +101,7 @@ $CudaVersions = [ordered]@{
         MinDriver    = "551.78"
     }
     "12.2" = @{
-        DisplayName  = "CUDA 12.2.2  -- minimum for vibevoice.c"
+        DisplayName  = "CUDA 12.2.2  -- minimum for TurboQwen"
         PatchVersion = "12.2.2"
         SubVer       = "12.2"
         NetworkUrl   = "https://developer.download.nvidia.com/compute/cuda/12.2.2/network_installers/cuda_12.2.2_windows_network.exe"
@@ -111,7 +111,7 @@ $CudaVersions = [ordered]@{
     }
 }
 
-# Components needed for vibevoice.c development
+# Components needed for TurboQwen development
 function Get-DevComponents([string]$sv) {
     return @(
         "nvcc_$sv"
@@ -151,7 +151,7 @@ function Write-Banner {
     Write-Host ""
     Write-Host "  +==================================================+" -ForegroundColor Cyan
     Write-Host "  |    NVIDIA CUDA Toolkit Installer                  |" -ForegroundColor Cyan
-    Write-Host "  |    for vibevoice.c                                |" -ForegroundColor Cyan
+    Write-Host "  |    for TurboQwen                                |" -ForegroundColor Cyan
     Write-Host "  +==================================================+" -ForegroundColor Cyan
     Write-Host ""
 }
@@ -233,7 +233,7 @@ if ($hasSmi) {
         $ccMajor = [int]($gpuCC.Split(".")[0])
         if ($ccMajor -lt 8) {
             Write-Warn "GPU compute capability $gpuCC is below SM 8.0 -- Ampere minimum."
-            Write-Warn "vibevoice.c requires Ampere RTX 30XX or newer."
+            Write-Warn "TurboQwen requires Ampere RTX 30XX or newer."
             if (-not $Force) {
                 $confirm = Read-Host "      Continue anyway? [y/N]"
                 if ($confirm -ne "y") { exit 0 }

@@ -1,4 +1,4 @@
-"""Emit Core ML models for the shapes vibevoice.c actually runs."""
+"""Emit Core ML models for the shapes TurboQwen actually runs."""
 import numpy as np, coremltools as ct
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types

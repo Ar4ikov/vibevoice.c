@@ -1,12 +1,12 @@
 @echo off
 REM ============================================================================
-REM  vibevoice.c — GPU Info & Compatibility Check
+REM  TurboQwen — GPU Info & Compatibility Check
 REM
 REM  Checks if your GPU meets the Ampere (SM 8.0+) minimum requirement.
 REM ============================================================================
 
 echo.
-echo  vibevoice.c GPU Compatibility Check
+echo  TurboQwen GPU Compatibility Check
 echo  ════════════════════════════════════
 echo.
 

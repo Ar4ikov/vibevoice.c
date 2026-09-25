@@ -1,4 +1,4 @@
-/* What the Apple Neural Engine does with the shapes vibevoice.c runs. */
+/* What the Apple Neural Engine does with the shapes TurboQwen runs. */
 #import <Foundation/Foundation.h>
 #import <CoreML/CoreML.h>
 #include <stdio.h>

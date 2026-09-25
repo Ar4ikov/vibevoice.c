@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/Ar4ikov/vibevoice.c/security/advisories/new
+    url: https://github.com/Ar4ikov/TurboQwen/security/advisories/new
     about: Report it privately instead of opening a public issue.

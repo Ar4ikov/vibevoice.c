@@ -1,7 +1,7 @@
 # What runs on the Neural Engine, and how fast
 
 The probe behind `docs/ANE.md`. Nothing here is part of the runtime: it
-builds Core ML models for the shapes vibevoice.c runs, asks Core ML where it
+builds Core ML models for the shapes TurboQwen runs, asks Core ML where it
 would put each operation, and times the result on the Neural Engine, the GPU
 and the CPU.
 

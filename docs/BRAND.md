@@ -1,8 +1,11 @@
 # Identity
 
 <p align="center">
-  <img src="../assets/brand/banner.svg" alt="vibevoice.c" width="760">
+  <img src="../assets/brand/banner.svg" alt="TurboQwen" width="760">
 </p>
+
+> The project is called TurboQwen since 0.6. The drawn wordmark below still
+> spells its first name, `vibevoice.c`; redrawing it is a design pass of its own.
 
 The runtime is a backend. Its identity is meant to survive being shrunk to a
 favicon, printed in one colour, and pasted into a terminal-coloured README —

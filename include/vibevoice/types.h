@@ -1,6 +1,6 @@
 /**
  * @file types.h
- * @brief Core types, error codes, and constants for vibevoice.c
+ * @brief Core types, error codes, and constants for TurboQwen
  */
 #ifndef VV_TYPES_H
 #define VV_TYPES_H

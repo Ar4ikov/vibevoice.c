@@ -27,7 +27,7 @@ RUN v="${VV_VERSION:-$(sed -n 's/^#define VV_VERSION_STRING "\(.*\)"$/\1/p' incl
     && cmake -B build -DVV_VERSION_FULL="$v" -DVV_REVISION="${VV_REVISION}" \
     && cmake --build build --target vv_cli --parallel 2 \
     && strip build/vv_cli \
-    && build/vv_cli --version | tee /dev/stderr | grep -qF "vibevoice.c $v "
+    && build/vv_cli --version | tee /dev/stderr | grep -qF "TurboQwen $v "
 
 FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libgomp1 ca-certificates \
@@ -36,10 +36,10 @@ COPY --from=build /src/build/vv_cli /usr/local/bin/vv_cli
 
 ARG VV_VERSION=
 ARG VV_REVISION=unknown
-LABEL org.opencontainers.image.title="vibevoice.c" \
+LABEL org.opencontainers.image.title="TurboQwen" \
       org.opencontainers.image.description="VibeVoice-ASR in C and CUDA: transcription with diarization and timestamps, OpenAI-compatible server" \
-      org.opencontainers.image.source="https://github.com/Ar4ikov/vibevoice.c" \
-      org.opencontainers.image.documentation="https://github.com/Ar4ikov/vibevoice.c/blob/master/deploy/gpustack/README.md" \
+      org.opencontainers.image.source="https://github.com/Ar4ikov/TurboQwen" \
+      org.opencontainers.image.documentation="https://github.com/Ar4ikov/TurboQwen/blob/master/deploy/gpustack/README.md" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VV_VERSION}" \
       org.opencontainers.image.revision="${VV_REVISION}"

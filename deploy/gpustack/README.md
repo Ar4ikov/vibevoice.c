@@ -8,7 +8,7 @@ No weights, Python or Hugging Face credentials are embedded in the image.
 
 ## Deploy
 
-1. Wait for a release to publish `ghcr.io/ar4ikov/vibevoice.c:latest` (the
+1. Wait for a release to publish `ghcr.io/ar4ikov/turboqwen:latest` (the
    newest release; `master` is the head of the branch). On first publication, make the GHCR package
    public in GitHub's package settings, or configure authenticated registry pulls
    in GPUStack. A public Git repository does not automatically make its package public.
@@ -126,8 +126,8 @@ how it gets there:
   writes that column.
 
 To put it in the catalog instead: fork the community repository, add a
-`vibevoice.c/` directory with `spec.yaml` (this manifest, with
-`backend_name: vibevoice.c` — the `-custom` suffix is only required of
+`turboqwen/` directory with `spec.yaml` (this manifest, with
+`backend_name: turboqwen` — the `-custom` suffix is only required of
 backends imported by hand), a `README.md`, and `logo.png` copied from
 `assets/brand/`, then open a pull request. Their automation triggers only on
 `*/logo.png`, `*/spec.yaml` and `*/spec.yml`, so the logo has to be a PNG
@@ -163,7 +163,7 @@ replica** in 2.2.2 (observed through `PUT /v2/models/<id>`): delete the
 replica, and GPUStack recreates it with the new spec in about half a minute.
 What the runtime does with several GPUs is set by `--split-mode`:
 
-| `--split-mode` | what it does | measured on two RTX 3090s ([#9](https://github.com/Ar4ikov/vibevoice.c/pull/9), [#10](https://github.com/Ar4ikov/vibevoice.c/pull/10)) |
+| `--split-mode` | what it does | measured on two RTX 3090s ([#9](https://github.com/Ar4ikov/TurboQwen/pull/9), [#10](https://github.com/Ar4ikov/TurboQwen/pull/10)) |
 |---|---|---|
 | `replica` | a full copy on every card, the slots spread over them behind one FIFO queue | 8 × 30 s clips through 4 slots: 13.2 s on one card, 7.6 s on two |
 | `layer` | one model, its layers split over the cards; each card holds the KV cache of its own layers and only the hidden state crosses | both capped at 6 GiB: 7 of 28 layers resident and RTF 0.595 on one card, 28 of 28 and RTF 0.059 on two |
@@ -174,7 +174,7 @@ copy per card will not fit either. Keep `--slots` below the number of GPUs or
 set `--split-mode layer`. With several GPUs and fewer slots, releases up to
 0.4.0 log `raise --slots to use them all`. The warning is wrong under `auto`
 and `layer`, because the layer split already uses every card; it is fixed in
-[#34](https://github.com/Ar4ikov/vibevoice.c/pull/34).
+[#34](https://github.com/Ar4ikov/TurboQwen/pull/34).
 
 One two-GPU replica with `--slots 2` holds the same per card as two one-GPU
 replicas. The difference is the queue: the two-GPU replica has one, and the
@@ -213,7 +213,7 @@ default runtime is `nvidia`, the image's `NVIDIA_VISIBLE_DEVICES=all` shows
 the replica every card on the host instead, and it uses them. On images up
 to 0.4.0, `--cpu` alone is not enough when no device is visible: also set
 the run command to the default without `--gpus all`. From
-[#34](https://github.com/Ar4ikov/vibevoice.c/pull/34) on, `--cpu` wins over
+[#34](https://github.com/Ar4ikov/TurboQwen/pull/34) on, `--cpu` wins over
 `--gpus`.
 
 ## Memory

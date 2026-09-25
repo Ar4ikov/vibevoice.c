@@ -1,6 +1,6 @@
 /**
  * @file alloc.c
- * @brief Tracked memory allocation wrappers for vibevoice.c
+ * @brief Tracked memory allocation wrappers for TurboQwen
  */
 
 #include "vibevoice/vibevoice.h"

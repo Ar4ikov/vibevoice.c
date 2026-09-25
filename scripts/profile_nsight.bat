@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 REM ============================================================================
-REM  vibevoice.c — Profile with NVIDIA Nsight Systems
+REM  TurboQwen — Profile with NVIDIA Nsight Systems
 REM
 REM  Usage:
 REM    scripts\profile_nsight.bat [path_to_audio.wav] [extra nsys args...]

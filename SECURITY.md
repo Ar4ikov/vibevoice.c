@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Report it privately through
-[GitHub's advisory form](https://github.com/Ar4ikov/vibevoice.c/security/advisories/new),
+[GitHub's advisory form](https://github.com/Ar4ikov/TurboQwen/security/advisories/new),
 not as a public issue. Include what you ran, what happened, and the commit or
 release you saw it on; a reproduction is worth more than a description.
 

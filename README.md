@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="assets/brand/banner.svg" alt="vibevoice.c" width="820">
+  <img src="assets/brand/banner.svg" alt="TurboQwen" width="820">
 </p>
 
 <p align="center">
-  <a href="https://github.com/Ar4ikov/vibevoice.c/actions/workflows/container.yml"><img alt="build" src="https://img.shields.io/github/actions/workflow/status/Ar4ikov/vibevoice.c/container.yml?branch=master&label=build&labelColor=0B0D12"></a>
-  <a href="https://github.com/Ar4ikov/vibevoice.c/releases/latest"><img alt="version" src="https://img.shields.io/github/v/release/Ar4ikov/vibevoice.c?sort=semver&display_name=tag&label=version&labelColor=0B0D12&color=0E9E74"></a>
-  <a href="https://github.com/Ar4ikov/vibevoice.c/pkgs/container/vibevoice.c"><img alt="image" src="https://img.shields.io/badge/ghcr.io-vibevoice.c-0E9E74?labelColor=0B0D12&logo=docker&logoColor=F7F8FA"></a>
+  <a href="https://github.com/Ar4ikov/TurboQwen/actions/workflows/container.yml"><img alt="build" src="https://img.shields.io/github/actions/workflow/status/Ar4ikov/TurboQwen/container.yml?branch=master&label=build&labelColor=0B0D12"></a>
+  <a href="https://github.com/Ar4ikov/TurboQwen/releases/latest"><img alt="version" src="https://img.shields.io/github/v/release/Ar4ikov/TurboQwen?sort=semver&display_name=tag&label=version&labelColor=0B0D12&color=0E9E74"></a>
+  <a href="https://github.com/Ar4ikov/TurboQwen/pkgs/container/turboqwen"><img alt="image" src="https://img.shields.io/badge/ghcr.io-turboqwen-0E9E74?labelColor=0B0D12&logo=docker&logoColor=F7F8FA"></a>
   <img alt="runtime" src="https://img.shields.io/badge/runtime-C11%20%2B%20CUDA%2012-0E9E74?labelColor=0B0D12">
   <img alt="links against" src="https://img.shields.io/badge/links%20against-libc%20%2B%20libm-0E9E74?labelColor=0B0D12">
   <img alt="parity" src="https://img.shields.io/badge/vs%20PyTorch-character--identical-0E9E74?labelColor=0B0D12">
@@ -13,7 +13,8 @@
 </p>
 
 
-A runtime for Microsoft's **VibeVoice-ASR** written in C and CUDA, with no
+**TurboQwen** (formerly *vibevoice.c*) is a runtime for Microsoft's
+**VibeVoice-ASR** written in C and CUDA, with no
 Python, PyTorch, ONNX Runtime or cuBLAS anywhere in the inference path. One
 binary transcribes audio with speaker diarization and timestamps, serves an
 OpenAI-compatible HTTP endpoint, or listens to a microphone.
@@ -660,8 +661,12 @@ shards, because the second replica would only sit idle.
 ## Container images
 
 ```bash
-docker run --rm --gpus all -p 8080:8080 -v /models:/model:ro   ghcr.io/ar4ikov/vibevoice.c:0.2 serve --model /model --host 0.0.0.0
+docker run --rm --gpus all -p 8080:8080 -v /models:/model:ro   ghcr.io/ar4ikov/turboqwen:0.2 serve --model /model --host 0.0.0.0
 ```
+
+The same image goes up under three names with one digest:
+`ghcr.io/ar4ikov/turboqwen`, `ghcr.io/ar4ikov/turboqwen-vllm`, and the old
+`ghcr.io/ar4ikov/vibevoice.c`, which deployments of the old name keep pulling.
 
 Versions follow [SemVer 2.0](https://semver.org), and every published image
 has one version tag that never moves — pin that one:
@@ -698,12 +703,12 @@ all report it, and CI refuses to announce an image that does not report
 exactly the version it is tagged with:
 
 ```bash
-$ docker run --rm ghcr.io/ar4ikov/vibevoice.c:0.2.0 --version
-vibevoice.c 0.2.0 (1a2b3c4) [cuda openmp]
+$ docker run --rm ghcr.io/ar4ikov/turboqwen:0.2.0 --version
+TurboQwen 0.2.0 (1a2b3c4) [cuda openmp]
 ```
 
 Each GitHub release also carries the same binary as
-`vibevoice.c-<version>-linux-x86_64.tar.gz`, with its SHA-256.
+`turboqwen-<version>-linux-x86_64.tar.gz`, with its SHA-256.
 
 Tagging, what each tag guarantees, and how to cut a release:
 [docs/RELEASING.md](docs/RELEASING.md). GPUStack deployment:

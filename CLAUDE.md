@@ -1,4 +1,4 @@
-# CLAUDE.md — vibevoice.c
+# CLAUDE.md — TurboQwen
 
 > Контекстный файл для AI-ассистента. Содержит всё необходимое для понимания
 > проекта, принятия архитектурных решений и генерации кода.
@@ -253,7 +253,7 @@ transcribe it with these keys: ...`.
 
 ## 1. Что это за проект
 
-**vibevoice.c** — высокопроизводительный runtime на **чистом C** для запуска
+**TurboQwen** (до 0.6 — vibevoice.c) — высокопроизводительный runtime на **чистом C** для запуска
 квантованной (4-bit NF4) модели **VibeVoice-ASR** от Microsoft.
 
 Модель выполняет:
@@ -437,7 +437,7 @@ eps:                     1e-6
 ## 5. Структура проекта
 
 ```
-vibevoice.c/
+TurboQwen/
 │
 ├── CMakeLists.txt                  # Корневой CMake
 ├── CLAUDE.md                       # ← Этот файл

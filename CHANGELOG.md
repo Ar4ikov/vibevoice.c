@@ -9,6 +9,22 @@ Write the entry for a change under Unreleased in the same pull request.
 
 ## Unreleased
 
+- The project is called **TurboQwen** (it was vibevoice.c): the runtime has
+  become an engine for Qwen2-family decoders -- three VibeVoice ASR
+  families, the 7B as an LLM, W4A16/W8A8/BitNet weights, paged KV -- more
+  than "VibeVoice in C". `--version` now reads `TurboQwen X.Y.Z (ref)
+  [features]` (a script that matched `vibevoice.c` has to follow), and so do
+  the CLI and chat banners, `serve`'s banner and `owned_by`, the release
+  title and tarball (`turboqwen-X.Y.Z-linux-x86_64.tar.gz`), the OCI labels
+  and the docs; the repository is `Ar4ikov/TurboQwen` (GitHub redirects the
+  old URLs). Every image tag is pushed under three names with one digest:
+  `ghcr.io/ar4ikov/turboqwen`, `ghcr.io/ar4ikov/turboqwen-vllm`, and the old
+  `ghcr.io/ar4ikov/vibevoice.c`, which existing deployments keep pulling;
+  the GPUStack template pulls the new one. The C API (`vv_*`,
+  `include/vibevoice/`), `vv_cli`, the libraries, `VV_*` variables and
+  metric names are unchanged, and so is every transcript
+  ([#49](https://github.com/Ar4ikov/TurboQwen/issues/49)).
+
 ## [0.5.1](https://github.com/Ar4ikov/vibevoice.c/compare/v0.5.0...v0.5.1) — 2026-09-21
 
 - A container that holds more `/dev/nvidiaN` nodes than

@@ -1,6 +1,6 @@
 # Versions and images
 
-vibevoice.c follows [SemVer 2.0](https://semver.org). Below 1.0 a minor bump
+TurboQwen follows [SemVer 2.0](https://semver.org). Below 1.0 a minor bump
 is allowed to break and a patch is not; from 1.0 on, only a major bump may
 break.
 
@@ -36,7 +36,9 @@ cmake -P cmake/Version.cmake
 
 ## What each image tag means
 
-Published to `ghcr.io/ar4ikov/vibevoice.c`. Every pushed build carries one
+Published to `ghcr.io/ar4ikov/turboqwen`, and the same digest to
+`ghcr.io/ar4ikov/turboqwen-vllm` and the old `ghcr.io/ar4ikov/vibevoice.c`.
+Every pushed build carries one
 SemVer tag that never moves — pin that one — plus the moving tags that apply:
 
 | tag | published by | moves |
@@ -72,7 +74,7 @@ flowchart TD
 ```
 
 For a deployment that must be reproducible to the byte, pin the digest:
-`ghcr.io/ar4ikov/vibevoice.c@sha256:...`. A digest cannot be repointed at all.
+`ghcr.io/ar4ikov/turboqwen@sha256:...`. A digest cannot be repointed at all.
 
 ## Cutting a release
 
@@ -113,7 +115,7 @@ the Container workflow):
    above, starts the published image and fails unless `--version` names
    exactly the release — before anything is announced.
 5. Creates the GitHub release with the changelog section as notes, and
-   attaches `vibevoice.c-X.Y.Z-linux-x86_64.tar.gz` (the binary from the
+   attaches `turboqwen-X.Y.Z-linux-x86_64.tar.gz` (the binary from the
    image, with the licences) and its SHA-256.
 
 `scripts/release.sh --dry-run auto` prints what would happen without
@@ -130,8 +132,8 @@ The version is compiled into the binary, so it can be asked rather than
 trusted:
 
 ```bash
-docker run --rm ghcr.io/ar4ikov/vibevoice.c:0.2.0 --version
-# vibevoice.c 0.2.0 (1a2b3c4) [cuda openmp]
+docker run --rm ghcr.io/ar4ikov/turboqwen:0.2.0 --version
+# TurboQwen 0.2.0 (1a2b3c4) [cuda openmp]
 ```
 
 The version, the commit it was built from, and the features compiled in. The
@@ -152,7 +154,7 @@ and the image carries them as OCI labels, which is what a registry UI and
 `docker inspect` read:
 
 ```bash
-docker inspect --format '{{json .Config.Labels}}' ghcr.io/ar4ikov/vibevoice.c:0.2.0
+docker inspect --format '{{json .Config.Labels}}' ghcr.io/ar4ikov/turboqwen:0.2.0
 ```
 
 ## GPUStack

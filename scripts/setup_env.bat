@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 REM ============================================================================
-REM  vibevoice.c — Environment Setup Script
+REM  TurboQwen — Environment Setup Script
 REM
 REM  Run this once per terminal session to configure MSVC + CUDA.
 REM  After running, you can use cmake/build.bat/ninja directly.
@@ -11,7 +11,7 @@ REM    scripts\setup_env.bat
 REM ============================================================================
 
 echo.
-echo  vibevoice.c Environment Setup
+echo  TurboQwen Environment Setup
 echo  ══════════════════════════════
 echo.
 

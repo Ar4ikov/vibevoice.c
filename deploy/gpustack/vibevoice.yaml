@@ -47,32 +47,32 @@ default_env:
 version_configs:
   # Newest release. The default.
   latest:
-    image_name: ghcr.io/ar4ikov/vibevoice.c:latest
+    image_name: ghcr.io/ar4ikov/turboqwen:latest
     entrypoint: /usr/local/bin/vv_cli
     custom_framework: cuda
   # The 0.5 release line: newest v0.5.x, moves when a patch is tagged.
   '0.5':
-    image_name: ghcr.io/ar4ikov/vibevoice.c:0.5
+    image_name: ghcr.io/ar4ikov/turboqwen:0.5
     entrypoint: /usr/local/bin/vv_cli
     custom_framework: cuda
   # The 0.4 release line: newest v0.4.x, moves when a patch is tagged.
   '0.4':
-    image_name: ghcr.io/ar4ikov/vibevoice.c:0.4
+    image_name: ghcr.io/ar4ikov/turboqwen:0.4
     entrypoint: /usr/local/bin/vv_cli
     custom_framework: cuda
   # The 0.3 release line: newest v0.3.x, moves when a patch is tagged.
   '0.3':
-    image_name: ghcr.io/ar4ikov/vibevoice.c:0.3
+    image_name: ghcr.io/ar4ikov/turboqwen:0.3
     entrypoint: /usr/local/bin/vv_cli
     custom_framework: cuda
   # The 0.2 release line: newest v0.2.x, moves when a patch is tagged.
   '0.2':
-    image_name: ghcr.io/ar4ikov/vibevoice.c:0.2
+    image_name: ghcr.io/ar4ikov/turboqwen:0.2
     entrypoint: /usr/local/bin/vv_cli
     custom_framework: cuda
   # Head of the default branch, republished on every push to master. Each of
   # those builds is also published under its own version, e.g. 0.2.1-dev.5.
   master:
-    image_name: ghcr.io/ar4ikov/vibevoice.c:master
+    image_name: ghcr.io/ar4ikov/turboqwen:master
     entrypoint: /usr/local/bin/vv_cli
     custom_framework: cuda

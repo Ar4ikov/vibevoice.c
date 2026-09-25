@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 REM ============================================================================
-REM  vibevoice.c -- Windows Build Script (CMD)
+REM  TurboQwen -- Windows Build Script (CMD)
 REM
 REM  Usage:
 REM    build.bat                     -- Release build, auto-detect everything
@@ -123,7 +123,7 @@ if not defined VV_JOBS set "VV_JOBS=%NUMBER_OF_PROCESSORS%"
 REM --- Configure --------------------------------------------------------------
 echo.
 echo ========================================================================
-echo  Configuring vibevoice.c  [%BUILD_TYPE%]
+echo  Configuring TurboQwen  [%BUILD_TYPE%]
 echo ========================================================================
 echo.
 
@@ -140,7 +140,7 @@ if %errorlevel% neq 0 (
 REM --- Build ------------------------------------------------------------------
 echo.
 echo ========================================================================
-echo  Building vibevoice.c  [%BUILD_TYPE%]  (%VV_JOBS% jobs)
+echo  Building TurboQwen  [%BUILD_TYPE%]  (%VV_JOBS% jobs)
 echo ========================================================================
 echo.
 

@@ -1,6 +1,6 @@
 /**
  * @file logger.c
- * @brief Simple logging facility for vibevoice.c
+ * @brief Simple logging facility for TurboQwen
  */
 
 #include "vibevoice/vibevoice.h"

@@ -1,6 +1,6 @@
 /**
  * @file vibevoice.h
- * @brief Umbrella header for vibevoice.c — Pure C VibeVoice-ASR runtime
+ * @brief Umbrella header for TurboQwen — Pure C VibeVoice-ASR runtime
  *
  * Include this single header to get access to the full public API.
  */

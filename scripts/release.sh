@@ -30,7 +30,7 @@ cd "$ROOT"
 HEADER=include/vibevoice/vibevoice.h
 CHANGELOG=CHANGELOG.md
 GPUSTACK=deploy/gpustack/vibevoice.yaml
-REPO_URL="https://github.com/Ar4ikov/vibevoice.c"
+REPO_URL="https://github.com/Ar4ikov/TurboQwen"
 SEMVER='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'
 
 die() { echo "release: $*" >&2; exit 1; }
@@ -228,7 +228,7 @@ if [ "$PRE" = 0 ] && [ -f "$GPUSTACK" ]; then
             insec && /^    custom_framework:/ && !done {
                 print "  # The " line " release line: newest v" line ".x, moves when a patch is tagged."
                 print "  '\''" line "'\'':"
-                print "    image_name: ghcr.io/ar4ikov/vibevoice.c:" line
+                print "    image_name: ghcr.io/ar4ikov/turboqwen:" line
                 print "    entrypoint: /usr/local/bin/vv_cli"
                 print "    custom_framework: cuda"
                 done = 1
@@ -240,7 +240,7 @@ fi
 
 git add "$HEADER" "$CHANGELOG" "$GPUSTACK"
 git commit -q -m "chore: release $NEXT"
-git tag -a "v$NEXT" -m "vibevoice.c $NEXT" -m "$BODY"
+git tag -a "v$NEXT" -m "TurboQwen $NEXT" -m "$BODY"
 echo "release: committed and tagged v$NEXT"
 echo "version=$NEXT" >> "${GITHUB_OUTPUT:-/dev/null}"
 echo "tag=v$NEXT" >> "${GITHUB_OUTPUT:-/dev/null}"

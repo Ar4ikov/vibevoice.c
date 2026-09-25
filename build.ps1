@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    vibevoice.c — Windows Build Script (PowerShell)
+    TurboQwen — Windows Build Script (PowerShell)
 
 .DESCRIPTION
-    Configures and builds the vibevoice.c project using CMake + MSVC + CUDA.
+    Configures and builds the TurboQwen project using CMake + MSVC + CUDA.
 
 .PARAMETER BuildType
     Build configuration: Debug, Release (default), RelWithDebInfo, MinSizeRel
@@ -76,7 +76,7 @@ function Write-Err    { param([string]$msg) Write-Host "[ERROR]     $msg" -Foreg
 # ─── Banner ───────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════════╗" -ForegroundColor Magenta
-Write-Host "  ║       vibevoice.c  Build System              ║" -ForegroundColor Magenta
+Write-Host "  ║       TurboQwen  Build System              ║" -ForegroundColor Magenta
 Write-Host "  ║       Pure C  |  CUDA                        ║" -ForegroundColor Magenta
 Write-Host "  ╚══════════════════════════════════════════════╝" -ForegroundColor Magenta
 Write-Host ""

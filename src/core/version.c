@@ -10,8 +10,8 @@
  * its context has no .git. Either way they are compiled in, so the answer is
  * the binary's own and cannot be overridden from the environment:
  *
- *     docker run --rm ghcr.io/ar4ikov/vibevoice.c:0.2.0 --version
- *     vibevoice.c 0.2.0 (1a2b3c4) [cuda openmp]
+ *     docker run --rm ghcr.io/ar4ikov/turboqwen:0.2.0 --version
+ *     TurboQwen 0.2.0 (1a2b3c4) [cuda openmp]
  */
 #include "vibevoice/vibevoice.h"
 

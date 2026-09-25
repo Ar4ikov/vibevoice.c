@@ -30,7 +30,7 @@ space where someone is representing the project.
 
 Report it to the maintainer: [bizy18588@gmail.com](mailto:bizy18588@gmail.com),
 or privately through
-[GitHub's advisory form](https://github.com/Ar4ikov/vibevoice.c/security/advisories/new)
+[GitHub's advisory form](https://github.com/Ar4ikov/TurboQwen/security/advisories/new)
 if it involves something that should not be public. Reports are read by the
 maintainer and answered; what happens next depends on the case and can be
 anything from a word in a thread to a block.

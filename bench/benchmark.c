@@ -1,6 +1,6 @@
 /**
  * @file benchmark.c
- * @brief Performance benchmarking for vibevoice.c components.
+ * @brief Performance benchmarking for TurboQwen components.
  *
  * Measures:
  * - Audio preprocessing throughput
@@ -230,7 +230,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    printf("=== vibevoice.c Benchmarks ===\n");
+    printf("=== TurboQwen Benchmarks ===\n");
     printf("=== CPU-only (no GPU required) ===\n\n");
 
     bench_normalize();

@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-#  vibevoice.c — Cursor Rules
+#  TurboQwen — Cursor Rules
 #  Pure C runtime for VibeVoice-ASR (4-bit quantized) with CUDA
 #  VERIFIED against actual model source code (2026-02-12)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -26,7 +26,7 @@
 # • cuBLAS/cuDNN: через CUDA Toolkit, линковка как внешние .dll/.lib.
 
 # ─── 3. АРХИТЕКТУРА ПРОЕКТА ───────────────────────────────────────────────────
-# vibevoice.c/
+# TurboQwen/
 # ├── CMakeLists.txt              — корневой CMake
 # ├── CLAUDE.md                   — контекст для AI-ассистента
 # ├── .cursorrules                — этот файл

@@ -1,6 +1,6 @@
 ---
 name: foundation-task
-description: Run a large piece of vibevoice.c work end to end — issue by the repo template, branch, implementation against the C rules, evidence-backed verification, PR with results, CI watched to green. Use for anything that adds a backend, a kernel family, a format or a CLI surface, rather than a one-line fix.
+description: Run a large piece of TurboQwen work end to end — issue by the repo template, branch, implementation against the C rules, evidence-backed verification, PR with results, CI watched to green. Use for anything that adds a backend, a kernel family, a format or a CLI surface, rather than a one-line fix.
 ---
 
 # Foundation task
@@ -24,7 +24,7 @@ three merged PRs before writing yours.
   benchmark and the reference.
 
 ```bash
-gh issue create --repo Ar4ikov/vibevoice.c --title "..." --body-file <(cat)
+gh issue create --repo Ar4ikov/TurboQwen --title "..." --body-file <(cat)
 ```
 
 Branch from `master`, named for the work (`metal-backend`, `awq-fast-path`).
@@ -89,7 +89,7 @@ Closes #N.
 could not run, so a reviewer knows the shape of the hole.
 
 ```bash
-gh pr create --repo Ar4ikov/vibevoice.c --base master --title "..." --body-file ...
+gh pr create --repo Ar4ikov/TurboQwen --base master --title "..." --body-file ...
 ```
 
 Then watch it: `gh pr checks <N> --watch`. CI (`.github/workflows/container.yml`)

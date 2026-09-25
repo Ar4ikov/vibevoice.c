@@ -503,7 +503,7 @@ install(DIRECTORY include/vibevoice DESTINATION include)
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 message(STATUS "")
-message(STATUS "  vibevoice.c ${VV_VERSION_FULL} build configuration:")
+message(STATUS "  TurboQwen ${VV_VERSION_FULL} build configuration:")
 message(STATUS "    Revision:  ${VV_REVISION}")
 message(STATUS "    CUDA:      ${VV_HAS_CUDA}")
 message(STATUS "    Metal:     ${VV_HAS_METAL}")

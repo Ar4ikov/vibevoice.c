@@ -63,7 +63,13 @@ jobs:
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          # Every tag goes up under three names with one digest: the
+          # project's, the alias deployments ask for, and the old one, which
+          # deployments of the old name keep pulling. Written out rather than
+          # taken from the repository, so that renaming it cannot move them.
+          images=(ghcr.io/ar4ikov/turboqwen ghcr.io/ar4ikov/turboqwen-vllm
+                  ghcr.io/ar4ikov/vibevoice.c)
+          image="${images[0]}"
           sha="sha-$(git rev-parse --short=7 HEAD)"
           tags=()
           case "$REF" in
@@ -109,7 +115,9 @@ jobs:
             echo "kind=$kind"
             echo "image=$image"
             echo "list<<EOF"
-            for t in "${tags[@]}"; do echo "$image:$t"; done
+            for i in "${images[@]}"; do
+              for t in "${tags[@]}"; do echo "$i:$t"; done
+            done
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
           printf 'tag: %s\n' "${tags[@]}"
@@ -151,7 +159,7 @@ jobs:
           out="$(docker run --rm "$ref" --version)"
           echo "$ref: $out"
           case "$out" in
-            "vibevoice.c $VERSION "*) ;;
+            "TurboQwen $VERSION "*) ;;
             *) echo "::error::$ref reports '$out', expected version $VERSION"; exit 1 ;;
           esac
           label="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$ref")"
@@ -169,7 +177,7 @@ jobs:
           IMAGE: ${{ steps.tags.outputs.image }}
         run: |
           tag="v$VERSION"
-          dir="vibevoice.c-$VERSION-linux-x86_64"
+          dir="turboqwen-$VERSION-linux-x86_64"
           mkdir -p "$dir"
           cid="$(docker create "$IMAGE:$VERSION")"
           docker cp "$cid:/usr/local/bin/vv_cli" "$dir/vv_cli"
@@ -186,7 +194,7 @@ jobs:
           if ! gh release view "$tag" >/dev/null 2>&1; then
             flags=()
             [ "$PRERELEASE" = true ] && flags+=(--prerelease)
-            gh release create "$tag" --verify-tag --title "vibevoice.c $VERSION" \
+            gh release create "$tag" --verify-tag --title "TurboQwen $VERSION" \
               --notes-file notes.md "${flags[@]}"
           fi
           gh release upload "$tag" "$dir.tar.gz" "$dir.tar.gz.sha256" --clobber
