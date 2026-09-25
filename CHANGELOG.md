@@ -13,19 +13,58 @@ Write the entry for a change under Unreleased in the same pull request.
   drafters (`--draft <dir>`, also for `serve`, `chat` and streaming
   sessions): a small drafter proposes a block of tokens in one pass, the
   model checks the block in one pass and keeps what it agrees with. The
-  check computes every row with a decode step's own arithmetic — multi-row
-  copies of the W4A16 GEMV, the split-KV decode attention (fa1, fa2,
+  check computes every row with a decode step's own arithmetic -- the
+  tensor-core W4A16 GEMV below, the split-KV decode attention (fa1, fa2,
   flashinfer, every KV format, paged or not), the ternary BitNet
   projections, the LM head and the argmax, each tested bit for bit against
-  one row at a time — so a transcript with a drafter is byte-for-byte the
-  transcript without one. `--draft-block N` sets how many rows a pass
-  checks, `--draft-quant int4|f16` the drafter's weights (INT4 by default:
-  a draft only has to be good, not exact). Drafters are trained on the
-  target's own transcripts (`tools/dflash`: corpus, `vv_dflash_data
-  gen|trace`, `train.py`, `check_drafter.py`); the design and the numbers
-  are in [docs/DFLASH.md](docs/DFLASH.md). Metal and the CPU path decline
-  (`VV_ERR_UNSUPPORTED`) and decode without the drafter
+  one row at a time -- so a transcript with a drafter is byte-for-byte the
+  transcript without one on the same attention backend (`--draft-check
+  exact`, the default). With a drafter `--attn auto` is flashinfer, whose
+  checked rows share their tiles where fa2 walks the cache once per row;
+  the transcript is then that of `--attn flashinfer`, and `--attn fa2
+  --draft` keeps fa2's. `--draft-check fast` checks with flashinfer's
+  attention and the prefill's projections instead: the greedy transcript
+  within rounding. NF4 and INT8 weights check exactly only one row at a
+  time, which never pays, so there the drafter is declined unless the check
+  is fast, which reads each weight once (the small-M kernel now takes 1..64
+  rows). `--draft-block N` sets how many rows a pass checks (without it:
+  half the drafter's block or all of it, whichever keeps more tokens per
+  ms), `--draft-quant int4|f16` the drafter's weights (INT4 by default); a
+  drafter may also ship its projections as INT4 (compressed-tensors,
+  `tools/dflash/awq_drafter.py`). A cycle -- draft, check, accept, the
+  drafter's context -- reads its positions on the device and runs as one
+  captured graph. Blocks run only while they beat plain steps (measured).
+  RTX 3090, AWQ 7B against its default decode: jfk 2.57x, test120 2.17x,
+  a 32-minute file 1.73x, 20 held-out clips 2.70x; Streaming-1.5B: test120
+  2.50x, 32 minutes 2.13x. Drafters for the AWQ checkpoints are on the Hub
+  ([ASR-7B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2-Drafter),
+  [Streaming-1.5B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter),
+  each also as `-AWQ-W4A16-ASYM`). They are trained on the target's own
+  transcripts (`tools/dflash`: corpus, `vv_dflash_data gen|trace`,
+  `train.py`, `awq_drafter.py`, `check_drafter.py`); the design and the
+  numbers are in [docs/DFLASH.md](docs/DFLASH.md). Metal and the CPU path
+  decline (`VV_ERR_UNSUPPORTED`) and decode without the drafter
   ([#47](https://github.com/Ar4ikov/vibevoice.c/issues/47)).
+- **W4A16 decoding changed its arithmetic** (AWQ, GPTQ, `--quant int4`).
+  The step's GEMV is now a tensor-core kernel whose rows are independent
+  of each other (`vv_w4a16_mv_dev`: the weights as the MMA's A operand, K cut
+  into fixed slices summed in a fixed tree), which is what lets a drafted
+  block be checked exactly at about one step's cost; it also runs prefills
+  of up to 16 rows. Its sums are FP32 inside the MMA where the old GEMV
+  summed FP16 chains of four, so its bits differ from 0.5.1's: on a 3090
+  the AWQ 7B's transcripts of jfk, test30, test120 and a 32-minute file
+  (9777 tokens) and the Streaming-1.5B's of jfk and test120 still came out
+  character for character the same; plain decoding of the 7B is 1-2 %
+  slower (a 1.5B layer's GEMVs take 10 % less). `VV_W4A16_MV=0` gives the
+  old GEMV. Before sm_80 nothing changes.
+- A checked block's flashinfer rows share their 16-row fragments (two or
+  three rows for 7 heads), found on the device from the cache length: 8 rows
+  at 24K positions cost 1.64 one-row decodes instead of 3.33, bit for bit
+  the same.
+- A failed `cudaMalloc` stayed the thread's last CUDA error, and the next
+  kernel launch reported it as its own: a drafter that did not fit on the
+  card ("decoding without it") took the transcription down with "CUDA
+  kernel launch failed". Allocations now clear it.
 - `vv_init_params_default()` now zero-fills the struct first: the per-device
   memory caps of an empty `gpus` set were left as stack garbage, so an API
   caller that did not go through the CLI's flag parser could get a random

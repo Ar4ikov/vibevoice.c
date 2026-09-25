@@ -326,7 +326,52 @@ transcripts again each epoch instead.
 
 ## Results
 
-TBD.
+RTX 3090 (Linux, CUDA 12.4, the card otherwise idle), greedy decoding,
+`--draft-check exact`, decode tokens per second; plain is the same binary
+without `--draft`. Every drafted transcript below was compared with its plain
+one byte for byte, and was the same.
+
+**VibeVoice-ASR 7B, AWQ W4A16** (`Ar4ikov/VibeVoice-ASR-DFlash2-Drafter`,
+commit a9cfb15, the check width measured as it runs):
+
+| | plain, fa2 (the default) | plain, flashinfer | drafted (flashinfer) | tokens per block |
+|---|---|---|---|---|
+| jfk, 11 s | 149.6 | 152.2 | 384.1 (**2.57×**) | 3.92 |
+| test30 | 149.2 | 152.4 | 325.5 (**2.18×**) | 2.85 |
+| test120, 2 speakers | 143.1 | 150.6 | 310.0 (**2.17×**) | 2.74 |
+| 32-minute file | 106.1 | 122.7 | 183.5 (**1.73×**) | 2.36 |
+| 20 held-out clips | 138.2 | 147.3 | 373.3 (**2.70×**) | 3.56 |
+
+(× against the default. The clips' fa2 figure is from 7d7d43e, whose plain
+decode is the same code.) The drafter stored as INT4
+(`-AWQ-W4A16-ASYM`, 0.55 GB) keeps 3.747 tokens per block on the held-out
+traces against the BF16 one's 3.741 and runs the same: clips 375.0, test120
+306.0, the 32-minute file 185.8.
+
+**VibeVoice-ASR-Streaming-1.5B, AWQ W4A16** (`Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter`,
+7d7d43e, 8 rows; flashinfer is this model's default either way):
+
+| | plain | drafted | tokens per block |
+|---|---|---|---|
+| test120 | 415.6 | 1040.2 (**2.50×**) | 3.99 |
+| 32-minute file | 341.4 | 728.6 (**2.13×**) | 4.06 |
+| 20 held-out clips | 409.2 | 869.4 (**2.12×**) | 3.52 |
+
+**Other weights of the 7B, the same drafter**, test30, 7d7d43e, fa2, 8 rows:
+BF16 56.5 → 90.6 (1.60×), W8A8 98.6 → 237.8 (2.41×), W4A8 146.3 → 232.4
+(1.59×). NF4 and INT8 check exactly only one row at a time and lose (NF4,
+test120: 123.9 → 112.3), so the drafter is declined there in exact mode;
+`--draft-check fast` reads each weight once through the small-M kernel.
+
+**BitNet**: 0.99× on the 20 clips -- its drafter does not learn (held-out
+depth-1 accuracy 0.24 against 0.80 for the others) and the controller keeps
+the blocks paused. Not published.
+
+Where the numbers come from: the 7B's check costs 1.3 steps at 8 rows (the
+projections 1.13, then the head, the rows' attention and the drafter's own
+pass), so the speedup is about tokens per block / 1.3. The drafters are
+data-starved -- on the 7B, 5.4 tokens per block on the training traces
+against 3.7 held out -- which is where the next ones come from.
 
 ## Not supported
 
