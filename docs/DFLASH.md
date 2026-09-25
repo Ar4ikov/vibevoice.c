@@ -6,7 +6,9 @@ its own. The drafter here is a [DFlash 2](https://inco.ai/blog/dflash2/) block
 drafter trained on the target's own transcripts; the check is **exact**: every
 row of a checked block is computed with the arithmetic of a one-token decode
 step, so a transcript with `--draft` is byte-for-byte the transcript without
-it (`tests/test_spec.c`, and the `IDENTICAL` runs in the PR).
+it on the same attention kernels (`tests/test_spec.c`, and the identical runs
+in the PR). With a drafter `--attn auto` means flashinfer, which checks rows
+together (below); `--attn fa2 --draft` keeps the batch model's default.
 
 ```
 vv_cli --model ./model_hf --audio talk.wav --draft ./drafter
@@ -102,66 +104,88 @@ takes its own greedy token after every row. Kept: d1…dk while each equals the
 target's token before it, then the target's own next token — k + 1 tokens for
 one pass. If those tokens are to be the ones plain decoding would produce, the
 logits of row i must be bit-for-bit the logits of the decode step that would
-have produced them. The prefill kernels do not give that (different reduction
-orders, tensor cores), so the check has its own kernels, each a multi-row copy
-of the decode step's:
+have produced them. So every op of the check computes each row with the
+decode step's own arithmetic:
 
-| Op | Decode step | Checked block |
+| Op | Decode step, and each row of a checked block |
+|---|---|
+| W4A16 projections | `vv_w4a16_mv_dev`: tensor cores (mma.m16n8k16) with the weights as the A operand, 16 output rows to a warp tile, and the rows of x as the columns of B. K is cut into 16 slices of 128-k blocks, each slice adds its blocks in order and the slices meet in a fixed halving tree, so a row's bits depend on its weight and its x alone — not on how many rows share the launch, which projections are fused into it, or the launch shape the kernel picks for the card. The step runs it with one row, the check with Bv. |
+| Attention | split-KV decode — fa2's scalar `gqa_decode_kernel` or flashinfer's `att_split` — where row r sees p + r + 1 positions, cut with that length's own split. fa2 gives every row a grid layer of its own; flashinfer packs rows that cut the cache alike two or three to a 16-row fragment (7 heads a row), so a K/V tile is read once for all of them. |
+| LM head | `lm_head_gemv_kernel`: a warp per vocab row, lane l takes k = 8l + 256i; `lm_head_rows_kernel` does the same per row and streams the head past L1 (`ld.global.nc.L1::no_allocate`) so the x rows stay there |
+| Argmax | 256 partial blocks, lowest index on ties, per row |
+
+Norms, RoPE, SwiGLU and the residual adds are row-wise already.
+`tests/test_w4a16.c` checks the tensor-core GEMV's rows for M = 2..16 against
+M = 1, four other launch shapes and every fused projection alone, bit for
+bit, on the 7B and 1.5B shapes; `tests/test_spec.c` does the same for the
+attention (fa1/fa2/flashinfer, fp16, fp8 and tq4 caches, paged and slab, up
+to 24K positions, the length on the host and on the device), the head and
+the argmax. Other weight formats check with the kernels a decode step runs:
+dense FP16 and ternary take up to 8 rows at once, NF4 and INT8 one row at a
+time (exact, slower), W8A8 any count (integer sums). W4A8 checks at most 8
+rows: past what its GEMV takes, the activations go to the GEMM, which adds
+the weight groups up in another order, so a larger `--draft-block` is cut to
+8 (`vv_decoder_verify_rows_max`).
+
+**The step changed to make the check cheap.** Until this release the W4A16
+step was an FP16-chain GEMV (four HFMA2 chains per 32-weight chunk, flushed
+to FP32), and the only exact check of M rows was M times its FP16 work: at 8
+rows 2.6 steps on a 3090, and the check ate most of what a block saved. The
+tensor-core GEMV reads the weights once for all rows and does the arithmetic
+on the tensor cores, and because its rows are independent it can be the
+step's kernel as well. Its sums are FP32 inside the mma, so plain W4A16
+decoding (AWQ, GPTQ, `--quant int4`) has other bits than 0.5.1's —
+`VV_W4A16_MV=0` gives the old GEMV, and the old multi-row check with it.
+(Where the tensor-core GEMV declines — before sm_80, K % 128, N % 16 — both
+sides keep the old pair.) Time of M rows over the old one-row GEMV, 3090,
+7B layer (q/k/v, o, gate/up, down; `VV_W4A16_BENCH=2 tests/test_w4a16`):
+
+| rows | old GEMV rows | tensor-core GEMV |
 |---|---|---|
-| W4A16 projections | `w4a16_gemv_kernel`: LPR lanes per row, chunk c on lane c mod LPR, four HFMA2 chains per 32-weight chunk, FP32 flush, xor butterfly | `w4a16_gemv_rows_kernel`: the same lane→chunk map and chains for up to 8 x rows; x staged in shared memory, each weight chunk loaded and dequantized once for all rows |
-| Attention | split-KV decode (`gqa_decode_kernel` / flashinfer `att_split`), split count from the cache length | the same kernels with a row index: row r sees cache length p + r + 1 and picks its own split count |
-| LM head | `lm_head_gemv_kernel`: a warp per vocab row, lane l takes k = 8l + 256i | `lm_head_rows_kernel`: the same per row; the head streams past L1 (`ld.global.nc.L1::no_allocate`) so the x rows stay in L1 |
-| Argmax | 256 partial blocks, lowest index on ties | the same per row |
+| 1 | 1.00 | 0.98 |
+| 4 | 1.71 | 1.11 |
+| 8 | 2.64 | 1.13 |
+| 16 | 5.2 | 1.78 |
 
-Norms, RoPE, SwiGLU and the residual adds are row-wise already. With these, a
-checked row and its decode step compute the same bits; `tests/test_spec.c`
-compares every kernel against the one-row version bit for bit (7B and 1.5B
-shapes, M 1..16, fa1/fa2/flashinfer, fp16 and tq4 caches, paged and slab).
-Other weight formats check with the kernels a decode step runs: dense FP16
-and ternary take up to 8 rows at once, NF4 and INT8 one row at a time
-(exact, slower), W8A8 any count (integer sums). W4A8 checks at most 8 rows:
-past what its GEMV takes, the activations go to the GEMM, which adds the
-weight groups up in another order, so a larger `--draft-block` is cut to 8
-(`vv_decoder_verify_rows_max`).
+(The 1.5B layer: 0.90 for one row, 1.09 for eight.)
 
-What that costs is compute. The one-token GEMV is memory-bound with its FP16
-pipe mostly idle; the same arithmetic for M rows is M times the FP16 work
-(HFMA2 chains and half→float flushes cannot be shared between rows), and from
-about 3 rows on it is the FP16 pipe, not the weights, that sets the time.
-3090, 7B AWQ shapes, time of M rows over one row (`VV_SPEC_BENCH=1
-tests/test_spec`):
-
-| rows | q/k/v | o | gate/up | down | a layer |
-|---|---|---|---|---|---|
-| 2 | 1.18 | 1.23 | 1.05 | 1.12 | **1.09** |
-| 3 | 1.20 | 1.38 | 1.10 | 1.34 | **1.20** |
-| 4 | 1.41 | 1.63 | 1.23 | 1.54 | **1.36** |
-| 8 | 2.28 | 2.61 | 2.19 | 2.68 | **2.4** |
-
-Two kernels, one arithmetic: x in shared memory a tile at a time with each
-lane group carrying 4 weight rows (`w4a16_gemv_rows_kernel`), and for 3–4
-rows of a 3584-wide x a persistent one that loads all of x once per block
-and walks every projection's rows in turn (`w4a16_gemv_rows_persist_kernel`,
-3–8 % faster there, slower elsewhere). The head is 1.08× one row for 8 rows
-(1.32 against 1.23 ms) once it streams past L1 — read through L1 it evicted
-the x rows and took 1.75×. Decode attention is latency-bound, not
-bandwidth-bound: rows run as separate grid layers (8 rows at 1K positions
-2.05× one row; 4 rows at 24K 3.1×), and a variant that reads each cached
-position once for all rows, with the same slices, was slower at every size
-(fewer warps in flight) and was dropped.
+The attention is where exactness still costs, and only on a long cache. A
+decode's walk over its slice is latency-bound — one dependent warp reduction
+per position — so fa2's rows run as separate grid layers, and a block of 8 at
+24K positions costs ~6.6 steps' attention (3070); a variant that walked each
+slice once for all rows, same slices and same arithmetic, was no faster and
+was dropped. flashinfer's rows share fragments: 1.64 steps' attention for 8
+rows at 24K, 0.98 for 4. So with a drafter `--attn auto` is flashinfer (the
+streaming models attend with it anyway): on the AWQ 7B and the 32-minute
+file, exact blocks made 1.06× the plain decode on fa2 and 1.47× on
+flashinfer. The transcript is then exactly that of `--attn flashinfer`
+without a drafter, which on the AWQ 7B has the default's words on test120
+and the 32-minute file, with one timestamp 10 ms apart on the latter.
+`--attn fa2 --draft` keeps the default's transcript bit for bit, at fa2's
+cost for the rows.
 
 So the runtime checks fewer rows than it drafts when that pays: the drafter
 always drafts its whole block (it was trained on whole blocks), and
-`--draft-block n` checks the anchor and the first n-1 drafts only.
+`--draft-block n` checks the anchor and the first n-1 drafts only. Without
+it the width is measured: half the block or all of it, whichever keeps more
+tokens per millisecond. A full block of n tokens tells what a half one would
+have kept (min(n, B/2)), each width's time is its own running average, the
+narrow width is timed once and, while it wins, every 32nd block runs full so
+what the longer runs would keep stays measured. Each width has its own
+captured cycle. (3070, Streaming-1.5B, test120: 646 tok/s chosen, 637 at 8
+rows, 505 at 4.)
 
-`--draft-check fast` checks with the prefill kernels instead (tensor-core
-GEMMs, the flash-attention prefill): a checked row then costs far less than
-a step, but its logits differ from its decode step's in the last bits, so a
-near-tie can go the other way than in a plain decode. What comes out is
-still the model's greedy transcript, computed with another rounding — the
-same trade the usual speculative decoders (vLLM, SGLang) make — but not
-byte for byte the one without `--draft`. `--draft-check exact` (the
-default) keeps that promise.
+`--draft-check fast` runs the same cycle with flashinfer's rows whatever the
+cache's backend, and the prefill's projections instead of each row's decode
+arithmetic: the same kernel for W4A16, a GEMM instead of a GEMV per row for
+NF4 and INT8. Its logits then differ from the decode step's wherever those
+kernels round differently (a fa2 target's attention), so a near-tie can go
+the other way than in plain decoding. What comes out is still the model's
+greedy transcript, computed with another rounding — the trade the usual
+speculative decoders (vLLM, SGLang) make — but not byte for byte the one
+without `--draft`. With W4A16 weights and flashinfer attention, fast and
+exact are the same computation. `--draft-check exact` (the default) keeps
+the promise.
 
 ## One cycle
 
@@ -171,18 +195,35 @@ cache and drafter context hold [0, p); anchor = token at p, not fed
   check:  Bv rows [anchor, d1..] through the target  -> post[0..Bv-1]
           (writes K/V at p..p+Bv-1, taps for those rows)
   keep:   k = longest prefix with d(i+1) == post[i]; out = post[0..k]
+  context: the Bv rows' taps into the drafter's context at p..p+Bv-1
   both caches end at p + k + 1; post[k] is the next anchor
 ```
 
-The rows past p + k + 1 that the check wrote are simply overwritten later.
-When a kept token ends generation (EOS, `<|im_end|>`, a streaming chunk's
-`<|text_chunk_end|>`, or the token cap) the tokens after it were fed too;
-one-shot transcription stops there anyway, and a streaming session cuts the
-cache back (`decode_block` / `truncate` in `vv_stream_backend_t`), so the
-next chunk's prefill sees exactly what plain decoding would have left.
-`tests/test_stream.c` drives a session through blocks of 2..16 with stops
-and caps landing inside blocks and checks tokens, text, stops, the fed
-sequence and the cache length against one step at a time.
+The rows past p + k + 1 that the check and the context update wrote are
+simply overwritten later. When a kept token ends generation (EOS,
+`<|im_end|>`, a streaming chunk's `<|text_chunk_end|>`, or the token cap) the
+tokens after it were fed too; one-shot transcription stops there anyway, and
+a streaming session cuts the cache back (`decode_block` / `truncate` in
+`vv_stream_backend_t`), so the next chunk's prefill sees exactly what plain
+decoding would have left. `tests/test_stream.c` drives a session through
+blocks of 2..16 with stops and caps landing inside blocks and checks tokens,
+text, stops, the fed sequence and the cache length against one step at a
+time.
+
+**A cycle is one graph launch.** Everything that moves from one cycle to the
+next — the anchor and both caches' lengths — the cycle reads from a small
+device block it fills from pinned memory first, and the tokens it keeps and
+their count go back to pinned memory last. Nothing else in it depends on p:
+the rows' RoPE and K/V writes take a device position
+(`vv_kv_cache_append_at`, `vv_dev_memcpy_d2d_rows_at`), the attention a
+device length (`vv_attn_decode_rows`, and `vv_attn_block_dev` for the draft
+pass), the rows the drafter's context gets are all Bv of them, kept or not.
+So the cycle is captured once and replayed until one of its attention
+launches changes shape (every 1024 positions) — one launch instead of ~600.
+What that is worth depends on the driver: on a Windows (WDDM) 3070 the
+Streaming-1.5B cycle launched kernel by kernel made 1.79× plain decoding and
+replayed makes 2.76×; on a Linux 3090, 4 % (`VV_SPEC_GRAPH=0` launches every
+kernel).
 
 The drafter's context follows the target through the target's **taps**
 (`vv_taps_t`, inference.h): a prefill (the prompt, a streaming chunk), a
@@ -212,11 +253,10 @@ On the 43 held-out clips with the Streaming-1.5B drafter this is what keeps
 the worst clips (Mandarin and Russian, which the drafter saw little of) near
 plain speed — 0.93–0.95× — instead of paying for blocks that keep one token.
 
-A block is hundreds of small launches where a plain step is one captured
-graph, so on a card shared with other busy processes blocks lose far more
-to time slicing than steps do (the same clip measured 0.23× with a training
-run on the card and 0.95× without). The numbers below are from an otherwise
-idle card.
+On a card shared with other busy processes blocks lose more to time slicing
+than steps do (before cycles were captured, the same clip measured 0.23×
+with a training run on the card and 0.95× without). The numbers below are
+from an otherwise idle card.
 
 ## Training
 
@@ -297,3 +337,6 @@ TBD.
 * A model split across devices (`--split-mode layer`): the taps would have
   to cross devices.
 * Sampling (`temperature > 0`): the check is greedy.
+* Replaying fa1's cycles: its rows run the one-row kernel row after row on
+  the host's lengths, so with `--attn fa1` (or before sm_75, where nothing
+  else resolves) every cycle launches its kernels. Exact all the same.

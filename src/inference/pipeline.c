@@ -1319,6 +1319,13 @@ static void attach_spec(vv_inference_ctx_t* c, const char* dir, int quant,
         why = "the embedding, LM head and final norm must be on the GPU";
     else if (!c->kv_cache || c->kv_cache->on_cpu)
         why = "the KV cache is not on the GPU";
+    else if (check != VV_DRAFT_CHECK_FAST && vv_decoder_verify_per_row(c->model))
+        /* The 7B drafter on the NF4 checkpoint, test120: 124 tok/s plain,
+         * 112 with exact blocks (paused as soon as they were measured);
+         * INT8, 96 and 88. */
+        why = "these weights (NF4, INT8) check a block exactly one row at a "
+              "time, which never beats plain decoding; --draft-check fast "
+              "checks it in one pass";
     else {
         /* The drafter's kernels are CUDA's; a backend without them declines
          * each one (VV_ERR_UNSUPPORTED). Ask before loading anything. */

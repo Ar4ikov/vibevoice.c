@@ -313,7 +313,10 @@ static void check_m(const weight_t* w, int M, void* tmp, bool may_decline) {
         vv_dev_memcpy_d2h(h_pub, d_pub, ny * 2, NULL);
         size_t f1 = 0, f2 = 0;
         const size_t dn = sn == VV_OK ? count_diff(h_new, h_old, ny, &f1) : 0;
-        const size_t dp = count_diff(h_pub, h_old, ny, &f2);
+        /* Below VV_SKINNY_M_MIN the entry points run a decode step's kernels
+         * (their bits, not the tile's); only a fast check takes these. */
+        const size_t dp = M >= VV_SKINNY_M_MIN
+                        ? count_diff(h_pub, h_old, ny, &f2) : 0;
         double wc = 0, wr = 0;
         const bool ref_ok =
             verify_ref(w, fx, sn == VV_OK ? h_new : h_old, M, bias, &wc, &wr);
@@ -414,7 +417,7 @@ static void check_declines(void* tmp) {
     vv_dev_alloc(&dx, (size_t)65 * 3584 * 2 + 16);
     vv_dev_alloc(&dy, (size_t)65 * 512 * 2);
     struct { int M; int off; const char* what; } cases[] = {
-        { 8, 0, "M = 8" }, { 65, 0, "M = 65" }, { 29, 2, "input not 16-byte aligned" },
+        { 0, 0, "M = 0" }, { 65, 0, "M = 65" }, { 29, 2, "input not 16-byte aligned" },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         const vv_skinny_proj_t p = { w.dw, NULL, NULL, dy, 512 };
@@ -595,7 +598,7 @@ int main(int argc, char** argv) {
         printf("FAIL: scratch\n");
         return 1;
     }
-    printf("=== small-M linear, 9..64 rows ===\n");
+    printf("=== small-M linear, 1..64 rows ===\n");
 
     const char* b = getenv("VV_SKINNY_BENCH");
     const bool bench_only = b && (b[0] == '2' || b[0] == '3');
@@ -603,10 +606,12 @@ int main(int argc, char** argv) {
     const bool bench_layer = b && b[0] == '3';
 
     if (!bench_only) {
-        const int ms_all[] = { 9, 15, 16, 17, 29, 31, 32, 33, 47, 48, 49, 63, 64 };
+        /* 1..8: a drafted block's fast check (the prefill starts at 9). */
+        const int ms_all[] = { 1, 2, 5, 8, 9, 15, 16, 17, 29, 31, 32, 33, 47,
+                               48, 49, 63, 64 };
         const int n_all = (int)(sizeof(ms_all) / sizeof(ms_all[0]));
-        const int ms_few[] = { 9, 29, 64 };
-        const int n_few = 3;
+        const int ms_few[] = { 8, 9, 29, 64 };
+        const int n_few = 4;
         for (int f = 0; f < 3; f++) {
             /* every tiling on a k/v-sized and a ragged projection */
             run_shape(f, 512, 3584, ms_all, n_all, tmp, false);
@@ -621,6 +626,8 @@ int main(int argc, char** argv) {
             const int qkv[3] = { 3584, 512, 512 }, gu[2] = { 18944, 18944 };
             check_multi(f, qkv, 3, 3584, 29);
             check_multi(f, gu, 2, 3584, 29);
+            check_multi(f, qkv, 3, 3584, 8);
+            check_multi(f, gu, 2, 3584, 8);
         }
         check_declines(tmp);
         if (g_declined)

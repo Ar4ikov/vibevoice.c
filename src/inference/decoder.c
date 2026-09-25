@@ -638,6 +638,42 @@ static vv_status_t linear_rows_group(
     return VV_OK;
 }
 
+/**
+ * @brief A fast check's projections (--draft-check fast): the prefill's,
+ *        except that NF4 and INT8 weights take the small-M kernel from 2 rows.
+ *
+ * Below VV_SKINNY_M_MIN rows their prefill path writes the whole weight out
+ * as FP16 and reads it back, which costs a block of 8 rows about what 8
+ * decode steps cost; the small-M kernel reads the weight once, as stored.
+ * Not a decode step's arithmetic -- that is what a fast check gives up.
+ */
+static vv_status_t fast_rows_group(
+    const vv_weight_t* const* ws, void* const* ys, const int* Ns, int n,
+    const void* x, void* scratch, size_t scratch_bytes, int M, int K,
+    void* stream)
+{
+    const int f = skinny_format(ws[0]);
+    bool small = M >= 2 && M < VV_SKINNY_M_MIN && n <= 3 &&
+                 (f == VV_SKINNY_INT8 || f == VV_SKINNY_NF4);
+    for (int i = 1; i < n && small; i++) small = skinny_format(ws[i]) == f;
+    if (small) {
+        vv_skinny_proj_t p[3];
+        for (int i = 0; i < n; i++) p[i] = skinny_proj(ws[i], ys[i], Ns[i]);
+        const vv_status_t s = vv_skinny_linear_dev(x, f, p, n, M, K, 1.0f,
+                                                   stream);
+        if (s != VV_ERR_UNSUPPORTED) return s;
+    }
+    return quant_linear_group(ws, ys, Ns, n, x, scratch, scratch_bytes, M, K,
+                              stream);
+}
+
+static vv_status_t fast_rows(const vv_weight_t* w, const void* x, void* y,
+                             void* scratch, size_t scratch_bytes, int M,
+                             int N, int K, void* stream) {
+    return fast_rows_group(&w, &y, &N, 1, x, scratch, scratch_bytes, M, K,
+                           stream);
+}
+
 /* ─── Int8 activations (W8A8, W4A8) ─────────────────────────────────────── */
 
 /**
@@ -889,6 +925,7 @@ static vv_status_t decoder_layer_body(
     const bool verify = vo != NULL;
     /* Each row with its decode step's arithmetic, or the prefill's. */
     const bool rows_exact = verify && !vo->fast;
+    const bool rows_fast = verify && vo->fast;
 
     int hs = config->hidden_size;
     int n_heads = config->num_attention_heads;
@@ -1006,6 +1043,8 @@ static vv_status_t decoder_layer_body(
         s = rows_exact ? linear_rows_group(ws, ys, ns, 3, norm_out,
                                            temp_weight, temp_bytes, seq_len,
                                            hs, stream)
+          : rows_fast  ? fast_rows_group(ws, ys, ns, 3, norm_out, temp_weight,
+                                         temp_bytes, seq_len, hs, stream)
                        : quant_linear_group(ws, ys, ns, 3, norm_out, temp_weight,
                                             temp_bytes, seq_len, hs, stream);
         if (s != VV_OK) return s;
@@ -1132,6 +1171,8 @@ static vv_status_t decoder_layer_body(
     s = rows_exact ? linear_rows(&layer->attn.o_proj, attn_out, norm_out,
                                  temp_weight, temp_bytes, seq_len, hs, hs,
                                  stream)
+      : rows_fast  ? fast_rows(&layer->attn.o_proj, attn_out, norm_out,
+                               temp_weight, temp_bytes, seq_len, hs, hs, stream)
                    : quant_linear(&layer->attn.o_proj, attn_out, norm_out,
                                   temp_weight, temp_bytes, seq_len, hs, hs,
                                   stream);
@@ -1160,6 +1201,8 @@ static vv_status_t decoder_layer_body(
         s = rows_exact ? linear_rows_group(ws, ys, ns, 2, norm_out,
                                            temp_weight, temp_bytes, seq_len,
                                            hs, stream)
+          : rows_fast  ? fast_rows_group(ws, ys, ns, 2, norm_out, temp_weight,
+                                         temp_bytes, seq_len, hs, stream)
                        : quant_linear_group(ws, ys, ns, 2, norm_out, temp_weight,
                                             temp_bytes, seq_len, hs, stream);
         if (s != VV_OK) return s;
@@ -1177,6 +1220,9 @@ static vv_status_t decoder_layer_body(
     s = rows_exact ? linear_rows(&layer->mlp.down_proj, gate_buf, mlp_out,
                                  temp_weight, temp_bytes, seq_len, hs,
                                  inter_size, stream)
+      : rows_fast  ? fast_rows(&layer->mlp.down_proj, gate_buf, mlp_out,
+                               temp_weight, temp_bytes, seq_len, hs,
+                               inter_size, stream)
                    : quant_linear(&layer->mlp.down_proj, gate_buf, mlp_out,
                                   temp_weight, temp_bytes, seq_len, hs,
                                   inter_size, stream);
@@ -1531,6 +1577,24 @@ vv_status_t vv_decoder_verify(
         }
     }
     return VV_OK;
+}
+
+bool vv_decoder_verify_per_row(const vv_model_t* model) {
+    if (!model) return false;
+    for (int i = 0; i < model->num_layers; i++) {
+        const vv_layer_weights_t* L = &model->layers[i];
+        if (layer_a8(L, &model->config.llm, true)) continue;  /* any M */
+        vv_weight_t* p[7];
+        vv_layer_projections((vv_layer_weights_t*)L, p);
+        for (int j = 0; j < 7; j++) {
+            const int k = p[j]->quant_kind;
+            const bool rows = (k == VV_QUANT_INT4G &&
+                               p[j]->int4g_layout == VV_INT4G_GPU) ||
+                              k == VV_QUANT_TERNARY || k == VV_QUANT_NONE;
+            if (!rows) return true;     /* linear_rows' one-row loop */
+        }
+    }
+    return false;
 }
 
 int vv_decoder_verify_rows_max(const vv_model_t* model) {

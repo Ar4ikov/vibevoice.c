@@ -462,6 +462,14 @@ vv_status_t vv_decoder_verify(
 int vv_decoder_verify_rows_max(const vv_model_t* model);
 
 /**
+ * @brief Whether an exact check runs some projection of `model` one row at a
+ *        time -- NF4, INT8 and legacy-layout INT4 weights, whose decode step
+ *        has no multi-row twin. A block then costs about a step per row and
+ *        never beats plain decoding; a fast check reads each weight once.
+ */
+bool vv_decoder_verify_per_row(const vv_model_t* model);
+
+/**
  * @brief One decode step through layers [first_layer, first_layer+n_layers).
  * @param pool  Optional layer pool for streaming (NULL = weights on GPU).
  * @param xfer  Transfer stream for async upload (NULL = use compute).

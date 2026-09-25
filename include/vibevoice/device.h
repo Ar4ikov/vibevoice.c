@@ -491,11 +491,15 @@ vv_status_t vv_gemm_fp16_tile_dev(
     int M, int N, int K, float alpha, float beta, void* stream);
 
 /*
- * Linear layers for 9..64 rows (a Streaming-7B chunk prefills 29), on the
+ * Linear layers for up to 64 rows (a Streaming-7B chunk prefills 29), on the
  * weight formats the dequant + tile GEMM path serves:
  *   VV_SKINNY_F16   dense FP16 [N][K]
  *   VV_SKINNY_INT8  int8 [N][K], FP32 scale per row (`--quant int8`)
  *   VV_SKINNY_NF4   NF4 [N][K/2] high nibble first, FP16 absmax per 64
+ * The prefill takes them from VV_SKINNY_M_MIN rows; below, a decode step's
+ * kernels read the weight as fast and keep the step's bits. A drafted block
+ * checked with `--draft-check fast` takes them from 2 rows: one read of an
+ * NF4 or INT8 weight instead of one per row.
  */
 typedef enum vv_skinny_format {
     VV_SKINNY_F16  = 0,
@@ -517,7 +521,7 @@ typedef struct vv_skinny_proj {
 
 /**
  * @brief y_i = alpha * A[M,K] . W_i^T (+ bias_i) for up to three projections
- *        of the same A (q/k/v, gate/up) in one launch, M in 9..64.
+ *        of the same A (q/k/v, gate/up) in one launch, M in 1..64.
  *
  * Tensor cores on sm_80+, each weight read once in its stored form and
  * dequantized in registers. Bit-identical to dequantizing into FP16
