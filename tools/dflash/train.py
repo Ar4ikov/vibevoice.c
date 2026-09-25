@@ -128,26 +128,79 @@ def mixed_reader(a, na, b, nb, seed=0):
         yield t
 
 
-def trace_kind(path):
-    """A trace's per-position roles, read without its features."""
+def trace_ids_kind(path):
+    """A trace's tokens and per-position roles, read without its features."""
     with open(path, "rb") as f:
         magic, ver, n, nt, hs, idl = struct.unpack("<6I", f.read(24))
         if magic != MAGIC or ver != 1:
             raise ValueError(f"{path}: not a v1 trace")
-        f.seek(24 + 4 * nt + idl + (4 - idl % 4) % 4 + 4 * n)
-        return np.frombuffer(f.read(n), np.uint8)
+        f.seek(24 + 4 * nt + idl + (4 - idl % 4) % 4)
+        ids = np.frombuffer(f.read(4 * n), np.int32)
+        return ids, np.frombuffer(f.read(n), np.uint8)
 
 
-def steps_in(d, epochs, seed, max_anchors, accum):
+def trace_kind(path):
+    """A trace's per-position roles, read without its features."""
+    return trace_ids_kind(path)[1]
+
+
+# ─── repetition loops ───────────────────────────────────────────────────────
+#
+# Greedy decoding sometimes falls into a loop ("Вот это вот." or "hmm, " to
+# the token cap): 57 % of the BitNet target's training tokens, 8.6 % of the
+# 7B's, some transcripts 16384 tokens of it for 14 s of audio. A drafter
+# learns a loop at once -- it only has to copy -- so the loops only drown
+# the transcription it should learn. Anchors inside one are capped at
+# --loop-cap of the others' count.
+
+LOOP_RUN = 16      # a token equal to the one p back, this many in a row
+LOOP_PERIOD = 32   # p = 1..LOOP_PERIOD
+
+
+def loop_mask(ids):
+    """Positions inside a repetition loop (see above)."""
+    ids = np.asarray(ids)
+    n = len(ids)
+    m = np.zeros(n, bool)
+    for p in range(1, min(LOOP_PERIOD, n - 1) + 1):
+        eq = np.zeros(n + 2, np.int8)
+        eq[1 + p:n + 1] = ids[p:] == ids[:-p]
+        edges = np.flatnonzero(np.diff(eq))
+        for s, e in zip(edges[::2], edges[1::2]):
+            if e - s >= LOOP_RUN:
+                m[s - p:e] = True       # the pattern's first copy too
+    return m
+
+
+def anchor_split(ids, kind):
+    """(anchors outside loops, anchors inside) -- generated positions with a
+    next position, as make_blocks draws them."""
+    n = len(ids)
+    elig = np.nonzero((kind == GEN) & (np.arange(n) + 1 < n))[0]
+    lm = loop_mask(ids)[elig]
+    return elig[~lm], elig[lm]
+
+
+def anchor_count(ids, kind, max_anchors, loop_cap):
+    """How many blocks make_blocks draws from a trace."""
+    if loop_cap >= 1.0:
+        n = len(ids)
+        return min(int(np.count_nonzero((kind == GEN) & (np.arange(n) + 1 < n))),
+                   max_anchors)
+    clean, looped = anchor_split(ids, kind)
+    return min(len(clean) + min(len(looped), int(loop_cap * len(clean))),
+               max_anchors)
+
+
+def steps_in(d, epochs, seed, max_anchors, accum, loop_cap=1.0):
     """Optimizer steps `epochs` passes of static_reader over `d` make: the
     same files in the same order, each giving make_blocks' block count, a
     step whenever `accum` blocks have gathered (the rest is dropped)."""
     files = sorted(glob.glob(os.path.join(d, "*.vvdt")))
     per = {}
     for f in files:
-        kind = trace_kind(f)
-        per[f] = min(int(np.count_nonzero(kind[:max(len(kind) - 1, 0)] == GEN)),
-                     max_anchors)
+        ids, kind = trace_ids_kind(f)
+        per[f] = anchor_count(ids, kind, max_anchors, loop_cap)
     rng = random.Random(seed)
     steps = blocks = 0
     for _ in range(epochs):
@@ -405,10 +458,17 @@ def build_target_layer_ids(n_target, n_draft):
 
 # ─── batches and loss ───────────────────────────────────────────────────────
 
-def make_blocks(t, B, max_anchors, rng):
+def make_blocks(t, B, max_anchors, rng, loop_cap=1.0):
     ids, kind = t["ids"], t["kind"]
     n = len(ids)
-    elig = np.nonzero((kind == GEN) & (np.arange(n) + 1 < n))[0]
+    if loop_cap >= 1.0:
+        elig = np.nonzero((kind == GEN) & (np.arange(n) + 1 < n))[0]
+    else:
+        clean, looped = anchor_split(ids, kind)
+        k = min(len(looped), int(loop_cap * len(clean)))
+        if k < len(looped):
+            looped = rng.choice(looped, k, replace=False)
+        elig = np.sort(np.concatenate([clean, looped]))
     if len(elig) == 0:
         return None
     if len(elig) > max_anchors:
@@ -458,10 +518,10 @@ def draft_vocab(path, n, V):
 
 
 def step_loss(model, emb, head, t, dev, B, gamma, max_anchors, rng,
-              chunk=768, mask_id=151662, vocab=None):
+              chunk=768, mask_id=151662, vocab=None, loop_cap=1.0):
     """vocab: (sub ids [Vd] long tensor, full->sub map [V] long tensor) when
     the head is the subset `head`; labels outside it cannot be drafted."""
-    blk = make_blocks(t, B, max_anchors, rng)
+    blk = make_blocks(t, B, max_anchors, rng, loop_cap)
     if blk is None:
         return None
     anchors, labels, ok = blk
@@ -596,6 +656,9 @@ def main():
                     help="draft blocks per optimizer step")
     ap.add_argument("--max-anchors", type=int, default=1024,
                     help="blocks drawn from one trace per visit")
+    ap.add_argument("--loop-cap", type=float, default=0.1,
+                    help="anchors inside repetition loops, at most this share "
+                         "of a trace's others (1: no cap; the eval never caps)")
     ap.add_argument("--warmup", type=float, default=0.04)
     ap.add_argument("--eval-every", type=int, default=200)
     ap.add_argument("--save-every", type=int, default=500)
@@ -683,7 +746,7 @@ def main():
         # The schedule has to end where the data does: a cosine cut off
         # half-way leaves the learning rate high for the last checkpoint.
         avail = steps_in(a.train_dir, a.epochs, a.seed, a.max_anchors,
-                         a.accum_blocks)
+                         a.accum_blocks, a.loop_cap)
         if avail < a.steps:
             print(f"{a.epochs} epochs of {a.train_dir} make {avail} steps, "
                   f"not {a.steps}: the schedule ends there", flush=True)
@@ -758,7 +821,8 @@ def main():
             print("data ended", flush=True)
             break
         r = step_loss(model, emb, head, t, dev, a.block, a.gamma,
-                      a.max_anchors, rng, mask_id=a.mask_id, vocab=vocab)
+                      a.max_anchors, rng, mask_id=a.mask_id, vocab=vocab,
+                      loop_cap=a.loop_cap)
         if r is None:
             continue
         loss, bl, sl, st = r
