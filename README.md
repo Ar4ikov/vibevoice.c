@@ -360,7 +360,7 @@ many passes the transcript takes.
 
 | flag | |
 |---|---|
-| `--draft <dir>` | `config.json` + `model.safetensors` of a drafter trained for this model |
+| `--draft <dir>` | `config.json` + `model.safetensors` of a drafter trained for this model; default `<model>/drafter` if the model directory has one (the `-DFlash2` bundles do), `none` never |
 | `--draft-block <n>` | rows of the drafted block the model checks per pass (default: half the block or all of it, whichever keeps more tokens per ms) |
 | `--draft-check exact\|fast` | exact (default): the transcript without a drafter on the same `--attn`, bit for bit; fast: flashinfer attention and prefill projections for the check, the greedy transcript within rounding |
 | `--draft-quant int4\|f16` | the drafter's weights (INT4 by default; it only proposes) |

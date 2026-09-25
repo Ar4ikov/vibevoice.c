@@ -56,7 +56,9 @@ static void usage(void) {
         "  --source <from>       BitNet weights: auto | gguf | safetensors\n"
         "  --draft <dir>         DFlash 2 drafter for this model: decode drafts\n"
         "                        a block of tokens and checks it in one pass\n"
-        "                        (tools/dflash; same tokens, fewer passes)\n"
+        "                        (tools/dflash; same tokens, fewer passes).\n"
+        "                        Default: <model>/drafter if there is one;\n"
+        "                        none: never\n"
         "  --draft-quant <fmt>   drafter weights: int4 (default) | f16\n"
         "  --draft-block <n>     rows of a block checked per pass (2..block,\n"
         "                        default 4)\n"
@@ -182,7 +184,8 @@ int vv_cmd_serve(int argc, char** argv) {
             ep.weights_source = (int)v;
         }
         else if (strcmp(a, "--draft") == 0 && next) {
-            ep.draft_dir = argv[++i];
+            /* "none": an empty dir, which also skips <model>/drafter. */
+            ep.draft_dir = strcmp(argv[++i], "none") == 0 ? "" : argv[i];
         }
         else if (strcmp(a, "--draft-quant") == 0 && next) {
             const vv_drafter_quant_t v = vv_drafter_quant_parse(argv[++i]);

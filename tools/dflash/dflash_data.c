@@ -151,8 +151,10 @@ static vv_status_t open_model(const args_t* a, vv_inference_ctx_t** ctx) {
     vv_init_params_t p = vv_init_params_default();
     p.max_seq_len = a->max_seq_len;
     /* A drafted transcript is the plain one (exact check) with the
-     * attention `--draft` picks -- flashinfer for `auto` -- only sooner. */
-    p.draft_dir = a->draft;
+     * attention `--draft` picks -- flashinfer for `auto` -- only sooner.
+     * A trace decodes nothing, so it never loads one (not even the
+     * model's own <model>/drafter). */
+    p.draft_dir = a->draft ? a->draft : (strcmp(a->cmd, "trace") == 0 ? "" : NULL);
     if (a->quant) {
         const vv_load_quant_t q = vv_load_quant_parse(a->quant);
         if (q == VV_LOAD_QUANT_COUNT) return VV_ERR_INVALID_ARG;

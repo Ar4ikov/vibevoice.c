@@ -39,7 +39,9 @@ Write the entry for a change under Unreleased in the same pull request.
   2.50x, 32 minutes 2.13x. Drafters for the AWQ checkpoints are on the Hub
   ([ASR-7B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2-Drafter),
   [Streaming-1.5B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter),
-  each also as `-AWQ-W4A16-ASYM`). They are trained on the target's own
+  each also as `-AWQ-W4A16-ASYM`), and bundled with their models: a model
+  directory's `drafter/` is used without `--draft` (`--draft none` turns
+  it off). They are trained on the target's own
   transcripts (`tools/dflash`: corpus, `vv_dflash_data gen|trace`,
   `train.py`, `awq_drafter.py`, `check_drafter.py`); the design and the
   numbers are in [docs/DFLASH.md](docs/DFLASH.md). Metal and the CPU path

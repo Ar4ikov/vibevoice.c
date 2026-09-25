@@ -138,10 +138,12 @@ static void print_usage(const char* prog) {
         "                        when present) | gguf | safetensors\n"
         "  --draft <dir>         DFlash 2 drafter for this model: decode drafts\n"
         "                        a block of tokens and checks it in one pass\n"
-        "                        (tools/dflash; same tokens, fewer passes)\n"
+        "                        (tools/dflash; same tokens, fewer passes).\n"
+        "                        Default: <model>/drafter if there is one;\n"
+        "                        none: never\n"
         "  --draft-quant <fmt>   drafter weights: int4 (default) | f16\n"
-        "  --draft-block <n>     rows of a block checked per pass (2..block,\n"
-        "                        default 4)\n"
+        "  --draft-block <n>     rows of a block checked per pass (2..block;\n"
+        "                        default: half the block or all, measured)\n"
         "  --draft-check <how>   exact (default: the transcript is the one\n"
         "                        without --draft, byte for byte) | fast (the\n"
         "                        prefill kernels; a near-tie may go the\n"
@@ -225,7 +227,8 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
         } else if (strcmp(argv[i], "--head") == 0 && i + 1 < argc) {
             args->head = argv[++i];
         } else if (strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
-            args->draft = argv[++i];
+            /* "none": an empty dir, which also skips <model>/drafter. */
+            args->draft = strcmp(argv[++i], "none") == 0 ? "" : argv[i];
         } else if (strcmp(argv[i], "--draft-quant") == 0 && i + 1 < argc) {
             args->draft_quant = vv_drafter_quant_parse(argv[++i]);
             if (args->draft_quant == VV_DRAFTER_QUANT_COUNT) {

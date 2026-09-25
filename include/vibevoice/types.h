@@ -557,7 +557,8 @@ typedef struct vv_init_params {
     /**
      * Directory of a DFlash 2 drafter for this model (spec.h): decode then
      * drafts a block of tokens in one pass and checks it with one pass of
-     * the model. NULL: plain decoding.
+     * the model. NULL: the model directory's own `drafter/` if it has one,
+     * else plain decoding; "" (empty): plain decoding.
      */
     const char* draft_dir;
     int    draft_quant;   /**< vv_drafter_quant_t. Default: int4             */

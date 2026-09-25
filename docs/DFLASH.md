@@ -13,7 +13,14 @@ together (below); `--attn fa2 --draft` keeps the batch model's default.
 ```
 vv_cli --model ./model_hf --audio talk.wav --draft ./drafter
 vv_cli serve --model ./model_hf --draft ./drafter --slots 2
+vv_cli --model ./bundle --audio talk.wav      # ./bundle/drafter is used as is
 ```
+
+A model directory may carry its drafter as `drafter/` (config.json and
+model.safetensors), which is how the `-DFlash2` bundles on the Hub ship
+one: every entry point (`vv_cli`, `serve`, `chat`, the API with a NULL
+`draft_dir`) then uses it without `--draft`, and `--draft none` (an empty
+`draft_dir`) turns it off.
 
 ## The drafter
 

@@ -103,6 +103,22 @@ static void attach_spec(vv_inference_ctx_t* c, const char* dir, int quant,
                         int verify_rows, int check,
                         const vv_inference_ctx_t* parent);
 
+/** @brief `<model_dir>/drafter` into `out` when it holds a drafter's
+ *         config.json and model.safetensors. */
+static bool bundled_drafter(const char* model_dir, char* out, size_t cap) {
+    const int n = snprintf(out, cap, "%s/drafter", model_dir);
+    if (n <= 0 || (size_t)n >= cap) return false;
+    static const char* const need[2] = { "config.json", "model.safetensors" };
+    for (int i = 0; i < 2; i++) {
+        char probe[1100];
+        snprintf(probe, sizeof(probe), "%s/%s", out, need[i]);
+        FILE* f = fopen(probe, "rb");
+        if (!f) return false;
+        fclose(f);
+    }
+    return true;
+}
+
 /**
  * @brief Upload the first `n_layers` transformer layers to the GPU.
  *
@@ -587,6 +603,15 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     /* Resolve params (NULL → defaults) */
     vv_init_params_t p = params ? *params : vv_init_params_default();
     bool cpu_only = p.cpu_only || p.vram_budget <= 0.0f;
+
+    /* A model directory may carry its drafter (`<model>/drafter/`, as the
+     * Hub bundles publish one); it is used when the caller named none. An
+     * empty draft_dir (`--draft none`) means no drafter at all. */
+    char bundled[1024];
+    if (!p.draft_dir && bundled_drafter(model_dir, bundled, sizeof(bundled))) {
+        p.draft_dir = bundled;
+        VV_LOG_I("spec: the drafter in %s", bundled);
+    }
 
     if (p.kv_format < 0 || p.kv_format >= VV_KV_FORMAT_COUNT) {
         VV_LOG_E("inference: unknown KV-cache format");
