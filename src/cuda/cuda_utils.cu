@@ -20,8 +20,13 @@ extern "C" {
 vv_status_t vv_dev_alloc(void** ptr, size_t size) {
     if (!ptr) return VV_ERR_NULL_PTR;
     cudaError_t err = cudaMalloc(ptr, size);
-    if (err == cudaErrorMemoryAllocation) return VV_ERR_CUDA_OOM;
-    if (err != cudaSuccess) return VV_ERR_CUDA;
+    if (err != cudaSuccess) {
+        /* Not sticky, but it stays the thread's last error, and the next
+         * kernel launch's check would report it as its own failure: a
+         * drafter that did not fit took the transcription down with it. */
+        (void)cudaGetLastError();
+        return err == cudaErrorMemoryAllocation ? VV_ERR_CUDA_OOM : VV_ERR_CUDA;
+    }
     return VV_OK;
 }
 
@@ -31,7 +36,10 @@ vv_status_t vv_dev_alloc(void** ptr, size_t size) {
 vv_status_t vv_dev_alloc_pinned(void** ptr, size_t size) {
     if (!ptr) return VV_ERR_NULL_PTR;
     cudaError_t err = cudaMallocHost(ptr, size);
-    if (err != cudaSuccess) return VV_ERR_CUDA;
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();        /* as in vv_dev_alloc */
+        return VV_ERR_CUDA;
+    }
     return VV_OK;
 }
 

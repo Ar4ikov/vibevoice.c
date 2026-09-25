@@ -750,7 +750,7 @@ static void run_mv(const int* Ns, int n, int K, int G) {
             }
         }
         /* Other launch shapes, and each projection on its own. */
-        static const char* const cfgs[] = { "4,1", "4,4", "16,2", "8,4" };
+        static const char* const cfgs[] = { "4,1,1", "4,4,4", "16,2,2", "8,1,4" };
         int bad_cfg = 0, bad_alone = 0;
         int nmax = 0;
         for (int i = 0; i < n; i++) nmax = Ns[i] > nmax ? Ns[i] : nmax;
@@ -1146,6 +1146,7 @@ int main(int argc, char** argv) {
     { const int n2[2] = { 8960, 8960 }; run_mv(n2, 2, 1536, 128); }
     { const int n1[1] = { 1536 }; run_mv(n1, 1, 8960, 128); }
     { const int n1[1] = { 512 }; run_mv(n1, 1, 3584, 32); }
+    { const int n1[1] = { 80 }; run_mv(n1, 1, 1024, 64); }
     }
     if (bench) {
         printf("\n--- tensor-core mv vs today's paths (M rows, weights past L2) ---\n");

@@ -1108,6 +1108,34 @@ static vv_status_t dlin(vv_spec_t* s, const void* x, const dlin_t* W, void* y,
     return vv_gemm_fp16_dev(x, W->w, y, M, N, K, 1.0f, 0.0f, stream);
 }
 
+/* Projections of the same rows (q/k/v, gate/up, k/v): one launch of the
+ * tensor-core GEMV when they are all INT4, else one dlin each. */
+static vv_status_t dlin_group(vv_spec_t* s, const void* x,
+                              const dlin_t* const* W, void* const* y,
+                              const int* N, int n, int M, int K,
+                              void* stream) {
+    bool fuse = M <= VV_W4A16_MV_MAX_ROWS && n <= 3;
+    for (int i = 0; i < n && fuse; i++) fuse = W[i]->packed != NULL;
+    if (fuse) {
+        vv_w4a16_proj_t p[3];
+        for (int i = 0; i < n; i++) {
+            p[i].packed = W[i]->packed;
+            p[i].sz = W[i]->sz;
+            p[i].bias = NULL;
+            p[i].y = y[i];
+            p[i].N = N[i];
+        }
+        const vv_status_t st = vv_w4a16_mv_dev(x, M, p, n, K, DRAFT_Q_GROUP,
+                                               stream);
+        if (st != VV_ERR_UNSUPPORTED) return st;
+    }
+    for (int i = 0; i < n; i++) {
+        const vv_status_t st = dlin(s, x, W[i], y[i], M, N[i], K, stream);
+        if (st != VV_OK) return st;
+    }
+    return VV_OK;
+}
+
 /* Elements of the largest INT4 projection, for the dequantizing GEMM. */
 static size_t largest_packed(const vv_drafter_t* d) {
     const vv_drafter_config_t* c = &d->cfg;
@@ -1145,8 +1173,10 @@ static vv_status_t ctx_update(vv_spec_t* s, const void* rows, int pos0, int n,
     dbg("ctx.norm", s->cxn, (size_t)n * H, false, stream);
     for (int l = 0; st == VV_OK && l < d->cfg.num_layers; l++) {
         const dlayer_t* L = &d->L[l];
-        st = dlin(s, s->cxn, &L->k, s->ck, n, kd, H, stream);
-        if (st == VV_OK) st = dlin(s, s->cxn, &L->v, s->cv, n, kd, H, stream);
+        const dlin_t* W[2] = { &L->k, &L->v };
+        void* Y[2] = { s->ck, s->cv };
+        const int N[2] = { kd, kd };
+        st = dlin_group(s, s->cxn, W, Y, N, 2, n, H, stream);
         if (st == VV_OK)
             st = vv_rmsnorm_dev(s->ck, L->kn, s->ckn, n * s->nkv, s->hd,
                                 d->cfg.rms_norm_eps, stream);
@@ -1235,9 +1265,12 @@ static vv_status_t draft(vv_spec_t* s, const vv_inference_ctx_t* ctx,
         OK(dlin(s, s->xn, &L->aproj, s->dyn, B, dyn_ld, H, stream));
         OK(vv_dflash_conv_dev(s->xn, s->dyn, dyn_ld, L->abase, s->xc, B, H,
                               c->conv_kernel, c->conv_group, B, stream));
-        OK(dlin(s, s->xc, &L->q, s->q, B, qd, H, stream));
-        OK(dlin(s, s->xc, &L->k, s->kk, B, kd, H, stream));
-        OK(dlin(s, s->xc, &L->v, s->vv, B, kd, H, stream));
+        {
+            const dlin_t* W[3] = { &L->q, &L->k, &L->v };
+            void* Y[3] = { s->q, s->kk, s->vv };
+            const int N[3] = { qd, kd, kd };
+            OK(dlin_group(s, s->xc, W, Y, N, 3, B, H, stream));
+        }
         OK(vv_rmsnorm_dev(s->q, L->qn, s->qn, B * s->nh, s->hd, c->rms_norm_eps, stream));
         OK(vv_rmsnorm_dev(s->kk, L->kn, s->kn, B * s->nkv, s->hd, c->rms_norm_eps, stream));
         OK(vv_rope_dev(s->qn, B, s->nh, s->hd, p, NULL, c->rope_theta, stream));
@@ -1266,8 +1299,12 @@ static vv_status_t draft(vv_spec_t* s, const vv_inference_ctx_t* ctx,
         OK(dlin(s, s->xn, &L->mproj, s->dyn, B, dyn_ld, H, stream));
         OK(vv_dflash_conv_dev(s->xn, s->dyn, dyn_ld, L->mbase, s->xc, B, H,
                               c->conv_kernel, c->conv_group, B, stream));
-        OK(dlin(s, s->xc, &L->gate, s->gate, B, s->I, H, stream));
-        OK(dlin(s, s->xc, &L->up, s->up, B, s->I, H, stream));
+        {
+            const dlin_t* W[2] = { &L->gate, &L->up };
+            void* Y[2] = { s->gate, s->up };
+            const int N[2] = { s->I, s->I };
+            OK(dlin_group(s, s->xc, W, Y, N, 2, B, H, stream));
+        }
         OK(vv_swiglu_dev(s->gate, s->up, s->gate, B * s->I, stream));
         if (l == 0) dbg("draft.act", s->gate, (size_t)B * s->I, false, stream);
         OK(dlin(s, s->gate, &L->down, s->o, B, H, s->I, stream));
