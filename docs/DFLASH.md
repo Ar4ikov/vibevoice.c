@@ -359,9 +359,12 @@ traces against the BF16 one's 3.741 and runs the same: clips 375.0, test120
 
 **Other weights of the 7B, the same drafter**, test30, 7d7d43e, fa2, 8 rows:
 BF16 56.5 → 90.6 (1.60×), W8A8 98.6 → 237.8 (2.41×), W4A8 146.3 → 232.4
-(1.59×). NF4 and INT8 check exactly only one row at a time and lose (NF4,
+(1.59×). NF4 and INT8 check exactly only one row at a time and lost (NF4,
 test120: 123.9 → 112.3), so the drafter is declined there in exact mode;
-`--draft-check fast` reads each weight once through the small-M kernel.
+`--draft-check fast` reads each weight once through the small-M kernel
+(b72be15): NF4 test30 127.0 → 213.9 (1.68×), test120 122.3 → 149.8 (1.22×);
+INT8 test30 98.2 → 176.9 (1.80×), test120 95.6 → 174.7 (1.83×) -- the
+transcripts happened to come out the same, which fast does not promise.
 
 **BitNet**: 0.99× on the 20 clips -- its drafter does not learn (held-out
 depth-1 accuracy 0.24 against 0.80 for the others) and the controller keeps

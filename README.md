@@ -375,7 +375,7 @@ the default's words, a timestamp 10 ms apart on a 32-minute file);
 `--attn fa2 --draft` keeps the default's bit for bit but gains little on
 long recordings. NF4 and INT8 weights check exactly only one row at a time,
 which never pays, so there the drafter is declined unless you ask for
-`--draft-check fast`.
+`--draft-check fast` (7B, test30: NF4 1.68x, INT8 1.80x).
 
 | RTX 3090, AWQ, exact | plain | drafted |
 |---|---|---|
