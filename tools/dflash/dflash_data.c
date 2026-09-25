@@ -81,6 +81,7 @@ typedef struct {
     const char* layers;
     const char* quant;
     const char* kv;
+    const char* draft;   /* gen: decode with this DFlash 2 drafter */
     int gpu;
     int max_seq_len;
     int max_tokens;
@@ -104,7 +105,7 @@ static void usage(void) {
         "usage:\n"
         "  vv_dflash_data gen   --model DIR --list clips.tsv --out gen.jsonl\n"
         "                       [--gpu N] [--quant Q] [--max-seq-len N]\n"
-        "                       [--max-tokens N] [--shard i/n]\n"
+        "                       [--max-tokens N] [--shard i/n] [--draft DIR]\n"
         "  vv_dflash_data trace --model DIR --gen gen.jsonl --dir OUT\n"
         "                       --layers 1,7,13,19,25 [--ring N] [--epochs E]\n"
         "                       [--seed S] [--max-pos P] [--gpu N] [--quant Q]\n");
@@ -126,7 +127,7 @@ static int parse_args(int argc, char** argv, args_t* a) {
 #define I(name, field) if (!strcmp(k, name) && v) { a->field = atoi(v); i++; continue; }
         S("--model", model) S("--list", list) S("--out", out) S("--gen", gen)
         S("--dir", dir) S("--layers", layers) S("--quant", quant)
-        S("--kv-cache", kv)
+        S("--kv-cache", kv) S("--draft", draft)
         I("--gpu", gpu) I("--max-seq-len", max_seq_len)
         I("--max-tokens", max_tokens) I("--ring", ring) I("--epochs", epochs)
         I("--max-pos", max_pos)
@@ -149,6 +150,9 @@ static int parse_args(int argc, char** argv, args_t* a) {
 static vv_status_t open_model(const args_t* a, vv_inference_ctx_t** ctx) {
     vv_init_params_t p = vv_init_params_default();
     p.max_seq_len = a->max_seq_len;
+    /* A drafted transcript is the plain one (exact check) with the
+     * attention `--draft` picks -- flashinfer for `auto` -- only sooner. */
+    p.draft_dir = a->draft;
     if (a->quant) {
         const vv_load_quant_t q = vv_load_quant_parse(a->quant);
         if (q == VV_LOAD_QUANT_COUNT) return VV_ERR_INVALID_ARG;
