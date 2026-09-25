@@ -2802,15 +2802,21 @@ static vv_status_t transcribe_gpu(
             if (graphs_taps[i].exec) vv_dev_graph_destroy(graphs_taps[i].exec);
         {
             const vv_spec_stats_t* st = vv_spec_get_stats(ctx->spec);
-            if (st && st->cycles > 0)
+            if (st && st->cycles > 0) {
+                /* A captured cycle has no drafting time of its own. */
+                char split[48] = "";
+                if (st->draft_ms > 0.0)
+                    snprintf(split, sizeof(split), ", drafting %.0f ms",
+                             st->draft_ms);
                 VV_LOG_I("spec: %lld cycles, %.2f tokens per cycle, %lld of "
                          "%lld drafts kept, %lld plain steps, %lld pauses "
-                         "(draft %.0f ms, verify %.0f ms)",
+                         "(blocks %.0f ms%s)",
                          (long long)st->cycles,
                          (double)st->tokens / (double)st->cycles,
                          (long long)st->accepted, (long long)st->drafted,
                          (long long)st->steps, (long long)st->fallbacks,
-                         st->draft_ms, st->verify_ms);
+                         st->draft_ms + st->verify_ms, split);
+            }
         }
         /* The plain steps read the length and the token on the device. */
         if (s == VV_OK && n_generated < max_new_tokens &&

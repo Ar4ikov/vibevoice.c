@@ -1146,14 +1146,20 @@ vv_status_t vv_stream_transcribe(vv_inference_ctx_t* ctx,
     }
     {
         const vv_spec_stats_t* sp = vv_inference_spec_stats(ctx);
-        if (sp && sp->cycles > 0)
+        if (sp && sp->cycles > 0) {
+            /* A captured cycle has no drafting time of its own. */
+            char split[48] = "";
+            if (sp->draft_ms > 0.0)
+                snprintf(split, sizeof(split), ", drafting %.0f ms",
+                         sp->draft_ms);
             VV_LOG_I("stream: %lld drafted blocks, %.2f tokens each, %lld of "
-                     "%lld drafts kept, %lld cut at a stop (draft %.0f ms, "
-                     "check %.0f ms)",
+                     "%lld drafts kept, %lld cut at a stop (blocks %.0f ms%s)",
                      (long long)sp->cycles,
                      (double)sp->tokens / (double)sp->cycles,
                      (long long)sp->accepted, (long long)sp->drafted,
-                     (long long)ss.blocks_cut, sp->draft_ms, sp->verify_ms);
+                     (long long)ss.blocks_cut, sp->draft_ms + sp->verify_ms,
+                     split);
+        }
     }
     for (int i = 0; i < col.n; i++) vv_free(col.texts[i]);
     vv_free(col.texts);
