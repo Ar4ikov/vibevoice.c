@@ -104,6 +104,30 @@ def static_reader(d, epochs=1, seed=0):
             yield read_vvdt(f)
 
 
+def mixed_reader(a, na, b, nb, seed=0):
+    """Two trace streams expected to give na and nb traces, interleaved at
+    random in that proportion (the one with more left is likelier next), so
+    a static set and a ring end together."""
+    rng = random.Random(seed + 1)
+    its = [iter(a), iter(b)]
+    left = [max(na, 0), max(nb, 0)]
+    while its[0] is not None or its[1] is not None:
+        if its[0] is None:
+            i = 1
+        elif its[1] is None:
+            i = 0
+        else:
+            w = [max(left[0], 1), max(left[1], 1)]
+            i = 0 if rng.random() * (w[0] + w[1]) < w[0] else 1
+        try:
+            t = next(its[i])
+        except StopIteration:
+            its[i] = None
+            continue
+        left[i] -= 1
+        yield t
+
+
 def trace_kind(path):
     """A trace's per-position roles, read without its features."""
     with open(path, "rb") as f:
@@ -546,7 +570,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
     ap.add_argument("--ring-dir")
-    ap.add_argument("--train-dir", help="static trace set instead of a ring")
+    ap.add_argument("--train-dir", help="static trace set instead of a ring, "
+                    "or mixed into it (then --ring-traces and --steps)")
+    ap.add_argument("--ring-traces", type=int, default=0,
+                    help="traces the ring will bring, all epochs of all its "
+                         "shards: sets how --train-dir is mixed in")
     ap.add_argument("--eval-dir")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="")
@@ -668,7 +696,16 @@ def main():
         p = (s - warm) / max(1, a.steps - warm)
         return a.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, p))))
 
-    if a.ring_dir:
+    if a.ring_dir and a.train_dir:
+        # The ring's traces are not on disk yet, so the schedule cannot be
+        # counted here: --steps comes from the caller.
+        n_static = len(glob.glob(os.path.join(a.train_dir, "*.vvdt"))) * a.epochs
+        stream = prefetch(mixed_reader(static_reader(a.train_dir, a.epochs, a.seed),
+                                       n_static, ring_reader(a.ring_dir),
+                                       a.ring_traces, a.seed))
+        print(f"mixed: {n_static} static traces, {a.ring_traces} from the ring",
+              flush=True)
+    elif a.ring_dir:
         stream = prefetch(ring_reader(a.ring_dir))
     else:
         stream = prefetch(static_reader(a.train_dir, a.epochs, a.seed))

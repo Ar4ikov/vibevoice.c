@@ -11,6 +11,13 @@ line order is shuffled so that any prefix of the manifest is a fair sample.
 
     build_corpus.py --src /mnt/hdd/vv3-dflash/datasets \
                     --out /mnt/hdd/vv3-dflash/clips --hours 140
+
+A second corpus that adds to a first one without repeating its long
+recordings: `--exclude` the first manifest (a recording any of its clips came
+from is skipped), a `--prefix` for the new ids, `--extra-splits` to draw the
+long-form sources from their held-out splits too (all but the file the eval
+clips come from), another `--seed`, and `--no-eval`. Read speech is drawn
+again with the new seed; its utterances may repeat in new company.
 """
 import argparse
 import glob
@@ -82,7 +89,10 @@ def windows(rng, pcm, sr, starts, budget_s, prefix, out_dir, rows):
     return used
 
 
-def long_form(rng, files, budget_h, name, out_dir, rows, ts_key=True):
+def long_form(rng, files, budget_h, name, out_dir, rows, ts_key=True,
+              seen=frozenset(), prefix="", frac=(0.3, 0.7)):
+    """Windows out of whole recordings; `seen` holds "<name>_<recording>"
+    of recordings another corpus already cut, which are skipped."""
     got = 0.0
     files = list(files)
     rng.shuffle(files)
@@ -91,20 +101,36 @@ def long_form(rng, files, budget_h, name, out_dir, rows, ts_key=True):
             for row in batch.to_pylist():
                 if got >= budget_h * 3600:
                     return got
-                pcm, sr = decode(row["audio"])
-                starts = row.get("timestamps_start") if ts_key else None
                 rid = os.path.splitext(os.path.basename(
                     row["audio"].get("path") or f"r{len(rows)}"))[0]
-                per = min(budget_h * 3600 - got, rng.uniform(0.3, 0.7) *
+                if f"{name}_{rid}" in seen:
+                    continue
+                pcm, sr = decode(row["audio"])
+                starts = row.get("timestamps_start") if ts_key else None
+                per = min(budget_h * 3600 - got, rng.uniform(*frac) *
                           len(pcm) / sr)
-                got += windows(rng, pcm, sr, starts, per, f"{name}_{rid}",
-                               out_dir, rows)
+                got += windows(rng, pcm, sr, starts, per,
+                               f"{prefix}{name}_{rid}", out_dir, rows)
     return got
 
 
-def joined(rng, utterances, budget_h, name, out_dir, rows, cap=300.0):
+def seen_recordings(manifests):
+    """"<name>_<recording>" of every clip id in the manifests: a long-form
+    clip id is that plus "_<window>"."""
+    out = set()
+    for m in manifests:
+        for line in open(m):
+            cid = line.split("\t")[0].strip()
+            if cid and "_" in cid:
+                out.add(cid.rsplit("_", 1)[0])
+    return frozenset(out)
+
+
+def joined(rng, utterances, budget_h, name, out_dir, rows, cap=300.0,
+           prefix=""):
     """Join utterances (pcm, sr, group) into clips; a clip keeps to one
     group (speaker/chapter or language) with prob 0.7, mixes otherwise."""
+    name = prefix + name
     got, k = 0.0, 0
     by_group = {}
     for u in utterances:
@@ -155,6 +181,15 @@ def main():
     ap.add_argument("--hours", type=float, default=140.0)
     ap.add_argument("--eval-hours", type=float, default=2.0)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--exclude", nargs="*", default=[],
+                    help="manifests of a corpus whose long recordings to skip")
+    ap.add_argument("--prefix", default="", help="put before every new clip id")
+    ap.add_argument("--extra-splits", action="store_true",
+                    help="long-form and FLEURS training clips from the held-out "
+                         "splits too, except the files the eval clips use")
+    ap.add_argument("--no-eval", action="store_true")
+    ap.add_argument("--long-frac", default="0.3,0.7",
+                    help="share of a long recording cut into windows (range)")
     a = ap.parse_args()
     rng = random.Random(a.seed)
     train_dir = os.path.join(a.out, "train")
@@ -164,44 +199,61 @@ def main():
     train, ev = [], []
     S = a.src
     H, E = a.hours, a.eval_hours
+    X = a.extra_splits
+    lf = dict(seen=seen_recordings(a.exclude), prefix=a.prefix,
+              frac=tuple(float(v) for v in a.long_frac.split(",")))
 
-    # Long-form, multi-speaker.
+    # Long-form, multi-speaker. The eval clips come from the first file of
+    # each held-out split; --extra-splits trains on the others.
     ami = sorted(glob.glob(f"{S}/diarizers-community__ami/ihm/train-*.parquet"))
     ami_ev = sorted(glob.glob(f"{S}/diarizers-community__ami/ihm/test-*.parquet"))
-    print("ami", long_form(rng, ami, H * MIX["ami"], "ami", train_dir, train) / 3600, flush=True)
-    print("ami eval", long_form(rng, ami_ev[:1], E * 0.25, "amiev", eval_dir, ev) / 3600, flush=True)
+    if X:
+        ami += ami_ev[1:] + sorted(glob.glob(
+            f"{S}/diarizers-community__ami/ihm/validation-*.parquet"))
+    print("ami", long_form(rng, ami, H * MIX["ami"], "ami", train_dir, train, **lf) / 3600, flush=True)
+    if not a.no_eval:
+        print("ami eval", long_form(rng, ami_ev[:1], E * 0.25, "amiev", eval_dir, ev) / 3600, flush=True)
 
     vc = sorted(glob.glob(f"{S}/diarizers-community__voxconverse/data/dev-*.parquet"))
     vc_ev = sorted(glob.glob(f"{S}/diarizers-community__voxconverse/data/test-*.parquet"))
-    print("voxconverse", long_form(rng, vc, H * MIX["voxconverse"], "vc", train_dir, train) / 3600, flush=True)
-    print("voxconverse eval", long_form(rng, vc_ev[:1], E * 0.2, "vcev", eval_dir, ev) / 3600, flush=True)
+    if X:
+        vc += vc_ev[1:]
+    print("voxconverse", long_form(rng, vc, H * MIX["voxconverse"], "vc", train_dir, train, **lf) / 3600, flush=True)
+    if not a.no_eval:
+        print("voxconverse eval", long_form(rng, vc_ev[:1], E * 0.2, "vcev", eval_dir, ev) / 3600, flush=True)
 
     ea = sorted(glob.glob(f"{S}/distil-whisper__earnings22/full/test-*.parquet"))
-    print("earnings22", long_form(rng, ea[1:], H * MIX["earnings22"], "earn", train_dir, train, ts_key=False) / 3600, flush=True)
-    print("earnings22 eval", long_form(rng, ea[:1], E * 0.15, "earnev", eval_dir, ev, ts_key=False) / 3600, flush=True)
+    print("earnings22", long_form(rng, ea[1:], H * MIX["earnings22"], "earn", train_dir, train, ts_key=False, **lf) / 3600, flush=True)
+    if not a.no_eval:
+        print("earnings22 eval", long_form(rng, ea[:1], E * 0.15, "earnev", eval_dir, ev, ts_key=False) / 3600, flush=True)
 
     # Read speech, joined.
+    P = a.prefix
     ls = sorted(glob.glob(f"{S}/openslr__librispeech_asr/clean/train.100/*.parquet"))
     u = utterances(ls, H * MIX["librispeech"] * 3600 * 1.1, rng,
                    lambda r: f"{r['speaker_id']}-{r['chapter_id']}")
-    print("librispeech", joined(rng, u, H * MIX["librispeech"], "ls", train_dir, train) / 3600, flush=True)
+    print("librispeech", joined(rng, u, H * MIX["librispeech"], "ls", train_dir, train, prefix=P) / 3600, flush=True)
     del u
-    ls_ev = sorted(glob.glob(f"{S}/openslr__librispeech_asr/clean/validation/*.parquet"))
-    u = utterances(ls_ev, E * 0.15 * 3600 * 1.2, rng,
-                   lambda r: f"{r['speaker_id']}-{r['chapter_id']}")
-    print("librispeech eval", joined(rng, u, E * 0.15, "lsev", eval_dir, ev) / 3600, flush=True)
-    del u
+    if not a.no_eval:
+        ls_ev = sorted(glob.glob(f"{S}/openslr__librispeech_asr/clean/validation/*.parquet"))
+        u = utterances(ls_ev, E * 0.15 * 3600 * 1.2, rng,
+                       lambda r: f"{r['speaker_id']}-{r['chapter_id']}")
+        print("librispeech eval", joined(rng, u, E * 0.15, "lsev", eval_dir, ev) / 3600, flush=True)
+        del u
 
     per_lang = H * MIX["fleurs"] / len(FLEURS)
     for lang in FLEURS:
+        eval_lang = lang in ("ru_ru", "cmn_hans_cn")
         fs = sorted(glob.glob(f"{S}/google__fleurs/parquet-data/{lang}/train-*.parquet"))
+        if X and not eval_lang:
+            fs += sorted(glob.glob(f"{S}/google__fleurs/parquet-data/{lang}/validation-*.parquet"))
         if not fs:
             print("fleurs missing", lang, flush=True)
             continue
         u = utterances(fs, per_lang * 3600 * 1.1, rng, lambda r, l=lang: l)
-        print("fleurs", lang, joined(rng, u, per_lang, f"fl{lang[:2]}", train_dir, train, cap=240) / 3600, flush=True)
+        print("fleurs", lang, joined(rng, u, per_lang, f"fl{lang[:2]}", train_dir, train, cap=240, prefix=P) / 3600, flush=True)
         del u
-        if lang in ("ru_ru", "cmn_hans_cn"):
+        if eval_lang and not a.no_eval:
             fv = sorted(glob.glob(f"{S}/google__fleurs/parquet-data/{lang}/validation-*.parquet"))
             u = utterances(fv, E * 0.1 * 3600 * 1.2, rng, lambda r, l=lang: l)
             print("fleurs eval", lang, joined(rng, u, E * 0.1, f"flev{lang[:2]}", eval_dir, ev, cap=180) / 3600, flush=True)
@@ -210,7 +262,7 @@ def main():
     sv = sorted(glob.glob(f"{S}/bond005__sova_rudevices/data/train-*.parquet"))
     if sv:
         u = utterances(sv, H * MIX["sova"] * 3600 * 1.1, rng, lambda r: "ru")
-        print("sova", joined(rng, u, H * MIX["sova"], "sova", train_dir, train, cap=180) / 3600, flush=True)
+        print("sova", joined(rng, u, H * MIX["sova"], "sova", train_dir, train, cap=180, prefix=P) / 3600, flush=True)
         del u
 
     rng.shuffle(train)

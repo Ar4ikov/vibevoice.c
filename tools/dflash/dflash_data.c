@@ -560,12 +560,28 @@ static int run_trace(const args_t* a) {
             }
         }
     }
-    /* A reader waiting on the ring learns the stream has ended. */
+    /* A reader waiting on the ring learns the stream has ended -- once every
+     * shard writing into it has: each leaves DONE.<shard> first, and the one
+     * that then finds them all leaves DONE. */
     {
         char path[1024];
-        snprintf(path, sizeof(path), "%s/DONE", a->dir);
-        FILE* f = fopen(path, "wb");
-        if (f) fclose(f);
+        int finished = a->n_shards;
+        if (a->n_shards > 1) {
+            snprintf(path, sizeof(path), "%s/DONE.%d", a->dir, a->shard);
+            FILE* f = fopen(path, "wb");
+            if (f) fclose(f);
+            finished = 0;
+            for (int i = 0; i < a->n_shards; i++) {
+                snprintf(path, sizeof(path), "%s/DONE.%d", a->dir, i);
+                FILE* g = fopen(path, "rb");
+                if (g) { finished++; fclose(g); }
+            }
+        }
+        if (finished == a->n_shards) {
+            snprintf(path, sizeof(path), "%s/DONE", a->dir);
+            FILE* f = fopen(path, "wb");
+            if (f) fclose(f);
+        }
     }
     fprintf(stderr, "trace: done, %ld files, %lld positions\n", written,
             (long long)positions);
