@@ -339,21 +339,23 @@ without `--draft`. Every drafted transcript below was compared with its plain
 one byte for byte, and was the same.
 
 **VibeVoice-ASR 7B, AWQ W4A16** (`Ar4ikov/VibeVoice-ASR-DFlash2-Drafter`,
-commit a9cfb15, the check width measured as it runs):
+v5; b72be15, the check width measured as it runs):
 
 | | plain, fa2 (the default) | plain, flashinfer | drafted (flashinfer) | tokens per block |
 |---|---|---|---|---|
-| jfk, 11 s | 149.6 | 152.2 | 384.1 (**2.57×**) | 3.92 |
-| test30 | 149.2 | 152.4 | 325.5 (**2.18×**) | 2.85 |
-| test120, 2 speakers | 143.1 | 150.6 | 310.0 (**2.17×**) | 2.74 |
-| 32-minute file | 106.1 | 122.7 | 183.5 (**1.73×**) | 2.36 |
-| 20 held-out clips | 138.2 | 147.3 | 373.3 (**2.70×**) | 3.56 |
+| jfk, 11 s | 149.9 | 152.5 | 577.0 (**3.85×**) | 6.71 |
+| test30 | 149.3 | 152.5 | 512.5 (**3.43×**) | 4.62 |
+| test120, 2 speakers | 143.3 | 150.6 | 547.1 (**3.82×**) | 4.87 |
+| 32-minute file | 106.5 | 122.9 | 290.5 (**2.73×**) | 3.57 |
+| 20 held-out clips | — | 147.7 | 566.5 (3.84× flashinfer) | 5.33 |
 
-(× against the default. The clips' fa2 figure is from 7d7d43e, whose plain
-decode is the same code.) The drafter stored as INT4
-(`-AWQ-W4A16-ASYM`, 0.55 GB) keeps 3.747 tokens per block on the held-out
-traces against the BF16 one's 3.741 and runs the same: clips 375.0, test120
-306.0, the 32-minute file 185.8.
+(× against the default.) The drafter stored as INT4 (`-AWQ-W4A16-ASYM`,
+0.55 GB) keeps 5.268 tokens per block on the held-out traces against the
+BF16 one's 5.272 and runs the same (clips 565.1). v5 is v4 trained on 2.8×
+the audio -- 8228 clips (~390 h) from two corpora, repetition loops capped
+(below) -- and keeps 5.27 tokens per block held out where v4 kept 3.74:
+v4 made 2.17× on test120, 1.73× on the 32-minute file and 2.70× on the
+clips (fa2 plain 138.2 there), with the same binary settings.
 
 **VibeVoice-ASR-Streaming-1.5B, AWQ W4A16** (`Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter`,
 7d7d43e, 8 rows; flashinfer is this model's default either way):
@@ -382,7 +384,7 @@ drafters, held as INT4; flashinfer on both sides for the 7B):
 
 | | test120 | 32-minute file |
 |---|---|---|
-| ASR-7B | 56.9 → 105.4 (1.85×) | 52.5 → 84.7 (1.61×) |
+| ASR-7B (v5) | 56.9 → 155.5 (2.73×) | 52.5 → 124.1 (2.36×) |
 | Streaming-7B | 57.0 → 118.6 (2.08×) | 53.8 → 108.7 (2.02×) |
 | Streaming-1.5B | 208.3 → 408.4 (1.96×) | 186.5 → 358.5 (1.92×) |
 
@@ -412,9 +414,9 @@ pursued further.
 
 Where the numbers come from: the 7B's check costs 1.3 steps at 8 rows (the
 projections 1.13, then the head, the rows' attention and the drafter's own
-pass), so the speedup is about tokens per block / 1.3. The drafters are
-data-starved -- on the 7B, 5.4 tokens per block on the training traces
-against 3.7 held out -- which is where the next ones come from.
+pass), so the speedup is about tokens per block / 1.3. The drafters were
+data-starved -- v4, 5.4 tokens per block on its training traces against 3.7
+held out -- and v5, with 2.8× the audio, keeps 5.3 held out.
 
 ## Not supported
 

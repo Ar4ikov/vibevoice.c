@@ -34,8 +34,9 @@ Write the entry for a change under Unreleased in the same pull request.
   `tools/dflash/awq_drafter.py`). A cycle -- draft, check, accept, the
   drafter's context -- reads its positions on the device and runs as one
   captured graph. Blocks run only while they beat plain steps (measured).
-  RTX 3090, AWQ 7B against its default decode: jfk 2.57x, test120 2.17x,
-  a 32-minute file 1.73x, 20 held-out clips 2.70x; Streaming-7B: test120
+  RTX 3090, AWQ 7B against its default decode: jfk 3.85x, test120 3.82x,
+  a 32-minute file 2.73x, 20 held-out clips 3.84x (against flashinfer);
+  BF16 7B 2.73x and 2.36x on the same two files; Streaming-7B: test120
   2.59x, 32 minutes 2.10x, clips 2.45x; Streaming-1.5B: test120 2.50x,
   32 minutes 2.13x. Drafters for the AWQ checkpoints are on the Hub
   ([ASR-7B](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2-Drafter),

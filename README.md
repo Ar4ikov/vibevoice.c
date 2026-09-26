@@ -379,9 +379,10 @@ which never pays, so there the drafter is declined unless you ask for
 
 | RTX 3090, AWQ, exact | plain | drafted |
 |---|---|---|
-| ASR-7B, test120 (2 speakers) | 143 tok/s | 310 tok/s (2.17x) |
-| ASR-7B, 32-minute file | 106 tok/s | 184 tok/s (1.73x) |
-| ASR-7B, 20 held-out clips | 138 tok/s | 373 tok/s (2.70x) |
+| ASR-7B, jfk | 150 tok/s | 577 tok/s (3.85x) |
+| ASR-7B, test120 (2 speakers) | 143 tok/s | 547 tok/s (3.82x) |
+| ASR-7B, 32-minute file | 107 tok/s | 291 tok/s (2.73x) |
+| ASR-7B, 20 held-out clips (plain on flashinfer) | 148 tok/s | 566 tok/s (3.84x) |
 | Streaming-7B, test120 | 151 tok/s | 391 tok/s (2.59x) |
 | Streaming-7B, 32-minute file | 131 tok/s | 275 tok/s (2.10x) |
 | Streaming-1.5B, test120 | 416 tok/s | 1040 tok/s (2.50x) |
@@ -395,7 +396,7 @@ and
 [VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2);
 Microsoft's BF16 checkpoints the same way with the BF16 drafters:
 [VibeVoice-ASR-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2)
-(1.89x on test120),
+(2.79x on test120),
 [VibeVoice-ASR-Streaming-7B-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-DFlash2)
 (2.08x) and
 [VibeVoice-ASR-Streaming-1.5B-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2)
