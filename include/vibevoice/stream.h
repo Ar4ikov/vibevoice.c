@@ -266,12 +266,19 @@ typedef struct {
     double           encode_ms;    /**< of which the encode, when measured */
     double           decode_ms;    /**< the greedy steps after it */
     int64_t          kv_len;       /**< cache positions after the chunk */
+    /** CHUNK: the ids generated (n_tokens of them, valid in the call) and
+     *  the one that stopped the chunk (-1: the token cap). */
+    const int32_t*   ids;
+    int32_t          stop_id;
 } vv_stream_event_t;
 
 typedef void (*vv_stream_event_fn)(void* user, const vv_stream_event_t* ev);
 
 /** @brief Most windows one encode_ahead call takes. */
 #define VV_STREAM_AHEAD_MAX 8
+
+/** @brief Most tokens one decode_block call returns. */
+#define VV_STREAM_BLOCK_MAX 16
 
 /** @brief Describes one chunk prefill to the backend. */
 typedef struct {
@@ -315,6 +322,20 @@ typedef struct {
     /** Feed one token at the current length and return the next argmax. */
     vv_status_t (*decode_step)(void* self, int32_t token, int32_t* next);
     /**
+     * Optional: speculative decoding. Feed `token` and a drafted block after
+     * it at the current length, and return in `out` the n (>= 1) tokens
+     * greedy decoding produces from there -- the ones decode_step would,
+     * one call each. The cache then holds `token` and out[0..n-2]; out[n-1]
+     * is not fed. At most block_size() tokens, and it needs that many free
+     * positions. NULL: decode_step only.
+     */
+    vv_status_t (*decode_block)(void* self, int32_t token, int32_t* out,
+                                int* n);
+    /** The most decode_block returns now; 0 when it cannot be used. */
+    int (*block_size)(void* self);
+    /** Drop the cache positions from `len` on: a block fed past a stop. */
+    vv_status_t (*truncate)(void* self, int64_t len);
+    /**
      * Optional. Encode `n` (<= VV_STREAM_AHEAD_MAX) consecutive ready
      * windows, chunk indices `first`.., in one go, ahead of their prefills:
      * an uploaded file, or a live session that fell behind. `windows` holds
@@ -332,6 +353,12 @@ typedef struct {
      * chunk's prefill as its first row instead.
      */
     vv_status_t (*append_tokens)(void* self, const int32_t* ids, int n);
+    /**
+     * Optional. Prefill known tokens at the current length (no logits):
+     * what a replay (vv_stream_params_t.force_ids) feeds instead of
+     * decoding. NULL: the session cannot replay.
+     */
+    vv_status_t (*prefill_tokens)(void* self, const int32_t* ids, int n);
     /** Positions in the cache now, and how many it can hold. */
     int64_t (*kv_len)(void* self);
     int64_t (*kv_capacity)(void* self);
@@ -372,6 +399,18 @@ typedef struct {
     bool               kv_no_wait;
     vv_stream_event_fn on_event;
     void*              user;
+    /**
+     * Replay instead of decode: chunk i feeds `force_n[i]` known ids (taken
+     * in order from `force_ids`, every chunk's run back to back, as a
+     * transcription's `tokens` / `chunk_tokens` hold them) in one prefill,
+     * and generates nothing. The cache then holds exactly what the run that
+     * produced those ids fed it; tools/dflash reads the target's hidden
+     * states off such a replay. 0 chunks: decode as usual. Needs the
+     * backend's prefill_tokens.
+     */
+    const int32_t*     force_ids;
+    const int*         force_n;
+    int                force_chunks;
 } vv_stream_params_t;
 
 /** @brief Streaming-7B geometry and ids, 256 tokens per chunk, folding on. */
@@ -391,6 +430,9 @@ typedef struct {
     double  encode_ms;      /**< sum of the chunks' encode_ms */
     double  decode_ms;      /**< sum of the chunks' decode_ms */
     double  max_chunk_ms;   /**< slowest chunk, prefill + decode */
+    int64_t blocks;         /**< drafted blocks decoded (decode_block) */
+    int64_t blocks_cut;     /**< of those, fed past a stop or the cap and
+                                 cut back (truncate) */
 } vv_stream_stats_t;
 
 typedef struct vv_stream vv_stream_t;

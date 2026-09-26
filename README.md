@@ -343,6 +343,77 @@ vv_cli chat --model ./model_hf
 The model loads once and stays warm. Ten seconds of startup per file is
 absurd for short clips; this pays it once.
 
+### Speculative decoding (DFlash 2)
+
+```bash
+vv_cli --model ./model_hf --audio talk.wav --draft ./drafter
+vv_cli serve --model ./model_hf --draft ./drafter --slots 4
+```
+
+A [DFlash 2](https://inco.ai/blog/dflash2/) drafter — a few layers that
+read the model's own hidden states — proposes a block of tokens in one pass;
+the model checks the block in one pass and keeps the tokens it agrees with,
+plus one of its own. The check computes every row with the arithmetic of a
+one-token decode step, so **the transcript is byte-for-byte the one without
+`--draft`** — words, timestamps, speakers. What a drafter changes is only how
+many passes the transcript takes.
+
+| flag | |
+|---|---|
+| `--draft <dir>` | `config.json` + `model.safetensors` of a drafter trained for this model; default `<model>/drafter` if the model directory has one (the `-DFlash2` bundles do), `none` never |
+| `--draft-block <n>` | rows of the drafted block the model checks per pass (default: half the block or all of it, whichever keeps more tokens per ms) |
+| `--draft-check exact\|fast` | exact (default): the transcript without a drafter on the same `--attn`, bit for bit; fast: flashinfer attention and prefill projections for the check, the greedy transcript within rounding |
+| `--draft-quant int4\|f16` | the drafter's weights (INT4 by default; it only proposes) |
+
+A checked block costs about one decode step for AWQ/GPTQ weights: the
+projections of a step and of a check run on the same tensor-core kernel,
+which reads the weights once for every row. The attention is the other
+half: fa2 walks the cache once per checked row, flashinfer packs the rows
+together, so with a drafter `--attn auto` is flashinfer. The transcript is
+then exactly that of `--attn flashinfer` without a drafter (on the AWQ 7B:
+the default's words, a timestamp 10 ms apart on a 32-minute file);
+`--attn fa2 --draft` keeps the default's bit for bit but gains little on
+long recordings. NF4 and INT8 weights check exactly only one row at a time,
+which never pays, so there the drafter is declined unless you ask for
+`--draft-check fast` (7B, test30: NF4 1.68x, INT8 1.80x).
+
+| RTX 3090, AWQ, exact | plain | drafted |
+|---|---|---|
+| ASR-7B, jfk | 150 tok/s | 577 tok/s (3.85x) |
+| ASR-7B, test120 (2 speakers) | 143 tok/s | 547 tok/s (3.82x) |
+| ASR-7B, 32-minute file | 107 tok/s | 291 tok/s (2.73x) |
+| ASR-7B, 20 held-out clips (plain on flashinfer) | 148 tok/s | 566 tok/s (3.84x) |
+| Streaming-7B, test120 | 151 tok/s | 391 tok/s (2.59x) |
+| Streaming-7B, 32-minute file | 131 tok/s | 275 tok/s (2.10x) |
+| Streaming-1.5B, test120 | 416 tok/s | 1040 tok/s (2.50x) |
+| Streaming-1.5B, 32-minute file | 341 tok/s | 729 tok/s (2.13x) |
+
+The AWQ checkpoints with their drafter in one download (`drafter/` is used
+without `--draft`):
+[VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-AWQ-W4A16-ASYM-DFlash2),
+[VibeVoice-ASR-Streaming-7B-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-AWQ-W4A16-ASYM-DFlash2)
+and
+[VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-AWQ-W4A16-ASYM-DFlash2);
+Microsoft's BF16 checkpoints the same way with the BF16 drafters:
+[VibeVoice-ASR-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2)
+(2.79x on test120),
+[VibeVoice-ASR-Streaming-7B-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-DFlash2)
+(2.08x) and
+[VibeVoice-ASR-Streaming-1.5B-DFlash2](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2)
+(1.96x).
+The drafters alone, for the other checkpoints of the same models:
+[VibeVoice-ASR-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-DFlash2-Drafter),
+[VibeVoice-ASR-Streaming-7B-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-7B-DFlash2-Drafter)
+and
+[VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter](https://huggingface.co/Ar4ikov/VibeVoice-ASR-Streaming-1.5B-DFlash2-Drafter),
+each also stored as INT4 (`-AWQ-W4A16-ASYM`).
+
+Works for one-shot transcription, streaming sessions (Streaming-7B and
+-1.5B), chat completions (greedy) and `serve` slots, on CUDA. Drafters are
+trained with `tools/dflash` on the target's own transcripts;
+[docs/DFLASH.md](docs/DFLASH.md) has the design, the training pipeline and
+the numbers.
+
 ---
 
 ## Quantization
@@ -953,7 +1024,9 @@ unpacked, seven times over. Both new backends read a position once per group.
 **`fa2` is what `auto` runs, and it is bit-identical to the kernels before
 it.** (Streaming-7B is the exception: its 29-row chunk prefills on a
 growing cache need flashinfer's split KV, it has no older transcripts to
-stay identical to, so `auto` is flashinfer there.) Its prefill packs the 7 heads of a group into the rows of one block —
+stay identical to, so `auto` is flashinfer there. So it is with `--draft`:
+a checked block's rows share flashinfer's tiles, while fa2 walks the cache
+once per row.) Its prefill packs the 7 heads of a group into the rows of one block —
 row r is position r / 7, head r % 7 — so a K/V tile is loaded once for all of
 them, but every row still sees the same tiles in the same order with the same
 `mma.sync` sequence and the same natural-base `__expf`. Its decode keeps the

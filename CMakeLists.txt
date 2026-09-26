@@ -210,6 +210,7 @@ add_library(vibevoice_core STATIC
     src/inference/stream.c
     src/inference/stream_ctx.c
     src/inference/bitnet_lm.c
+    src/inference/spec.c
 )
 # The BitNet reference paths repeat VibeASR.cpp's float expressions operation
 # for operation; a fused multiply-add the compiler invents would move bits.
@@ -301,6 +302,7 @@ if(VV_HAS_CUDA)
         src/cuda/embedding.cu
         src/cuda/cuda_utils.cu
         src/cuda/bitnet.cu
+        src/cuda/dflash.cu
     )
     target_link_libraries(vibevoice_cuda PUBLIC CUDA::cudart_static)
     if(VV_ENABLE_NVTX)
@@ -360,6 +362,18 @@ if(VV_BUILD_CLI)
     target_link_libraries(vv_cli PRIVATE vibevoice_core)
     if(VV_ACCEL_LIB)
         target_link_libraries(vv_cli PRIVATE ${VV_ACCEL_LIB})
+    endif()
+endif()
+
+# ─── DFlash training data (tools/dflash) ─────────────────────────────────────
+# The target's transcripts and its hidden states along them, for training a
+# drafter (docs/DFLASH.md). Built with the CLI where its source is there; the
+# container copies only what the runtime needs, and nothing links it.
+if(VV_BUILD_CLI AND EXISTS "${CMAKE_SOURCE_DIR}/tools/dflash/dflash_data.c")
+    add_executable(vv_dflash_data tools/dflash/dflash_data.c)
+    target_link_libraries(vv_dflash_data PRIVATE vibevoice_core)
+    if(VV_ACCEL_LIB)
+        target_link_libraries(vv_dflash_data PRIVATE ${VV_ACCEL_LIB})
     endif()
 endif()
 
@@ -442,6 +456,12 @@ if(VV_BUILD_TESTS)
     target_compile_definitions(test_model_load PRIVATE
                                VV_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data")
     vv_add_test(test_prefill_append tests/test_prefill_append.c)
+    # Speculative decoding: verified blocks bit for bit against decode steps,
+    # the drafter's kernels against CPU references, and with VV_TEST_MODEL +
+    # VV_TEST_DRAFT a transcript with and without the drafter.
+    vv_add_test(test_spec tests/test_spec.c)
+    target_compile_definitions(test_spec PRIVATE
+                               VV_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data")
     # W8A8 / W4A8: quantizers bit-exact, integer sums exact, every GPU path
     # (dp4a GEMV, tensor-core GEMM, SIMT fallback) forced in turn.
     vv_add_test(test_int8_linear tests/test_int8_linear.c)

@@ -42,6 +42,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "attn_common.cuh"
 #include "decode_split.h"
@@ -191,6 +192,11 @@ void att_rows_kernel(
  * Decode and small-q prefill: 16 packed rows per block, split KV
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/** @brief Tiles in each slice of a split over `len` positions in `parts`. */
+__device__ __forceinline__ int att_chunk_tiles(int len, int parts) {
+    return ((len + parts - 1) / parts + ATT_BC - 1) / ATT_BC;
+}
+
 template <int FMT>
 __global__ __launch_bounds__(ATT_THREADS)
 void att_split_kernel(
@@ -202,12 +208,48 @@ void att_split_kernel(
     float* __restrict__ part_l,
     int n_q_heads, int n_kv_heads, int q_len, int q_offset,
     int kv_len, const int* __restrict__ d_kv_len, int n_parts,
-    int bpv, float scale, bool causal)
+    int bpv, float scale, bool causal, int verify_rows, int frag_rows,
+    int row_base)
 {
 #if ATT_HAS_MMA
     /* A replayed graph keeps its arguments, so the length comes from device
      * memory; n_parts only sizes the grid and is fixed within a bucket. */
     if (d_kv_len) kv_len = *d_kv_len;
+
+    /*
+     * The rows of a verified block (verify_rows > 1): row r is the decode at
+     * kv_len + r. Runs of up to frag_rows rows that cut the cache the same
+     * way -- split count, tile-rounded slice -- share a fragment; blockIdx.y
+     * is the fragment, found here from the length alone. Its rows go in as
+     * the causal prefill they are (row ra at position kv_len - 1 + ra), and
+     * their partials where their own decodes put them (row_base).
+     */
+    if (verify_rows > 1) {
+        const int L = kv_len;
+        const int f = (int)blockIdx.y;
+        int ra = 0, rb = 0, idx = 0, P = 0;
+        bool found = false;
+        while (ra < verify_rows) {
+            P = vv_fi_decode_parts(n_kv_heads, L + ra);
+            const int ct = att_chunk_tiles(L + ra, P);
+            rb = ra + 1;
+            while (rb < verify_rows && rb - ra < frag_rows &&
+                   vv_fi_decode_parts(n_kv_heads, L + rb) == P &&
+                   att_chunk_tiles(L + rb, P) == ct)
+                ++rb;
+            if (idx == f) { found = true; break; }
+            ++idx;
+            ra = rb;
+        }
+        if (!found || (int)blockIdx.z >= P) return;
+        n_parts = P;
+        Q += (size_t)ra * n_q_heads * ATT_D;
+        q_len = rb - ra;
+        q_offset = L - 1 + ra;
+        kv_len = L + rb - 1;
+        causal = true;
+        row_base = ra;
+    }
 
     const int kv_head = blockIdx.x;
     const int part    = blockIdx.z;
@@ -219,7 +261,7 @@ void att_split_kernel(
     const int grp     = lane >> 2;
     const int quad    = lane & 3;
 
-    const int row0 = blockIdx.y * 16;
+    const int row0 = verify_rows > 1 ? 0 : blockIdx.y * 16;
     const int r_lo = row0 + grp, r_hi = r_lo + 8;
     const bool ok_lo = r_lo < n_rows, ok_hi = r_hi < n_rows;
     const int p_lo = r_lo / G, p_hi = r_hi / G;
@@ -353,7 +395,12 @@ void att_split_kernel(
         const int pos = row / G;
         const int head = kv_head * G + (row - pos * G);
         const size_t out_row = (size_t)pos * n_q_heads + head;
-        const size_t pi = out_row * n_parts + part;
+        /* row_base >= 0: position pos is row row_base + pos of a verified
+         * block, whose partials go where that row's own decode puts them. */
+        const size_t pi = row_base >= 0
+            ? (size_t)(row_base + pos) * n_q_heads * VV_DECODE_MAX_PARTS
+              + (size_t)head * n_parts + part
+            : out_row * n_parts + part;
         part_o[pi * ATT_D + d] = acc;
         if (d == 0) { part_m[pi] = mx; part_l[pi] = l; }
     }
@@ -412,13 +459,7 @@ int vv_attn_device_sm_count(void) {
 
 /** @brief Split count for flashinfer decode; steps every 1024 positions. */
 static int att_fi_decode_parts(int n_kv_heads, int cache_len) {
-    int b = (cache_len + 1023) / 1024;
-    if (b < 1) b = 1;
-    int cap = VV_DECODE_MAX_PARTS / (n_kv_heads > 0 ? n_kv_heads : 1);
-    if (cap < 4) cap = 4;
-    if (cap > VV_DECODE_MAX_PARTS) cap = VV_DECODE_MAX_PARTS;
-    const int p = 4 * b;
-    return p < cap ? p : cap;
+    return vv_fi_decode_parts(n_kv_heads, cache_len);
 }
 
 vv_status_t vv_attn_fi_prefill_dev(
@@ -474,7 +515,7 @@ vv_status_t vv_attn_fi_prefill_dev(
             att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(    \
                 (const half*)q, K, V, Km, Vm, kv->page_table,                  \
                 pt.o, pt.m, pt.l, n_q_heads, n_kv, q_len, q_offset, kv_len,    \
-                NULL, parts, bpv, scale, causal);
+                NULL, parts, bpv, scale, causal, 0, 0, -1);
             ATT_DISPATCH(fmt, SPLIT_CALL)
 #undef SPLIT_CALL
             att_combine_kernel<<<q_len * n_q_heads, ATT_D, 0, st>>>(
@@ -520,11 +561,136 @@ vv_status_t vv_attn_fi_decode_dev(
     att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(            \
         (const half*)q, K, V, Km, Vm, kv->page_table, pt.o, pt.m, pt.l,        \
         n_q_heads, n_kv, 1, 0, cache_len, d_cache_len, parts, bpv,             \
-        scale, false);
+        scale, false, 0, 0, -1);
     ATT_DISPATCH(kv->format, DEC_CALL)
 #undef DEC_CALL
     att_combine_kernel<<<n_q_heads, ATT_D, 0, st>>>(pt.o, pt.m, pt.l,
                                                    (half*)out, parts);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
+/*
+ * `rows` consecutive flashinfer decodes (a verified block): row r is the
+ * decode at cache_len + r positions.
+ *
+ * A decode fills G of a fragment's 16 rows. Rows that cut the cache the same
+ * way -- all of them, but where the block straddles a change of split count
+ * or slice -- go in two or three to a fragment (att_split_kernel finds its
+ * rows from the length), sharing every K/V tile. A row's scores and its
+ * P . V are its own rows of each mma; the tiles past a row's end that its
+ * fragment's later rows still need are masked out whole, which leaves its
+ * state as it was (max and factor unchanged, P zero); and its partials go
+ * where its own decode puts them. So each row is its one-row decode, bit for
+ * bit, at about half the tiles and MMAs (3070, 24K positions: 8 rows 1.64x
+ * one row, a fragment each 3.33x). VV_ATTN_FI_ROWS_PACKED=0 gives every row
+ * its own fragment.
+ */
+static vv_status_t vv_attn_fi_decode_rows_dev(
+    const void* q, const vv_kv_view_t* kv, void* out, int n_q_heads,
+    int rows, int cache_len, const int* d_cache_len, void* scratch,
+    void* stream)
+{
+    if (!q || !kv || !kv->k || !kv->v || !out || !scratch)
+        return VV_ERR_NULL_PTR;
+    if (rows == 1)
+        return vv_attn_fi_decode_dev(q, kv, out, n_q_heads, cache_len,
+                                     d_cache_len, scratch, stream);
+    if (kv->head_dim != ATT_D) return VV_ERR_UNSUPPORTED;
+    const int n_kv = kv->n_kv_heads;
+    if (n_kv <= 0 || n_q_heads % n_kv || n_q_heads / n_kv > 16)
+        return VV_ERR_UNSUPPORTED;
+
+    const int bpv = vv_kv_bytes_per_vec((vv_kv_format_t)kv->format, ATT_D);
+    const float scale = 1.0f / sqrtf((float)ATT_D);
+    cudaStream_t st = (cudaStream_t)stream;
+    const int parts = att_fi_decode_parts(n_kv, cache_len + rows - 1);
+    const vv_decode_parts_t pt = vv_decode_parts_rows(scratch, n_q_heads,
+                                                      ATT_D, rows);
+    const uint8_t* K = (const uint8_t*)kv->k;
+    const uint8_t* V = (const uint8_t*)kv->v;
+    const half* Km = (const half*)kv->k_meta;
+    const half* Vm = (const half*)kv->v_meta;
+
+    static thread_local int packed_env = -2;
+    if (packed_env == -2) {
+        const char* e = getenv("VV_ATTN_FI_ROWS_PACKED");
+        packed_env = (e && e[0] == '0') ? 0 : 1;
+    }
+    const int frag_rows = packed_env ? 16 / (n_q_heads / n_kv) : 1;
+
+    dim3 grid(n_kv, rows, parts);
+#define DEC_CALL(F)                                                            \
+    att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(            \
+        (const half*)q, K, V, Km, Vm, kv->page_table, pt.o, pt.m, pt.l,        \
+        n_q_heads, n_kv, 1, 0, cache_len, d_cache_len, parts, bpv,             \
+        scale, false, rows, frag_rows, -1);
+    ATT_DISPATCH(kv->format, DEC_CALL)
+#undef DEC_CALL
+    att_combine_rows_kernel<<<dim3(n_q_heads, rows), ATT_D, 0, st>>>(
+        pt.o, pt.m, pt.l, (half*)out, n_q_heads, cache_len, d_cache_len, n_kv);
+    return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
+}
+
+/*
+ * A drafted block over its context: every row sees the first *d_kv_len
+ * positions. The split kernel reads the length on the device; the host's
+ * `kv_len` only sizes the split, so a replay holds for every length up to
+ * the next 1024 above it (block_parts rounds up to that).
+ */
+static int block_parts(int n_kv, int G, int q_len, int kv_len, int n_sm) {
+    const int tiles16 = (q_len * G + 15) / 16;
+    const int base = n_kv * tiles16;
+    int parts = (2 * n_sm + base - 1) / base;
+    int cap = VV_DECODE_MAX_PARTS / (q_len > 0 ? q_len : 1);
+    const int span = (kv_len + 1023) / 1024 * 1024;
+    const int by_len = (span + 4 * ATT_BC - 1) / (4 * ATT_BC);
+    if (cap > by_len) cap = by_len;
+    if (parts > cap) parts = cap;
+    return parts > 0 ? parts : 1;
+}
+
+int vv_attn_block_shape(int n_q_heads, int n_kv_heads, int q_len, int kv_len) {
+    int sm = 0, n_sm = 0;
+    att_device(&sm, &n_sm);
+    if (n_kv_heads <= 0) return 0;
+    return block_parts(n_kv_heads, n_q_heads / n_kv_heads, q_len, kv_len, n_sm);
+}
+
+vv_status_t vv_attn_block_dev(const void* q, const vv_kv_view_t* kv,
+                              void* out, int n_q_heads, int q_len, int kv_len,
+                              const int* d_kv_len, void* scratch,
+                              void* stream)
+{
+    if (!q || !kv || !kv->k || !kv->v || !out || !scratch)
+        return VV_ERR_NULL_PTR;
+    if (q_len <= 0 || kv_len <= 0) return VV_ERR_INVALID_ARG;
+    if (kv->head_dim != ATT_D) return VV_ERR_UNSUPPORTED;
+    const int n_kv = kv->n_kv_heads;
+    if (n_kv <= 0 || n_q_heads % n_kv || n_q_heads / n_kv > 16)
+        return VV_ERR_UNSUPPORTED;
+    int sm = 0, n_sm = 0;
+    att_device(&sm, &n_sm);
+    if (sm < 75) return VV_ERR_UNSUPPORTED;
+    const int G = n_q_heads / n_kv;
+    const int parts = block_parts(n_kv, G, q_len, kv_len, n_sm);
+    const int bpv = vv_kv_bytes_per_vec((vv_kv_format_t)kv->format, ATT_D);
+    const float scale = 1.0f / sqrtf((float)ATT_D);
+    cudaStream_t st = (cudaStream_t)stream;
+    const vv_decode_parts_t pt = vv_decode_parts(scratch, n_q_heads, ATT_D);
+    const uint8_t* K = (const uint8_t*)kv->k;
+    const uint8_t* V = (const uint8_t*)kv->v;
+    const half* Km = (const half*)kv->k_meta;
+    const half* Vm = (const half*)kv->v_meta;
+    const dim3 grid(n_kv, (q_len * G + 15) / 16, parts);
+#define BLOCK_CALL(F)                                                          \
+    att_split_kernel<F><<<grid, ATT_THREADS, ATT_SMEM_BYTES, st>>>(            \
+        (const half*)q, K, V, Km, Vm, kv->page_table, pt.o, pt.m, pt.l,        \
+        n_q_heads, n_kv, q_len, 0, kv_len, d_kv_len, parts, bpv, scale,        \
+        false, 0, 0, -1);
+    ATT_DISPATCH(kv->format, BLOCK_CALL)
+#undef BLOCK_CALL
+    att_combine_kernel<<<q_len * n_q_heads, ATT_D, 0, st>>>(
+        pt.o, pt.m, pt.l, (half*)out, parts);
     return cudaGetLastError() == cudaSuccess ? VV_OK : VV_ERR_CUDA_LAUNCH;
 }
 
@@ -654,6 +820,40 @@ vv_status_t vv_attn_decode(int backend, const void* q, const vv_kv_view_t* kv,
         q, kv->k, kv->v, kv->k_meta, kv->v_meta, out, n_q_heads,
         kv->n_kv_heads, kv->head_dim, cache_len, d_cache_len, kv->format,
         scratch, stream);
+}
+
+size_t vv_attn_rows_scratch_bytes(int n_q_heads, int head_dim, int rows) {
+    return vv_decode_parts_rows_bytes(n_q_heads, head_dim, rows > 0 ? rows : 1);
+}
+
+vv_status_t vv_attn_decode_rows(int backend, const void* q,
+                                const vv_kv_view_t* kv, void* out,
+                                int n_q_heads, int rows, int cache_len,
+                                const int* d_cache_len, void* scratch,
+                                void* stream)
+{
+    if (!q || !kv || !out) return VV_ERR_NULL_PTR;
+    if (rows < 1) return VV_ERR_INVALID_ARG;
+    if (backend == VV_ATTN_FLASHINFER)
+        return vv_attn_fi_decode_rows_dev(q, kv, out, n_q_heads, rows,
+                                          cache_len, d_cache_len, scratch,
+                                          stream);
+    if (backend == VV_ATTN_FA2 &&
+        vv_attn_gqa_decode_ok(n_q_heads, kv->n_kv_heads, kv->head_dim))
+        return vv_attn_gqa_decode_rows_dev(q, kv, out, n_q_heads, rows,
+                                           cache_len, d_cache_len, scratch,
+                                           stream);
+    /* fa1: its one-row kernels, one row after another. Exact, not fast. */
+    if (d_cache_len) return VV_ERR_UNSUPPORTED;
+    const size_t row = (size_t)n_q_heads * (size_t)kv->head_dim * 2;
+    for (int r = 0; r < rows; r++) {
+        const vv_status_t s = vv_attn_decode(
+            backend, (const uint8_t*)q + (size_t)r * row, kv,
+            (uint8_t*)out + (size_t)r * row, n_q_heads, cache_len + r, NULL,
+            scratch, stream);
+        if (s != VV_OK) return s;
+    }
+    return VV_OK;
 }
 
 } /* extern "C" */

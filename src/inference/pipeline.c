@@ -35,6 +35,8 @@
 #include "vv_thread.h"
 #include "pipeline_internal.h"
 #include "vibevoice/stream.h"
+#include "vibevoice/spec.h"
+#include "spec_internal.h"
 
 /* Forward declarations — CUDA helpers */
 
@@ -97,6 +99,25 @@ static vv_status_t upload_tensor_to_gpu(vv_tensor_t* t, void* stream) {
  * Used only for VV_PLACE_ALL_GPU mode.
  */
 static void attach_frontend(vv_inference_ctx_t* c);
+static void attach_spec(vv_inference_ctx_t* c, const char* dir, int quant,
+                        int verify_rows, int check,
+                        const vv_inference_ctx_t* parent);
+
+/** @brief `<model_dir>/drafter` into `out` when it holds a drafter's
+ *         config.json and model.safetensors. */
+static bool bundled_drafter(const char* model_dir, char* out, size_t cap) {
+    const int n = snprintf(out, cap, "%s/drafter", model_dir);
+    if (n <= 0 || (size_t)n >= cap) return false;
+    static const char* const need[2] = { "config.json", "model.safetensors" };
+    for (int i = 0; i < 2; i++) {
+        char probe[1100];
+        snprintf(probe, sizeof(probe), "%s/%s", out, need[i]);
+        FILE* f = fopen(probe, "rb");
+        if (!f) return false;
+        fclose(f);
+    }
+    return true;
+}
 
 /**
  * @brief Upload the first `n_layers` transformer layers to the GPU.
@@ -476,12 +497,16 @@ static vv_status_t prefill_all_shards(vv_inference_ctx_t* ctx, void* hidden,
                                       int seq_len) {
     const size_t bytes = (size_t)seq_len *
                          (size_t)ctx->model->config.llm.hidden_size * 2;
-    vv_status_t s = vv_decoder_prefill(ctx->model, hidden, seq_len,
-                                       ctx->kv_cache, ctx->layer_pool,
-                                       ctx->workspace, ctx->workspace_size,
-                                       ctx->compute_stream,
-                                       ctx->transfer_stream,
-                                       0, ctx->primary_layers);
+    /* Taps read every layer on one device; a split model has no such place. */
+    if (ctx->taps && ctx->n_shards > 0) return VV_ERR_UNSUPPORTED;
+    vv_status_t s = vv_decoder_prefill_taps(ctx->model, hidden, seq_len,
+                                            ctx->kv_cache, ctx->layer_pool,
+                                            ctx->workspace,
+                                            ctx->workspace_size,
+                                            ctx->compute_stream,
+                                            ctx->transfer_stream,
+                                            0, ctx->primary_layers,
+                                            ctx->taps);
     if (s != VV_OK || ctx->n_shards == 0) return s;
 
     int src_gpu = ctx->gpu_id;
@@ -578,6 +603,15 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     /* Resolve params (NULL → defaults) */
     vv_init_params_t p = params ? *params : vv_init_params_default();
     bool cpu_only = p.cpu_only || p.vram_budget <= 0.0f;
+
+    /* A model directory may carry its drafter (`<model>/drafter/`, as the
+     * Hub bundles publish one); it is used when the caller named none. An
+     * empty draft_dir (`--draft none`) means no drafter at all. */
+    char bundled[1024];
+    if (!p.draft_dir && bundled_drafter(model_dir, bundled, sizeof(bundled))) {
+        p.draft_dir = bundled;
+        VV_LOG_I("spec: the drafter in %s", bundled);
+    }
 
     if (p.kv_format < 0 || p.kv_format >= VV_KV_FORMAT_COUNT) {
         VV_LOG_E("inference: unknown KV-cache format");
@@ -726,6 +760,21 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
     if (attn_want == VV_ATTN_AUTO &&
         c->model->config.family == VV_FAMILY_ASR_STREAMING_7B)
         attn_want = VV_ATTN_FLASHINFER;
+    /*
+     * With a drafter `auto` is flashinfer as well. A checked block runs each
+     * row's attention as its own decode step; fa2's walk over the cache is
+     * one dependent reduction per position, so eight rows cost eight walks,
+     * while flashinfer packs two or three rows to a fragment (AWQ 7B,
+     * 32-minute file: drafted 1.06x the plain decode with fa2, 1.47x with
+     * flashinfer). The drafted transcript is then byte for byte that of
+     * `--attn flashinfer` without a drafter; `--attn fa2 --draft` keeps fa2.
+     * Not where the drafter is declined for sure (CPU, layer shards); where
+     * it is declined later, a slab goes back to `auto`'s choice (below).
+     */
+    const bool attn_for_draft = attn_want == VV_ATTN_AUTO && !cpu_only &&
+                                !sharding && p.draft_dir && p.draft_dir[0];
+    if (attn_for_draft)
+        attn_want = VV_ATTN_FLASHINFER;
     const int attn_slab = vv_attn_resolve(
         (int)attn_want, p.kv_format, false, llm->num_attention_heads,
         llm->num_key_value_heads, llm->head_dim);
@@ -792,8 +841,21 @@ vv_status_t vv_inference_init(const char* model_dir, int gpu_id,
          * no cap at all.
          */
         const size_t frontend = calc_frontend_gpu_bytes(c);
-        const size_t reserve = vv_gpu_reserved(&p.gpus, c->gpu_index)
-                             + frontend;
+        size_t reserve = vv_gpu_reserved(&p.gpus, c->gpu_index)
+                       + frontend;
+        /* A drafter: its weights once, its state once per slot. */
+        if (p.draft_dir && p.draft_dir[0]) {
+            vv_drafter_config_t dc;
+            if (vv_drafter_config_load(p.draft_dir, &dc) == VV_OK) {
+                dc.weight_quant = p.draft_quant;
+                const size_t sb = vv_drafter_weight_bytes(&dc) +
+                                  (size_t)n_slots *
+                                  vv_spec_context_bytes(&dc, max_seq);
+                reserve += sb;
+                VV_LOG_I("budget: %.1f MB for the drafter",
+                         (double)sb / (1024.0 * 1024.0));
+            }
+        }
         VV_LOG_I("budget: reserving %.1f MB (in use %.1f, speech front end "
                  "%.1f incl. its arena)",
                  (double)reserve / (1024.0*1024.0),
@@ -1233,6 +1295,23 @@ fail_gpu:
 
 init_common:
     attach_frontend(c);
+    attach_spec(c, p.draft_dir, p.draft_quant, p.draft_block, p.draft_check,
+                NULL);
+    /* `--draft` made `auto` flashinfer for the rows the drafter's blocks
+     * check. Without the drafter, decode as `auto` does: a slab's backend is
+     * only which kernels read it (the scratch fits every backend); a paged
+     * pool keeps the backend its layout was chosen for. */
+    if (attn_for_draft && !c->drafter && c->kv_cache && !paged) {
+        const int plain = vv_attn_resolve(VV_ATTN_AUTO, p.kv_format, false,
+                                          llm->num_attention_heads,
+                                          llm->num_key_value_heads,
+                                          llm->head_dim);
+        if (plain != c->kv_cache->attn_backend) {
+            c->kv_cache->attn_backend = plain;
+            VV_LOG_I("inference: no drafter; attention %s",
+                     vv_attn_backend_name((vv_attn_backend_t)plain));
+        }
+    }
 
     VV_LOG_I("inference: initialized (%s, workspace=%zu MB, tokenizer=%s)",
              placement_str(c->placement),
@@ -1242,6 +1321,78 @@ init_common:
     return VV_OK;
 }
 
+
+/**
+ * @brief Give a context its drafter: the parent loads it from `dir`, a
+ *        clone borrows the parent's. Speculative decoding needs the whole
+ *        model, its embedding, head and final norm on one device; anything
+ *        else decodes without it, with a warning, rather than failing.
+ */
+static void attach_spec(vv_inference_ctx_t* c, const char* dir, int quant,
+                        int verify_rows, int check,
+                        const vv_inference_ctx_t* parent) {
+    if (!parent && (!dir || !dir[0])) return;
+    c->draft_block = verify_rows;
+    c->draft_check = check;
+    if (parent && !parent->drafter) return;
+    const char* why = NULL;
+    if (!c->use_gpu || c->placement == VV_PLACE_CPU_ONLY)
+        why = "the drafter runs on the GPU only";
+    else if (c->n_shards > 0)
+        why = "the model is split across devices";
+    else if (!c->embed_table_gpu || !c->lm_head_gpu || !c->final_norm_gpu)
+        why = "the embedding, LM head and final norm must be on the GPU";
+    else if (!c->kv_cache || c->kv_cache->on_cpu)
+        why = "the KV cache is not on the GPU";
+    else if (check != VV_DRAFT_CHECK_FAST && vv_decoder_verify_per_row(c->model))
+        /* The 7B drafter on the NF4 checkpoint, test120: 124 tok/s plain,
+         * 112 with exact blocks (paused as soon as they were measured);
+         * INT8, 96 and 88. */
+        why = "these weights (NF4, INT8) check a block exactly one row at a "
+              "time, which never beats plain decoding; --draft-check fast "
+              "checks it in one pass";
+    else {
+        /* The drafter's kernels are CUDA's; a backend without them declines
+         * each one (VV_ERR_UNSUPPORTED). Ask before loading anything. */
+        int32_t none = 0;
+        if (vv_gather_i32_dev(&none, 1, &none, 0, NULL) == VV_ERR_UNSUPPORTED)
+            why = "this backend has no speculative decoding kernels";
+    }
+    if (why) {
+        VV_LOG_W("spec: %s; decoding without the drafter", why);
+        if (!parent) return;
+        c->drafter = NULL;
+        return;
+    }
+    const int rows_max = vv_decoder_verify_rows_max(c->model);
+    if (verify_rows > rows_max) {
+        if (!parent)
+            VV_LOG_W("spec: this model checks at most %d rows exactly "
+                     "(W4A8); --draft-block %d -> %d", rows_max, verify_rows,
+                     rows_max);
+        verify_rows = rows_max;
+    }
+    vv_status_t s = VV_OK;
+    if (!parent)
+        s = vv_drafter_load(dir, c->model, c->gpu_id, quant, &c->drafter);
+    if (s == VV_OK)
+        s = vv_spec_create(c->drafter, c->model->config.llm.hidden_size,
+                           c->kv_cache->max_seq_len, c->kv_cache->attn_backend,
+                           verify_rows, check, c->compute_stream, &c->spec);
+    if (s != VV_OK) {
+        VV_LOG_W("spec: no drafter (%s); decoding without it",
+                 vv_status_str(s));
+        if (!parent && c->drafter) vv_drafter_free(c->drafter);
+        c->drafter = NULL;
+        c->spec = NULL;
+        return;
+    }
+    vv_spec_limit_rows(c->spec, rows_max);
+}
+
+const vv_spec_stats_t* vv_inference_spec_stats(const vv_inference_ctx_t* ctx) {
+    return ctx && ctx->spec ? vv_spec_get_stats(ctx->spec) : NULL;
+}
 
 /**
  * @brief Attach the tokenizer and the speech front end to a context.
@@ -1426,6 +1577,8 @@ vv_status_t vv_inference_clone(const vv_inference_ctx_t* parent,
     }
 
     attach_frontend(c);
+    c->drafter = parent->drafter;
+    attach_spec(c, NULL, 0, parent->draft_block, parent->draft_check, parent);
 
     if (c->kv_cache->pool)
         VV_LOG_I("inference: cloned context (workspace=%zu MB, kv shared "
@@ -1655,11 +1808,12 @@ static vv_status_t step_slice(vv_model_t* model, void* hidden,
                               void* ws, size_t ws_size,
                               void* compute, void* xfer,
                               int first_layer, int n_layers,
-                              bool graph_ok, graph_slot_t* g)
+                              bool graph_ok, graph_slot_t* g,
+                              const vv_taps_t* taps)
 {
     #define VV_STEP_DIRECT()                                                 \
-        vv_decoder_step(model, hidden, kv, pool, ws, ws_size,                \
-                        compute, xfer, first_layer, n_layers)
+        vv_decoder_step_taps(model, hidden, kv, pool, ws, ws_size,           \
+                             compute, xfer, first_layer, n_layers, taps)
 
     /*
      * The capacity check lives in vv_kv_cache_append, and a replayed step
@@ -1726,14 +1880,18 @@ static vv_status_t step_slice(vv_model_t* model, void* hidden,
  * `graphs` holds one slot for the primary and one per shard. With no shards
  * this is exactly the single captured step it was before.
  */
-static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
-                                        bool graph_ok, graph_slot_t* graphs)
+static vv_status_t decoder_step_graphed_taps(vv_inference_ctx_t* ctx,
+                                             void* hidden, bool graph_ok,
+                                             graph_slot_t* graphs,
+                                             const vv_taps_t* taps)
 {
+    /* Taps are for a speculative context, which is never sharded. */
+    if (taps && ctx->n_shards > 0) return VV_ERR_UNSUPPORTED;
     vv_status_t s = step_slice(ctx->model, hidden, ctx->kv_cache,
                                ctx->layer_pool, ctx->workspace,
                                ctx->workspace_size, ctx->compute_stream,
                                ctx->transfer_stream, 0, ctx->primary_layers,
-                               graph_ok, &graphs[0]);
+                               graph_ok, &graphs[0], taps);
     if (s != VV_OK || ctx->n_shards == 0) return s;
 
     const size_t bytes = (size_t)ctx->model->config.llm.hidden_size * 2;
@@ -1750,7 +1908,7 @@ static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
                            sh->layer_pool, sh->workspace, sh->workspace_size,
                            sh->compute_stream, sh->transfer_stream,
                            sh->first_layer, sh->n_layers,
-                           graph_ok, &graphs[i + 1]);
+                           graph_ok, &graphs[i + 1], NULL);
         if (s != VV_OK) { vv_dev_set_device(ctx->gpu_id); return s; }
         src_gpu = sh->gpu_id; src = sh->hidden;
         src_stream = sh->compute_stream; src_done = sh->done;
@@ -1758,6 +1916,12 @@ static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
 
     return hand_off(ctx->gpu_id, hidden, ctx->compute_stream,
                     src_gpu, src, src_stream, src_done, bytes);
+}
+
+static vv_status_t decoder_step_graphed(vv_inference_ctx_t* ctx, void* hidden,
+                                        bool graph_ok, graph_slot_t* graphs)
+{
+    return decoder_step_graphed_taps(ctx, hidden, graph_ok, graphs, NULL);
 }
 
 /**
@@ -2418,7 +2582,19 @@ static vv_status_t transcribe_gpu(
     t_step = vv_time_ms();
     VV_LOG_I("inference: prefill %d tokens, %d layers", seq_len, ctx->model->num_layers);
 
+    /*
+     * With a drafter the prompt's taps become its context as each prefill
+     * chunk finishes. Not while forcing tokens (the reference decides) or
+     * splitting the decode into timed phases.
+     */
+    const bool spec_on = ctx->spec && !lm_head_on_cpu && !embed_on_cpu &&
+                         !profile_decode();
+    if (spec_on) {
+        vv_spec_reset(ctx->spec);
+        ctx->taps = vv_spec_prefill_taps(ctx->spec);
+    }
     s = prefill_all_shards(ctx, hidden_states_gpu, seq_len);
+    ctx->taps = NULL;
     if (s != VV_OK) {
         VV_LOG_E("inference: prefill failed: %s", vv_status_str(s));
         vv_dev_free(hidden_states_gpu);
@@ -2595,7 +2771,127 @@ static vv_status_t transcribe_gpu(
         }
     }
 
-    while (n_generated < max_new_tokens && !teacher_done &&
+    /*
+     * Speculative decoding: each cycle drafts a block and keeps what the
+     * model agrees with (spec.h). It stops at a stop token, at the token
+     * cap, or when a block no longer fits the window -- the plain steps
+     * below then take the last few positions.
+     */
+    if (spec_on && !teacher.ids) {
+        vv_spec_stats_reset(ctx->spec);
+        /* Plain steps between blocks tap their row for the drafter: their
+         * captures are not the untapped step's (graphs, below). */
+        graph_slot_t graphs_taps[VV_MAX_GPUS];
+        for (int i = 0; i < VV_MAX_GPUS; i++) { graphs_taps[i].exec = NULL;
+                                                graphs_taps[i].shape = -1; }
+        /* Whether the device holds the length and the token a step reads:
+         * a step leaves them there for the next, a block does not. */
+        bool dev_fresh = false;
+        while (n_generated < max_new_tokens && !token_ends(ctx, token_id)) {
+            int32_t outs[VV_SPEC_MAX_BLOCK];
+            int n_out = 0;
+            const double t0 = vv_time_ms();
+            if (vv_spec_want_block(ctx->spec)) {
+                s = vv_spec_cycle(ctx, ctx->spec, token_id, outs, &n_out);
+                if (s == VV_ERR_KV_POOL_EXHAUSTED) {
+                    /* No pages for a whole block: plain steps for a while. */
+                    s = VV_OK;
+                    vv_spec_pause(ctx->spec);
+                    continue;
+                }
+                if (s == VV_ERR_OVERFLOW) { s = VV_OK; break; }
+                if (s != VV_OK) {
+                    VV_LOG_E("inference: speculative step at %d failed: %s",
+                             n_generated, vv_status_str(s));
+                    break;
+                }
+                dev_fresh = false;
+                vv_spec_note_block(ctx->spec, n_out, vv_time_ms() - t0);
+            } else {
+                /* A plain step, seen by the drafter as well. It reads the
+                 * length and the token on the device. */
+                if (!dev_fresh) {
+                    vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+                    s = vv_dev_memcpy_h2d(token_out_gpu, &token_id,
+                                          sizeof(int32_t), ctx->compute_stream);
+                }
+                if (s == VV_OK)
+                    s = vv_embedding_dev(ctx->embed_table_gpu,
+                                         (const int32_t*)token_out_gpu,
+                                         hidden_one_gpu, 1, hs,
+                                         ctx->compute_stream);
+                if (s == VV_OK)
+                    s = decoder_step_graphed_taps(ctx, hidden_one_gpu, graph_ok,
+                                                  graphs_taps,
+                                                  vv_spec_step_taps(ctx->spec));
+                if (s == VV_ERR_OVERFLOW) { s = VV_OK; break; }
+                if (s == VV_OK) {
+                    int32_t tok_host = 0;
+                    s = vv_pipeline_head_argmax(ctx, hidden_one_gpu, normed_gpu,
+                                                logits_f32_gpu, argmax_v_gpu,
+                                                argmax_i_gpu, token_out_gpu,
+                                                &tok_host, host_normed_h,
+                                                host_normed_f, &outs[0]);
+                }
+                if (s == VV_OK) s = vv_spec_push_step(ctx->spec);
+                if (s != VV_OK) break;
+                dev_fresh = true;
+                n_out = 1;
+                vv_spec_note_step(ctx->spec, vv_time_ms() - t0);
+            }
+            for (int i = 0; i < n_out; i++) {
+                token_id = outs[i];
+                if (token_ends(ctx, token_id)) break;
+                if (n_generated >= out_cap) {
+                    out_cap *= 2;
+                    output_tokens = (int32_t*)vv_realloc(output_tokens,
+                        (size_t)out_cap * sizeof(int32_t));
+                    if (!output_tokens) { s = VV_ERR_OUT_OF_MEMORY; break; }
+                }
+                output_tokens[n_generated++] = token_id;
+                if (echo_tokens) {
+                    char* tok_text = NULL;
+                    vv_tokenizer_decode(ctx->tokenizer, &token_id, 1, &tok_text);
+                    if (tok_text) {
+                        fprintf(stderr, "%s", tok_text);
+                        fflush(stderr);
+                        vv_free(tok_text);
+                    }
+                }
+                if (n_generated >= max_new_tokens) break;
+            }
+            if (s != VV_OK) break;
+        }
+        for (int i = 0; i < VV_MAX_GPUS; i++)
+            if (graphs_taps[i].exec) vv_dev_graph_destroy(graphs_taps[i].exec);
+        {
+            const vv_spec_stats_t* st = vv_spec_get_stats(ctx->spec);
+            if (st && st->cycles > 0) {
+                /* A captured cycle has no drafting time of its own. */
+                char split[48] = "";
+                if (st->draft_ms > 0.0)
+                    snprintf(split, sizeof(split), ", drafting %.0f ms",
+                             st->draft_ms);
+                VV_LOG_I("spec: %lld cycles, %.2f tokens per cycle, %lld of "
+                         "%lld drafts kept, %lld plain steps, %lld pauses "
+                         "(blocks %.0f ms%s)",
+                         (long long)st->cycles,
+                         (double)st->tokens / (double)st->cycles,
+                         (long long)st->accepted, (long long)st->drafted,
+                         (long long)st->steps, (long long)st->fallbacks,
+                         st->draft_ms + st->verify_ms, split);
+            }
+        }
+        /* The plain steps read the length and the token on the device. */
+        if (s == VV_OK && n_generated < max_new_tokens &&
+            !token_ends(ctx, token_id)) {
+            vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+            vv_dev_memcpy_h2d(token_out_gpu, &token_id, sizeof(int32_t),
+                              ctx->compute_stream);
+        }
+    }
+
+    while (s == VV_OK && n_generated < max_new_tokens && !teacher_done &&
            !token_ends(ctx, token_id)) {
 
         double t_tok = vv_time_ms();
@@ -2749,6 +3045,12 @@ static vv_status_t transcribe_gpu(
     }
     s = vv_postprocess_tokens(token_texts, n_generated, result);
     if (s == VV_OK && *result) (*result)->duration = perf->audio_duration_sec;
+    if (s == VV_OK && *result) {
+        const int32_t stop = token_ends(ctx, token_id) ? token_id : -1;
+        s = vv_transcription_set_tokens(*result, output_tokens, n_generated,
+                                        &n_generated, &stop, 1);
+        if (s != VV_OK) { vv_transcription_free(*result); *result = NULL; }
+    }
     for (int i = 0; i < n_generated; i++)
         if (token_texts[i] && token_texts[i][0] != '\0') vv_free((void*)token_texts[i]);
     vv_free((void*)token_texts);
@@ -3042,6 +3344,16 @@ static vv_status_t transcribe_cpu(
             }
             s = vv_postprocess_tokens(token_texts, n_generated, result);
             if (s == VV_OK && *result) (*result)->duration = perf->audio_duration_sec;
+            if (s == VV_OK && *result) {
+                const int32_t stop = token_ends(ctx, token_id) ? token_id : -1;
+                s = vv_transcription_set_tokens(*result, output_tokens,
+                                                n_generated, &n_generated,
+                                                &stop, 1);
+                if (s != VV_OK) {
+                    vv_transcription_free(*result);
+                    *result = NULL;
+                }
+            }
             for (int i = 0; i < n_generated; i++)
                 if (token_texts[i] && token_texts[i][0] != '\0') vv_free((void*)token_texts[i]);
             vv_free((void*)token_texts);
@@ -3065,6 +3377,146 @@ cpu_cleanup:
     vv_free(logits);
     vv_free(hidden_one);
     return s;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Trace — a transcription replayed as prefills, taps kept (spec.h)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * The prompt with its audio and then every generated token, all in one
+ * prefill: the cache ends up as the transcription left it, and each row's
+ * taps are the hidden states the drafter would have read there.
+ */
+static vv_status_t trace_oneshot_gpu(vv_inference_ctx_t* ctx,
+                                     const float* audio, int n_samples,
+                                     const char* context_info,
+                                     const vv_transcription_t* tr,
+                                     vv_spec_trace_t* t)
+{
+    const int hs = ctx->model->config.llm.hidden_size;
+    const vv_i8vae_t* i8vae = ctx->model->i8vae;
+    if (!i8vae && (!ctx->frontend || !ctx->fe_stream))
+        return VV_ERR_WEIGHT_MISSING;
+    if (!ctx->embed_table_gpu || !ctx->kv_cache) return VV_ERR_UNSUPPORTED;
+
+    const int frames = i8vae ? vv_i8vae_frames(i8vae, n_samples)
+                             : vv_frontend_frames(ctx->frontend, n_samples);
+    vv_prompt_t pr;
+    vv_status_t s = vv_family_build_prompt(&ctx->family, ctx->tokenizer,
+                                           frames, (float)n_samples / 24000.0f,
+                                           context_info, &pr);
+    if (s != VV_OK) return s;
+
+    const int n_gen = tr->num_tokens;
+    const int32_t stop = tr->num_chunks > 0 && tr->chunk_stops
+                       ? tr->chunk_stops[0] : -1;
+    const int n_fed = pr.n + n_gen;
+    t->n = n_fed + (stop >= 0 ? 1 : 0);
+    if (t->n > t->cap || n_fed > t->taps.rows ||
+        n_fed > ctx->kv_cache->max_seq_len) {
+        vv_prompt_free(&pr);
+        return VV_ERR_OVERFLOW;
+    }
+    for (int i = 0; i < pr.n; i++) {
+        t->ids[i] = pr.ids[i];
+        t->kind[i] = VV_TRACE_CONTEXT;
+    }
+    for (int i = 0; i < n_gen; i++) {
+        t->ids[pr.n + i] = tr->tokens[i];
+        t->kind[pr.n + i] = VV_TRACE_GEN;
+    }
+    if (stop >= 0) {
+        t->ids[n_fed] = stop;
+        t->kind[n_fed] = VV_TRACE_LABEL;
+    }
+    const int audio_offset = pr.audio_offset;
+    vv_prompt_free(&pr);
+
+    vv_pipeline_kv_reset(ctx);
+    s = vv_pipeline_kv_reserve(ctx, n_fed);
+    if (s != VV_OK) return s;
+
+    void* hidden = NULL;
+    int32_t* ids_dev = NULL;
+    s = vv_dev_alloc(&hidden, (size_t)n_fed * hs * 2);
+    if (s == VV_OK)
+        s = vv_dev_alloc((void**)&ids_dev, (size_t)n_fed * sizeof(int32_t));
+    if (s == VV_OK)
+        s = vv_dev_memcpy_h2d(ids_dev, t->ids, (size_t)n_fed * sizeof(int32_t),
+                              ctx->compute_stream);
+    if (s == VV_OK)
+        s = vv_embedding_dev(ctx->embed_table_gpu, ids_dev, hidden, n_fed, hs,
+                             ctx->compute_stream);
+    if (s == VV_OK && ctx->fe_ready)
+        s = vv_dev_event_record(ctx->fe_ready, ctx->compute_stream);
+
+    void* rows = (uint8_t*)hidden + (size_t)audio_offset * hs * 2;
+    if (s == VV_OK && i8vae) {
+        float* feat = (float*)vv_alloc((size_t)(frames > 0 ? frames : 1) * hs *
+                                       sizeof(float));
+        uint16_t* h16 = (uint16_t*)vv_alloc((size_t)(frames > 0 ? frames : 1) *
+                                            hs * 2);
+        int nf = 0;
+        s = (feat && h16) ? VV_OK : VV_ERR_OUT_OF_MEMORY;
+        if (s == VV_OK)
+            s = vv_i8vae_encode(i8vae, audio, n_samples,
+                                VV_I8VAE_WINDOW_SAMPLES, feat, &nf);
+        if (s == VV_OK && nf != frames) s = VV_ERR_SHAPE_MISMATCH;
+        if (s == VV_OK) {
+            for (size_t i = 0; i < (size_t)nf * hs; i++)
+                h16[i] = vv_float_to_half_rne(feat[i]);
+            s = vv_dev_memcpy_h2d(rows, h16, (size_t)nf * hs * 2,
+                                  ctx->compute_stream);
+        }
+        if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
+        vv_free(feat);
+        vv_free(h16);
+    } else if (s == VV_OK) {
+        s = encode_audio_gpu(ctx, NULL, audio, n_samples, frames, rows);
+        if (s == VV_OK)
+            s = vv_dev_stream_wait_event(ctx->compute_stream, ctx->fe_done);
+    }
+
+    if (s == VV_OK) {
+        ctx->taps = &t->taps;
+        s = prefill_all_shards(ctx, hidden, n_fed);
+        ctx->taps = NULL;
+    }
+    if (s == VV_OK) s = vv_dev_stream_sync(ctx->compute_stream);
+    if (ids_dev) vv_dev_free(ids_dev);
+    if (hidden) vv_dev_free(hidden);
+    if (ctx->kv_cache->pool) {
+        vv_dev_stream_sync(ctx->compute_stream);
+        vv_kv_cache_release(ctx->kv_cache);
+    }
+    return s;
+}
+
+vv_status_t vv_spec_trace(vv_inference_ctx_t* ctx, const float* pcm24k,
+                          int n_samples, const char* context_info,
+                          const vv_transcription_t* tr, vv_spec_trace_t* t) {
+    if (!ctx || !pcm24k || !tr || !t || !t->ids || !t->kind || !t->taps.buf)
+        return VV_ERR_NULL_PTR;
+    if (t->taps.on_chunk || t->taps.row_base != 0 || t->taps.n <= 0 ||
+        t->taps.n > VV_TAPS_MAX)
+        return VV_ERR_INVALID_ARG;
+    if (tr->num_tokens > 0 && !tr->tokens) return VV_ERR_INVALID_ARG;
+    t->n = 0;
+    if (!ctx->tokenizer || !ctx->family_ok) return VV_ERR_MODEL_FORMAT;
+    if (!ctx->use_gpu || ctx->placement == VV_PLACE_CPU_ONLY ||
+        ctx->n_shards > 0 || !ctx->layer_pool ||
+        !ctx->layer_pool->all_resident)
+        return VV_ERR_UNSUPPORTED;
+    for (int i = 0; i < t->taps.n; i++)
+        if (t->taps.layers[i] < 0 ||
+            t->taps.layers[i] >= ctx->model->num_layers)
+            return VV_ERR_INVALID_ARG;
+    vv_status_t s = vv_dev_set_device(ctx->gpu_id);
+    if (s != VV_OK) return s;
+    if (ctx->family.mode != VV_GEN_ONE_SHOT)
+        return vv_stream_trace(ctx, pcm24k, n_samples, context_info, tr, t);
+    return trace_oneshot_gpu(ctx, pcm24k, n_samples, context_info, tr, t);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -3146,6 +3598,9 @@ vv_status_t vv_inference_free(vv_inference_ctx_t* ctx) {
     if (!ctx) return VV_ERR_NULL_PTR;
 
     vv_stream_ctx_drop_cache(ctx);
+    if (ctx->spec) { vv_spec_free(ctx->spec); ctx->spec = NULL; }
+    if (ctx->drafter && !ctx->is_clone) vv_drafter_free(ctx->drafter);
+    ctx->drafter = NULL;
     if (ctx->use_gpu) {
         if (ctx->workspace) vv_dev_free(ctx->workspace);
         if (!ctx->is_clone) {
@@ -3212,6 +3667,12 @@ vv_status_t vv_pipeline_prefill(vv_inference_ctx_t* ctx, void* hidden,
 vv_status_t vv_pipeline_step(vv_inference_ctx_t* ctx, void* hidden,
                              bool graph_ok, vv_graph_slot_t* graphs) {
     return decoder_step_graphed(ctx, hidden, graph_ok, graphs);
+}
+
+vv_status_t vv_pipeline_step_taps(vv_inference_ctx_t* ctx, void* hidden,
+                                  bool graph_ok, vv_graph_slot_t* graphs,
+                                  const vv_taps_t* taps) {
+    return decoder_step_graphed_taps(ctx, hidden, graph_ok, graphs, taps);
 }
 
 bool vv_pipeline_graph_ok(const vv_inference_ctx_t* ctx) {
@@ -3580,7 +4041,17 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
             }
         }
 
+        /* Greedy answers can go a drafted block at a time (spec.h): the
+         * drafter reads the prompt through the target's taps. */
+        bool spec_on = ctx->spec && !sampling && !embed_on_cpu &&
+                       !lm_head_on_cpu && ctx->n_shards == 0;
+        if (spec_on) {
+            vv_spec_reset(ctx->spec);
+            vv_spec_stats_reset(ctx->spec);
+            ctx->taps = vv_spec_prefill_taps(ctx->spec);
+        }
         if (s == VV_OK) s = prefill_all_shards(ctx, hidden_gpu, seq_len);
+        ctx->taps = NULL;
 
         /* The first token comes off the last prompt row. */
         if (s == VV_OK) {
@@ -3621,6 +4092,19 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
         }
         vv_dev_set_device(ctx->gpu_id);
 
+        /*
+         * A block returns several tokens at once, all but the last of them
+         * already fed. They wait here and come out one per iteration, so the
+         * text, the stop strings and the cap see each of them exactly as
+         * they would see a step's; only when none is left is anything fed.
+         */
+        int32_t queued[VV_SPEC_MAX_BLOCK];
+        int n_queued = 0, q_at = 0;
+        bool dev_fresh = false;     /* device length and token: a step's */
+        graph_slot_t graphs_taps[VV_MAX_GPUS];
+        for (int i = 0; i < VV_MAX_GPUS; i++) { graphs_taps[i].exec = NULL;
+                                                graphs_taps[i].shape = -1; }
+
         while (s == VV_OK && n_generated < max_new &&
                !token_ends(ctx, token_id) && token_id != im_start) {
             char piece[256];
@@ -3649,6 +4133,80 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
                     cancelled = true; break;
                 }
                 emitted = text.n;
+            }
+
+            /* A token a block has fed already: the next one is known. */
+            if (q_at < n_queued) {
+                token_id = queued[q_at++];
+                continue;
+            }
+            if (spec_on && vv_spec_want_block(ctx->spec)) {
+                int n_out = 0;
+                const double t0 = vv_time_ms();
+                s = vv_spec_cycle(ctx, ctx->spec, token_id, queued, &n_out);
+                if (s == VV_OK) {
+                    vv_spec_note_block(ctx->spec, n_out, vv_time_ms() - t0);
+                    dev_fresh = false;
+                    n_queued = n_out;
+                    q_at = 0;
+                    token_id = queued[q_at++];
+                    continue;
+                }
+                if (s == VV_ERR_KV_POOL_EXHAUSTED) {
+                    /* No pages for a whole block: a plain step, below. */
+                    s = VV_OK;
+                    vv_spec_pause(ctx->spec);
+                } else if (s != VV_ERR_OVERFLOW) {
+                    break;
+                } else {
+                    /* The window has no room for a block: plain steps from
+                     * here, which read the length and the token on the
+                     * device. */
+                    s = VV_OK;
+                    spec_on = false;
+                    vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+                    s = vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
+                                          ctx->compute_stream);
+                    if (s != VV_OK) break;
+                }
+            }
+            if (spec_on) {
+                /* Blocks are not paying here (or found no pages): a plain
+                 * step the drafter sees as well, so they can resume later. */
+                const double t0 = vv_time_ms();
+                if (!dev_fresh) {
+                    vv_kv_cache_publish_len(ctx->kv_cache, ctx->compute_stream);
+                    s = vv_dev_memcpy_h2d(tok_dev, &token_id, sizeof(int32_t),
+                                          ctx->compute_stream);
+                }
+                if (s == VV_OK)
+                    s = vv_embedding_dev(ctx->embed_table_gpu,
+                                         (const int32_t*)tok_dev, one_gpu, 1,
+                                         hs, ctx->compute_stream);
+                if (s == VV_OK)
+                    s = decoder_step_graphed_taps(ctx, one_gpu, graph_ok,
+                                                  graphs_taps,
+                                                  vv_spec_step_taps(ctx->spec));
+                if (s == VV_ERR_OVERFLOW) {
+                    VV_LOG_W("generate: the KV window is full (%d positions); "
+                             "the answer stops here -- raise --max-seq-len",
+                             ctx->kv_cache->max_seq_len);
+                    s = VV_OK;
+                    g->finish_reason = "length";
+                    break;
+                }
+                if (s == VV_OK) {
+                    int32_t tok_host = 0;
+                    s = vv_pipeline_head_argmax(ctx, one_gpu, normed_gpu,
+                                                logits_gpu, am_v, am_i, tok_dev,
+                                                &tok_host, host_h, host_f,
+                                                &token_id);
+                }
+                if (s == VV_OK) s = vv_spec_push_step(ctx->spec);
+                if (s != VV_OK) break;
+                dev_fresh = true;
+                vv_spec_note_step(ctx->spec, vv_time_ms() - t0);
+                continue;
             }
 
             /* Embed the token that is already on the device, step, sample. */
@@ -3694,6 +4252,17 @@ vv_status_t vv_inference_generate(vv_inference_ctx_t* ctx,
                                              params->top_p, params->top_k,
                                              &rng, &token_id);
             }
+        }
+
+        for (int i = 0; i < VV_MAX_GPUS; i++)
+            if (graphs_taps[i].exec) vv_dev_graph_destroy(graphs_taps[i].exec);
+        if (ctx->spec && !sampling) {
+            const vv_spec_stats_t* st = vv_spec_get_stats(ctx->spec);
+            if (st && st->cycles > 0)
+                VV_LOG_I("generate: %lld drafted blocks, %.2f tokens each, "
+                         "%lld plain steps", (long long)st->cycles,
+                         (double)st->tokens / (double)st->cycles,
+                         (long long)st->steps);
         }
 
         for (int i = 0; i <= ctx->n_shards; i++)

@@ -32,6 +32,13 @@ vv_status_t vv_pipeline_prefill(vv_inference_ctx_t* ctx, void* hidden,
 vv_status_t vv_pipeline_step(vv_inference_ctx_t* ctx, void* hidden,
                              bool graph_ok, vv_graph_slot_t* graphs);
 
+/** @brief vv_pipeline_step that also leaves its row of the tapped layers in
+ *         row 0 of `taps` (a speculative context's plain step). Its captures
+ *         belong in their own `graphs`, apart from the untapped step's. */
+vv_status_t vv_pipeline_step_taps(vv_inference_ctx_t* ctx, void* hidden,
+                                  bool graph_ok, vv_graph_slot_t* graphs,
+                                  const vv_taps_t* taps);
+
 /** @brief Whether decode steps on `ctx` can be captured and replayed. */
 bool vv_pipeline_graph_ok(const vv_inference_ctx_t* ctx);
 
@@ -58,6 +65,16 @@ void vv_pipeline_kv_release(vv_inference_ctx_t* ctx);
 /** @brief Free the device buffers a closed streaming session parked on
  *         `ctx` (stream_ctx.c). Called by vv_inference_free(). */
 void vv_stream_ctx_drop_cache(vv_inference_ctx_t* ctx);
+
+struct vv_spec_trace;
+struct vv_transcription;
+
+/** @brief vv_spec_trace() for a chunked model: a replayed session
+ *         (stream_ctx.c). The device is bound and `t` checked. */
+vv_status_t vv_stream_trace(vv_inference_ctx_t* ctx, const float* pcm24k,
+                            int n_samples, const char* context_info,
+                            const struct vv_transcription* tr,
+                            struct vv_spec_trace* t);
 
 /** @brief Partials the device argmax reduces through, per call. */
 #define VV_ARGMAX_PARTIALS 256

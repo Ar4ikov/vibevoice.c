@@ -1,8 +1,8 @@
 /**
  * @file gemm_skinny.cu
- * @brief Tensor-core linear layers for 9..64 rows on dense FP16, per-channel
- *        INT8 and NF4 weights, bit-identical to the dequant + tile GEMM path
- *        they replace.
+ * @brief Tensor-core linear layers for up to 64 rows (a prefill's 9..64, a
+ *        fast check's 2..8) on dense FP16, per-channel INT8 and NF4 weights,
+ *        bit-identical to the dequant + tile GEMM path they replace.
  *
  * A Streaming-7B chunk prefills 29 rows. The tile GEMM (gemm.cu) pads them
  * to a 128-row tile and covers N with 128-wide blocks: 4 blocks for the
@@ -510,7 +510,7 @@ vv_status_t vv_skinny_linear_dev(const void* A, int format,
     if (n_proj < 1 || n_proj > SK_MAX_SEGS ||
         format < VV_SKINNY_F16 || format > VV_SKINNY_NF4)
         return VV_ERR_INVALID_ARG;
-    if (M < VV_SKINNY_M_MIN || M > VV_SKINNY_M_MAX || K <= 0 ||
+    if (M < 1 || M > VV_SKINNY_M_MAX || K <= 0 ||
         ((uintptr_t)A & 15) != 0 || !sk_enabled())
         return VV_ERR_UNSUPPORTED;
 

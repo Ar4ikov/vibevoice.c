@@ -1000,6 +1000,21 @@ vv_status_t vv_dev_memcpy_d2d(void* dst, const void* src, size_t size,
     return copy_kernel(dst, src, size, stream);
 }
 
+vv_status_t vv_dev_memcpy2d_d2d(void* dst, size_t dpitch, const void* src,
+                                size_t spitch, size_t width, size_t height,
+                                void* stream) {
+    if (!dst || !src) return VV_ERR_NULL_PTR;
+    /* A row at a time: only the drafter's feature taps use it, and those
+     * are a handful of rows per step. */
+    for (size_t r = 0; r < height; r++) {
+        const vv_status_t e = vv_dev_memcpy_d2d(
+            (uint8_t*)dst + r * dpitch, (const uint8_t*)src + r * spitch,
+            width, stream);
+        if (e != VV_OK) return e;
+    }
+    return VV_OK;
+}
+
 typedef struct { uint64_t n; } mtl_copy_at_p;
 
 vv_status_t vv_dev_memcpy_d2d_at(void* dst_base, const void* src, size_t size,

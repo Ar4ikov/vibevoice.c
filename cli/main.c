@@ -58,6 +58,10 @@ typedef struct {
     const char* source;
     const char* vae;
     const char* head;
+    const char* draft;
+    int         draft_quant;
+    int         draft_block;
+    int         draft_check;
     const char* kv_paged;
     bool        cpu_only;
     float       vram_budget;
@@ -132,6 +136,18 @@ static void print_usage(const char* prog) {
         "                        default)\n"
         "  --source <from>       BitNet weights: auto (default: the GGUF pair\n"
         "                        when present) | gguf | safetensors\n"
+        "  --draft <dir>         DFlash 2 drafter for this model: decode drafts\n"
+        "                        a block of tokens and checks it in one pass\n"
+        "                        (tools/dflash; same tokens, fewer passes).\n"
+        "                        Default: <model>/drafter if there is one;\n"
+        "                        none: never\n"
+        "  --draft-quant <fmt>   drafter weights: int4 (default) | f16\n"
+        "  --draft-block <n>     rows of a block checked per pass (2..block;\n"
+        "                        default: half the block or all, measured)\n"
+        "  --draft-check <how>   exact (default: the transcript is the one\n"
+        "                        without --draft, byte for byte) | fast (the\n"
+        "                        prefill kernels; a near-tie may go the\n"
+        "                        other way)\n"
         "  --head <fmt>          BitNet LM head on the CPU: auto (default: the\n"
         "                        F16 head's exact argmax through an int8\n"
         "                        filter) | f16 (full scan) | int8 (int8 rows\n"
@@ -210,6 +226,30 @@ static int parse_args(int argc, char** argv, cli_args_t* args) {
             args->source = argv[++i];
         } else if (strcmp(argv[i], "--head") == 0 && i + 1 < argc) {
             args->head = argv[++i];
+        } else if (strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
+            /* "none": an empty dir, which also skips <model>/drafter. */
+            args->draft = strcmp(argv[++i], "none") == 0 ? "" : argv[i];
+        } else if (strcmp(argv[i], "--draft-quant") == 0 && i + 1 < argc) {
+            args->draft_quant = vv_drafter_quant_parse(argv[++i]);
+            if (args->draft_quant == VV_DRAFTER_QUANT_COUNT) {
+                fprintf(stderr, "Error: --draft-quant is int4 or f16, not "
+                                "'%s'\n", argv[i]);
+                return -1;
+            }
+        } else if (strcmp(argv[i], "--draft-check") == 0 && i + 1 < argc) {
+            args->draft_check = vv_draft_check_parse(argv[++i]);
+            if (args->draft_check == VV_DRAFT_CHECK_COUNT) {
+                fprintf(stderr, "Error: --draft-check is exact or fast, not "
+                                "'%s'\n", argv[i]);
+                return -1;
+            }
+        } else if (strcmp(argv[i], "--draft-block") == 0 && i + 1 < argc) {
+            args->draft_block = atoi(argv[++i]);
+            if (args->draft_block < 2) {
+                fprintf(stderr, "Error: --draft-block is 2 or more, not "
+                                "'%s'\n", argv[i]);
+                return -1;
+            }
         } else if (strcmp(argv[i], "--vram-budget") == 0 && i + 1 < argc) {
             args->vram_budget = (float)atof(argv[++i]);
             if (args->vram_budget < 0.0f) args->vram_budget = 0.0f;
@@ -439,6 +479,10 @@ int main(int argc, char** argv) {
         }
         init_params.head_format = (int)v;
     }
+    init_params.draft_dir = args.draft;
+    init_params.draft_quant = args.draft_quant;
+    init_params.draft_block = args.draft_block;
+    init_params.draft_check = args.draft_check;
     if (args.kv_cache) {
         vv_kv_format_t f = vv_kv_format_parse(args.kv_cache);
         if (f >= VV_KV_FORMAT_COUNT) {

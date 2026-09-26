@@ -485,6 +485,35 @@ typedef enum vv_head_format {
     VV_HEAD_COUNT
 } vv_head_format_t;
 
+/**
+ * @brief How a DFlash 2 drafter's projections are held on the device. A draft
+ *        is only a proposal -- the target checks every token -- so the drafter
+ *        may be quantized freely; what that costs is acceptance, not accuracy.
+ */
+typedef enum vv_drafter_quant {
+    VV_DRAFTER_INT4 = 0,    /**< INT4 groups of 128 on the W4A16 kernels    */
+    VV_DRAFTER_F16  = 1,    /**< as trained (BF16 -> FP16)                  */
+    VV_DRAFTER_QUANT_COUNT
+} vv_drafter_quant_t;
+
+/** @brief "int4" | "f16"; VV_DRAFTER_QUANT_COUNT if unknown. */
+vv_drafter_quant_t vv_drafter_quant_parse(const char* name);
+
+/** @brief How a drafted block is checked (--draft-check). */
+typedef enum vv_draft_check {
+    VV_DRAFT_CHECK_AUTO  = 0,  /**< the default: exact                     */
+    VV_DRAFT_CHECK_EXACT = 1,  /**< every row with its decode step's
+                                    arithmetic: the transcript is byte for
+                                    byte the one without a drafter        */
+    VV_DRAFT_CHECK_FAST  = 2,  /**< the prefill kernels (tensor cores):
+                                    cheaper per row, but a near-tie can go
+                                    the other way than in a plain decode  */
+    VV_DRAFT_CHECK_COUNT
+} vv_draft_check_t;
+
+/** @brief "auto" | "exact" | "fast"; VV_DRAFT_CHECK_COUNT if unknown. */
+vv_draft_check_t vv_draft_check_parse(const char* name);
+
 /** @brief "auto" | "gguf" | "safetensors"; VV_SOURCE_COUNT if unknown. */
 vv_weights_source_t vv_weights_source_parse(const char* name);
 const char* vv_weights_source_name(vv_weights_source_t s);
@@ -525,11 +554,30 @@ typedef struct vv_init_params {
     int    weights_source; /**< vv_weights_source_t (asr-bitnet). Default: auto */
     int    vae_numerics;   /**< vv_vae_numerics_t. Default: auto             */
     int    head_format;    /**< vv_head_format_t (asr-bitnet). Default: auto */
+    /**
+     * Directory of a DFlash 2 drafter for this model (spec.h): decode then
+     * drafts a block of tokens in one pass and checks it with one pass of
+     * the model. NULL: the model directory's own `drafter/` if it has one,
+     * else plain decoding; "" (empty): plain decoding.
+     */
+    const char* draft_dir;
+    int    draft_quant;   /**< vv_drafter_quant_t. Default: int4             */
+    /**
+     * Rows of a drafted block the model checks per pass: the last token and
+     * draft_block - 1 drafts (2..the drafter's block size). The drafter
+     * always drafts its whole block; checking a row costs about as much as
+     * a step once there are more than two, so fewer rows can be faster when
+     * the later drafts are rarely kept. 0: the default (4).
+     */
+    int    draft_block;
+    int    draft_check;   /**< vv_draft_check_t. Default: auto (exact)      */
 } vv_init_params_t;
 
 /** @brief Fill vv_init_params_t with sane defaults. */
 static inline vv_init_params_t vv_init_params_default(void) {
-    vv_init_params_t p;
+    /* Zeroed first: a field left out below (the per-device caps of an empty
+     * `gpus`, say) must read as "not asked for", not as stack garbage. */
+    vv_init_params_t p = {0};
     p.vram_budget = 1.0f;
     p.kv_format = 0;
     p.cpu_only = false;
@@ -547,6 +595,10 @@ static inline vv_init_params_t vv_init_params_default(void) {
     p.weights_source = VV_SOURCE_AUTO;
     p.vae_numerics = VV_VAE_AUTO;
     p.head_format = VV_HEAD_AUTO;
+    p.draft_dir = NULL;
+    p.draft_quant = VV_DRAFTER_INT4;
+    p.draft_block = 0;
+    p.draft_check = VV_DRAFT_CHECK_AUTO;
     return p;
 }
 
@@ -581,6 +633,18 @@ typedef struct vv_transcription {
     const char*   full_text;
     float         duration;
     const char*   language;
+    /**
+     * The ids the model generated, every chunk's back to back (one chunk
+     * for a one-shot model), without the tokens that stopped them. What a
+     * tool that retraces a transcription needs (tools/dflash); may be NULL.
+     */
+    int32_t*      tokens;
+    int           num_tokens;
+    /** Per chunk: how many of `tokens` it produced, and the id that
+     *  stopped it (-1 when the token cap did). */
+    int*          chunk_tokens;
+    int32_t*      chunk_stops;
+    int           num_chunks;
 } vv_transcription_t;
 
 /* ─── Performance metrics ───────────────────────────────────────────────── */
